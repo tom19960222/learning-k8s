@@ -1,10 +1,9 @@
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import { notFound } from 'next/navigation'
 import { ExternalLink } from 'lucide-react'
 
 export function generateStaticParams() {
-  // Provide one dummy entry per project so static export doesn't fail
-  return PROJECT_IDS.map(project => ({
+  return PROJECT_IDS_FOR_STATIC_EXPORT.map(project => ({
     project,
     filepath: ['README.md'],
   }))

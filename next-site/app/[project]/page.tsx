@@ -1,11 +1,11 @@
 import Link from 'next/link'
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import { notFound } from 'next/navigation'
 import { ExternalLink, Map, BookOpen, HelpCircle, Lightbulb, ArrowRight } from 'lucide-react'
 import { ProjectStory } from '@/components/ProjectStory'
 
 export function generateStaticParams() {
-  return PROJECT_IDS.map(id => ({ project: id }))
+  return PROJECT_IDS_FOR_STATIC_EXPORT.map(id => ({ project: id }))
 }
 
 const PATH_CONFIG = [

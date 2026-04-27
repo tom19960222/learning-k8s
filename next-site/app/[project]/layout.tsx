@@ -1,11 +1,11 @@
 import { notFound } from 'next/navigation'
 import { SiteHeader } from '@/components/SiteHeader'
 import { ProjectSidebar } from '@/components/ProjectSidebar'
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import type { ProjectId } from '@/lib/projects'
 
 export function generateStaticParams() {
-  return PROJECT_IDS.map(id => ({ project: id }))
+  return PROJECT_IDS_FOR_STATIC_EXPORT.map(id => ({ project: id }))
 }
 
 export default function ProjectLayout({

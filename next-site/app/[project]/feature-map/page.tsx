@@ -1,4 +1,4 @@
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import { loadFeatureMap } from '@/lib/content-loader'
 import { notFound } from 'next/navigation'
 import dynamic from 'next/dynamic'
@@ -9,7 +9,7 @@ const FeatureMapGraph = dynamic(
 )
 
 export function generateStaticParams() {
-  return PROJECT_IDS.map(id => ({ project: id }))
+  return PROJECT_IDS_FOR_STATIC_EXPORT.map(id => ({ project: id }))
 }
 
 export default function FeatureMapPage({ params }: { params: { project: string } }) {

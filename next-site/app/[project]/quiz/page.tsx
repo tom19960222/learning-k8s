@@ -1,11 +1,11 @@
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import { notFound } from 'next/navigation'
 import { QuizQuestion } from '@/components/QuizQuestion'
 import { existsSync, readFileSync } from 'fs'
 import path from 'path'
 
 export function generateStaticParams() {
-  return PROJECT_IDS.map(id => ({ project: id }))
+  return PROJECT_IDS_FOR_STATIC_EXPORT.map(id => ({ project: id }))
 }
 
 export default async function QuizPage({ params }: { params: { project: string } }) {

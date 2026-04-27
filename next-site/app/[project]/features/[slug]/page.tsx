@@ -1,4 +1,4 @@
-import { getProject, PROJECT_IDS } from '@/lib/projects'
+import { getProject, PROJECT_IDS_FOR_STATIC_EXPORT } from '@/lib/projects'
 import { loadFeatureSource } from '@/lib/content-loader'
 import { notFound } from 'next/navigation'
 import { MDXRemote } from 'next-mdx-remote/rsc'
@@ -14,8 +14,12 @@ import { TableOfContents } from '@/components/TableOfContents'
 
 export function generateStaticParams() {
   const params: { project: string; slug: string }[] = []
-  for (const projectId of PROJECT_IDS) {
-    const proj = getProject(projectId)!
+  for (const projectId of PROJECT_IDS_FOR_STATIC_EXPORT) {
+    const proj = getProject(projectId)
+    if (!proj) {
+      params.push({ project: projectId, slug: '__placeholder__' })
+      continue
+    }
     for (const slug of proj.features) {
       params.push({ project: projectId, slug })
     }

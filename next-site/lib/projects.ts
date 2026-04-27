@@ -62,3 +62,12 @@ export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)
 export function getProject(id: string): ProjectMeta | undefined {
   return PROJECTS[id]
 }
+
+/**
+ * Returns PROJECT_IDS padded with a single placeholder so that
+ * generateStaticParams() never returns [] when using `output: export`.
+ * Next.js 14 errors on empty generateStaticParams with static export.
+ * The placeholder param triggers notFound() at render time.
+ */
+export const PROJECT_IDS_FOR_STATIC_EXPORT: ProjectId[] =
+  PROJECT_IDS.length > 0 ? PROJECT_IDS : ['__placeholder__']
