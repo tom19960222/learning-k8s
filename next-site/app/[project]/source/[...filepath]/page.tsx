@@ -17,12 +17,7 @@ export default function SourcePage({ params }: { params: { project: string; file
   if (!project) notFound()
 
   const file = params.filepath.join('/')
-  const bases: Record<string, string> = {
-    'cluster-api': 'https://github.com/kubernetes-sigs/cluster-api',
-    'cluster-api-provider-maas': 'https://github.com/spectrocloud/cluster-api-provider-maas',
-    'cluster-api-provider-metal3': 'https://github.com/metal3-io/cluster-api-provider-metal3',
-  }
-  const githubUrl = `${bases[project.id] ?? ''}/blob/main/${file}`
+  const githubUrl = project.githubUrl ? `${project.githubUrl}/blob/main/${file}` : ''
 
   return (
     <div className="max-w-4xl mx-auto px-8 py-10">
