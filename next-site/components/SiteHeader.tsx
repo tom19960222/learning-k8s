@@ -13,7 +13,7 @@ export function SiteHeader({ currentProject }: Props) {
       <div className="max-w-screen-2xl mx-auto px-6 h-14 flex items-center gap-4">
         <Link href="/" className="flex items-center gap-2 font-bold text-white hover:text-[#2f81f7] transition-colors shrink-0">
           <BookOpen size={18} className="text-[#2f81f7]" />
-          <span>MoLearn</span>
+          <span>learning-k8s</span>
         </Link>
         <span className="text-[#30363d] shrink-0">/</span>
 
@@ -39,7 +39,7 @@ export function SiteHeader({ currentProject }: Props) {
         </nav>
 
         <div className="ml-auto flex items-center gap-3">
-          <a href="https://github.com/hwchiu/molearn" target="_blank" rel="noopener noreferrer"
+          <a href="#" target="_blank" rel="noopener noreferrer"
             className="text-[#8b949e] hover:text-white transition-colors">
             <Github size={18} />
           </a>
