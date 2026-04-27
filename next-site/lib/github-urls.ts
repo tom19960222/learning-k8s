@@ -1,16 +1,15 @@
+import { PROJECTS } from './projects'
 import type { ProjectId } from './projects'
 
-const GITHUB_BASES: Record<ProjectId, string> = {
-  'cluster-api': 'https://github.com/kubernetes-sigs/cluster-api',
-  'cluster-api-provider-maas': 'https://github.com/spectrocloud/cluster-api-provider-maas',
-  'cluster-api-provider-metal3': 'https://github.com/metal3-io/cluster-api-provider-metal3',
-  'rook': 'https://github.com/rook/rook',
-  'kube-ovn': 'https://github.com/kubeovn/kube-ovn',
-  'kubevirt': 'https://github.com/kubevirt/kubevirt',
+function baseUrl(project: ProjectId): string {
+  const meta = PROJECTS[project]
+  if (!meta) return ''
+  return meta.githubUrl
 }
 
 export function buildGithubBlobUrl(project: ProjectId, file: string, lineStart?: number, lineEnd?: number): string {
-  const base = GITHUB_BASES[project]
+  const base = baseUrl(project)
+  if (!base) return ''
   let url = `${base}/blob/main/${file}`
   if (lineStart) url += `#L${lineStart}`
   if (lineEnd) url += `-L${lineEnd}`
@@ -18,5 +17,7 @@ export function buildGithubBlobUrl(project: ProjectId, file: string, lineStart?:
 }
 
 export function buildGithubTreeUrl(project: ProjectId, dir: string): string {
-  return `${GITHUB_BASES[project]}/tree/main/${dir}`
+  const base = baseUrl(project)
+  if (!base) return ''
+  return `${base}/tree/main/${dir}`
 }
