@@ -1,0 +1,11 @@
+{
+  "name": "molearn",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "cd next-site && npm run dev",
+    "build": "cd next-site && npm run build",
+    "preview": "cd next-site && npm run preview"
+  },
+  "devDependencies": {}
+}
