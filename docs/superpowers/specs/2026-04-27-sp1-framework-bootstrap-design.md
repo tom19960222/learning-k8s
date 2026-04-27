@@ -162,7 +162,7 @@ skills/                                     (entire tree, all 4 skills)
 | File | Outline |
 |---|---|
 | `README.md` | Purpose, tech stack, local dev commands, sub-project list, acknowledgement of molearn |
-| `CLAUDE.md` | Future-AI guide: 5 target projects + learning-plan, content language (zh-TW), `make validate` rule, lab-verification level |
+| `CLAUDE.md` | Future-AI guide. MUST explicitly state: (1) **all Chinese content uses Taiwan Mandarin (繁體中文，台灣用語)** — examples of TW vs CN word choices (軟體/網路/檔案/程式/預設/資料/使用者/影片/解析度/物件); (2) technical terms stay in English per molearn's never-translate list (node, cluster, controller, namespace, container, image, workload, bare-metal, gateway, scheduling, rolling update, label, etc.); (3) the 5 target projects + learning-plan; (4) `make validate` is mandatory before commit; (5) lab command verification level (source/syntax + kind where possible). |
 | `BOOTSTRAP.md` | Adapted from molearn — the 5-step "add a new project" guide |
 
 **SKIP** (do not copy):
@@ -192,12 +192,14 @@ skills/                                     (entire tree, all 4 skills)
 
 ## Branding & Site Identity
 
+All zh content below uses Taiwan Mandarin (繁體中文，台灣用語). Technical terms stay in English.
+
 | Surface | New value |
 |---|---|
 | `<title>` | "Kubernetes 深潛 — k8s / cilium / kubevirt / ceph / multus 原始碼學習站" |
 | `<meta name="description">` | "從原始碼深度分析 Kubernetes 與其生態系，附 30 天 hands-on lab" |
 | Homepage hero headline | "從原始碼學習 Kubernetes 生態系" |
-| Homepage hero subline | "以 30 天動手實驗 + 5 個專案的深度原始碼導讀，建立可開發 KubeVirt 平台的能力" |
+| Homepage hero subline | "以 30 天動手實驗加 5 個專案的深度原始碼導讀，建立可開發 KubeVirt 平台的能力" |
 | Repo URL in header | placeholder `#` (filled when repo is pushed to GitHub) |
 | Homepage footer | "框架 fork 自 [hwchiu/molearn](https://github.com/hwchiu/molearn)，感謝 @hwchiu" |
 | Design tokens (colors) | Unchanged — keep molearn's GitHub Dark palette |
