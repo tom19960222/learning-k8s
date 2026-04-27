@@ -2,8 +2,8 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'MoLearn — Kubernetes Source Deep Dive',
-  description: '深入解析 Cluster API 生態系原始碼，以功能視角學習 Kubernetes 基礎設施管理',
+  title: 'Kubernetes 深潛 — k8s / cilium / kubevirt / ceph / multus 原始碼學習站',
+  description: '從原始碼深度分析 Kubernetes 與其生態系，附 30 天 hands-on lab',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
