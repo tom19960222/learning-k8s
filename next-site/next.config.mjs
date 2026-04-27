@@ -1,7 +1,6 @@
-
-
-const isProd = process.env.NODE_ENV === 'production'
-const basePath = isProd ? '/molearn' : ''
+// learning-k8s defaults to root deployment.
+// If deploying to GitHub Pages under a subpath, set NEXT_PUBLIC_BASE_PATH at build time.
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? ''
 
 const nextConfig = {
   output: 'export',
