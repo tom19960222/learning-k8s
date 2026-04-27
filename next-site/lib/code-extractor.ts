@@ -2,6 +2,7 @@ import { readFileSync, existsSync } from 'fs'
 import path from 'path'
 import { codeToHtml } from 'shiki'
 import type { ProjectId } from './projects'
+import { buildGithubBlobUrl } from './github-urls'
 
 export interface CodeSnippet {
   highlightedHtml: string
@@ -23,15 +24,7 @@ function detectLang(file: string): string {
 }
 
 function buildGithubUrl(project: ProjectId, file: string, start: number, end: number): string {
-  const bases: Record<ProjectId, string> = {
-    'cluster-api': 'https://github.com/kubernetes-sigs/cluster-api',
-    'cluster-api-provider-maas': 'https://github.com/spectrocloud/cluster-api-provider-maas',
-    'cluster-api-provider-metal3': 'https://github.com/metal3-io/cluster-api-provider-metal3',
-    'rook': 'https://github.com/rook/rook',
-    'kube-ovn': 'https://github.com/kubeovn/kube-ovn',
-    'kubevirt': 'https://github.com/kubevirt/kubevirt',
-  }
-  return `${bases[project]}/blob/main/${file}#L${start}-L${end}`
+  return buildGithubBlobUrl(project, file, start, end)
 }
 
 export async function extractCodeSnippet(
