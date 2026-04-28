@@ -1,0 +1,213 @@
+---
+layout: doc
+title: Day 10 — NetworkPolicy + CiliumNetworkPolicy
+description: 用 K8s NetworkPolicy 做 L3/L4 default-deny，再用 CiliumNetworkPolicy 開放特定 HTTP path，體驗 L7 enforcement 的實際效果。
+---
+
+## 今日目標
+
+- 建立 `np-demo` namespace 並確認 Pod 間預設連通
+- Apply K8s NetworkPolicy 實現 default-deny，觀察連線被阻斷
+- Apply CiliumNetworkPolicy（CNP）只開放 `/healthz` HTTP path
+- 驗證 `/healthz` 成功、其他 path 收到 403
+- 理解 L7 enforcement 透過 envoy proxy 在 network namespace 層實現
+
+## 今日在 30 天計畫中的位置
+
+Day 9 我們看到 BPF map 是 dataplane 決策的基礎；今天把這個機制具體展現在 policy 場景。K8s NetworkPolicy 觸發 cilium 寫入 BPF policy map（L3/L4 規則），CNP 的 L7 規則則進一步透過 envoy proxy 攔截 HTTP 流量。Day 11 的 Hubble 能即時呈現今天你設定的 allow / drop flow，所以今天把 policy 先建好很重要。
+
+## 前置條件
+
+- 昨日 [Day 09](/learning-plan/features/day-09) 已完成，理解 BPF endpoint map
+- cilium 健康運作（`cilium status` 顯示 OK）
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get pods -l k8s-app=cilium
+```
+
+```
+NAME           READY   STATUS    RESTARTS   AGE
+cilium-xxxxx   1/1     Running   0          1d
+cilium-yyyyy   1/1     Running   0          1d
+```
+
+## 動手做
+
+### 1. 建立 namespace 與兩個 Pod
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create ns np-demo
+kubectl run -n np-demo a --image=nginx --labels=app=a
+kubectl run -n np-demo b --image=curlimages/curl --labels=app=b -- sleep 3600
+```
+
+等 Pod Ready：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n np-demo get pods -o wide
+```
+
+```
+NAME   READY   STATUS    IP           NODE          ...
+a      1/1     Running   10.244.1.x   k8s-worker-01
+b      1/1     Running   10.244.1.y   k8s-worker-01
+```
+
+記下 Pod `a` 的 IP。
+
+### 2. 確認預設連通
+
+從 Pod `b` curl Pod `a`（使用 Pod IP，因為還沒有 Service）：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl exec -n np-demo b -- curl -s -o /dev/null -w "%{http_code}" http://<pod-a-ip>/ -m 5
+```
+
+```
+200
+```
+
+預設沒有 NetworkPolicy，所有流量都通。
+
+### 3. Apply default-deny NetworkPolicy
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: np-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+EOF
+```
+
+```
+networkpolicy.networking.k8s.io/default-deny-ingress created
+```
+
+`podSelector: {}` 選中 namespace 內所有 Pod；`policyTypes: [Ingress]` 且 `ingress:` 欄位缺省 → 等同 `ingress: []` → 拒絕所有 ingress 流量。
+
+### 4. 驗證 default-deny 生效
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl exec -n np-demo b -- curl -s -o /dev/null -w "%{http_code}" http://<pod-a-ip>/ -m 5 || echo "timeout/error"
+```
+
+```
+timeout/error
+```
+
+連線應該 timeout（cilium eBPF program 在 ingress 方向 drop 掉這個封包）。
+
+### 5. Apply CiliumNetworkPolicy 開放 L7 /healthz
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<'EOF'
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-b-to-a-healthz
+  namespace: np-demo
+spec:
+  endpointSelector:
+    matchLabels:
+      app: a
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: b
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+          rules:
+            http:
+              - method: GET
+                path: /healthz
+EOF
+```
+
+```
+ciliumnetworkpolicy.cilium.io/allow-b-to-a-healthz created
+```
+
+這條 CNP 說：Pod `a` 的 ingress 只允許來自 Pod `b` 的 TCP/80 GET 請求，且 HTTP path 必須是 `/healthz`。
+
+### 6. 驗證 /healthz 成功、其他 path 被拒
+
+測試允許的 path：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl exec -n np-demo b -- curl -s -o /dev/null -w "%{http_code}" http://<pod-a-ip>/healthz -m 5
+```
+
+```
+404
+```
+
+（nginx 預設沒有 `/healthz` route，所以 HTTP 層到達了但回 404；若要看 200 可先 `kubectl exec -n np-demo a -- sh -c "echo ok > /usr/share/nginx/html/healthz"`。重點是**連線有通**，沒有 timeout。）
+
+測試其他 path：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl exec -n np-demo b -- curl -s -o /dev/null -w "%{http_code}" http://<pod-a-ip>/other -m 5
+```
+
+```
+403
+```
+
+`403 Forbidden` 是 envoy proxy 回傳的——HTTP 連線建立了，但 envoy 在 L7 層拒絕了這個 path。這和 L3/L4 drop（timeout）的行為不同。
+
+### 7. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete ns np-demo
+```
+
+## 觀念深化
+
+**K8s NetworkPolicy 只能做 L3/L4**：它讓 cilium 把 IP 與 port 規則寫入 BPF policy map，kernel 的 eBPF program 在 tc hook 直接 allow / drop，不需要過 user-space。
+
+**CiliumNetworkPolicy 加上 L7**：當 CNP 包含 `rules.http`，cilium-agent 會在 Pod 的 network namespace 裡透過 iptables 或 sockops 把 HTTP 流量導到本機的 envoy proxy（Cilium 內建的，稱為 Cilium Envoy）。Envoy 在 HTTP 層解析 path / method / header，按 CNP 規則 allow 或回傳 403。這樣 L7 決策不在 kernel（eBPF 只負責識別「這條流要給 envoy」），而是在 user-space 的 envoy 進行。
+
+這個設計的取捨：L7 inspection 增加一個 user-space hop（延遲略高），但能檢查應用層語義；L3/L4 全在 kernel（更快），但只能看 IP / port。
+
+參考：
+- [Cilium Network Policy 概念](https://docs.cilium.io/en/v1.19/security/policy/)
+- [pkg/policy 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/pkg/policy)
+
+## 收穫檢查
+
+- `podSelector: {}` 在 NetworkPolicy 裡選中什麼？
+- L4 drop（cilium eBPF）和 L7 拒絕（envoy 403）從 client 的角度感受有什麼不同？
+- CNP 的 L7 HTTP 規則是由 kernel eBPF 還是 user-space envoy 執行的？
+- 如果同時存在 K8s NetworkPolicy 和 CiliumNetworkPolicy，兩者的關係是 AND 還是 OR？
+- `endpointSelector` 和 `fromEndpoints` 的差別是什麼？
+
+## 參考資料
+
+- [Cilium Network Policy](https://docs.cilium.io/en/v1.19/security/policy/) — L3/L4/L7 policy 語法完整說明
+- [CiliumNetworkPolicy CRD 參考](https://docs.cilium.io/en/v1.19/security/policy/kubernetes/) — CNP spec 欄位說明
+- [pkg/policy 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/pkg/policy) — policy engine 實作
+- [K8s NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/) — 官方規格文件
+
+## 明日預告
+
+明天 [Day 11](/learning-plan/features/day-11) 部署 Hubble Relay 與 Hubble UI，把今天設定的 policy flow 視覺化——你可以在 service map 上直接看到哪些 Pod 之間的流量被 allow / drop。

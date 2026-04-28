@@ -1,0 +1,195 @@
+---
+layout: doc
+title: Day 11 — Hubble 觀測
+description: 部署 Hubble Relay 與 Hubble UI，用 hubble observe 追蹤 Pod 間 flow，在 service map 上直接看到 allow / drop 原因。
+---
+
+## 今日目標
+
+- 用 `helm upgrade` 啟用 Hubble Relay 與 Hubble UI
+- 確認 `hubble-relay` Pod 正常運作
+- 用 `hubble observe` 即時看到 Pod 間的 flow 事件
+- 在 flow 記錄中找到 drop reason
+- 開啟 Hubble UI，瀏覽 service map
+
+## 今日在 30 天計畫中的位置
+
+Day 10 我們設定了 NetworkPolicy 與 CiliumNetworkPolicy；今天用 Hubble 把那些 allow / drop flow 視覺化。Hubble 本質上是把 eBPF event ring buffer 的資料透過 gRPC 暴露出來——這和 Day 9 的 `cilium monitor` 是相同的底層資料來源，只是 Hubble 多了跨 node 聚合與 UI。Day 12 啟用 WireGuard 加密後，你可以用 Hubble 觀察加密前的 flow（Hubble 在 WireGuard 之前 tap，所以仍能看到明文 flow metadata）。
+
+## 前置條件
+
+- 昨日 [Day 10](/learning-plan/features/day-10) 已完成，cilium 運作且 np-demo 已清理
+- 本機已安裝 `hubble` CLI（安裝見 https://docs.cilium.io/en/v1.19/observability/hubble/setup/）
+
+環境確認：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium status | grep -i hubble
+```
+
+```
+Hubble Relay:       disabled
+```
+
+（安裝前應該看到 `disabled`，安裝後才會是 `OK`。）
+
+## 動手做
+
+### 1. Helm upgrade：啟用 Hubble Relay 與 UI
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm upgrade cilium cilium/cilium \
+  --version 1.19.3 \
+  --namespace kube-system \
+  --reuse-values \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+```
+
+```
+Release "cilium" has been upgraded. Happy Helming!
+STATUS: deployed
+REVISION: 2
+```
+
+`--reuse-values` 保留 Day 8 設定的所有 values（`kubeProxyReplacement=false` 等），只疊加新的 flag。
+
+### 2. 等待 hubble-relay 就緒
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get pods -l k8s-app=hubble-relay -w
+```
+
+```
+NAME                            READY   STATUS    RESTARTS   AGE
+hubble-relay-xxxxxxxxxx-xxxxx   1/1     Running   0          90s
+```
+
+### 3. 確認 Hubble UI
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get deploy hubble-ui
+```
+
+```
+NAME        READY   UP-TO-DATE   AVAILABLE   AGE
+hubble-ui   1/1     1            1           2m
+```
+
+### 4. 建立 port-forward
+
+在背景啟動 port-forward（或開獨立 terminal）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium hubble port-forward &
+```
+
+```
+Forwarding from 127.0.0.1:4245 -> 4245
+```
+
+### 5. 確認 hubble CLI 可連接
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+hubble status
+```
+
+```
+Healthcheck (via localhost:4245): Ok
+Current/Max Flows:   4,096/4,096 (100.00%)
+Flows/s:             7.50
+Connected Nodes:     2/2
+```
+
+`Connected Nodes: 2/2` 表示 Relay 已聚合兩個 node 的資料。
+
+### 6. 建一個 demo Pod 並觀察 flow
+
+建立測試環境：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create ns hubble-demo
+kubectl run -n hubble-demo server --image=nginx --labels=app=server
+kubectl run -n hubble-demo client --image=curlimages/curl --labels=app=client -- sleep 3600
+```
+
+等 Pod Ready 後，在另一個 terminal 持續觀察：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+hubble observe --namespace hubble-demo --follow
+```
+
+```
+TIMESTAMP             SOURCE                   DESTINATION              TYPE        VERDICT   REASON
+...
+```
+
+回到原本的 terminal 觸發流量：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+POD_A_IP=$(kubectl get pod -n hubble-demo server -o jsonpath='{.status.podIP}')
+kubectl exec -n hubble-demo client -- curl -s -o /dev/null -w "%{http_code}" http://${POD_A_IP}/ -m 5
+```
+
+observe terminal 應該出現類似：
+
+```
+2026-05-07T... hubble-demo/client:xxxxx -> hubble-demo/server:80   http-request   FORWARDED
+2026-05-07T... hubble-demo/server:80   -> hubble-demo/client:xxxxx  http-response  FORWARDED
+```
+
+### 7. 開啟 Hubble UI service map
+
+```bash
+# 🔴 需在你環境跑後對照
+kubectl -n kube-system port-forward service/hubble-ui 12000:80 &
+```
+
+用瀏覽器開啟 `http://localhost:12000`，切換到 `hubble-demo` namespace，你應該看到 `client` → `server` 的有向連線，帶有 FORWARDED 狀態。若先設定 NetworkPolicy 再觀察，可以看到 DROPPED flow 和 drop reason。
+
+### 8. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete ns hubble-demo
+```
+
+## 觀念深化
+
+**Hubble 的資料流程**：cilium-agent 在處理封包的 eBPF program 裡，把 flow 事件寫入 `BPF_MAP_TYPE_PERF_EVENT_ARRAY`（ring buffer）。Agent 的 user-space 部分讀取這個 buffer，把 flow 存進 in-memory circular buffer（預設 4096 個 flow per node）。Hubble Relay 透過 Unix socket 連到每個 node 的 Hubble server（cilium-agent 的 gRPC endpoint），聚合所有 node 的 flow，再暴露給 `hubble` CLI 或 Hubble UI 查詢。
+
+Hubble 能看到的是 **flow metadata**（src/dst IP、port、verdict、reason、HTTP path），而不是 payload content。即使啟用了 WireGuard 加密（Day 12），Hubble 仍能看到 flow metadata——因為 tap 點在 WireGuard 封裝之前（node 內部的 veth hook），此時封包還是明文 Pod 流量。
+
+**hubble observe 的篩選語法**：`--pod`、`--namespace`、`--type` 等 flag 在 Relay 端過濾，不是在 CLI 端；所以不用擔心漏掉 event。
+
+參考：
+- [Hubble 觀測文件](https://docs.cilium.io/en/v1.19/observability/hubble/)
+- [hubble/ 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/hubble)
+
+## 收穫檢查
+
+- Hubble Relay 的功能是什麼？如果沒有 Relay，hubble CLI 能跨 node 看 flow 嗎？
+- Hubble 的 flow 資料存在哪裡？重啟 cilium-agent 後，歷史 flow 還能查到嗎？
+- 為什麼 Hubble 在 WireGuard 加密啟用後仍能看到 flow metadata？
+- `hubble observe --verdict DROPPED` 可以做什麼？你能找到今天 default-deny 造成的 drop 記錄嗎？
+- Hubble UI 的資料是從 Relay 拿的還是直接連 cilium-agent？
+
+## 參考資料
+
+- [Hubble Getting Started](https://docs.cilium.io/en/v1.19/observability/hubble/setup/) — CLI 安裝與 port-forward 設定
+- [Hubble 觀測文件](https://docs.cilium.io/en/v1.19/observability/hubble/) — 觀測概念與 flow filter 語法
+- [hubble/ 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/hubble) — Hubble server 與 Relay 實作
+- [hubble CLI GitHub](https://github.com/cilium/hubble) — hubble CLI 原始碼與 release
+
+## 明日預告
+
+明天 [Day 12](/learning-plan/features/day-12) 啟用 cilium 的 WireGuard transparent encryption，把所有 node 間的 Pod 流量加密成 UDP/51871，並在 node 上用 `wg show` 和 `tcpdump` 確認加密封包。

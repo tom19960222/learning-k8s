@@ -1,0 +1,194 @@
+---
+layout: doc
+title: Day 08 — 安裝 Cilium
+description: 移除預設 CNI、安裝 cilium v1.19.3，確認 cilium-agent DaemonSet 與 cilium-operator Deployment 健康，進入 Block 2 網路層探索。
+---
+
+## 今日目標
+
+- 了解替換 CNI 的風險與步驟順序
+- 用 `helm install` 部署 cilium v1.19.3 到 `kube-system`
+- 確認所有 cilium-agent Pod 進入 Ready 狀態
+- 用 `cilium status` 驗證 eBPF datapath 啟用
+- 識別 cilium-agent（DaemonSet）與 cilium-operator（Deployment）的職責差異
+
+## 今日在 30 天計畫中的位置
+
+Day 7 我們自己寫了一個 operator，親身體驗 reconcile loop；Block 1 正式收關。Day 8 起進入 Block 2，目標是深入網路層。今天換掉 CNI 是所有後續實驗的基礎——Day 9 到 Day 12 都需要 cilium 在跑才能觀察。Block 2 的最後（Day 13-14）再引入 Multus，讓 Pod 能接上第二張網卡。
+
+## 前置條件
+
+- 昨日 [Day 07](/learning-plan/features/day-07) 已完成，operator 概念清楚
+- **重要警告：** 換 CNI 會讓 cluster 短暫失去 Pod 間連線，請只在非生產的學習用 cluster 操作
+- 本機已安裝 `helm` v3 與 `cilium` CLI（安裝見 https://docs.cilium.io/en/v1.19/gettingstarted/k8s-install-default/#install-the-cilium-cli）
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes
+```
+
+```
+NAME              STATUS   ROLES           AGE   VERSION
+k8s-control-01   Ready    control-plane   ...   v1.36.x
+k8s-worker-01    Ready    <none>          ...   v1.36.x
+k8s-worker-02    Ready    <none>          ...   v1.36.x
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+helm version --short
+```
+
+```
+v3.x.x+...
+```
+
+## 動手做
+
+### 1. 新增 Cilium Helm repo
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm repo add cilium https://helm.cilium.io/
+helm repo update
+```
+
+```
+"cilium" has been added to your repositories
+Hang tight while we grab the latest from your chart repositories...
+...Successfully got an update from the "cilium" chart repository
+```
+
+### 2. 確認 cluster CIDR
+
+安裝前先確認你的 cluster 使用什麼 Pod CIDR，稍後 `--set` 參數要一致：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl cluster-info dump | grep -i cluster-cidr | head -1
+```
+
+```
+"--cluster-cidr=10.244.0.0/16",
+```
+
+記下這個 CIDR（預設通常是 `10.244.0.0/16` 或 `192.168.0.0/16`，依 cluster 建立方式而定）。
+
+### 3. 移除既有 CNI（選做）
+
+若你的 cluster 已有 flannel 或 calico，移除它會中斷現有 Pod 網路。**如果你的學習 cluster 可以接受短暫中斷，才執行這步；若不確定請跳過此步，直接安裝 cilium（有些環境可以共存）：**
+
+```bash
+# 🔴 需在你環境跑後對照
+# 以 flannel 為例（calico 請參考 calico 文件移除方式）
+kubectl delete -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+```
+
+移除後等待舊的 flannel Pod 消失：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-flannel get pods
+```
+
+### 4. 安裝 cilium v1.19.3
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm install cilium cilium/cilium \
+  --version 1.19.3 \
+  --namespace kube-system \
+  --set kubeProxyReplacement=false \
+  --set ipam.mode=kubernetes
+```
+
+```
+NAME: cilium
+LAST DEPLOYED: ...
+NAMESPACE: kube-system
+STATUS: deployed
+REVISION: 1
+```
+
+`kubeProxyReplacement=false` 表示繼續讓 kube-proxy 處理 Service，cilium 只做 Pod 網路。`ipam.mode=kubernetes` 讓 cilium 沿用 cluster 原本配置的 Pod CIDR，不自行管理 IP 池。
+
+### 5. 等待所有 cilium-agent 就緒
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get pods -l k8s-app=cilium -w
+```
+
+```
+NAME                READY   STATUS    RESTARTS   AGE
+cilium-xxxxx        1/1     Running   0          2m
+cilium-yyyyy        1/1     Running   0          2m
+```
+
+當所有 Pod 都顯示 `1/1 Running` 之後，按 `Ctrl+C` 結束 watch。
+
+### 6. 確認 cilium-operator 健康
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get deploy cilium-operator
+```
+
+```
+NAME              READY   UP-TO-DATE   AVAILABLE   AGE
+cilium-operator   1/1     1            1           3m
+```
+
+### 7. 用 cilium CLI 驗證整體狀態
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium status --wait
+```
+
+```
+    /¯¯\
+ /¯¯\__/¯¯\    Cilium:             OK
+ \__/¯¯\__/    Operator:           OK
+ /¯¯\__/¯¯\    Envoy DaemonSet:    disabled
+ \__/¯¯\__/    Hubble Relay:       disabled
+    \__/        ClusterMesh:        disabled
+
+DaemonSet         cilium             Desired: 2, Ready: 2/2, Available: 2/2
+Deployment        cilium-operator    Desired: 1, Ready: 1/1, Available: 1/1
+```
+
+看到 `Cilium: OK` 和 `Operator: OK` 就表示安裝成功。
+
+## 觀念深化
+
+**cilium-agent** 是 DaemonSet，每個 node 一個 Pod。它的職責是：編譯 eBPF 程式（C source 位於 `bpf/` 目錄）、透過 BPF verifier 載入 kernel、維護 BPF map（存放 endpoint metadata、policy rules、service backends），以及管理 network namespace 的 veth pair。每個 Pod endpoint 在 ingress / egress 方向各有一個 eBPF program。
+
+**cilium-operator** 是 Deployment（通常只需要一個 leader 副本）。它負責：分配 node CIDR（當 ipam.mode=cluster-pool 時）、把 K8s Service 轉成 cilium 內部 service objects、垃圾回收 orphaned endpoint 等跨 node 的控制平面工作。
+
+換 CNI 的關鍵要點：CNI plugin binary 放在 node 的 `/opt/cni/bin/`，設定檔放在 `/etc/cni/net.d/`（字典序最小的檔案先被 kubelet 使用）。cilium 安裝完後會在每個 node 寫入 `/etc/cni/net.d/05-cilium.conflist`，接管新建立的 Pod 網路。
+
+參考：
+- [Cilium Component Overview](https://docs.cilium.io/en/v1.19/overview/component-overview/)
+- [cilium/daemon/cmd 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/daemon/cmd)
+
+## 收穫檢查
+
+- cilium-agent 和 cilium-operator 的職責各是什麼？為什麼 agent 要是 DaemonSet？
+- `kubeProxyReplacement=false` 與 `kubeProxyReplacement=true` 在功能上差在哪裡？
+- CNI 設定檔字典序最小的是什麼意思？如果同時有 `05-cilium.conflist` 和 `10-flannel.conflist`，kubelet 會用哪個？
+- BPF verifier 的功能是什麼？為什麼 eBPF 需要在 kernel 載入前過 verifier？
+- 安裝 cilium 後，舊的 Pod（在換 CNI 前建立的）網路連線會怎樣？
+
+## 參考資料
+
+- [Cilium Installation via Helm](https://docs.cilium.io/en/v1.19/installation/k8s-install-helm/) — 完整 Helm 安裝選項
+- [Cilium Component Overview](https://docs.cilium.io/en/v1.19/overview/component-overview/) — agent / operator 職責說明
+- [cilium/daemon/cmd](https://github.com/cilium/cilium/tree/v1.19.3/daemon/cmd) — agent 主程式進入點原始碼
+- [cilium CLI Releases](https://github.com/cilium/cilium-cli/releases) — cilium CLI 下載
+
+## 明日預告
+
+明天 [Day 09](/learning-plan/features/day-09) 進入 eBPF datapath 觀察：用 `cilium bpf endpoint list` 看 endpoint BPF map，用 `cilium monitor --type drop` 即時追蹤封包 drop 事件，親眼看到 eBPF 如何在 kernel 裡決定封包命運。

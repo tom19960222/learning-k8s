@@ -1,0 +1,232 @@
+---
+layout: doc
+title: Day 13 — Multus 安裝 + NetworkAttachmentDefinition
+description: 安裝 multus-cni v4.2.4，建立一個 bridge NetworkAttachmentDefinition，讓 Pod 同時擁有 cilium 主介面（eth0）和接到物理網段的第二張網卡（net1）。
+---
+
+## 今日目標
+
+- 部署 multus-cni DaemonSet v4.2.4
+- 確認 `/etc/cni/net.d/00-multus.conf` 出現在 node 上
+- 建立一個 bridge 類型的 NetworkAttachmentDefinition（NAD）
+- 建立帶有 `k8s.v1.cni.cncf.io/networks` annotation 的 Pod
+- 用 `kubectl exec -- ip addr` 確認 Pod 有 `eth0`（cilium）+ `net1`（bridge）兩張介面
+
+## 今日在 30 天計畫中的位置
+
+Day 8-12 深入觀察了 cilium 的 eBPF datapath、policy、Hubble 視覺化、WireGuard 加密；今天引入 Multus，讓 Pod 能同時連到 cluster 網路（cilium）和外部物理網路。這是 Day 14 讀 multus 原始碼的前置——你需要先看到 multi-network Pod 實際運作，才能帶著具體疑問去讀 `cmdAdd()` 的程式碼。Block 3 的 ceph / KubeVirt 實驗也會依賴這種多網路架構。
+
+## 前置條件
+
+- 昨日 [Day 12](/learning-plan/features/day-12) 已完成，cilium WireGuard 加密正常
+- 有 SSH 能登入 worker node 確認 CNI 設定檔
+- 你的 node 上有 Linux bridge（例如 Proxmox 的 `vmbr0`，或你自行建的 `br0`）
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get pods -l k8s-app=cilium
+```
+
+```
+NAME           READY   STATUS    RESTARTS   AGE
+cilium-xxxxx   1/1     Running   0          ...
+```
+
+## 動手做
+
+### 1. 部署 multus-cni DaemonSet
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/v4.2.4/deployments/multus-daemonset.yml
+```
+
+```
+customresourcedefinition.apiextensions.k8s.io/network-attachment-definitions.k8s.cni.cncf.io created
+clusterrole.rbac.authorization.k8s.io/multus created
+clusterrolebinding.rbac.authorization.k8s.io/multus created
+serviceaccount/multus created
+daemonset.apps/kube-multus-ds created
+```
+
+### 2. 確認 DaemonSet 就緒
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system get ds kube-multus-ds
+```
+
+```
+NAME             DESIRED   CURRENT   READY   ...
+kube-multus-ds   2         2         2       ...
+```
+
+### 3. 確認 node 上的 CNI 設定
+
+SSH 進任一 node：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ls /etc/cni/net.d/
+```
+
+```
+00-multus.conf
+05-cilium.conflist
+```
+
+`00-multus.conf` 字典序最小，所以 kubelet 會把它當作主要 CNI plugin。Multus 接到 ADD call 後，再依設定呼叫 cilium（用 `05-cilium.conflist`）做主介面，然後依 Pod annotation 呼叫附加的 plugin。
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+head -20 /etc/cni/net.d/00-multus.conf
+```
+
+```json
+{
+    "cniVersion": "0.3.1",
+    "name": "multus-cni-network",
+    "type": "multus",
+    "capabilities": { "portMappings": true },
+    "delegates": [ ... ],
+    "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig"
+}
+```
+
+### 4. 確認 node 上有 Linux bridge
+
+```bash
+# 🔴 需在你環境跑後對照
+ip link show type bridge
+```
+
+```
+3: vmbr0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+```
+
+（如果你的環境沒有 `vmbr0`，可以自行建一個測試用 bridge：`ip link add br-test type bridge && ip link set br-test up`，然後把下面 NAD 的 `master` 改成 `br-test`。）
+
+### 5. 建立 NetworkAttachmentDefinition（NAD）
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<'EOF'
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: bridge-nad
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "bridge-nad",
+      "type": "bridge",
+      "bridge": "vmbr0",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24",
+        "rangeStart": "192.168.100.100",
+        "rangeEnd": "192.168.100.200",
+        "gateway": "192.168.100.1"
+      }
+    }
+EOF
+```
+
+```
+networkattachmentdefinition.k8s.cni.cncf.io/bridge-nad created
+```
+
+`spec.config` 是一個 CNI JSON config 字串，Multus 在呼叫 bridge plugin 時會把這段 JSON 傳給它。`host-local` IPAM 從指定 subnet 裡分配 IP，分配記錄存在 node 本機。
+
+### 6. 建立帶有 NAD annotation 的 Pod
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-net-pod
+  namespace: default
+  annotations:
+    k8s.v1.cni.cncf.io/networks: bridge-nad
+spec:
+  containers:
+    - name: app
+      image: busybox
+      command: ["sleep", "3600"]
+EOF
+```
+
+等 Pod Ready：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pod multi-net-pod
+```
+
+```
+NAME            READY   STATUS    RESTARTS   AGE
+multi-net-pod   1/1     Running   0          30s
+```
+
+### 7. 確認 Pod 有兩張網路介面
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl exec multi-net-pod -- ip addr
+```
+
+```
+1: lo: <LOOPBACK,UP,LOWER_UP> ...
+    inet 127.0.0.1/8 scope host lo
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+    inet 10.244.x.x/32 scope global eth0      ← cilium 主介面
+3: net1: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+    inet 192.168.100.xxx/24 scope global net1  ← bridge 附加介面
+```
+
+`eth0` 是 cilium 分配的 cluster 網路 IP，`net1` 是 bridge plugin 從 `192.168.100.0/24` 分配的物理網段 IP。在你的 Proxmox 環境裡，`net1` 的 IP 可以直接從同一個 L2 網段的其他機器 ping 到。
+
+### 8. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete pod multi-net-pod
+kubectl delete -n default networkattachmentdefinition bridge-nad
+```
+
+## 觀念深化
+
+**Multus 是「meta-plugin」**：它自己不做實際的網路設定，而是攔截 kubelet 發出的 CNI ADD / DEL / CHECK call，依序呼叫其他 CNI plugin（稱為 delegate）來完成工作。執行順序固定：先呼叫「主 delegate」（`00-multus.conf` 的 `delegates[0]`，通常是 cilium）建立 eth0，再依 Pod annotation 的 NAD 清單，逐一呼叫附加 plugin 建立 net1、net2… 等介面。
+
+**NetworkAttachmentDefinition** 是 Multus 定義的 CRD，`spec.config` 就是一個普通的 CNI config JSON。Multus 在呼叫附加 plugin 時，把這段 JSON 直接傳給 CNI binary；所以任何合法的 CNI plugin（bridge、macvlan、ipvlan、host-device、sr-iov…）都可以當作附加 plugin 使用。
+
+**應用場景**：KubeVirt 的 VM Pod 需要同時連 cluster 網路（用於 K8s 控制通訊）和物理 L2 網路（用於 VM 的對外流量），這正是 Multus 設計的核心使用情境。
+
+參考：
+- [Multus Quickstart](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/quickstart.md)
+- [Multus How-to-use](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/how-to-use.md)
+
+## 收穫檢查
+
+- Multus 為什麼叫「meta-plugin」？它本身做了什麼網路設定？
+- `00-multus.conf` 的字典序排最前有什麼意義？
+- NAD 的 `spec.config` 是什麼格式？Multus 怎麼使用它？
+- `host-local` IPAM 和 DHCP IPAM 的差別是什麼？各適合什麼場景？
+- 如果 annotation 寫了 `k8s.v1.cni.cncf.io/networks: nad1,nad2`，Multus 的呼叫順序是什麼？
+
+## 參考資料
+
+- [Multus Quickstart](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/quickstart.md) — 安裝與第一個 NAD
+- [Multus How-to-use](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/how-to-use.md) — NAD 語法與 annotation 格式
+- [CNI Specification](https://github.com/containernetworking/cni/blob/main/SPEC.md) — CNI ADD / DEL / CHECK 介面規格
+- [bridge CNI plugin](https://www.cni.dev/plugins/current/main/bridge/) — bridge plugin 設定選項
+
+## 明日預告
+
+明天 [Day 14](/learning-plan/features/day-14) 讀 multus 原始碼，從 `cmdAdd()` 進入點追蹤整條 delegate flow：解析 stdin NetConf → 讀取 Pod annotation → 呼叫主 delegate → 呼叫附加 delegate → 合併 CNI result，把今天的實際操作和程式碼對應起來。

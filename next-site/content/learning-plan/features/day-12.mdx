@@ -1,0 +1,187 @@
+---
+layout: doc
+title: Day 12 — Encryption：WireGuard
+description: 啟用 cilium 的 WireGuard transparent encryption，觀察 node 間流量變成加密的 UDP/51871 封包，並用 wg show 確認金鑰交換正常。
+---
+
+## 今日目標
+
+- 用 `helm upgrade` 啟用 cilium WireGuard encryption
+- 用 `cilium status` 確認加密模式生效
+- SSH 進 node 用 `wg show` 看到 `cilium_wg0` 介面與 peer 公鑰
+- 用 `tcpdump` 抓到 UDP/51871 加密封包
+- 理解 cilium WireGuard 的 transparent encryption 與手動 WireGuard 隧道的差異
+
+## 今日在 30 天計畫中的位置
+
+Day 11 的 Hubble 讓我們能觀察 flow；今天在 datapath 上加一層 WireGuard 加密，讓 node 間的 Pod 流量對外部攻擊者不可見。這是 Block 2 的最後一個 1 小時平日 lab。明天（Day 13）進入第一個週末長時 lab，安裝 Multus 並建立 NetworkAttachmentDefinition，讓 Pod 能同時連接 cilium 網路與外部物理網路。
+
+## 前置條件
+
+- 昨日 [Day 11](/learning-plan/features/day-11) 已完成，Hubble 正常運作
+- 至少有兩個 node（WireGuard 是 node-to-node 加密，單 node cluster 看不到效果）
+- 有 SSH 能登入 worker node
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes
+```
+
+```
+NAME              STATUS   ROLES           AGE   VERSION
+k8s-control-01   Ready    control-plane   ...   v1.36.x
+k8s-worker-01    Ready    <none>          ...   v1.36.x
+k8s-worker-02    Ready    <none>          ...   v1.36.x
+```
+
+## 動手做
+
+### 1. Helm upgrade：啟用 WireGuard encryption
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm upgrade cilium cilium/cilium \
+  --version 1.19.3 \
+  --namespace kube-system \
+  --reuse-values \
+  --set encryption.enabled=true \
+  --set encryption.type=wireguard
+```
+
+```
+Release "cilium" has been upgraded. Happy Helming!
+STATUS: deployed
+REVISION: 3
+```
+
+### 2. 等待 DaemonSet rollout
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kube-system rollout status ds/cilium
+```
+
+```
+daemon set "cilium" successfully rolled out
+```
+
+每個 cilium-agent Pod 重啟後會自動產生 WireGuard keypair，並透過 K8s API（CiliumNode object）交換公鑰。
+
+### 3. 確認加密狀態
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium status | grep -i encrypt
+```
+
+```
+Encryption:         Wireguard   [cilium_wg0 (Pubkey: <base64-key>, Port: 51871, Peers: 2)]
+```
+
+`Peers: 2` 對應兩個 node（control-plane + worker；或依你的 cluster node 數）。
+
+### 4. 在 node 上查看 WireGuard 介面
+
+SSH 進任一 node：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+wg show
+```
+
+```
+interface: cilium_wg0
+  public key: <this-node-pubkey>
+  private key: (hidden)
+  listening port: 51871
+
+peer: <other-node-pubkey>
+  endpoint: <other-node-ip>:51871
+  allowed ips: 0.0.0.0/0, ::/0
+  latest handshake: X seconds ago
+  transfer: X MiB received, X MiB sent
+```
+
+`cilium_wg0` 是 cilium 自動建立與管理的 WireGuard 介面。`peer` 清單列出所有其他 node 的公鑰與 endpoint。`latest handshake` 若在幾秒內表示 tunnel 正常運作。
+
+### 5. 抓取加密封包
+
+找到 node 的對外網路介面名稱（例如 `eth0`、`ens3`、`enp3s0`）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ip route get 8.8.8.8 | awk '{print $5; exit}'
+```
+
+用 `tcpdump` 抓 WireGuard UDP 封包：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+tcpdump -i <node-iface> -nn 'udp port 51871' -c 5
+```
+
+```
+13:42:01 IP 192.168.1.101.51871 > 192.168.1.102.51871: UDP, length 148
+13:42:01 IP 192.168.1.102.51871 > 192.168.1.101.51871: UDP, length 148
+...
+```
+
+這些 UDP 封包就是加密後的 Pod 間流量。payload 是 WireGuard 加密的 ChaCha20-Poly1305 密文，wireshark 也看不出原始 Pod IP。
+
+### 6. 製造跨 node 流量並確認加密
+
+在另一個 terminal 先確保有跨 node 的 Pod：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl run cross-test --image=curlimages/curl -- sleep 600
+kubectl get pod cross-test -o wide
+```
+
+若 Pod 恰好在同一個 node，刪除重跑直到排到不同 node。確認跨 node 後：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+# 在 cross-test Pod 裡 curl 另一個 node 上的 Pod
+kubectl exec cross-test -- wget -q -O - http://10.244.x.x/  # 對端 node 上的任一 Pod IP
+```
+
+同時在 `tcpdump` terminal 應能看到對應時間點的 UDP/51871 封包，確認流量確實走 WireGuard 加密通道。
+
+### 7. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete pod cross-test
+```
+
+## 觀念深化
+
+**Cilium WireGuard transparent encryption** 的設計目標是「對 Pod 完全透明」——Pod 不知道底層有 WireGuard，它還是對普通 Pod IP 發送封包。Cilium 在 node 上的 eBPF 路由邏輯把跨 node 的封包導向 `cilium_wg0` 介面，WireGuard kernel module 把封包加密後以 UDP 送出；對端 node 收到 UDP 後 WireGuard 解密，再交還給 eBPF routing 送到目標 Pod。
+
+與 IPsec（cilium 也支援）比較：WireGuard 的 handshake 更簡單（基於 Diffie-Hellman，沒有 IKE 協商複雜度），且完全在 kernel 實作（Linux 5.6+ 原生支援），效能優異、實作更少複雜度。
+
+**公鑰交換機制**：每個 cilium-agent 把自己的 WireGuard 公鑰存到 `CiliumNode` CR 的 annotations（`network.cilium.io/wg-pub-key`）。其他 node 的 agent watch 這個欄位，自動把 peer 的公鑰加進 WireGuard 設定。這樣新加 node 只需要 K8s API 就能完成金鑰交換，不需要額外的 key management infrastructure。
+
+參考：
+- [Cilium WireGuard Encryption](https://docs.cilium.io/en/v1.19/security/network/encryption-wireguard/)
+
+## 收穫檢查
+
+- WireGuard 和 IPsec 在 cilium 的使用情境上有什麼取捨？
+- `cilium_wg0` 的公鑰是如何讓其他 node 知道的？
+- Hubble 在 WireGuard 啟用後能看到 flow 嗎？為什麼？
+- Pod 在跨 node 通訊時，封包從發出到對端 Pod 收到，經過哪些介面？
+- 如果某個 node 的 `cilium_wg0` 介面掉了，封包會怎樣？
+
+## 參考資料
+
+- [Cilium WireGuard Encryption](https://docs.cilium.io/en/v1.19/security/network/encryption-wireguard/) — 啟用步驟與設計說明
+- [WireGuard 官網](https://www.wireguard.com/) — 協定設計與安全性分析
+- [CiliumNode CRD](https://docs.cilium.io/en/v1.19/network/clustermesh/clustermesh/#ciliumnode) — 公鑰儲存欄位說明
+
+## 明日預告
+
+週末長時 lab 開始！明天 [Day 13](/learning-plan/features/day-13) 安裝 multus-cni v4.2.4，建立一個 bridge NetworkAttachmentDefinition，讓 Pod 同時擁有 cilium 的 cluster 網路介面（eth0）和接到 Proxmox 物理網段的第二張網卡（net1）。

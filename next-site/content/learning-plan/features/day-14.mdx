@@ -1,0 +1,193 @@
+---
+layout: doc
+title: Day 14 — Multus Delegate Flow 原始碼閱讀
+description: 讀 multus cmdAdd() 從進入到回傳的整條 delegate flow：解析 NetConf、讀取 Pod annotation、呼叫主 delegate、呼叫附加 delegate、合併 CNI result。
+---
+
+## 今日目標
+
+- clone multus-cni v4.2.4 原始碼到本機
+- 定位並閱讀 `pkg/multus/multus.go` 的 `cmdAdd()` 函式
+- 標記 5 個關鍵步驟：解析 stdin、讀取 Pod annotation、呼叫主 delegate、呼叫附加 delegate、合併 result
+- 本機編譯 multus binary，對照大小確認與 cluster 裡的版本吻合
+- 把 Day 13 看到的多網路 Pod 行為與今天讀到的程式碼對應起來
+
+## 今日在 30 天計畫中的位置
+
+Day 13 讓我們親眼看到 Multus 讓 Pod 同時有兩張網卡；今天深入原始碼，把「Multus 做了什麼」變成「Multus 的哪幾行程式碼做了什麼」。這個閱讀 → 對照實際行為的方法，和 Block 1 讀 kubernetes 原始碼的方式完全一樣，也是後面 Block 3 讀 rook-ceph operator 的前哨練習。Block 2 在今天收關，明天進入 Block 3（ceph + rook）。
+
+## 前置條件
+
+- 昨日 [Day 13](/learning-plan/features/day-13) 已完成，多網路 Pod 實際跑過
+- 本機有 Go 1.22+（`go version` 確認）
+- 有 `git` 可存取 GitHub
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+go version
+```
+
+```
+go version go1.22.x linux/amd64
+```
+
+## 動手做
+
+### 1. Clone multus-cni 原始碼
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+git clone --branch v4.2.4 --depth 1 \
+  https://github.com/k8snetworkplumbingwg/multus-cni.git \
+  /tmp/multus
+```
+
+```
+Cloning into '/tmp/multus'...
+...
+Note: switching to '...'
+```
+
+### 2. 定位 cmdAdd() 函式
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "func cmdAdd" /tmp/multus/pkg/multus/multus.go
+```
+
+```
+xxx: func cmdAdd(args *skel.CmdArgs) error {
+```
+
+開啟這個檔案，從 `cmdAdd()` 開始讀（也可以用你喜歡的編輯器）。
+
+### 3. 閱讀步驟 A：解析 stdin NetConf
+
+在 `cmdAdd()` 裡找到以下邏輯（行數依版本略有差異）：
+
+```
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "loadNetConf\|NetConf\|stdin" /tmp/multus/pkg/multus/multus.go | head -10
+```
+
+Multus 用 `loadNetConf(args.StdinData)` 把 kubelet 傳來的 JSON（即 `00-multus.conf` 的內容）解析成 Go struct。這個 struct 含有 `delegates`（主 delegate 的 config）和 kubeconfig 路徑（用來存取 K8s API）。
+
+**筆記重點**：CNI spec 規定 plugin 透過 stdin 接收 config；Multus 的 `NetConf` 在標準欄位（`name`、`type`）之上加了自己的 `delegates` 欄位。
+
+### 4. 閱讀步驟 B：讀取 Pod annotation
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "GetNetworkStatus\|GetPodNetworkAnnotation\|networks" /tmp/multus/pkg/multus/multus.go | head -15
+```
+
+Multus 用 kubeconfig 建立 K8s client，然後 `GET /api/v1/namespaces/<ns>/pods/<name>`，讀取 Pod 的 `k8s.v1.cni.cncf.io/networks` annotation，解析出要附加的 NAD 清單（`[]NetworkSelectionElement`）。
+
+**筆記重點**：這是 Multus 和 K8s API 的唯一互動點。CNI call 是同步的（kubelet 等待 `cmdAdd()` 回傳），所以讀取 API 如果慢，Pod 啟動就會慢。
+
+### 5. 閱讀步驟 C：呼叫主 delegate（cilium）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "delegateAdd\|DelegateAdd\|main.*delegate\|primary" /tmp/multus/pkg/multus/multus.go | head -10
+```
+
+主 delegate 是 `delegates[0]`（cilium），Multus 呼叫 `delegateAdd()` 把主 delegate 的 config JSON 注入 stdin，exec 出 `/opt/cni/bin/cilium-cni` binary。回傳的 CNI result 包含 eth0 的 IP 和路由。
+
+**筆記重點**：`delegateAdd()` 的本質是重新組合一個合法的 CNI call 交給子 plugin 執行——它把 NAD 的 `spec.config` 合入 args，然後 exec 對應的 CNI binary。
+
+### 6. 閱讀步驟 D：呼叫附加 delegate 清單
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "for.*network\|NetworkList\|attachedNets\|net1" /tmp/multus/pkg/multus/multus.go | head -10
+```
+
+找到對 annotation 裡每個附加 NAD 做迴圈呼叫 `delegateAdd()` 的那段 for loop。每次呼叫前，Multus 先從 K8s API 讀取對應的 NAD object，取出 `spec.config`，然後用它組合 CNI call。介面名稱（`net1`、`net2`…）是 Multus 自動計算的序號。
+
+**筆記重點**：附加 delegate 的 result 不會覆蓋主 delegate 的 result，而是 append 到 `Interfaces` 清單。
+
+### 7. 閱讀步驟 E：合併 CNI result
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+grep -n "mergeWith\|MergeWith\|result.*merge\|NetConfResult" /tmp/multus/pkg/multus/multus.go | head -10
+```
+
+最後 Multus 把所有 delegate 的 result 合併成一個完整的 CNI result，寫回 stdout 給 kubelet。kubelet 從 result 裡讀取主介面的 IP 填進 `pod.status.podIP`。
+
+### 8. 本機編譯 binary
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+cd /tmp/multus && make build
+```
+
+```
+go build -o bin/multus ./cmd/multus/...
+...
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+ls -lh /tmp/multus/bin/multus
+```
+
+```
+-rwxr-xr-x  1 user group  XX MB  /tmp/multus/bin/multus
+```
+
+### 9. 對照 cluster 裡的 DaemonSet image
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kube-system get ds kube-multus-ds -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
+
+```
+ghcr.io/k8snetworkplumbingwg/multus-cni:v4.2.4
+```
+
+### 10. 把程式碼對應到 Day 13 的 Pod events
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl describe pod multi-net-pod 2>/dev/null || echo "Pod already deleted - check with: kubectl get events"
+```
+
+若 Pod 還在（或看 events），`Events` 欄位裡的 `Add network attachment...` 訊息對應的就是今天讀到的 delegateAdd() 呼叫。（若 Day 13 的 Pod 已刪除，可重新建一個觀察 events。）
+
+## 觀念深化
+
+**Multus 的整個核心大約 1500 行 Go 程式碼**，複雜度集中在兩個地方：
+
+1. **Delegate config 渲染**：Multus 需要把 NAD 的 `spec.config`（一個 JSON 字串）合入一個完整的 CNI args，包括 container ID、netns path、interface name 等——這些是 kubelet 傳給 Multus 的，不在 NAD 裡。這段邏輯在 `pkg/multus/multus.go` 的 `delegateAdd()` 中。
+
+2. **Result 合併**：CNI spec 的 result 格式（`Result.Interfaces`、`Result.IPs`、`Result.Routes`）是給 kubelet 讀的。Multus 要把多個 delegate 的 result 合成一個合法的 result；主 delegate 的 IP 放在第一位（成為 `podIP`），附加 delegate 的 interface 依序 append。
+
+閱讀這段程式碼後，你會發現 Multus 和 Day 7 的 controller-runtime operator 有相似之處：它們都是「協調器」——拿到一個宣告式的設定（operator 是 CR spec；Multus 是 Pod annotation），呼叫具體的執行單元（operator 是 reconcile loop；Multus 是 CNI binary），把結果回報給 K8s。
+
+參考：
+- [multus.go 原始碼](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/multus/multus.go)
+- [Multus How-to-use](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/how-to-use.md)
+
+## 收穫檢查
+
+- `cmdAdd()` 的 5 個關鍵步驟你都能從記憶裡列出嗎？
+- Multus 在哪個步驟和 K8s API 互動？互動的頻率和延遲對 Pod 啟動有什麼影響？
+- `delegateAdd()` 如何決定要 exec 哪個 CNI binary？（提示：CNI `type` 欄位）
+- 主 delegate result 的 interface index 和附加 delegate 的 interface index 在合併後如何排列？
+- 如果某個附加 NAD 的 plugin exec 失敗，Multus 會怎樣處理已建立的主介面？
+
+## 參考資料
+
+- [multus.go 原始碼](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/multus/multus.go) — cmdAdd / delegateAdd 實作
+- [Multus How-to-use](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/how-to-use.md) — NAD 語法與 annotation 格式
+- [CNI Specification](https://github.com/containernetworking/cni/blob/main/SPEC.md) — CNI result 格式定義
+- [containernetworking/plugins](https://github.com/containernetworking/plugins) — bridge、macvlan 等常用 CNI plugin 原始碼
+
+## 明日預告
+
+Block 2 完成！下週進入 Block 3——[Day 15](/learning-plan/features/day-15) 開始用 SSH 進 Proxmox node，巡禮你的 ceph cluster 健康狀態，看懂 `ceph status` 的各個指標，為接下來的 rook-ceph 深度探索做準備。

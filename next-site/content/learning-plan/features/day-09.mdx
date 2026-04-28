@@ -1,0 +1,171 @@
+---
+layout: doc
+title: Day 09 — eBPF Datapath 觀察
+description: 用 cilium bpf endpoint list 看 BPF map，用 cilium monitor 即時追蹤封包 drop 事件，理解 eBPF 如何讓 dataplane 完全在 kernel 執行。
+---
+
+## 今日目標
+
+- 用 `cilium status --verbose` 看 datapath mode 與 IPAM 統計
+- 用 `cilium bpf endpoint list` 瀏覽 endpoint BPF map
+- 理解 BPF map 在 cilium datapath 中的角色
+- 用 `cilium monitor --type drop` 即時觀察 drop event
+- 觸發一個 drop event 並在 monitor 輸出中找到對應記錄
+
+## 今日在 30 天計畫中的位置
+
+Day 8 裝好 cilium，今天進到 eBPF 的「神經系統」——BPF map 和 event channel。這兩個概念是接下來所有觀察的共同底層：Day 10 的 NetworkPolicy、Day 11 的 Hubble、Day 12 的 WireGuard 加密，全都建立在 eBPF 對封包的讀取與決策上。今天把基礎打好，後面幾天才看得懂 cilium 報出來的資料。
+
+## 前置條件
+
+- 昨日 [Day 08](/learning-plan/features/day-08) 已完成，cilium 健康運作
+- `cilium` CLI 在本機 `PATH` 裡可執行
+
+環境確認：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium status | head -5
+```
+
+```
+    /¯¯\
+ /¯¯\__/¯¯\    Cilium:             OK
+ \__/¯¯\__/    Operator:           OK
+```
+
+## 動手做
+
+### 1. 看 verbose status
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+cilium status --verbose | head -60
+```
+
+```
+KVStore:                Ok   etcd ...
+Kubernetes:             Ok   ...
+Kubernetes APIs:        ["cilium/v2::CiliumNetworkPolicy", ...]
+KubeProxyReplacement:   False   ...
+Host firewall:          Disabled
+CNI Chaining:           none
+Cilium:                 Ok   ...
+NodeMonitor:            Listening for events on 2 CPUs with 64x4096 of shared memory
+Cilium health daemon:   Ok
+IPAM:                   IPv4: 5/254 allocated from 10.244.0.0/24, ...
+...
+```
+
+`IPAM` 那行告訴你目前 node 上已分配幾個 Pod IP、剩餘多少。`KubeProxyReplacement` 這裡顯示 `False`，確認 Day 8 的設定生效。
+
+### 2. 列出 endpoint BPF map
+
+在任一 cilium-agent Pod 裡執行：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kube-system exec -it ds/cilium -- cilium bpf endpoint list | head -15
+```
+
+```
+ENDPOINT   FLAGS   IPV4        IPV6   IDENTITY   POLICY (ingress)   POLICY (egress)   STATE       READY
+1          0x0     10.244.0.5  <nil>  1234       Enabled            Disabled          ready       true
+2          0x0     10.244.0.6  <nil>  5678       Enabled            Disabled          ready       true
+...
+```
+
+每一行對應一個 Pod endpoint。`IDENTITY` 欄位是 cilium 依 label 派給 Pod 的安全身份 ID，是 NetworkPolicy 決策的基礎單位。`POLICY (ingress)` 顯示 ingress 方向是否啟用 policy enforcement。
+
+### 3. 看特定 endpoint 的 policy map
+
+先記下上一步某個 endpoint 的 ID（左側數字）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kube-system exec -it ds/cilium -- cilium bpf policy get <endpoint-id>
+```
+
+```
+DIRECTION   LABELS (source:key[=value])   PORT/PROTO   PROXY PORT   BYTES   PACKETS
+Allow       reserved:host                 ANY          NONE         ...     ...
+Allow       reserved:remote-node          ANY          NONE         ...     ...
+```
+
+這張 BPF policy map 就是 eBPF program 查詢的決策表——進來的封包符合哪個 entry 就做對應的動作。
+
+### 4. 開啟 cilium monitor 監聽 drop
+
+在一個獨立的 terminal（保持開著）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kube-system exec -it ds/cilium -- cilium monitor --type drop
+```
+
+```
+Listening for events on 2 CPUs with 64x4096 of shared memory
+Press Ctrl-C to quit
+```
+
+現在 monitor 正在等待 drop event。
+
+### 5. 觸發 drop event
+
+回到原本的 terminal，送一個封包到不存在的 IP：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl run probe --image=busybox --restart=Never -i --rm -- wget -T 3 -q http://1.2.3.4/ || true
+```
+
+```
+wget: download timed out
+pod "probe" deleted
+```
+
+回到 monitor terminal，你應該看到類似這樣的輸出：
+
+```
+xx drop (Policy denied) flow 0x... to endpoint 0, ...
+    src: 10.244.0.x dst: 1.2.3.4 ...
+    proto: TCP
+```
+
+`Policy denied` 或 `CT_NO_MAP_FOUND` 等原因碼告訴你 kernel 的 eBPF program 做出了什麼判斷。
+
+## 觀念深化
+
+**BPF map 是 eBPF dataplane 的「共享記憶體」**：user-space 的 cilium-agent 往 map 裡寫入 policy rules 和 endpoint metadata；kernel-space 的 eBPF program 在封包進出時讀取這些 map 做決策。兩者透過 map（不是 syscall）互動，所以 dataplane 決策完全在 kernel 完成，延遲極低。
+
+cilium-agent 的 control plane 工作大致是：
+1. Watch K8s API（Pod / NetworkPolicy / Service 的變化）
+2. 計算每個 endpoint 的安全 identity 與 policy
+3. 把結果寫入對應的 BPF map
+
+eBPF program（C 語言，source 在 `bpf/` 目錄）在 Pod 建立時被載入到對應的 tc hook（ingress / egress），之後每個封包都會觸發對應的 program，在 kernel 裡查 map、做 allow / drop / redirect 決定。
+
+`cilium monitor` 利用的是 `perf event` ring buffer（BPF_MAP_TYPE_PERF_EVENT_ARRAY）：eBPF program 把 drop / trace event 寫入 ring buffer，user-space 的 cilium-agent 再把它轉給 `cilium monitor` 顯示。
+
+參考：
+- [Cilium eBPF Introduction](https://docs.cilium.io/en/v1.19/concepts/ebpf/intro/)
+- [bpf/ 目錄原始碼](https://github.com/cilium/cilium/tree/v1.19.3/bpf)
+
+## 收穫檢查
+
+- BPF map 和一般的 kernel data structure（如 routing table）的主要差別是什麼？
+- cilium 的 endpoint identity 是根據什麼計算出來的？更改 Pod label 會發生什麼事？
+- `cilium monitor --type drop` 只看 drop，如果想看所有封包事件，需要加什麼 flag？
+- eBPF program 在哪個 hook 點（tc ingress / egress）掛載？ingress 和 egress 各負責什麼方向？
+- 為什麼 control plane（agent）和 dataplane（eBPF program）的職責要分開？
+
+## 參考資料
+
+- [Cilium eBPF Introduction](https://docs.cilium.io/en/v1.19/concepts/ebpf/intro/) — BPF map / program / hook 概念
+- [bpf/ 原始碼](https://github.com/cilium/cilium/tree/v1.19.3/bpf) — eBPF C 程式實作
+- [cilium monitor 說明](https://docs.cilium.io/en/v1.19/observability/monitor/) — 各種 event type 說明
+- [Linux eBPF man page](https://man7.org/linux/man-pages/man2/bpf.2.html) — bpf() syscall 與 map type 參考
+
+## 明日預告
+
+明天 [Day 10](/learning-plan/features/day-10) 實作 NetworkPolicy 與 CiliumNetworkPolicy：先用 K8s 原生 NetworkPolicy 做 L3/L4 default-deny，再加 CiliumNetworkPolicy 開放特定 HTTP path，親眼看到 L7 enforcement 的效果。
