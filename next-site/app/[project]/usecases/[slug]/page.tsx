@@ -16,7 +16,7 @@ export function generateStaticParams() {
   const params: { project: string; slug: string }[] = []
   for (const projectId of PROJECT_IDS_FOR_STATIC_EXPORT) {
     const proj = getProject(projectId)
-    if (!proj) {
+    if (!proj || proj.usecases.length === 0) {
       params.push({ project: projectId, slug: '__placeholder__' })
       continue
     }
