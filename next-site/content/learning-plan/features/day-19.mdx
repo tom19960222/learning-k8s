@@ -1,0 +1,217 @@
+---
+layout: doc
+title: Day 19 — CephFS + 多 Pod 共用 PV
+description: 在 ceph 開 CephFS volume，k8s 端裝 ceph-csi-cephfs，建一個 ReadWriteMany PVC 讓兩個 Pod 同時掛同一份資料。
+---
+
+## 今日目標
+
+- 在 Proxmox ceph 建立 CephFS volume（含 MDS 自動部署）
+- 在 k8s 安裝 ceph-csi-cephfs
+- 建立一個 RWX PVC，兩個 Pod 同時掛、寫入互相可見
+- 理解 MDS 在 metadata 路徑上的角色
+
+## 今日在 30 天計畫中的位置
+
+Day 18 接好 RBD（block storage、單 Pod RWO），但有些場景需要多 Pod 共用一份檔案（log 收集、報表輸出、ML training data）。今天加上 CephFS。後面 Day 24 KubeVirt VM 的 boot disk 還是用 RBD，但 VM 的 shared workspace 可以走 CephFS。
+
+## 前置條件
+
+- 昨日 [day-18](/learning-plan/features/day-18) 已完成，ceph-csi-rbd 工作正常
+- ceph-csi config Secret / ConfigMap 已建好（CephFS 可以共用）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get sc
+```
+
+```
+NAME       PROVISIONER         ...
+ceph-rbd   rbd.csi.ceph.com    ...
+```
+
+## 動手做
+
+### 1. 在 ceph 建立 CephFS volume
+
+`ceph fs volume create` 是 Squid 的 high-level command，會自動建好 metadata pool + data pool 並部署 MDS。
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph fs volume create k8s-fs
+```
+
+```
+(no output)
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph fs ls
+```
+
+```
+name: k8s-fs, metadata pool: cephfs.k8s-fs.meta, data pools: [cephfs.k8s-fs.data ]
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph mds stat
+```
+
+```
+k8s-fs:1 {0=k8s-fs.pve-01.xxx=up:active} 1 up:standby
+```
+
+`up:active` MDS 服務 metadata 請求，`up:standby` 是熱備。
+
+### 2. 安裝 ceph-csi-cephfs Helm chart
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create namespace ceph-csi-cephfs
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm install ceph-csi-cephfs ceph-csi/ceph-csi-cephfs \
+  --namespace ceph-csi-cephfs --version 3.13.0 \
+  --set csiConfig[0].clusterID=<your-fsid> \
+  --set csiConfig[0].monitors='{10.0.0.1:6789,10.0.0.2:6789,10.0.0.3:6789}'
+```
+
+ceph-csi-cephfs 也需要 secret，跟 RBD 那邊類似但 user 要有 CephFS 權限。先在 ceph 上建：
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph fs authorize k8s-fs client.k8s-cephfs / rw
+```
+
+```
+[client.k8s-cephfs]
+        key = AQ...base64...==
+```
+
+把 key 注入成 Secret `csi-cephfs-secret`：
+
+```yaml
+# 🔴 需在你環境跑後對照（key 換成你的）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-cephfs-secret
+  namespace: ceph-csi-cephfs
+stringData:
+  userID: k8s-cephfs
+  userKey: AQ...base64...==
+  adminID: k8s-cephfs
+  adminKey: AQ...base64...==
+```
+
+### 3. 建 CephFS StorageClass
+
+```yaml
+# 🔴 需在你環境跑後對照
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-fs
+provisioner: cephfs.csi.ceph.com
+parameters:
+  clusterID: <your-fsid>
+  fsName: k8s-fs
+  pool: cephfs.k8s-fs.data
+  csi.storage.k8s.io/provisioner-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-cephfs
+  csi.storage.k8s.io/controller-expand-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi-cephfs
+  csi.storage.k8s.io/node-stage-secret-name: csi-cephfs-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi-cephfs
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+### 4. 建 RWX PVC + 兩個 Pod 共用
+
+```yaml
+# 🟢 已驗證 (kind / 顯然正確)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ceph-fs
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+spec:
+  containers:
+  - name: w
+    image: busybox
+    command: [sh, -c, 'while true; do echo "$(date) from writer" >> /data/log.txt; sleep 5; done']
+    volumeMounts: [{name: d, mountPath: /data}]
+  volumes: [{name: d, persistentVolumeClaim: {claimName: shared-data}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reader
+spec:
+  containers:
+  - name: r
+    image: busybox
+    command: [sh, -c, 'tail -f /data/log.txt']
+    volumeMounts: [{name: d, mountPath: /data}]
+  volumes: [{name: d, persistentVolumeClaim: {claimName: shared-data}}]
+```
+
+### 5. 看 reader 同步看到 writer 寫的內容
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl logs reader -f
+```
+
+```
+... from writer
+... from writer
+...
+```
+
+兩個 Pod 可能落在不同 node，但都 mount 同一份 CephFS volume，寫入會立刻看到。
+
+## 觀念深化
+
+CephFS 是 POSIX 檔案系統 over RADOS。資料還是落 RADOS object（在 data pool），metadata（dir entry、inode、檔名、權限、locks）由 MDS 服務。MDS 是 stateful daemon —— active MDS 在 memory 維護一個 metadata cache，讀寫都先過它。
+
+為什麼 RBD 不需要 MDS、CephFS 需要？因為 RBD 是 single-client (single-Pod) 直接讀寫 object，不需要協調；CephFS 是 multi-client filesystem semantics，需要 MDS 集中協調 inode lock、處理 capability lease。
+
+CephFS 也能 scale-out：在 active MDS 上 `ceph fs set k8s-fs max_mds 2` 可以加成 multi-active，metadata namespace 會被 partition 到不同 MDS（subtree partitioning）。
+
+更深入：
+
+- [CephFS 架構](https://docs.ceph.com/en/squid/cephfs/architecture/)
+- 原始碼：[src/mds/](https://github.com/ceph/ceph/tree/v19.2.3/src/mds)
+
+## 收穫檢查
+
+- CephFS 與 RBD 哪些場景該用哪個？資料庫該用？影片儲存該用？
+- 為什麼 RWX 需要 MDS 但 RWO 不用？
+- 如果 active MDS 死了，會發生什麼？standby 接手要多久？
+- CephFS 上的小檔案（< 4 KiB）跟大檔案（> 100 MiB）在 RADOS 上的 footprint 差在哪？
+
+## 參考資料
+
+- [CephFS](https://docs.ceph.com/en/squid/cephfs/) — 官方文件首頁
+- [ceph-csi cephfs deploy](https://github.com/ceph/ceph-csi/blob/v3.13.0/docs/deploy-cephfs.md) — k8s 端安裝
+- [src/mds/Server.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/mds/Server.cc) — MDS 主 RPC handler
+
+## 明日預告
+
+明天 [day-20](/learning-plan/features/day-20) 是 weekend lab，3 小時。換個方向：在 kind cluster 跑 mini Rook，看 operator 怎麼把 CephCluster CRD reconcile 成真正的 ceph daemon。

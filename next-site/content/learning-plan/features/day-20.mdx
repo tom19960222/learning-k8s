@@ -1,0 +1,212 @@
+---
+layout: doc
+title: Day 20 — Rook 在 kind 上 mini ceph
+description: 在本機 kind cluster 跑 Rook + 最小 CephCluster，觀察 operator reconcile loop，讀 Rook source 拆解 CRD → daemon 的轉換。
+---
+
+## 今日目標
+
+- 用 kind 起一個拋棄式 cluster
+- 安裝 Rook v1.16 operator
+- 用 hostPath 模式建一個最小 CephCluster（不掛 raw disk）
+- 看 CephCluster status 從 Creating 到 Connected 的轉換
+- 讀 Rook operator 主 reconcile 函式
+
+## 今日在 30 天計畫中的位置
+
+Day 15-19 用 Proxmox 上既有的 ceph cluster；那是「純 ceph」沒有 k8s operator。今天反過來：在 k8s 內裝 Rook，看一個 operator 怎麼把 CephCluster CRD「翻譯」成 MON / OSD / MGR Pod。這是理解 operator pattern 與 ceph 在 k8s 上完整 lifecycle 的關鍵 lab。Day 21 回到 Proxmox ceph 做 RGW S3。
+
+## 前置條件
+
+- 昨日 [day-19](/learning-plan/features/day-19) 已完成
+- 本機裝 `kind`、`kubectl`、`helm`
+- 至少 8 GiB 可用記憶體（Rook + ceph daemon 不算少）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kind version && kubectl version --client && helm version --short
+```
+
+```
+kind v0.27.x ...
+Client Version: v1.36.x
+v3.16.x+...
+```
+
+## 動手做
+
+### 1. 起 kind cluster
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kind create cluster --name rook-study
+```
+
+```
+Creating cluster "rook-study" ...
+ ✓ Ensuring node image ...
+ ✓ Preparing nodes ...
+ ...
+Set kubectl context to "kind-rook-study"
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes
+```
+
+```
+NAME                       STATUS   ROLES           AGE   VERSION
+rook-study-control-plane   Ready    control-plane   1m    v1.31.x
+```
+
+### 2. 安裝 Rook operator
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm repo add rook-release https://charts.rook.io/release && helm repo update
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm install --create-namespace --namespace rook-ceph rook-ceph rook-release/rook-ceph --version 1.16.0
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n rook-ceph get pods -w
+```
+
+幾分鐘後：
+
+```
+NAME                                READY   STATUS    RESTARTS   AGE
+rook-ceph-operator-...              1/1     Running   0          2m
+```
+
+只有 operator，還沒 ceph daemon —— 因為還沒建 CephCluster CR。
+
+### 3. 建最小 CephCluster（hostPath 模式）
+
+正式生產用 raw disk；學習用直接給 hostPath 即可。kind 容器裡有 `/var/lib/rook` 可以寫。
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: my-cluster
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v19.2.3
+  dataDirHostPath: /var/lib/rook
+  mon:
+    count: 1   # 學習用，正式環境至少 3
+    allowMultiplePerNode: true
+  mgr:
+    count: 1
+  dashboard:
+    enabled: false
+  storage:
+    useAllNodes: true
+    useAllDevices: false
+    config:
+      databaseSizeMB: "256"
+      journalSizeMB: "256"
+    directories:
+    - path: /var/lib/rook/storage
+  resources:
+    mon: {requests: {cpu: "200m", memory: "512Mi"}}
+    mgr: {requests: {cpu: "200m", memory: "256Mi"}}
+    osd: {requests: {cpu: "200m", memory: "512Mi"}}
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f cephcluster.yaml
+```
+
+### 4. 看 status 轉換
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n rook-ceph get cephcluster -o yaml -w
+```
+
+留意 `status.phase`：`Progressing` → `Ready`（路上會經過 several minutes）。同時 `kubectl -n rook-ceph get pods` 會看到陸續長出：
+
+```
+rook-ceph-mon-a-...           1/1   Running
+rook-ceph-mgr-a-...            1/1   Running
+rook-ceph-osd-prepare-...      0/1   Completed
+rook-ceph-osd-0-...            1/1   Running
+```
+
+### 5. 看 operator reconcile log
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n rook-ceph logs -l app=rook-ceph-operator --tail=300 | grep -E '(Reconcile|reconcile|cluster_controller)' | head -30
+```
+
+你會看到一系列 reconcile 訊息，提到「starting cluster controller」「ensuring monitor」「creating osd」等等。每個 step 對應一個獨立的 sub-controller。
+
+### 6. 讀 Rook source
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+git clone --depth=1 -b release-1.16 https://github.com/rook/rook.git /tmp/rook
+```
+
+打開 [pkg/operator/ceph/cluster/cluster_controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/cluster_controller.go)，找 `Reconcile()` 函式。標記主要分支：
+
+1. 拿到 CephCluster CR；如果 spec 變了要 detect。
+2. 確認 dependencies（CRD 已安裝、namespace 存在、auth secret）
+3. 呼叫 mon controller → 部署 MON Pod、等到 quorum
+4. 呼叫 mgr controller → 部署 MGR
+5. 呼叫 osd controller → 對每個 storage 配置建 OSD prepare Job → OSD Deployment
+6. 更新 `.status` 反映目前 phase
+
+### 7. 收尾
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kind delete cluster --name rook-study
+```
+
+## 觀念深化
+
+Rook 沒有重寫 ceph —— 它跑的是 **upstream ceph binary 包成 container**。Operator 只負責 lifecycle 編排：
+
+- 把 CephCluster CR 翻譯成 Pod / Deployment / DaemonSet / ConfigMap / Secret
+- 處理 keyring 生成、auth bootstrap、版本升級、failure 回收
+- 提供 CRD 給 user 操作 (CephCluster、CephBlockPool、CephObjectStore、CephFilesystem)
+
+這是典型的 **operator pattern**：domain-specific knowledge 編成 reconcile 邏輯。Rook 一個 operator 內含多個 controller（cluster、mon、mgr、osd、pool、object、file 等），各自 watch 自己的 CRD 與 owned resources。
+
+對比 Day 18 的 ceph-csi：ceph-csi 是 **CSI driver**（提供 volume mount），Rook 是 **lifecycle operator**（管 daemon）。兩者完全互補，可以同時用 —— Rook 部署 ceph，ceph-csi 提供 PVC。
+
+更深入：
+
+- [Rook design](https://rook.io/docs/rook/v1.16/Getting-Started/intro/)
+- 主 controller 原始碼：[pkg/operator/ceph/cluster/cluster_controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/cluster_controller.go)
+- mon 控制：[pkg/operator/ceph/cluster/mon/mon.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/mon/mon.go)
+- osd 控制：[pkg/operator/ceph/cluster/osd/osd.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/osd/osd.go)
+
+## 收穫檢查
+
+- Rook 跟 ceph-ansible 在 ceph 部署上的差異？哪些情境選哪個？
+- CephCluster CR 的 spec 改了 mon count 從 1 到 3 會發生什麼？operator 怎麼處理？
+- 為什麼 osd 部署有個 `osd-prepare` Job 而不是直接起 OSD Pod？
+- 如果你刪了 CephCluster CR，`finalizer` 會做什麼？
+
+## 參考資料
+
+- [Rook Getting Started](https://rook.io/docs/rook/v1.16/Getting-Started/intro/)
+- [Rook CRDs reference](https://rook.io/docs/rook/v1.16/CRDs/Cluster/ceph-cluster-crd/)
+- [pkg/operator/ceph/](https://github.com/rook/rook/tree/release-1.16/pkg/operator/ceph) — 全部 ceph operator 邏輯
+
+## 明日預告
+
+明天 [day-21](/learning-plan/features/day-21) 回 Proxmox ceph，開 RGW（Rados Gateway），用 boto3 從 k8s Pod 上傳檔案到自家的 S3-compatible storage。

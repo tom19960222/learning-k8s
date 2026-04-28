@@ -1,0 +1,175 @@
+---
+layout: doc
+title: Day 16 — CRUSH map
+description: 用 jq 解析 ceph osd crush dump，理解 CRUSH 如何把 PG 對應到 OSD，以及 failure domain 的設計原理。
+---
+
+## 今日目標
+
+- dump CRUSH map，讀出 buckets 樹狀結構與 rules
+- 用 jq 統計每個 bucket 的 children 數
+- 讀 CRUSH rule，理解 `step chooseleaf` 的 failure domain 語意
+- 查單一 OSD 的 device class 與 host
+- （選做）理解建立自訂 CRUSH rule 的語法
+
+## 今日在 30 天計畫中的位置
+
+Day 15 確認了 ceph cluster 健康，今天深入 CRUSH 機制。CRUSH（Controlled Replication Under Scalable Hashing）決定資料要放在哪些 OSD，是 ceph 分散式特性的核心。Day 17 建立 RBD pool 時需要指定 CRUSH rule，若要建自訂 rule（例如只用 SSD），也要先看懂 dump 的格式。理解 CRUSH 也是讀 ceph 原始碼的前置知識。
+
+## 前置條件
+
+- 昨日 [Day 15](/learning-plan/features/day-15) 已完成，ceph cluster 健康確認
+- 同一個 Proxmox node SSH session，已確認有 `ceph` 與 `jq` 可用
+
+環境確認：
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd crush dump | jq '.rules | length'
+```
+
+```
+2
+```
+
+（你的 cluster 可能有更多 rules；只要有輸出、不報 JSON parse error 即可繼續。）
+
+## 動手做
+
+### 1. dump 完整 CRUSH map
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd crush dump | head -100
+```
+
+```json
+{
+    "devices": [
+        {"id": 0, "name": "osd.0", "class": "hdd"},
+        {"id": 1, "name": "osd.1", "class": "hdd"},
+        ...
+    ],
+    "types": [
+        {"type_id": 0, "name": "osd"},
+        {"type_id": 1, "name": "host"},
+        {"type_id": 2, "name": "chassis"},
+        {"type_id": 3, "name": "rack"},
+        {"type_id": 4, "name": "row"},
+        {"type_id": 5, "name": "pdu"},
+        {"type_id": 6, "name": "pod"},
+        {"type_id": 7, "name": "room"},
+        {"type_id": 8, "name": "datacenter"},
+        {"type_id": 9, "name": "zone"},
+        {"type_id": 10, "name": "region"},
+        {"type_id": 11, "name": "root"}
+    ],
+    "buckets": [...],
+    "rules": [...]
+}
+```
+
+CRUSH map 由四部分組成：`devices`（葉節點，每個 OSD 一個）、`types`（bucket 型別的 ID 定義）、`buckets`（樹節點，root → rack → host → osd 等）、`rules`（選擇 OSD 的演算法）。
+
+### 2. 統計每個 bucket 的 children 數
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd crush dump | jq '.buckets[] | {name, type_name, item_count: (.items | length)}'
+```
+
+```json
+{"name": "default", "type_name": "root", "item_count": 3}
+{"name": "node1",   "type_name": "host", "item_count": 3}
+{"name": "node2",   "type_name": "host", "item_count": 3}
+{"name": "node3",   "type_name": "host", "item_count": 3}
+```
+
+`root default` 有 3 個 children（3 台 host），每台 host 有 3 個 OSD。這棵樹就是 CRUSH 的輸入，稱為 **cluster map**。
+
+### 3. 讀現有 CRUSH rules
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd crush dump | jq '.rules'
+```
+
+```json
+[
+  {
+    "rule_id": 0,
+    "rule_name": "replicated_rule",
+    "ruleset": 0,
+    "type": 1,
+    "steps": [
+      {"op": "take",         "item_name": "default"},
+      {"op": "chooseleaf firstn", "num": 0, "type": "host"},
+      {"op": "emit"}
+    ]
+  }
+]
+```
+
+`chooseleaf firstn` 的 `type: "host"` 表示 failure domain 是 **host**：選副本時保證每個副本落在不同 host。`num: 0` 表示副本數用 pool 設定的 `size`（通常是 3）。這就是 3 副本為何各在不同機器的原因。
+
+### 4. 查單一 OSD 的 device class 與 host
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd metadata 0 | grep -E "(device_class|hostname)"
+```
+
+```
+"device_class": "hdd",
+"hostname": "node1",
+```
+
+`device_class` 是 CRUSH device class，可用於建立「只選 SSD」的 rule。Proxmox 8 在 OSD 加入時自動偵測並標記。
+
+### 5. 了解自訂 CRUSH rule 語法（不執行）
+
+以下指令建立一條名為 `my_ssd_rule` 的 rule，failure domain 為 host，只選 ssd class 的 OSD。**這是示範語法，不需要在你的環境上執行，除非你確定有 SSD OSD 且要實際使用這條 rule。**
+
+```bash
+# 🔴 需在你環境跑後對照
+# 注意：以下指令會修改 CRUSH map，在你環境執行前請確認意圖
+ceph osd crush rule create-replicated my_ssd_rule default host ssd
+```
+
+```
+created rule my_ssd_rule at 1
+```
+
+如果沒有 ssd class 的 OSD，rule 會建立成功但 pool 使用時 PG 會無法 active（CRUSH 找不到符合的 OSD）。
+
+## 觀念深化
+
+**CRUSH** 是 Controlled Replication Under Scalable Hashing 的縮寫，最初由 Sage Weil 等人在 2006 年 SC 論文中提出。它是一個 **deterministic pseudo-random** 函式：輸入 (cluster map, rule, PG ID, replica index) → 輸出 OSD ID，不需要查中央 metadata，任何客戶端都可以本機算出資料在哪。
+
+演算法核心是遞迴 `choose`：從根 bucket 開始，在每一層用 hash 選一個 child，一路往下直到選到 OSD（葉節點）。`chooseleaf` 是特殊變體：在選到指定型別的 bucket 後，保證最終選出的 leaf（OSD）都在不同的這類 bucket（failure domain）中。
+
+CRUSH 的優點：去中心化（不需 metadata server 查表）、確定性（任何節點算的結果一致）、cluster map 變動時只有少量 PG 需要搬移。缺點：cluster map 必須同步給所有節點，大型 cluster 的 map 可能很大。
+
+參考：
+- [CRUSH 論文 (PDF)](https://ceph.com/wp-content/uploads/2016/08/weil-crush-sc06.pdf) — 原始演算法論文
+- [Ceph 原始碼 src/crush](https://github.com/ceph/ceph/tree/v19.2.3/src/crush) — C++ 實作
+- [CRUSH map 文件](https://docs.ceph.com/en/squid/rados/operations/crush-map/)
+
+## 收穫檢查
+
+- CRUSH 為什麼叫「deterministic」？客戶端不需要查詢就能知道資料在哪，原理是什麼？
+- `chooseleaf firstn` 的 `type: "host"` 代表什麼 failure domain？如果改成 `type: "rack"` 行為會有什麼不同？
+- `num: 0` 在 CRUSH step 裡是什麼意思？
+- device class 機制讓你可以做什麼？在一個 HDD 和 SSD 混合的 cluster 裡有什麼用途？
+- CRUSH map 改變時（例如加一台新 node），哪些 PG 需要搬移？
+
+## 參考資料
+
+- [CRUSH 演算法論文](https://ceph.com/wp-content/uploads/2016/08/weil-crush-sc06.pdf) — 原始論文，含 pseudocode
+- [CRUSH map 操作指南](https://docs.ceph.com/en/squid/rados/operations/crush-map/) — Squid 文件
+- [Ceph 原始碼 src/crush](https://github.com/ceph/ceph/tree/v19.2.3/src/crush) — C++ 實作入口
+- [Device Classes](https://docs.ceph.com/en/squid/rados/operations/crush-map/#device-classes) — device class 設定說明
+
+## 明日預告
+
+明天 [Day 17](/learning-plan/features/day-17) 實際建立 RBD pool，設定正確的 PG 數，建一個 RBD image，看底層 RADOS object 是怎麼對應到 OSD 的。

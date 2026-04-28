@@ -1,0 +1,199 @@
+---
+layout: doc
+title: Day 15 — Proxmox ceph 健檢
+description: 進入儲存層第一天：ssh 到 Proxmox node，用 ceph 原生指令巡禮 cluster 健康狀態，認識 MON / OSD / MGR daemon 的角色。
+---
+
+## 今日目標
+
+- 用 `ceph -s` 確認 cluster 整體狀態，辨識 HEALTH_OK / HEALTH_WARN
+- 用 `ceph osd tree` 讀出 CRUSH 階層（root → host → osd）
+- 用 `ceph mon stat` 找出 quorum 與 leader
+- 用 `ceph mgr module ls` 確認已啟用的管理模組
+- 用 `ceph df` 掌握 pool 與 OSD 容量
+
+## 今日在 30 天計畫中的位置
+
+Day 7 完成了自寫 controller，Day 8–12 深入 cilium eBPF datapath，Day 13–14 引入 Multus 多網路。今天進入 Block 3 儲存層。Proxmox 內建的 ceph cluster 是後五天所有 PV 的底層，Day 16–17 會研究 CRUSH 與 pool 設計，Day 18–19 接 ceph-csi 讓 k8s 直接消耗 PV，Day 20–21 則橫向延伸到 Rook operator 與 RGW S3。今天的健檢是一切的起點，先確認 cluster 健康再繼續。
+
+## 前置條件
+
+- 昨日 [Day 14](/learning-plan/features/day-14) 已完成，multus 原始碼閱讀完畢
+- 能 SSH 到任一 Proxmox node（有 root 或 ceph group 成員身份）
+- Proxmox node 上已有 `ceph` CLI（Proxmox 8 預設安裝）
+
+環境確認：
+
+```bash
+# 🔴 需在你環境跑後對照
+ssh root@<proxmox-node-ip> "ceph --version"
+```
+
+```
+ceph version 19.2.3 (...)  squid (stable)
+```
+
+## 動手做
+
+### 1. 確認 cluster 整體狀態
+
+ssh 進任一 Proxmox node，執行：
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph -s
+```
+
+```
+  cluster:
+    id:     xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    health: HEALTH_OK
+
+  services:
+    mon: 3 daemons, quorum node1,node2,node3 (age 2h)
+    mgr: node1(active, since 2h), standbys: node2, node3
+    osd: 9 osds: 9 up (since 2h), 9 in (since 3d)
+
+  data:
+    pools:   4 pools, 97 pgs
+    objects: 1.23 k objects, 4.5 GiB
+    usage:   15 GiB used, 985 GiB / 1 TiB avail
+    pgs:     97 active+clean
+```
+
+`health: HEALTH_OK` 表示所有 daemon 正常、資料副本完整。若顯示 `HEALTH_WARN`，記下警告訊息，Day 15 最後一步會用 `ceph health detail` 看細節。
+
+### 2. 讀取 CRUSH 階層
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd tree
+```
+
+```
+ID  CLASS  WEIGHT   TYPE NAME        STATUS  REWEIGHT  PRI-AFF
+-1         0.97659  root default
+-3         0.32553      host node1
+ 0    hdd  0.10851          osd.0        up   1.00000  1.00000
+ 1    hdd  0.10851          osd.1        up   1.00000  1.00000
+ 2    hdd  0.10851          osd.2        up   1.00000  1.00000
+-5         0.32553      host node2
+ 3    hdd  0.10851          osd.3        up   1.00000  1.00000
+ ...
+```
+
+記錄你環境的 host 數與每台 host 的 OSD 數，之後 Day 16 討論 failure domain 時會用到。`CLASS` 欄位（hdd / ssd / nvme）是 device class，影響 CRUSH rule 的選擇。
+
+### 3. 確認 MON quorum
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph mon stat
+```
+
+```
+e3: 3 mons at {node1=[v2:10.0.0.1:3300/0,v1:10.0.0.1:6789/0],...}, election epoch 6, leader node1, quorum 0,1,2 node1,node2,node3
+```
+
+`leader` 是目前負責協調的 MON。quorum 需要超過半數節點在線（3 個 MON 容許 1 個 crash）。
+
+### 4. 看 MGR 已啟用模組
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph mgr module ls | head -30
+```
+
+```
+{
+    "always_on_modules": [
+        "balancer",
+        "crash",
+        "devicehealth",
+        ...
+    ],
+    "enabled_modules": [
+        "dashboard",
+        "prometheus",
+        "pg_autoscaler",
+        ...
+    ],
+    ...
+}
+```
+
+`dashboard` 提供 Web UI，`prometheus` 暴露指標，`balancer` 自動平衡 PG 分布，`pg_autoscaler` 自動調整 PG 數量。
+
+### 5. 檢查 pool 與 OSD 容量
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph df
+```
+
+```
+--- RAW STORAGE ---
+CLASS     SIZE    AVAIL     USED  RAW USED  %RAW USED
+hdd      1 TiB  985 GiB   15 GiB    15 GiB       1.46
+TOTAL    1 TiB  985 GiB   15 GiB    15 GiB       1.46
+
+--- POOLS ---
+POOL           ID  PGS  STORED  OBJECTS  USED  %USED  MAX AVAIL
+device_health   1    1   0 B        0   0 B      0    311 GiB
+.mgr            2    1  577 KiB    2  1.7 MiB    0    311 GiB
+...
+```
+
+`AVAIL`（RAW STORAGE）是實際剩餘磁碟空間。`MAX AVAIL`（POOLS）是考慮副本數後邏輯可用空間，3 副本大約是 RAW 的 1/3。
+
+### 6. 若有 HEALTH_WARN，看細節
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph health detail
+```
+
+```
+HEALTH_WARN 1 osds have slow ops; 1 pool(s) have no replicas configured
+OSD_SLOW_OPS 1 osds have slow ops
+    osd.5 has 1 slow ops, oldest one blocked for 8 sec, daemons [osd.5] have 1 slow ops.
+```
+
+常見的 WARN 類型：OSD 遲緩（可能磁碟老化）、PG undersized（副本數不足）、MON clock skew（NTP 問題）。記下訊息，後續幾天實驗前先確認警告不影響寫入。
+
+## 觀念深化
+
+Ceph 是分散式物件儲存系統，對外提供 block（RBD）、filesystem（CephFS）、object（RGW）三種介面，底層統一是 **RADOS**（Reliable Autonomic Distributed Object Store）。
+
+幾類核心 daemon：
+
+- **MON**（Monitor）：儲存 cluster map（OSD map、CRUSH map、PG map 等），跑 Paxos 協議達成 quorum。MON 不儲存資料，但客戶端必須先聯絡 MON 取得 cluster map 才知道資料在哪。
+- **OSD**（Object Storage Daemon）：每顆磁碟一個。負責存 RADOS object、做副本複製、做 recovery / backfill、回報自身與鄰居的健康狀態給 MON。
+- **MGR**（Manager）：蒐集 metrics、執行管理任務（rebalance、pg_autoscaler）、對外提供 REST API 與 dashboard。
+- **MDS**（Metadata Server）：僅 CephFS 需要，服務目錄樹的 metadata（inode、dentry）。
+- **RGW**（Rados Gateway）：無狀態 HTTP daemon，提供 S3/Swift 相容 API，Day 21 會實際開啟。
+
+Proxmox 8 使用 `cephadm` 管理這些 daemon 的生命週期，`ceph orch ps` 可以看所有 daemon 的 container 狀態。
+
+參考：
+- [Ceph Architecture](https://docs.ceph.com/en/squid/architecture/)
+- [Ceph 原始碼 v19.2.3](https://github.com/ceph/ceph/tree/v19.2.3/src)
+
+## 收穫檢查
+
+- `ceph -s` 裡的 `health: HEALTH_OK` 代表什麼？什麼情況會變 HEALTH_WARN？
+- MON 的 quorum 是什麼？3 個 MON 最多可以容許幾個失敗？
+- OSD daemon 與磁碟是什麼關係？一顆磁碟可以有多個 OSD 嗎？
+- `ceph df` 的 `AVAIL`（RAW STORAGE）和 `MAX AVAIL`（POOLS）為什麼數字不同？
+- MGR 的 `pg_autoscaler` 模組做什麼事？
+
+## 參考資料
+
+- [Ceph Architecture](https://docs.ceph.com/en/squid/architecture/) — 官方架構總覽，含各 daemon 角色
+- [Ceph Monitoring and Alerting](https://docs.ceph.com/en/squid/operations/monitoring/) — `ceph -s` 各欄位說明
+- [Ceph 原始碼 src/mon](https://github.com/ceph/ceph/blob/v19.2.3/src/mon) — MON 實作
+- [Ceph 原始碼 src/osd](https://github.com/ceph/ceph/blob/v19.2.3/src/osd) — OSD 實作
+
+## 明日預告
+
+明天 [Day 16](/learning-plan/features/day-16) 深入 CRUSH map：dump 現有的 buckets 與 rules，理解 CRUSH 怎麼把 PG 對應到 OSD，以及 failure domain 的設計原理。

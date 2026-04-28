@@ -1,0 +1,144 @@
+---
+layout: doc
+title: Day 17 — Pool + PG + RBD
+description: 在 Proxmox ceph 上建立給 k8s 用的 RBD pool，建立第一個 RBD image，理解 PG (Placement Group) 在 object 與 OSD 之間扮演的角色。
+---
+
+## 今日目標
+
+- 建立給 k8s 用的 replicated pool（含合適的 PG 數）
+- 把 pool 標記為 RBD application
+- 建立第一個 RBD image，看它是怎麼拆成 4 MB RADOS object
+- 理解 PG → OSD 的對應如何由 CRUSH 決定
+
+## 今日在 30 天計畫中的位置
+
+Day 16 看完 CRUSH map，知道 placement 是怎麼算的；今天親手建一個 pool，讓 CRUSH 真正開始幫我們安置 object。Day 18 要把這個 pool 透過 ceph-csi 接到 k8s 端，所以今天先把 pool 名稱、PG 數、application 標記準備好。
+
+## 前置條件
+
+- 昨日 [day-16](/learning-plan/features/day-16) 已完成
+- ssh 進得去 Proxmox node
+- ceph cluster `HEALTH_OK`
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph -s | head -3
+```
+
+```
+  cluster:
+    id:     <uuid>
+    health: HEALTH_OK
+```
+
+## 動手做
+
+### 1. 建立 RBD pool
+
+PG 數的常見計算：`100 × OSD 總數 / replica 數`，取最接近的 2 次方。例如 6 OSD × 100 / 3 = 200，取 256；如果你的 cluster 比較小（3 OSD）可以從 32 開始。
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd pool create k8s-rbd 32 32 replicated
+```
+
+```
+pool 'k8s-rbd' created
+```
+
+第一個 32 是 `pg_num`，第二個 32 是 `pgp_num`（placement group for placement，通常與 `pg_num` 相同）。`replicated` 是 pool type，另一個選項是 `erasure`。
+
+### 2. 標記 pool 用途
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph osd pool application enable k8s-rbd rbd
+```
+
+```
+enabled application 'rbd' on pool 'k8s-rbd'
+```
+
+Application label 讓 ceph 知道這 pool 給誰用，未來新版本可能會根據 label 套不同的 default 設定（例如 RBD 預設啟用某些 feature flag）。
+
+### 3. 建第一個 RBD image
+
+```bash
+# 🔴 需在你環境跑後對照
+rbd create k8s-rbd/test-vol --size 1G
+```
+
+無輸出代表成功。`k8s-rbd/test-vol` 是 `<pool>/<image>` 格式。
+
+### 4. 看 image 的內部結構
+
+```bash
+# 🔴 需在你環境跑後對照
+rbd info k8s-rbd/test-vol
+```
+
+```
+rbd image 'test-vol':
+        size 1 GiB in 256 objects
+        order 22 (4 MiB objects)
+        snapshot_count: 0
+        id: <hex>
+        block_name_prefix: rbd_data.<hex>
+        format: 2
+        features: layering, exclusive-lock, object-map, fast-diff, deep-flatten
+        op_features:
+        flags:
+        create_timestamp: ...
+```
+
+注意 `block_name_prefix` — image 的資料會以 `rbd_data.<hex>.<sequence>` 為名存成 RADOS object。1 GiB image = 256 個 4 MiB object（`order 22` 表示 2^22 = 4 MiB）。
+
+### 5. 看新 pool 的 PG 落在哪些 OSD
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph pg ls-by-pool k8s-rbd | head -5
+```
+
+```
+PG       OBJECTS  ...  ACTING                STATE
+2.0      0        ...  [3,1,5]p3            active+clean
+2.1      0        ...  [4,0,2]p4            active+clean
+...
+```
+
+`ACTING` 那欄是 CRUSH 算出來的 OSD 列表（primary 在最前，後面是 replica）。剛建好 pool object 還是 0；等 Day 18 建 PVC 之後就會有資料。
+
+## 觀念深化
+
+PG 是 object 與 OSD 之間的中介層：
+
+```
+object name → hash → PG id → CRUSH(PG) → [OSD list]
+```
+
+為什麼要 PG 而不是直接 `object → OSD`？因為 CRUSH 計算對單一 object 太慢，且有了 PG 這個粒度，rebalance 時可以以 PG 為單位整批搬。PG 太少會讓 OSD 熱點集中（每個 OSD 拿到的 PG 數差異大），PG 太多會耗 OSD 記憶體（每個 PG 都有 metadata 佔位）。Squid 之後 ceph 有 `pg_autoscaler` module 可以動態調 PG 數，看 `ceph osd pool autoscale-status`。
+
+更深入閱讀：
+
+- 官方 PG 概念：https://docs.ceph.com/en/squid/rados/operations/placement-groups/
+- 原始碼：[src/osd/PG.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PG.cc) 是 PG 主類別
+
+## 收穫檢查
+
+- 1 GiB RBD image 在 RADOS 裡是幾個 object？object 名稱怎麼算？
+- 你 pool 的 PG 數是依什麼公式選的？跑 `ceph osd pool autoscale-status` 看建議值
+- `replicated` 與 `erasure` pool 在 fault tolerance vs storage overhead 上的取捨？
+- 如果 cluster 加進新的 OSD，PG 會怎麼動？
+
+## 參考資料
+
+- [Pools — Ceph docs](https://docs.ceph.com/en/squid/rados/operations/pools/) — pool create / 設定 / 刪除
+- [Placement Groups](https://docs.ceph.com/en/squid/rados/operations/placement-groups/) — PG 數選擇
+- [RBD Block Devices](https://docs.ceph.com/en/squid/rbd/) — RBD 概念
+- [src/osd/](https://github.com/ceph/ceph/tree/v19.2.3/src/osd) — OSD 原始碼
+
+## 明日預告
+
+明天 [day-18](/learning-plan/features/day-18) 從 k8s 端裝 ceph-csi，把 `k8s-rbd` pool 接成 StorageClass，讓 PVC 自動建 RBD image。

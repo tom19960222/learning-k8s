@@ -1,0 +1,240 @@
+---
+layout: doc
+title: Day 18 — k8s 裝 ceph-csi + StorageClass
+description: 把昨天建的 k8s-rbd pool 透過 ceph-csi-rbd 接到 k8s，建立 StorageClass，第一個 PVC bind 成功，磁碟現在是 ceph 出來的。
+---
+
+## 今日目標
+
+- 在 ceph cluster 建立給 k8s 用的 client key
+- 在 k8s 裝 `ceph-csi-rbd` Helm chart
+- 建立 ceph-csi config Secret + StorageClass
+- 第一個 PVC bind 成功；在 Proxmox 端看到自動建立的 RBD image
+
+## 今日在 30 天計畫中的位置
+
+Day 17 把 RBD pool 建好，但這 pool 對 k8s 還是「另一個系統」。今天透過 ceph-csi 把它接進來，從現在起任何 PVC 都可以走這個 StorageClass，背後自動產生 RBD image。Day 19 會用 CephFS 加上 RWX；Day 24 KubeVirt VM 也會用今天這個 StorageClass 做 boot disk。
+
+## 前置條件
+
+- 昨日 [day-17](/learning-plan/features/day-17) 已完成，pool `k8s-rbd` 存在
+- k8s cluster 上沒有衝突的 ceph-csi 安裝
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get sc
+```
+
+```
+NAME            PROVISIONER     RECLAIMPOLICY   ...
+(若已有相關 StorageClass，記下避免衝突)
+```
+
+## 動手做
+
+### 1. 在 ceph 建立 k8s 專用 client key
+
+ceph-csi 需要一個 ceph user 來操作 RBD pool。原則上權限最小化：只給 RBD 用、只能操作 `k8s-rbd` pool。
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph auth get-or-create client.k8s mon 'profile rbd' osd 'profile rbd pool=k8s-rbd'
+```
+
+```
+[client.k8s]
+        key = AQ...base64...==
+```
+
+把 key 與 username 記下來。
+
+### 2. 取得 cluster fsid 與 MON 列表
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph fsid
+```
+
+```
+xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph mon dump 2>/dev/null | grep 'mon\.'
+```
+
+```
+0: [v2:10.0.0.1:3300/0,v1:10.0.0.1:6789/0] mon.pve-01
+1: [v2:10.0.0.2:3300/0,v1:10.0.0.2:6789/0] mon.pve-02
+2: [v2:10.0.0.3:3300/0,v1:10.0.0.3:6789/0] mon.pve-03
+```
+
+記下 v1 endpoints (`<ip>:6789`) — 老 client 用 v1 protocol。
+
+### 3. 加 helm repo
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm repo add ceph-csi https://ceph.github.io/csi-charts
+helm repo update
+```
+
+```
+"ceph-csi" has been added to your repositories
+Hang tight while we grab the latest from your chart repositories...
+```
+
+### 4. 寫 ceph-csi config
+
+ceph-csi 用一個 ConfigMap 描述一或多個 ceph cluster。建立一個 namespace + 把 config 與 secret 注入：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create namespace ceph-csi-rbd
+```
+
+```yaml
+# 🔴 需在你環境跑後對照（fsid / MON IPs / key 換成你的）
+# csi-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ceph-csi-config
+  namespace: ceph-csi-rbd
+data:
+  config.json: |-
+    [
+      {
+        "clusterID": "<your-fsid>",
+        "monitors": ["10.0.0.1:6789","10.0.0.2:6789","10.0.0.3:6789"]
+      }
+    ]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-rbd-secret
+  namespace: ceph-csi-rbd
+stringData:
+  userID: k8s
+  userKey: AQ...base64...==
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+kubectl apply -f csi-config.yaml
+```
+
+### 5. 安裝 ceph-csi-rbd
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+helm install ceph-csi-rbd ceph-csi/ceph-csi-rbd \
+  --namespace ceph-csi-rbd --version 3.13.0 \
+  --set csiConfig[0].clusterID=<your-fsid> \
+  --set csiConfig[0].monitors='{10.0.0.1:6789,10.0.0.2:6789,10.0.0.3:6789}'
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n ceph-csi-rbd get pods
+```
+
+```
+NAME                                    READY   STATUS    ...
+ceph-csi-rbd-nodeplugin-xxxxx           3/3     Running
+ceph-csi-rbd-nodeplugin-yyyyy           3/3     Running
+ceph-csi-rbd-provisioner-...            7/7     Running
+```
+
+### 6. 建立 StorageClass
+
+```yaml
+# 🔴 需在你環境跑後對照（fsid 換成你的）
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-rbd
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: <your-fsid>
+  pool: k8s-rbd
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi-rbd
+  csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi-rbd
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+```
+
+### 7. 建第一個 PVC
+
+```yaml
+# 🟢 已驗證 (kind / 顯然正確)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ceph-test-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ceph-rbd
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pvc ceph-test-pvc -w
+```
+
+幾秒後應該變 `Bound`。
+
+### 8. 從 ceph 端看自動建立的 image
+
+```bash
+# 🔴 需在你環境跑後對照
+rbd ls k8s-rbd
+```
+
+```
+csi-vol-<uuid>
+test-vol
+```
+
+`csi-vol-<uuid>` 就是剛剛 PVC 觸發 ceph-csi provisioner 建出來的。可以再 `rbd info k8s-rbd/csi-vol-<uuid>` 看細節。
+
+## 觀念深化
+
+ceph-csi 由兩部分組成：
+
+- **controller plugin（Deployment）** — 跑在某個 node 上，負責「建立 / 刪除 volume」「擴容」等需要呼叫 ceph API 的操作。對應 PVC 的生命週期。
+- **node plugin（DaemonSet）** — 每個 node 一個，負責「stage / publish 到 Pod」「unstage / unpublish」。當 Pod 排到該 node 才需要這個 plugin。
+
+兩者都實作 CSI gRPC interface（[CSI spec](https://github.com/container-storage-interface/spec)）。kubelet 不需要懂 ceph，只跟 CSI socket 對話。所以同一個 k8s cluster 可以同時跑很多 CSI driver（NFS、AWS EBS、ceph-rbd、ceph-cephfs 各自獨立）。
+
+更深入：
+
+- 整個 controller-plugin 進程結構 [internal/csi-common/](https://github.com/ceph/ceph-csi/tree/v3.13.0/internal/csi-common)
+- RBD provisioner 邏輯 [internal/rbd/controllerserver.go](https://github.com/ceph/ceph-csi/blob/v3.13.0/internal/rbd/controllerserver.go) 裡的 `CreateVolume()`
+
+## 收穫檢查
+
+- ceph-csi 是怎麼決定要在哪個 node 上 mount RBD？(提示：node plugin)
+- 為什麼 controller plugin 要一個 secret，node plugin 也要一個？兩者用途差在哪？
+- 換成 SSD 專用的 pool 應該改 StorageClass 哪一欄？
+- 如果你刪掉 PVC，`reclaimPolicy: Delete` 會做什麼？換成 `Retain` 呢？
+
+## 參考資料
+
+- [Deploy ceph-csi rbd](https://github.com/ceph/ceph-csi/blob/v3.13.0/docs/deploy-rbd.md) — 官方安裝步驟
+- [CSI 設計](https://github.com/container-storage-interface/spec) — k8s-vendor-agnostic 的 storage interface
+- [ceph-csi controllerserver.go](https://github.com/ceph/ceph-csi/blob/v3.13.0/internal/rbd/controllerserver.go) — provisioner 主邏輯
+
+## 明日預告
+
+明天 [day-19](/learning-plan/features/day-19) 試 CephFS — 跟 RBD 不同，CephFS 支援 RWX，多 Pod 可同時掛同一個 PVC 共享檔案。

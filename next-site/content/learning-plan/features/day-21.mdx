@@ -1,0 +1,236 @@
+---
+layout: doc
+title: Day 21 — RGW (S3) + boto3 訪問
+description: 在 Proxmox ceph 啟用 RGW，建一個 S3 user，從 k8s Pod 用 boto3 上傳檔案，理解 S3 物件在 RADOS 上的儲存模型。
+---
+
+## 今日目標
+
+- 在 Proxmox ceph cluster 部署 RGW
+- 建一個 S3 user 並拿到 access/secret key
+- 從本機 aws CLI 與 k8s Pod boto3 兩種方式上傳檔案
+- 理解 S3 物件在 RADOS 上的存放方式（head + tail object）
+
+## 今日在 30 天計畫中的位置
+
+Day 17-19 給 k8s 接上了 block (RBD) 與 file (CephFS)；今天補上第三種 ceph storage：物件儲存 (RGW S3)。VM 平台日常會碰到備份、靜態資源、ML 訓練資料這些 use case，S3 通常是首選。明天起進入 Week 4，焦點轉到 KubeVirt VM 本身；今天的 S3 endpoint 也會在後面 lab 用到（例如備份 VM image）。
+
+## 前置條件
+
+- 昨日 [day-20](/learning-plan/features/day-20) 已完成
+- ssh 進得去 Proxmox node，`ceph -s` HEALTH_OK
+- 本機裝 `aws` CLI v2（用來測 endpoint）
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph -s | head -3 && ceph orch ls 2>/dev/null | head -5
+```
+
+## 動手做
+
+### 1. 部署 RGW
+
+依 Proxmox 版本的差異，方式不同。Proxmox VE 9 使用 cephadm orchestrator：
+
+```bash
+# 🔴 需在你環境跑後對照
+ceph orch apply rgw default --placement="1 pve-01"
+```
+
+```
+Scheduled rgw.default update...
+```
+
+如果你的環境是 Proxmox 自己包的指令：
+
+```bash
+# 🔴 需在你環境跑後對照
+pveceph rgw create
+```
+
+部署完成後 RGW 會在 7480 port 監聽 HTTP（預設）：
+
+```bash
+# 🔴 需在你環境跑後對照
+curl http://<rgw-host>:7480
+```
+
+```
+<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult ...><Owner>...
+```
+
+看到 XML 回應代表 RGW 起來了（雖然 anonymous 還沒權限做任何事）。
+
+### 2. 建 S3 user
+
+```bash
+# 🔴 需在你環境跑後對照
+radosgw-admin user create \
+  --uid=k8s-app \
+  --display-name="K8s App" \
+  --email=devnull@example.com
+```
+
+```json
+{
+    "user_id": "k8s-app",
+    "display_name": "K8s App",
+    "keys": [
+        {
+            "user": "k8s-app",
+            "access_key": "AKIA...",
+            "secret_key": "SECRET..."
+        }
+    ],
+    ...
+}
+```
+
+把 `access_key` 與 `secret_key` 抄下來。
+
+### 3. 從本機 aws CLI 測
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+export AWS_ACCESS_KEY_ID=AKIA...
+export AWS_SECRET_ACCESS_KEY=SECRET...
+export ENDPOINT=http://<rgw-host>:7480
+
+aws --endpoint-url=$ENDPOINT s3 mb s3://test-bucket --region=default
+```
+
+```
+make_bucket: test-bucket
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+echo "hello from local" > hello.txt
+aws --endpoint-url=$ENDPOINT s3 cp hello.txt s3://test-bucket/
+aws --endpoint-url=$ENDPOINT s3 ls s3://test-bucket/
+```
+
+```
+upload: ./hello.txt to s3://test-bucket/hello.txt
+2026-05-17 ... hello.txt
+```
+
+### 4. 從 k8s Pod 用 boto3
+
+把 access/secret 注入成 Secret，然後跑一個 Python Pod：
+
+```yaml
+# 🟢 已驗證 (kind / 顯然正確)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rgw-creds
+type: Opaque
+stringData:
+  access: "AKIA..."
+  secret: "SECRET..."
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: s3-tester
+spec:
+  restartPolicy: Never
+  containers:
+  - name: py
+    image: python:3.12-slim
+    command:
+    - sh
+    - -c
+    - |
+      pip install boto3 -q
+      python - <<'PY'
+      import os, boto3
+      s3 = boto3.client(
+          's3',
+          endpoint_url=os.environ['EP'],
+          aws_access_key_id=os.environ['AK'],
+          aws_secret_access_key=os.environ['SK'],
+      )
+      with open('/etc/hostname') as f:
+          body = f.read()
+      s3.put_object(Bucket='test-bucket', Key='hostname.txt', Body=body)
+      objs = s3.list_objects_v2(Bucket='test-bucket').get('Contents', [])
+      for o in objs:
+          print(o['Key'], o['Size'])
+      PY
+    env:
+    - {name: EP, value: "http://<rgw-host>:7480"}
+    - {name: AK, valueFrom: {secretKeyRef: {name: rgw-creds, key: access}}}
+    - {name: SK, valueFrom: {secretKeyRef: {name: rgw-creds, key: secret}}}
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl logs s3-tester
+```
+
+```
+hello.txt 17
+hostname.txt 12
+```
+
+### 5. 從 ceph 端看 bucket
+
+```bash
+# 🔴 需在你環境跑後對照
+radosgw-admin bucket list --uid=k8s-app
+```
+
+```
+[
+    "test-bucket"
+]
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+radosgw-admin bucket stats --bucket=test-bucket | head -30
+```
+
+可以看 `usage.rgw.main.size_kb`、`num_objects`，與 `placement_rule`（決定資料 pool）。
+
+## 觀念深化
+
+S3 物件在 RADOS 上的存法：
+
+```
+object key (e.g. "hostname.txt")
+  → head object (1 個 RADOS object，存 metadata + 第一段資料)
+  → 0..N tail objects（每個 4 MiB，存剩下資料）
+```
+
+Head object 的命名是 `<bucket-marker>_<object-key>`；tail object 是 `<bucket-marker>__shadow_<hash>.<seq>`。可以用 `rados -p default.rgw.buckets.data ls | head` 看（會看到一堆 hex 名）。
+
+RGW 自己也是 stateless：所有 bucket / user / ACL / policy metadata 都存在另外的 RADOS pool（`*.rgw.meta` / `*.rgw.log` / `*.rgw.control`）。所以 RGW 可以水平 scale — 起多個 RGW Pod 共享同一份 metadata 即可。
+
+對比 RBD：RBD 也是把 image 拆成 4 MiB object，但完全沒有 metadata layer（RBD object 名是 deterministic 的 `rbd_data.<image-id>.<seq>`）。RGW 則需要 metadata layer 處理 bucket policy、versioning、lifecycle 等 S3 語義。
+
+更深入：
+
+- [RGW S3 API](https://docs.ceph.com/en/squid/radosgw/s3/)
+- [src/rgw/](https://github.com/ceph/ceph/tree/v19.2.3/src/rgw) — RGW 原始碼
+- [src/rgw/rgw_rest_s3.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/rgw/rgw_rest_s3.cc) — S3 REST 接口
+
+## 收穫檢查
+
+- 3 KiB 的 S3 物件需要幾個 RADOS object？8 MiB 的呢？
+- RGW 與 MDS 的角色差異 — 兩者都是 metadata 處理，差在哪？
+- `radosgw-admin user create` 跟 `ceph auth get-or-create` 在底層是同一套 auth 系統嗎？
+- 如果你部署 2 個 RGW 在不同 node 並 LB，S3 client 看到的物件會一致嗎？
+
+## 參考資料
+
+- [RADOS Gateway](https://docs.ceph.com/en/squid/radosgw/) — RGW 文件首頁
+- [RGW S3 API support matrix](https://docs.ceph.com/en/squid/radosgw/s3/)
+- [boto3 S3 examples](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/s3-uploading-files.html)
+- [src/rgw/rgw_rados.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/rgw/rgw_rados.cc) — RGW 跟 RADOS 的橋接
+
+## 明日預告
+
+明天 [day-22](/learning-plan/features/day-22) 進入 Week 4，主題 KubeVirt。先安裝 KubeVirt operator + KubeVirt CR，看 4 個元件 (virt-api / controller / handler / operator) 各自起在哪。
