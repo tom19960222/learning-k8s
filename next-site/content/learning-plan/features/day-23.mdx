@@ -1,0 +1,192 @@
+---
+layout: doc
+title: Day 23 — 第一台 VM
+description: 寫一份 VirtualMachine YAML 跑 Fedora cloud image，用 virtctl console 進系統，理解 VirtualMachine vs VirtualMachineInstance 的差異。
+---
+
+## 今日目標
+
+- 用 `containerDisk` source 跑第一台 VM（不需事先準備 PVC）
+- 注入 cloud-init 設密碼
+- 用 `virtctl console` 登入
+- 理解 `VirtualMachine` 與 `VirtualMachineInstance` 的關係
+
+## 今日在 30 天計畫中的位置
+
+Day 22 把 KubeVirt 元件裝起來，今天驗證它真的能跑 VM。為了避開 ceph 與網路的複雜度，這個 VM 用 `containerDisk`（image 包在 container image 裡）+ Pod network。Day 24 換成 ceph-csi PVC 當磁碟，Day 26 加 multus 第二張網卡。
+
+## 前置條件
+
+- 昨日 [day-22](/learning-plan/features/day-22) 已完成，KubeVirt CR 是 Available
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt get kv kubevirt -o jsonpath='{.status.phase}'
+```
+
+```
+Deployed
+```
+
+## 動手做
+
+### 1. 寫 VirtualMachine YAML
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: fedora-vm
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: fedora-vm
+    spec:
+      domain:
+        cpu: {cores: 1}
+        memory: {guest: 1Gi}
+        devices:
+          disks:
+          - name: rootdisk
+            disk: {bus: virtio}
+          - name: cloudinit
+            disk: {bus: virtio}
+          interfaces:
+          - name: default
+            masquerade: {}
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - name: rootdisk
+        containerDisk:
+          image: quay.io/containerdisks/fedora:39
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            password: fedora
+            chpasswd: { expire: False }
+            ssh_pwauth: True
+```
+
+### 2. apply + 等 VMI 起來
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f vm.yaml
+kubectl get vm
+```
+
+```
+NAME        AGE   STATUS    READY
+fedora-vm   5s    Starting  False
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi -w
+```
+
+等到 `Running`：
+
+```
+fedora-vm   45s   Running    10.244.x.x   worker-01
+```
+
+VirtualMachine（vm）= 持久定義；VirtualMachineInstance（vmi）= 實際在跑的 VM 實例。Stop VM 時 vmi 會消失但 vm 還在。
+
+### 3. 看 launcher Pod
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -l kubevirt.io=virt-launcher
+```
+
+```
+NAME                            READY   STATUS    ...
+virt-launcher-fedora-vm-xxxxx   2/2     Running
+```
+
+每個 VMI 對應一個 virt-launcher Pod，Pod 內跑 libvirt + qemu。
+
+### 4. 用 virtctl console 進 VM
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl console fedora-vm
+```
+
+```
+Successfully connected to fedora-vm console. The escape sequence is ^]
+
+Fedora Linux 39 (Cloud Edition)
+Kernel 6.x.x on an x86_64 (ttyS0)
+
+fedora-vm login:
+```
+
+帳號 `fedora` 密碼 `fedora`（cloud-init 注入）。登入後試 `ip a` 看 NIC、`uname -a` 看 kernel。離開按 `Ctrl+]`。
+
+### 5. Stop / Start 看 VM 與 VMI 的關係
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-vm
+kubectl get vm,vmi
+```
+
+```
+NAME                                  AGE   STATUS    READY
+virtualmachine.kubevirt.io/fedora-vm  5m    Stopped   False
+# vmi 不見了
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl start fedora-vm
+kubectl get vmi
+```
+
+幾秒後 VMI 重新出現。原本的 cloud-init 會再執行一次（每次 VMI 都是新 instance）。
+
+## 觀念深化
+
+`VirtualMachine` 對 `VirtualMachineInstance` 的關係，類似 `Deployment` 對 `Pod`：
+
+| 持久定義 | 短暫實例 |
+|---|---|
+| Deployment / ReplicaSet | Pod |
+| VirtualMachine | VirtualMachineInstance |
+
+但 VM 跟 Deployment 有兩個重要差別：
+
+1. **單實例**：VM 永遠最多 1 個 VMI（不是 N 個 replica）。VM 的 `runStrategy` 控制何時啟動 VMI（`Always` / `RerunOnFailure` / `Manual` / `Halted`）。
+2. **狀態保留位置**：磁碟內容存在 PVC（Day 24 會講）。VMI 死掉重起，磁碟保留；但 RAM 不保留 — 重起就是 cold boot。Live migration（Day 27）才能保留 RAM。
+
+`containerDisk` 是 Day 23 的捷徑：image 包在 OCI image 裡，每次 VMI 啟動都從 image 拉一份新的（read-only），改動不會持久化。生產應該用 `persistentVolumeClaim` 或 `dataVolume`。
+
+更深入：
+
+- [VirtualMachine vs VirtualMachineInstance](https://kubevirt.io/user-guide/virtual_machines/lifecycle/)
+- VM controller 原始碼：[pkg/virt-controller/watch/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vm.go)
+
+## 收穫檢查
+
+- VirtualMachine 的 `runStrategy: Always` 跟 Deployment 的 `replicas: 1` 有什麼差別？
+- 為什麼 cloud-init 在 stop/start 後又執行一次？
+- `containerDisk` 跟 PVC 各適合什麼場景？
+- 你的 Fedora VM 在哪個 node？怎麼證明？
+
+## 參考資料
+
+- [VirtualMachine](https://kubevirt.io/user-guide/virtual_machines/) — VM YAML 規格
+- [Cloud-init in KubeVirt](https://kubevirt.io/user-guide/virtual_machines/startup_scripts/)
+- [virtctl reference](https://kubevirt.io/user-guide/operations/virtctl_client_tool/)
+
+## 明日預告
+
+明天 [day-24](/learning-plan/features/day-24) 把 `containerDisk` 換成 ceph-csi 的 PVC，VM 重啟後資料保留。

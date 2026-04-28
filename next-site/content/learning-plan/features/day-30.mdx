@@ -1,0 +1,263 @@
+---
+layout: doc
+title: Day 30 — 平台整合 demo + 30 天回顧
+description: 把 30 天累積的所有元件整合成一個 production-style web service VM：ceph-csi 磁碟、multus 第二張網卡、live migration 全部用上，最後回顧整段學習路徑。
+---
+
+## 今日目標
+
+- 部署一台 web service VM：ceph-csi RBD root disk + multus bridge NIC + cloud-init 啟動 nginx
+- 從 cluster 內外各驗證一次連線
+- 觸發 live migration，nginx 不中斷服務
+- 回顧 30 天的學習路徑與下一步
+
+## 今日在 30 天計畫中的位置
+
+最後一天，總結。Day 1 你 ssh 進 control plane node 第一次看到 kube-apiserver；Day 30 你親手部署一個跨儲存、網路、虛擬化整層的 production-style VM 平台。
+
+## 前置條件
+
+- 昨日 [day-29](/learning-plan/features/day-29) 已完成；Day 1-29 累積的所有元件正常運作
+- 所有元件健康：cilium / multus / ceph-csi-rbd / multus bridge NAD / KubeVirt CR Available
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt get kv kubevirt -o jsonpath='{.status.phase}{"\n"}' && \
+kubectl -n kube-system get ds | grep -E "(cilium|multus)" && \
+kubectl get sc | grep ceph-rbd && \
+kubectl get net-attach-def
+```
+
+```
+Deployed
+cilium                             3 ...
+kube-multus-ds                     3 ...
+ceph-rbd                           rbd.csi.ceph.com  ...
+NAME           AGE
+bridge-nad     ...
+```
+
+## 動手做
+
+### 1. 準備 VM root disk
+
+複用 Day 24 的 fedora-rootdisk PVC，或重建一份新的：
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: web-vm-root
+spec:
+  source:
+    pvc: {namespace: default, name: fedora-rootdisk}
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources: {requests: {storage: 10Gi}}
+    storageClassName: ceph-rbd
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f web-vm-dv.yaml
+kubectl get dv web-vm-root -w
+```
+
+等 `Succeeded`。
+
+### 2. 部署整合 VM
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: web-vm
+  labels: {app: web-vm}
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels: {kubevirt.io/vm: web-vm, app: web-vm}
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |-
+          [{
+            "name": "bridge-nad",
+            "interface": "eth1",
+            "ips": ["192.168.1.100/24"]
+          }]
+    spec:
+      domain:
+        cpu: {cores: 2}
+        memory: {guest: 2Gi}
+        devices:
+          disks:
+          - {name: rootdisk, disk: {bus: virtio}}
+          - {name: cloudinit, disk: {bus: virtio}}
+          interfaces:
+          - {name: default, masquerade: {}}
+          - {name: bridge-net, bridge: {}}
+        machine: {type: q35}
+      networks:
+      - {name: default, pod: {}}
+      - name: bridge-net
+        multus: {networkName: bridge-nad}
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim: {claimName: web-vm-root}
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            password: fedora
+            chpasswd: { expire: False }
+            ssh_pwauth: True
+            packages:
+              - nginx
+            runcmd:
+              - ip addr add 192.168.1.100/24 dev eth1 || true
+              - ip link set eth1 up
+              - systemctl enable --now nginx
+              - bash -c 'echo "<h1>web-vm on $(hostname)</h1>" > /usr/share/nginx/html/index.html'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-vm-svc
+spec:
+  type: ClusterIP
+  selector: {kubevirt.io/vm: web-vm}
+  ports:
+  - {port: 80, targetPort: 80}
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f web-vm.yaml
+kubectl get vmi -w
+```
+
+等 `Running`。
+
+### 3. 驗證 cluster 內連線（cilium pod network）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl run probe --image=curlimages/curl --restart=Never -i --rm -- curl -sf http://web-vm-svc/
+```
+
+```
+<h1>web-vm on web-vm</h1>
+```
+
+### 4. 驗證物理網段連線（multus bridge）
+
+從 LAN 上其他設備（例如你的開發筆電），假設跟 192.168.1.0/24 通：
+
+```bash
+# 🔴 需在你環境跑後對照
+curl http://192.168.1.100/
+```
+
+```
+<h1>web-vm on web-vm</h1>
+```
+
+兩條路徑都通，分別走的是：
+
+- ClusterIP service → cilium → masquerade NAT → VM eth0
+- 192.168.1.100 → 你 LAN 的 router → vmbr0 bridge → VM eth1
+
+### 5. 觸發 live migration，驗證服務不中斷
+
+開兩個 terminal：
+
+**Terminal A（持續 curl）：**
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+while true; do curl -s -m 1 -o /dev/null -w "%{http_code} $(date +%T)\n" http://192.168.1.100/; sleep 0.3; done
+```
+
+**Terminal B（觸發遷移）：**
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl migrate web-vm
+```
+
+Terminal A 應該偶爾出現 `000` 或 timeout（cutover 期間），但 nginx 重啟後立刻復原。整體 downtime 通常 < 1 秒。
+
+### 6. 看 VM 換 node
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi web-vm -o wide
+```
+
+`NODENAME` 應該變了。再試 curl 還是通。
+
+### 7. 收尾 — 不刪 VM，保留作為日後玩具
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+virtctl stop web-vm
+kubectl get vm
+```
+
+VM 進 Stopped 狀態但 PVC / VirtualMachine 還在。需要時 `virtctl start` 即可。
+
+## 觀念深化
+
+這個 VM 用上你 30 天累積的所有元件：
+
+| 元件 | 在這個 VM 扮演 |
+|---|---|
+| k8s control plane (Day 1-7) | 整個編排與 API |
+| cilium (Day 8-12) | 主介面 (eth0) 的 CNI 與 NetworkPolicy |
+| multus (Day 13-14) | 第二介面 (eth1) 的多網路接入 |
+| ceph + ceph-csi (Day 15-19) | VM root disk 的 RBD volume |
+| KubeVirt (Day 22-29) | VM lifecycle、live migration、virt-launcher |
+| CDI (Day 28) | DataVolume PVC clone |
+
+剩下沒涵蓋進來但你也認識了：CRUSH 與 OSD 的 placement、Rook 的 operator pattern、CephFS 與 RGW、scheduler 與 controller-manager 的 reconcile。
+
+## 30 天回顧
+
+從 Day 1 第一次 ssh 進 control plane node、發現 kube-apiserver 是個 static Pod，到 Day 30 親手部署一個跨儲存、網路、虛擬化的 web service VM —— 你走過了一整段 k8s 生態系的學習路徑。
+
+**Block 1 (Day 1-7)** 把 k8s 的 4 個控制平面元件 + kubelet + kube-proxy 拆解，最後親手寫一個 controller — 從此 Reconcile() 不再是黑魔法。
+
+**Block 2 (Day 8-14)** 把網路層換成 cilium，看到 eBPF 真實在跑；補上 multus 為 VM 的多網路鋪路。
+
+**Block 3 (Day 15-21)** 進入儲存層，先理解 Proxmox-managed ceph 的 RADOS / CRUSH / PG 模型，再用 ceph-csi 把它接進 k8s；同時花一個 weekend 看 Rook operator 怎麼用 k8s pattern 管 ceph。
+
+**Block 4 (Day 22-30)** 終於把 KubeVirt 裝起來，從第一台 fedora VM 一路堆到 PVC 磁碟 → 多網路 → live migration → 整合 demo。每一步都連回前面 block 累積的東西。
+
+接下來可以做的：
+
+- 把這些原始碼的細節寫進站內的 5 個專案分析頁（SP-3..SP-7）—— 對應的子計畫已在 docs/superpowers/specs/ 規劃中
+- 把 demo VM 包成 Helm chart 或 GitOps workflow（ArgoCD / FluxCD）
+- 用 Cluster API Provider KubeVirt 把整個 k8s cluster 當作「VM 平台」管理，做巢狀 cluster
+- 加上 monitoring stack（kube-prometheus-stack）、log（Loki）、tracing（Jaeger）
+
+謝謝你陪這個 30 天計畫走到這裡。
+
+## 收穫檢查
+
+- 這個 demo VM 對外暴露兩條路徑（ClusterIP + bridge IP），各自的封包路徑你能說清楚嗎？
+- 如果這個 VM 要 scale 成 3 個（HA），你會怎麼設計？（提示：KubeVirt 沒有原生 replica）
+- 把 web-vm 的 root disk 換到 SSD pool 會怎麼影響 boot 時間？
+- 如果你的 Proxmox 環境網段不是 192.168.1.0/24，要改哪幾處設定？
+
+## 參考資料
+
+- [KubeVirt user guide — End to end demos](https://kubevirt.io/labs/) — 更多教學 lab
+- [Cluster API Provider KubeVirt](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt) — KubeVirt VM 當 k8s node
+- [KubeVirt SIG Storage](https://github.com/kubevirt/community/tree/main/sig-storage) — VM 儲存整合最新討論
+- 本站待寫：SP-3..SP-7 的 5 個原始碼分析頁
+
+## 結語
+
+這段路你已經親自走完。下次有人問你「KubeVirt 怎麼跑」、「ceph-csi 怎麼接」、「cilium 跟 multus 差在哪」，你的答案不會是「看官網」而是「我做過、我知道」。

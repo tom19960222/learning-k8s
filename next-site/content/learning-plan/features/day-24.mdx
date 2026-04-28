@@ -1,0 +1,234 @@
+---
+layout: doc
+title: Day 24 — VM 用 PVC 當磁碟
+description: 把 VM 的根磁碟從 containerDisk 換成 ceph-csi RBD PVC，理解 DataVolume 怎麼把 cloud image 灌進 PVC，VM 重啟後資料保留。
+---
+
+## 今日目標
+
+- 用 DataVolume 把 Fedora cloud image 從 URL 灌進 ceph-csi PVC
+- 修改 VM 把 root disk 從 `containerDisk` 換成 `persistentVolumeClaim`
+- 驗證在 VM 內寫入的資料 stop / start 後仍存在
+- 在 ceph 端確認 RBD image 真的被 VM 使用中
+
+## 今日在 30 天計畫中的位置
+
+Day 23 用 `containerDisk` 跑 VM 是「會動就好」；今天升級成持久儲存。Day 18 的 ceph-csi StorageClass 終於派上用場。Day 27 live migration 也會建立在這個基礎上 — VM 必須用 shared storage（PVC）才能在 node 之間搬。
+
+## 前置條件
+
+- 昨日 [day-23](/learning-plan/features/day-23) 已完成，KubeVirt + virtctl 可用
+- Day 18 的 `ceph-rbd` StorageClass 仍在
+- 安裝 CDI（Containerized Data Importer），KubeVirt v1.8.2 對應 CDI v1.62.0 附近
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get sc ceph-rbd
+```
+
+```
+NAME       PROVISIONER         RECLAIMPOLICY   ...
+ceph-rbd   rbd.csi.ceph.com    Delete          ...
+```
+
+## 動手做
+
+### 1. 安裝 CDI
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+CDI_VERSION=v1.62.0
+kubectl apply -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-operator.yaml
+kubectl apply -f https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-cr.yaml
+kubectl -n cdi wait --for=condition=Available cdi cdi --timeout=5m
+```
+
+```
+cdi.cdi.kubevirt.io/cdi condition met
+```
+
+### 2. 建立 DataVolume 從 URL 拉 image
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: fedora-rootdisk
+spec:
+  source:
+    http:
+      url: "https://download.fedoraproject.org/pub/fedora/linux/releases/39/Cloud/x86_64/images/Fedora-Cloud-Base-39-1.5.x86_64.qcow2"
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: ceph-rbd
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f datavolume.yaml
+kubectl get dv -w
+```
+
+```
+NAME              PHASE              PROGRESS   ...
+fedora-rootdisk   ImportInProgress   25.00%
+fedora-rootdisk   ImportInProgress   80.00%
+fedora-rootdisk   Succeeded          100.0%
+```
+
+CDI 起一個 importer Pod 下載 qcow2，用 `qemu-img convert` 寫進 PVC。完成後 PVC 變 Bound。
+
+### 3. 看 PVC 與 RBD image
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pvc fedora-rootdisk
+```
+
+```
+NAME              STATUS   VOLUME           CAPACITY   ACCESS MODES   STORAGECLASS
+fedora-rootdisk   Bound    pvc-<uuid>       10Gi       RWO            ceph-rbd
+```
+
+```bash
+# 🔴 需在你環境跑後對照
+rbd ls k8s-rbd
+```
+
+```
+csi-vol-<uuid>   # ← 這個就是上面 PVC 對應的 image
+```
+
+### 4. 改 VM 用 PVC 當 rootdisk
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: fedora-vm
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels: {kubevirt.io/vm: fedora-vm}
+    spec:
+      domain:
+        cpu: {cores: 1}
+        memory: {guest: 1Gi}
+        devices:
+          disks:
+          - name: rootdisk
+            disk: {bus: virtio}
+          - name: cloudinit
+            disk: {bus: virtio}
+          interfaces:
+          - name: default
+            masquerade: {}
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim:
+          claimName: fedora-rootdisk
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            password: fedora
+            chpasswd: { expire: False }
+            ssh_pwauth: True
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-vm 2>/dev/null
+kubectl apply -f vm.yaml
+kubectl get vmi -w
+```
+
+幾秒後 `Running`。
+
+### 5. 在 VM 內寫資料、stop、start，驗證資料保留
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl console fedora-vm
+# 登入 fedora/fedora，然後：
+# echo "hello from before stop" > /root/persist.txt
+# 退出 console (Ctrl+])
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-vm
+sleep 5
+virtctl start fedora-vm
+# 等 VMI Running 後再 console，cat /root/persist.txt
+```
+
+`hello from before stop` 應該還在。
+
+### 6. 看 VM 在 node 上怎麼掛 RBD
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi fedora-vm -o jsonpath='{.status.nodeName}'
+```
+
+ssh 到那個 node：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ls -l /dev/rbd*
+```
+
+ceph-csi 把 RBD image map 成 `/dev/rbdX`，再透過 mount 進 virt-launcher Pod。
+
+## 觀念深化
+
+VM disk 在 KubeVirt 的層次：
+
+```
+VirtualMachine.spec.template.spec.volumes[].persistentVolumeClaim
+  ↓
+PVC (Day 18 的 ceph-rbd StorageClass)
+  ↓ ceph-csi node plugin
+node 上的 /dev/rbdX
+  ↓ virt-launcher Pod 內掛載
+qemu 看到的 virtio block device
+  ↓
+VM 內 /dev/vda
+```
+
+DataVolume 是 KubeVirt 給 PVC 加 lifecycle 的 wrapper：自動建 PVC + 跑 importer 把 image 灌進去 + 標記 status。如果你只 `kubectl get pvc` 看到 PVC、不知道哪來的，多半就是 DataVolume 建的。
+
+`storage` size 跟 image size 不直接相等：DataVolume 會把 PVC 的 size attribute 對齊到 storage class 的最小單位（ceph-rbd 通常是 4 MiB），實際 image 比 PVC 小很多時 PVC 還是該 size，多餘的空間是 sparse。
+
+更深入：
+
+- [DataVolumes](https://kubevirt.io/user-guide/storage/containerized-data-importer/) — CDI 文件
+- [Disks and Volumes](https://kubevirt.io/user-guide/storage/disks_and_volumes/) — VM disk 配置
+- [pkg/virt-launcher/virtwrap/converter/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/virtwrap/converter) — VMI spec 轉 libvirt domain XML 的程式碼
+
+## 收穫檢查
+
+- DataVolume 是必要的嗎？能直接寫 PVC 然後手動填內容嗎？
+- 為什麼 ceph-csi 要先 map 成 `/dev/rbdX` 再給 Pod？不能直接給 qemu？
+- VM 內看到的 `/dev/vda` 跟 node 上的 `/dev/rbdX` 之間多走了幾層？
+- 把 RBD pool 換 SSD 與 HDD 做 lab，VM boot 時間會差多少？
+
+## 參考資料
+
+- [Storage with KubeVirt](https://kubevirt.io/user-guide/storage/)
+- [CDI](https://github.com/kubevirt/containerized-data-importer)
+- [DataVolume API](https://kubevirt.io/user-guide/storage/datavolumes/)
+
+## 明日預告
+
+明天 [day-25](/learning-plan/features/day-25) 進 node 看 virt-launcher Pod 內部 — qemu process、libvirt domain XML、namespace 拓樸。

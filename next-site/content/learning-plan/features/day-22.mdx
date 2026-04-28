@@ -1,0 +1,181 @@
+---
+layout: doc
+title: Day 22 — 安裝 KubeVirt
+description: 在 k8s 安裝 KubeVirt operator 與 KubeVirt CR，理解 4 個元件 (virt-operator / api / controller / handler) 的角色分工。
+---
+
+## 今日目標
+
+- 確認 cluster nodes 支援 nested KVM
+- 部署 kubevirt-operator
+- 建立 KubeVirt CR 啟動其他元件
+- 找到 virt-api / virt-controller / virt-handler Pod，理解各自工作
+
+## 今日在 30 天計畫中的位置
+
+Week 1-3 把 control plane / CNI / storage 鋪好，今天裝上虛擬化層。後續 8 天會持續用今天裝好的 KubeVirt：先跑第一台 VM（Day 23），再串到 ceph-csi（Day 24）做磁碟、串到 multus（Day 26）做網路、做 live migration（Day 27）、最後 Day 30 把所有元件整合成 demo。
+
+## 前置條件
+
+- 昨日 [day-21](/learning-plan/features/day-21) 已完成
+- k8s nodes 是 Proxmox VM，CPU type 設成 `host` 啟用 nested KVM
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.allocatable.devices\.kubevirt\.io/kvm}{"\n"}{end}'
+```
+
+```
+worker-01: 1k
+worker-02: 1k
+control-01: 1k
+```
+
+如果是 `0` 或 empty，回 Proxmox 把 VM CPU type 改 `host` 然後重啟 VM。`devices.kubevirt.io/kvm` 是 KubeVirt 的 device plugin 後續才會出現；裝完 KubeVirt 才看得到。今天可以用 `lscpu | grep -i virt` 在 node 上初步確認：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ssh <worker-node> 'lscpu | grep -i "virtualization\|hypervisor"'
+```
+
+```
+Virtualization:                         VT-x
+Hypervisor vendor:                      KVM
+```
+
+## 動手做
+
+### 1. 部署 KubeVirt operator
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/v1.8.2/kubevirt-operator.yaml
+```
+
+```
+namespace/kubevirt created
+customresourcedefinition.apiextensions.k8s.io/kubevirts.kubevirt.io created
+serviceaccount/kubevirt-operator created
+...
+deployment.apps/virt-operator created
+```
+
+### 2. 建立 KubeVirt CR
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/v1.8.2/kubevirt-cr.yaml
+```
+
+```
+kubevirt.kubevirt.io/kubevirt created
+```
+
+`KubeVirt` CR 觸發 operator 部署其他元件。
+
+### 3. 等待元件就緒
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt wait --for=condition=Available kv kubevirt --timeout=10m
+```
+
+```
+kubevirt.kubevirt.io/kubevirt condition met
+```
+
+幾分鐘後檢查 Pod：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt get pods
+```
+
+```
+NAME                               READY   STATUS    ...
+virt-api-xxx                       1/1     Running
+virt-api-yyy                       1/1     Running
+virt-controller-xxx                1/1     Running
+virt-controller-yyy                1/1     Running
+virt-handler-aaa                   1/1     Running   # DaemonSet, 1 per node
+virt-handler-bbb                   1/1     Running
+virt-handler-ccc                   1/1     Running
+virt-operator-...                  1/1     Running
+```
+
+### 4. 認識 4 個元件
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt get deploy,daemonset
+```
+
+```
+NAME                          READY  ...
+deployment.apps/virt-api      2/2
+deployment.apps/virt-controller 2/2
+deployment.apps/virt-operator 2/2
+
+NAME                       DESIRED  CURRENT  READY ...
+daemonset.apps/virt-handler  3        3        3
+```
+
+- **virt-operator**: lifecycle 編排 KubeVirt 自身（升級、重啟、卸載）
+- **virt-api**: API server 擴充，新增 `VirtualMachine` / `VirtualMachineInstance` 資源；同時做 admission webhook
+- **virt-controller**: VirtualMachine ↔ VMI ↔ Pod 的 reconcile，類似 Deployment Controller 對 Pod
+- **virt-handler**: per-node DaemonSet，跟 libvirt/qemu 互動，類似 kubelet 對 container
+
+### 5. 安裝 virtctl CLI（本機）
+
+`virtctl` 是 KubeVirt 額外提供的 CLI，給 console / vnc / migrate / start / stop 用。
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+curl -L -o /usr/local/bin/virtctl https://github.com/kubevirt/kubevirt/releases/download/v1.8.2/virtctl-v1.8.2-linux-amd64
+chmod +x /usr/local/bin/virtctl
+virtctl version --client
+```
+
+```
+{"clientVersion":{"gitVersion":"v1.8.2",...}}
+```
+
+## 觀念深化
+
+KubeVirt 把 VM 當 first-class k8s 資源：
+
+- 從使用者角度看：寫 `VirtualMachine` YAML 就跟寫 Deployment 一樣，`kubectl get vm` 就像 `kubectl get pod`
+- 從實作角度看：每個 VM 在 node 上其實是個 Pod（virt-launcher Pod），裡面跑 libvirt + qemu
+
+四個元件對應四種職責：
+
+| 元件 | 在哪 | 職責 | 類比 |
+|---|---|---|---|
+| virt-operator | cluster-wide | KubeVirt 自身 lifecycle | kube-aggregator/operator |
+| virt-api | cluster-wide | 擴充 k8s API + admission | kube-apiserver subresource |
+| virt-controller | cluster-wide | VM/VMI/Pod 的 reconcile | kube-controller-manager |
+| virt-handler | per-node | 跟 libvirt/qemu 互動 | kubelet |
+
+更深入：
+
+- [KubeVirt architecture](https://kubevirt.io/user-guide/architecture/)
+- 原始碼進入點：[cmd/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/cmd) 下各元件的 main.go
+- virt-controller 主邏輯：[pkg/virt-controller/watch/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-controller/watch)
+
+## 收穫檢查
+
+- 為什麼 virt-handler 是 DaemonSet 而 virt-controller 是 Deployment？
+- 沒有 virt-operator 的話，KubeVirt 升級會發生什麼問題？
+- VM 的 admission webhook 為什麼放在 virt-api 而不是用 k8s 內建？
+- 如果 nested KVM 沒開，devices plugin 會怎麼回？VM 還能跑嗎（軟體模擬）？
+
+## 參考資料
+
+- [KubeVirt user guide — installation](https://kubevirt.io/user-guide/cluster_admin/installation/)
+- [KubeVirt architecture](https://kubevirt.io/user-guide/architecture/)
+- [v1.8.2 release notes](https://github.com/kubevirt/kubevirt/releases/tag/v1.8.2)
+- [pkg/virt-operator/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-operator) — operator 原始碼
+
+## 明日預告
+
+明天 [day-23](/learning-plan/features/day-23) 跑第一台 VM：寫 VirtualMachine YAML、啟動、用 `virtctl console` 進系統。

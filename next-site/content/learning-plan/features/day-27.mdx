@@ -1,0 +1,188 @@
+---
+layout: doc
+title: Day 27 — Live migration
+description: 觸發 KubeVirt VM live migration，觀察 VirtualMachineInstanceMigration phase 轉換、memory dirty page tracking 與 cutover，量測 downtime。
+---
+
+## 今日目標
+
+- 確認 VM 用 shared storage（PVC）以滿足 live migration 前提
+- 用 `virtctl migrate` 觸發遷移
+- 觀察 VirtualMachineInstanceMigration phase 從 Scheduling → Running → Succeeded
+- 邊遷移邊 ping VM，量測 downtime
+- 看 virt-handler 與 qemu 之間的 memory copy log
+
+## 今日在 30 天計畫中的位置
+
+Live migration 是 KubeVirt 區別於普通 container workload 的關鍵能力。一個能 live migrate 的 VM 平台才能做 node maintenance、不停機升級、自動 rebalance。今天親手做一次，量測自己環境的 downtime。Day 28 再深入 image management（DataVolume / CDI）。
+
+## 前置條件
+
+- 昨日 [day-26](/learning-plan/features/day-26) 已完成
+- VM 用 ceph-csi PVC 當 root disk（Day 24）
+- cluster 至少 2 個 worker node 都裝了 KubeVirt（virt-handler DaemonSet）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt get ds virt-handler
+```
+
+```
+NAME           DESIRED   CURRENT   READY   ...
+virt-handler   3         3         3
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi fedora-vm -o jsonpath='{.status.nodeName}{"\n"}'
+```
+
+記下原本所在 node。
+
+## 動手做
+
+### 1. 確認 VM 可遷移
+
+VMI 的 `LiveMigratable` condition 必須是 True：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl get vmi fedora-vm -o jsonpath='{.status.conditions[?(@.type=="LiveMigratable")].status}{"\n"}'
+```
+
+```
+True
+```
+
+如果是 False，常見原因：磁碟 source 不是 shared storage、VM 用了 hostpath、CPU pinning 不容於目標 node。修正後再試。
+
+### 2. 開個監控視窗：邊 ping 邊看 phase
+
+開三個 terminal：
+
+**Terminal A（持續 ping）：**
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl run pinger --image=busybox --restart=Never -i --rm --command -- \
+  sh -c 'while true; do ping -W 1 -c 1 <VM-IP> | grep -E "(time|loss)" || echo "TIMEOUT $(date +%T)"; sleep 1; done'
+```
+
+把 `<VM-IP>` 換成 VM 第一張 NIC 的 IP（`kubectl get vmi fedora-vm -o jsonpath='{.status.interfaces[0].ipAddress}'`）。
+
+**Terminal B（看 migration phase）：**
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmim -w
+```
+
+**Terminal C（觸發遷移）：**
+
+### 3. 觸發 live migration
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl migrate fedora-vm
+```
+
+```
+VM fedora-vm was scheduled to migrate
+```
+
+Terminal B 會看到 phase 序列：
+
+```
+NAME                  PHASE          ...
+kubevirt-migrate-xxx  Scheduling
+kubevirt-migrate-xxx  PreparingTarget
+kubevirt-migrate-xxx  TargetReady
+kubevirt-migrate-xxx  Running
+kubevirt-migrate-xxx  Succeeded
+```
+
+Terminal A 在 cutover 期間會出現 1-3 次 timeout（取決於 memory dirty rate 與網路）。
+
+### 4. 確認 VM 換 node 了
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi fedora-vm -o wide
+```
+
+```
+NAME         AGE  PHASE     IP              NODENAME    READY
+fedora-vm    ...  Running   10.244.x.x      worker-02   True
+```
+
+`NODENAME` 應該換成另一個 node 了。
+
+### 5. 看 virt-handler 的 migration log
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt logs -l kubevirt.io=virt-handler --tail=300 --prefix | grep -i "migrate\|migration" | head -30
+```
+
+你會看到 source 與 target 兩端 virt-handler 的訊息：
+
+```
+[handler-source]: ...starting migration of VMI fedora-vm
+[handler-target]: ...preparing target Pod
+[handler-source]: ...migration completed successfully
+```
+
+### 6. 看 launcher Pod 在 target node 的痕跡
+
+到 target node ssh：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl pods --name virt-launcher-fedora-vm | head
+```
+
+新的 launcher Pod 在 target node 起來。Source node 上原本的 launcher 在 cutover 後被刪除。
+
+## 觀念深化
+
+Live migration 的核心是 **memory dirty page tracking**：
+
+1. **預備階段**：target node 起一個新的 launcher Pod；qemu 在 target 啟動但暫停（不執行 instruction）
+2. **第一輪 copy**：source 把 VM 整份 RAM dump 給 target（同時 VM 還在 source 跑）
+3. **後續迭代**：source 追蹤 page 的 dirty bit，把這輪變動過的 page 再 copy 給 target；如此不斷迭代
+4. **收斂**：當 dirty rate 低於閾值（KubeVirt 預設 100 Mbps），進入 **cutover**
+5. **Cutover**：source qemu 暫停，傳最後一輪 dirty pages，target qemu 解除暫停 — 此時 VM 在 target 繼續執行
+6. **收尾**：source launcher Pod 被刪除
+
+Downtime 主要發生在 cutover 那段。一台輕度負載 VM 通常 < 200ms；高 dirty rate VM 可能要等很久才收斂（極端情況下 KubeVirt 會 abort migration）。
+
+KubeVirt 不發明這個 — 用的是 qemu/libvirt 內建的 migration 功能。它做的是：
+
+- 排程 target Pod
+- 在 source/target qemu 間建 TCP socket
+- 透過 libvirt API 觸發 migration
+- 監控 progress、處理失敗、清理資源
+
+更深入：
+
+- [Live Migration](https://kubevirt.io/user-guide/operations/live_migration/)
+- migration 控制：[pkg/virt-controller/watch/migration/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-controller/watch/migration)
+- handler 端：[pkg/virt-handler/migration-proxy/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-handler/migration-proxy)
+- [QEMU live migration internals](https://www.qemu.org/docs/master/devel/migration.html)
+
+## 收穫檢查
+
+- 量測你環境的 downtime — 大概多少 ms？比想像高還低？
+- 為什麼 live migration 一定要 shared storage？
+- 如果在遷移中強制斷網（拔網線），VM 會留在 source 還是 target？state machine 怎麼決定？
+- 遷移期間網路 packet 是否在 cutover 那刻可能丟一兩個 packet？怎麼證明？
+
+## 參考資料
+
+- [KubeVirt Live Migration](https://kubevirt.io/user-guide/operations/live_migration/) — 觸發方式、限制
+- [QEMU migration docs](https://www.qemu.org/docs/master/devel/migration.html) — 底層機制
+- [migration controller 原始碼](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migration.go)
+
+## 明日預告
+
+明天 [day-28](/learning-plan/features/day-28) 還是 weekend lab，3 小時：DataVolume + CDI，從不同 source（http、PVC clone、registry）匯入 VM image。

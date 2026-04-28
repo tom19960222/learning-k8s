@@ -1,0 +1,246 @@
+---
+layout: doc
+title: Day 28 — DataVolume + CDI
+description: 用 DataVolume 從多種 source 匯入 VM image：http、PVC clone、registry，理解 CDI importer 的 lifecycle 與資料路徑。
+---
+
+## 今日目標
+
+- 從 HTTP URL 匯入 cloud image (Day 24 已做過，今天細化)
+- 從另一個 PVC clone 出新 PVC（snapshot-style）
+- 從 OCI registry image 匯入（KubeVirt 提供的 containerdisk image）
+- 看 importer Pod 的工作流程與 log
+- 理解 CDI 的三個主要 component：cdi-operator、cdi-controller、cdi-uploadproxy
+
+## 今日在 30 天計畫中的位置
+
+VM image 是 KubeVirt 平台的「種子」—— 沒有好的 image 流程，build / 升級 / clone VM 都會痛。今天把所有 import source 走一遍，建立可複用的 base image，明天 Day 29 看監控指標時也會用到 cdi metrics。
+
+## 前置條件
+
+- 昨日 [day-27](/learning-plan/features/day-27) 已完成
+- CDI 已安裝（Day 24 裝過）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n cdi get cdi cdi -o jsonpath='{.status.phase}{"\n"}'
+```
+
+```
+Deployed
+```
+
+## 動手做
+
+### 1. http source（複習）
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-cloud
+spec:
+  source:
+    http:
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: ceph-rbd
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f dv-http.yaml
+kubectl get dv ubuntu-cloud -w
+```
+
+跟 Day 24 一樣，會看到 importer Pod 起來下載 + qemu-img convert：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -l app=containerized-data-importer
+```
+
+```
+NAME                          READY   STATUS    ...
+importer-ubuntu-cloud         1/1     Running
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl logs importer-ubuntu-cloud --tail=20
+```
+
+```
+... downloading from https://cloud-images.ubuntu.com/...
+... bytes downloaded: <progress>
+... converting qcow2 → raw to PVC
+```
+
+### 2. PVC clone source
+
+複製已有的 PVC 變成新 PVC（適合做 base image → instance image）：
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: fedora-clone
+spec:
+  source:
+    pvc:
+      namespace: default
+      name: fedora-rootdisk   # Day 24 建的
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: ceph-rbd
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f dv-clone.yaml
+kubectl get dv fedora-clone -w
+```
+
+```
+NAME           PHASE                 PROGRESS   ...
+fedora-clone   CSICloneInProgress    50.0%
+fedora-clone   Succeeded             100.0%
+```
+
+ceph-csi 支援 CSI VolumeSource clone（用 ceph 的 RBD snapshot/copy），CDI 偵測到後會用 native clone 取代 importer Pod；速度比 http 快很多（不必跨網路傳）。
+
+### 3. registry source（從 OCI image 匯入）
+
+KubeVirt 提供了一些 ready-to-use containerdisk image 在 quay.io/containerdisks，CDI 可以把 container image 內的 disk 匯出到 PVC：
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: centos-from-registry
+spec:
+  source:
+    registry:
+      url: "docker://quay.io/containerdisks/centos-stream:9"
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+    storageClassName: ceph-rbd
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f dv-registry.yaml
+```
+
+importer Pod 會用 containers/image library 拉 OCI image 後解壓 disk image 寫進 PVC。
+
+### 4. blank source（空白磁碟）
+
+需要一個空白 disk（例如給 VM 額外 data disk）：
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: data-disk
+spec:
+  source:
+    blank: {}
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 5Gi
+    storageClassName: ceph-rbd
+```
+
+不需要 importer Pod；直接建 PVC 然後 `qemu-img create -f raw` 一份 sparse 的空白 image。
+
+### 5. 用 clone 過的 PVC 跑新 VM
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: fedora-clone-vm
+spec:
+  runStrategy: Always
+  template:
+    metadata: {labels: {kubevirt.io/vm: fedora-clone-vm}}
+    spec:
+      domain:
+        cpu: {cores: 1}
+        memory: {guest: 1Gi}
+        devices:
+          disks:
+          - {name: rootdisk, disk: {bus: virtio}}
+          interfaces:
+          - {name: default, masquerade: {}}
+      networks: [{name: default, pod: {}}]
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim:
+          claimName: fedora-clone
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl apply -f vm-clone.yaml
+virtctl console fedora-clone-vm
+```
+
+跟 Day 23 的 fedora-vm 內容一致（包含你前面寫過的 `/root/persist.txt`），但是新 VM 獨立的 PVC。
+
+## 觀念深化
+
+CDI 三個元件：
+
+- **cdi-operator**：Deployment，1 replica。負責部署/升級 CDI 自己。
+- **cdi-deployment（cdi-controller + cdi-apiserver）**：watch DataVolume CR，依 source 類型決定要起 importer Pod 還是用 CSI clone / snapshot。
+- **cdi-uploadproxy**：HTTPS upload endpoint，給 user 從本機 `virtctl image-upload` 上傳 image 用。
+
+DataVolume 與 PVC 的關係：
+
+- DataVolume 是個 CR，CDI controller 看到後幫你建 PVC（命名相同）+ 必要時起 importer Pod
+- 你也可以直接寫 `kubectl get pvc`，看到的就是 DataVolume 對應的 PVC
+- 在 VM YAML 也可以直接寫 `dataVolume:` 而非 `persistentVolumeClaim:`，VM 啟動時自動等 DataVolume Succeeded 才開始
+
+PVC clone 走 CSI 的 [`spec.dataSource`](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/)，由 storage backend 決定是 fast clone（ceph-rbd 用 RBD snapshot）還是 slow copy（fallback dd）。Ceph 的 RBD clone 是 copy-on-write，建立瞬間完成、實際 IO 在 write 時才 copy。
+
+更深入：
+
+- [DataVolume types](https://kubevirt.io/user-guide/storage/datavolumes/) — 所有 source 形式
+- [CDI repository](https://github.com/kubevirt/containerized-data-importer) — 原始碼
+- [Volume PVC dataSource](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/) — k8s clone 規格
+
+## 收穫檢查
+
+- 4 種 source 的 import 時間排序？哪個最快、哪個最慢？
+- ceph-rbd 的 RBD snapshot clone 在 PVC 還沒寫資料前佔用多少實體空間？
+- 從 registry image 匯入跟 `containerDisk` 直接用差在哪？
+- 如果 importer Pod 失敗，DataVolume 會怎麼樣？怎麼 retry？
+
+## 參考資料
+
+- [DataVolumes guide](https://kubevirt.io/user-guide/storage/datavolumes/)
+- [CDI 設計](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/basic_flow.md)
+- [Container Disks](https://kubevirt.io/user-guide/virtual_machines/disks_and_volumes/#containerdisk) — 跟 registry source 對比
+
+## 明日預告
+
+明天 [day-29](/learning-plan/features/day-29) 看 KubeVirt 監控：vmi metrics、prometheus 指標、debug 工具。

@@ -1,0 +1,191 @@
+---
+layout: doc
+title: Day 25 — virt-handler 與 virt-launcher 行為
+description: 進 node 看 virt-launcher Pod 內部，找到 qemu process 與 libvirt domain，理解 KubeVirt VM 在 OS 層真正的長相。
+---
+
+## 今日目標
+
+- 找到 VMI 在哪個 node、哪個 launcher Pod
+- 從 launcher Pod 內找到 qemu-system-x86_64 process
+- 用 libvirt 的 virsh 看 domain XML
+- 理解 virt-handler ↔ virt-launcher 通訊路徑
+
+## 今日在 30 天計畫中的位置
+
+到 Day 24 為止 VM 對你而言還是「kubectl yaml + virtctl console」黑盒。今天打開盒子：VM 在 node OS 上是什麼樣的 process、什麼 namespace、什麼 device。明天 Day 26 加 multus 給 VM 第二張網卡時，你會更需要這些底層直覺。
+
+## 前置條件
+
+- 昨日 [day-24](/learning-plan/features/day-24) 已完成，`fedora-vm` 是 Running 狀態
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi fedora-vm
+```
+
+```
+NAME         AGE   PHASE     IP            NODENAME    READY
+fedora-vm    10m   Running   10.244.x.x    worker-01   True
+```
+
+## 動手做
+
+### 1. 找 launcher Pod 與 node
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi fedora-vm -o jsonpath='{"node="}{.status.nodeName}{" pod="}{.status.activePods}{"\n"}'
+```
+
+```
+node=worker-01 pod={"<pod-uid>":"worker-01"}
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pod -l kubevirt.io=virt-launcher -o jsonpath='{.items[?(@.spec.nodeName=="worker-01")].metadata.name}'
+```
+
+```
+virt-launcher-fedora-vm-xxxxx
+```
+
+### 2. 進 launcher Pod 找 qemu
+
+ssh 到 `worker-01`：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl pods --name virt-launcher-fedora-vm | head -3
+crictl ps --pod <sandbox-id>
+```
+
+```
+CONTAINER     IMAGE                                 NAME
+<id>          .../virt-launcher@sha256:...          compute
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl exec -it <compute-container-id> ps -ef | head -10
+```
+
+```
+UID        PID  PPID  C STIME TTY          TIME CMD
+qemu         1     0  0 ...    ?        00:00:00 /usr/bin/virt-launcher-monitor ...
+qemu        12     1  0 ...    ?        00:00:00 /usr/bin/virt-launcher --qemu-timeout 5m ...
+qemu        45    12  1 ...    ?        00:00:09 /usr/libexec/qemu-kvm -name guest=fedora-vm,...
+```
+
+`qemu-kvm` 主 process 就是 VM 的 hypervisor。後面的 args 描述 VM 的所有硬體（CPU、memory、devices、network、disks）。
+
+### 3. 看 qemu 完整 command line
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl exec -it <compute-container-id> ps ax -o pid,cmd | grep qemu-kvm
+```
+
+輸出會非常長 — 那就是 libvirt 從 domain XML 翻譯出來的 qemu command。注意關鍵 args：
+
+- `-machine ... accel=kvm` 用 KVM 硬體加速
+- `-cpu host` (或 `host-model`) — 透傳 CPU features
+- `-drive file=/var/run/kubevirt/...,if=virtio` — virtio block device，背後是 ceph-csi 的 RBD
+- `-netdev tap,...` + `-device virtio-net-pci` — virtio NIC
+- `-chardev socket,id=charserial0,path=/var/run/kubevirt-private/.../virt-serial0` — VMI console socket
+
+### 4. 用 virsh 看 libvirt domain
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl exec -it <compute-container-id> virsh list
+```
+
+```
+ Id   Name                       State
+----------------------------------------
+ 1    default_fedora-vm          running
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl exec -it <compute-container-id> virsh dumpxml default_fedora-vm | head -60
+```
+
+domain XML 描述 VM 的所有硬體，是 libvirt 的 source of truth。virt-launcher 把 KubeVirt 的 `VirtualMachineInstance` spec 翻譯成這個 XML 餵給 libvirt。
+
+### 5. 看 namespace 拓樸
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+LAUNCHER_PID=$(crictl inspect <sandbox-id> --output json | jq -r '.info.pid')
+ls -l /proc/$LAUNCHER_PID/ns/
+```
+
+```
+ipc -> 'ipc:[...]'
+mnt -> 'mnt:[...]'
+net -> 'net:[...]'
+pid -> 'pid:[...]'
+```
+
+VM 跟 launcher Pod 共享 net namespace（所以 Pod IP 就是 VM 主介面 IP）。`mnt` namespace 是 launcher 自己的。
+
+### 6. virt-handler 是怎麼控制這個 Pod 的？
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl -n kubevirt logs ds/virt-handler --tail=50 | grep "fedora-vm" | head -10
+```
+
+virt-handler 透過 unix socket 跟 virt-launcher 對話（命名類似 `kubevirt-domain-info-<vm-uid>`）。launcher 內 libvirt 的 socket 也只給 virt-handler 用。詳細通訊協定在原始碼 [pkg/handler-launcher-com/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/handler-launcher-com)。
+
+## 觀念深化
+
+KubeVirt VM 在 node 的層次圖：
+
+```
+node 上：
+  systemd
+    └── kubelet
+        └── containerd
+            └── virt-launcher Pod (per VM)
+                  ├── pause container (sandbox, 持有 namespace)
+                  └── compute container
+                        ├── virt-launcher-monitor (PID 1)
+                        ├── virt-launcher (子 process，跟 virt-handler 通訊)
+                        ├── libvirtd (per Pod libvirt daemon)
+                        └── qemu-system-x86_64 (VM 真本體)
+```
+
+幾個關鍵設計：
+
+- **每 VM 一個 libvirtd**：避免 multi-tenant 問題；libvirt 限 1 個 domain
+- **virt-launcher-monitor 是 PID 1**：負責 graceful shutdown（讓 qemu 先 ACPI poweroff，再 force kill）
+- **virt-handler 不直接 fork qemu**：所有 qemu 操作都透過 launcher Pod 的 libvirt socket，這樣 cgroup / namespace / capability 都繼承 Pod 的限制
+- **網路**：因為 launcher Pod 有自己的 net namespace，VM 的 NIC（tap）就是建在這個 namespace；CNI（cilium）給 Pod 配的 IP 就是 VM 主介面 IP
+
+更深入：
+
+- [KubeVirt architecture](https://kubevirt.io/user-guide/architecture/)
+- launcher 的 entry：[cmd/virt-launcher/virt-launcher.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-launcher/virt-launcher.go)
+- handler ↔ launcher 通訊：[pkg/handler-launcher-com/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/handler-launcher-com)
+- VMI → libvirt domain XML：[pkg/virt-launcher/virtwrap/converter/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/virtwrap/converter)
+
+## 收穫檢查
+
+- 為什麼每個 launcher Pod 自己跑一個 libvirtd 而不是 node 共享？
+- 如果 launcher Pod 死掉但 qemu 還活著，會發生什麼？
+- VM 在 node 上吃的記憶體跟 VMI YAML 的 `memory` 一定相等嗎？
+- 用 `nsenter` 進 launcher 的 net namespace，看到的網卡跟 VM 內看到的一樣嗎？
+
+## 參考資料
+
+- [virt-launcher 設計](https://github.com/kubevirt/kubevirt/blob/v1.8.2/docs/architecture.md)
+- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/manager.go) — domain lifecycle 管理
+- [libvirt domain XML 格式](https://libvirt.org/formatdomain.html)
+
+## 明日預告
+
+明天 [day-26](/learning-plan/features/day-26) 給 VM 加 Day 13 multus 的 bridge 第二張網卡，VM 內 ip a 會看到 eth0 + eth1。

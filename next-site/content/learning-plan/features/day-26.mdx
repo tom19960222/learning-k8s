@@ -1,0 +1,229 @@
+---
+layout: doc
+title: Day 26 — 多網路 VM
+description: 用 Day 13 的 multus NetworkAttachmentDefinition 給 VM 加第二張 bridge 網卡，VM 內看到 eth0 + eth1，理解 KubeVirt 與 Multus 的整合。
+---
+
+## 今日目標
+
+- 重用 Day 13 建好的 multus bridge NAD
+- 修改 VM 加上第二張 NIC，連到 NAD
+- VM 內 `ip addr` 看到兩張介面：cilium pod network + bridge 物理網段
+- 從 VM 第二張 NIC 對外連到非 k8s 的設備
+
+## 今日在 30 天計畫中的位置
+
+Day 24 解決 storage（VM 用 ceph-csi PVC）；今天解決 network（VM 接出 cluster 到物理網段）。VM 平台的真實 use case 大多需要這個 — 例如 VM 跑 legacy 軟體要連辦公室網段、VM 是 5G UPF 要連 SR-IOV。今天的 bridge 模式是最容易上手的版本；正式環境會換成 SR-IOV 或 macvlan 取得更高效能。
+
+## 前置條件
+
+- 昨日 [day-25](/learning-plan/features/day-25) 已完成
+- Day 13 的 multus DaemonSet 已運行，bridge NAD 已存在
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get net-attach-def
+```
+
+```
+NAME           AGE
+bridge-nad     ...
+```
+
+## 動手做
+
+### 1. 確認 NAD 內容
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get net-attach-def bridge-nad -o yaml
+```
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: bridge-nad
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "bridge",
+      "bridge": "vmbr0",
+      "ipam": { "type": "static" }
+    }
+```
+
+如果 IPAM 是 static，需要 Pod annotation 指定 IP；用 dhcp 則 cluster 上要跑 DHCP server。為了示範，下面用 static IP 寫死。
+
+### 2. 修改 VM YAML 加第二張 NIC
+
+```yaml
+# 🟡 已對照官方文件 / 原始碼
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: fedora-vm
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels: {kubevirt.io/vm: fedora-vm}
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |-
+          [{
+            "name": "bridge-nad",
+            "interface": "eth1",
+            "ips": ["192.168.1.99/24"]
+          }]
+    spec:
+      domain:
+        cpu: {cores: 1}
+        memory: {guest: 1Gi}
+        devices:
+          disks:
+          - {name: rootdisk, disk: {bus: virtio}}
+          - {name: cloudinit, disk: {bus: virtio}}
+          interfaces:
+          - name: default
+            masquerade: {}
+          - name: bridge-net
+            bridge: {}
+      networks:
+      - name: default
+        pod: {}
+      - name: bridge-net
+        multus:
+          networkName: bridge-nad
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim:
+          claimName: fedora-rootdisk
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            password: fedora
+            chpasswd: { expire: False }
+            ssh_pwauth: True
+            runcmd:
+              - ip addr add 192.168.1.99/24 dev eth1 || true
+              - ip link set eth1 up
+```
+
+把 `192.168.1.99/24` 換成你 Proxmox bridge 網段內的可用 IP。
+
+### 3. apply + 等 VM 重新啟動
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+virtctl stop fedora-vm
+kubectl apply -f vm.yaml
+kubectl get vmi -w
+```
+
+等到 `Running`。
+
+### 4. VM 內看到兩張 NIC
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl console fedora-vm
+# 登入後：
+# ip addr
+```
+
+```
+1: lo: <LOOPBACK,UP,LOWER_UP>
+    inet 127.0.0.1/8 scope host lo
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 10.0.2.2/24 ...
+    (預設 cilium pod network，masquerade NAT 出去)
+3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.1.99/24 ...
+    (multus bridge，直連 vmbr0)
+```
+
+### 5. 驗證 eth1 可以連 cluster 外的設備
+
+從 VM ping 你 LAN 上的另一台設備（例如 router / 印表機 / 其他 Proxmox VM）：
+
+```bash
+# 🔴 需在你環境跑後對照
+# 在 VM 內：
+# ping -c 3 192.168.1.1   # 你的 router
+```
+
+### 6. 看 launcher Pod 的 NIC 拓樸
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+NODE=$(kubectl get vmi fedora-vm -o jsonpath='{.status.nodeName}')
+ssh $NODE
+# 進 launcher 的 net namespace：
+LAUNCHER=$(crictl pods --name virt-launcher-fedora-vm -q)
+PID=$(crictl inspect $(crictl ps --pod $LAUNCHER -q) | jq -r '.info.pid')
+nsenter -t $PID -n ip a
+```
+
+你會看到：
+
+- `eth0` — Pod 主介面（cilium，給 VM 透過 masquerade 用）
+- `net1` — multus 加的介面，bridge to vmbr0
+- `tap0` / `tap1` — qemu 給每個 VM NIC 配的 tap 介面（VM 內看到的 eth0/eth1 對應 launcher namespace 的 tap）
+
+## 觀念深化
+
+KubeVirt VM 的網路繞了好幾圈：
+
+```
+VM 內 eth0
+  ↓ qemu virtio
+launcher Pod 的 tap0
+  ↕ Linux bridge 或 NAT
+launcher Pod 的 eth0 (CNI 給的)
+  ↓ veth pair
+node 的 host-side veth
+  ↓
+cilium eBPF datapath / iptables
+  ↓
+node eth0 → 物理網路
+```
+
+第二張 NIC（multus bridge）就比較直：
+
+```
+VM 內 eth1
+  ↓ qemu virtio
+launcher Pod 的 tap1
+  ↕
+launcher Pod 的 net1 (multus 加的)
+  ↓ veth pair 進 node 的 vmbr0
+vmbr0 物理 bridge → 物理網路
+```
+
+注意：第二張網卡走 multus 後，cilium 的 NetworkPolicy **不適用**這條路徑。安全策略要靠 bridge 上層的 firewall（例如 Proxmox 端 firewall 或 nftables）。
+
+更深入：
+
+- [KubeVirt 網路模型](https://kubevirt.io/user-guide/network/)
+- [Multus + KubeVirt 整合](https://kubevirt.io/user-guide/network/interfaces_and_networks/)
+- VM NIC 程式碼：[pkg/network/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/network)
+- [SR-IOV with KubeVirt](https://kubevirt.io/user-guide/network/sriov/) — 高效能版本
+
+## 收穫檢查
+
+- 為什麼預設介面用 `masquerade` 而第二介面用 `bridge`？兩種 binding mode 差在哪？
+- 如果第二介面也想走 cilium NetworkPolicy 該怎麼做？
+- multus bridge 模式跟 SR-IOV 在 latency / throughput 差多少？
+- VM 內看到的 MAC 是 launcher Pod 給的還是 multus 給的？
+
+## 參考資料
+
+- [KubeVirt Interfaces and Networks](https://kubevirt.io/user-guide/network/interfaces_and_networks/)
+- [Multus Quickstart](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/quickstart.md)
+- [pkg/network/setup/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/network/setup) — 網卡配置原始碼
+
+## 明日預告
+
+明天 [day-27](/learning-plan/features/day-27) 是 weekend lab：觸發 live migration，看 VM 在不停機狀態下被搬到另一個 node。

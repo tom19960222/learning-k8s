@@ -1,0 +1,180 @@
+---
+layout: doc
+title: Day 29 — VM 監控與除錯
+description: 看 VMI 狀態、Prometheus metrics、virt-handler log，建立平台運維時的觀察力。
+---
+
+## 今日目標
+
+- 用 `kubectl describe vmi` 讀 condition 與 event
+- 取得 KubeVirt 提供的 Prometheus metrics
+- 用 `virtctl vnc` 開 GUI 連線
+- 從 virt-handler log 找到單一 VMI 的關鍵事件
+
+## 今日在 30 天計畫中的位置
+
+明天 Day 30 是平台整合 demo，遇到問題時你需要立刻知道從哪個 endpoint / log 找答案。今天先跑一次「除錯巡禮」，把所有監控 surface 都摸過。
+
+## 前置條件
+
+- 昨日 [day-28](/learning-plan/features/day-28) 已完成
+- 至少一台 VMI 在跑（fedora-vm 或 fedora-clone-vm）
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vmi
+```
+
+```
+NAME              AGE   PHASE     IP            NODENAME    READY
+fedora-vm         ...   Running   10.244.x.x    worker-02   True
+```
+
+## 動手做
+
+### 1. describe vmi 細看 condition
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl describe vmi fedora-vm | head -80
+```
+
+關注幾個段落：
+
+- **Conditions**: `Ready`, `LiveMigratable`, `Synchronized` 等
+- **Events**: 從 Created → Scheduled → Started 的 event timeline
+- **Network Interfaces**: 看到 `eth0` 的 IP、MAC，與 multus eth1（如果有）
+
+### 2. KubeVirt 自身的 Prometheus metrics
+
+KubeVirt 在每個元件 Pod 上都暴露 `/metrics`。一個簡單作法是 port-forward 看：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt port-forward $(kubectl -n kubevirt get pod -l kubevirt.io=virt-handler -o name | head -1) 8080:8443 &
+curl -ks https://localhost:8080/metrics | grep '^kubevirt_vmi_' | head -20
+```
+
+```
+# HELP kubevirt_vmi_cpu_usage_seconds_total Total CPU time spent in user and kernel
+kubevirt_vmi_cpu_usage_seconds_total{name="fedora-vm",namespace="default",node="worker-02"} 12.34
+kubevirt_vmi_memory_actual_balloon_bytes{...} 1073741824
+kubevirt_vmi_network_receive_bytes_total{interface="eth0",...} 12345
+...
+```
+
+關鍵 metrics 系列：
+
+- `kubevirt_vmi_cpu_*` — vCPU 使用
+- `kubevirt_vmi_memory_*` — RAM 使用、ballooning
+- `kubevirt_vmi_network_*` — NIC throughput / packets / drops
+- `kubevirt_vmi_storage_*` — disk read/write
+- `kubevirt_vmi_phase_count` — 各 phase 的 VMI 數量
+- `kubevirt_vmi_migration_*` — migration 統計
+
+### 3. 整合到 Prometheus（如果有裝）
+
+如果 cluster 有 prometheus-operator + kube-prometheus-stack，KubeVirt 提供 ServiceMonitor：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt get servicemonitor 2>/dev/null
+```
+
+```
+NAME                  AGE
+kubevirt-prometheus   ...
+```
+
+ServiceMonitor 已自動讓 prometheus scrape KubeVirt metrics。Grafana dashboard 範例可從 [KubeVirt 官方 grafana repo](https://github.com/kubevirt/monitoring) 拿。
+
+### 4. virtctl vnc — GUI 連線
+
+console 是文字介面（serial console），vnc 是圖形：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+virtctl vnc fedora-vm
+```
+
+會啟動 VNC viewer（通常呼叫本機的 `vncviewer` 或 macOS Screen Sharing）。如果 VM image 有裝 desktop environment 才看得到 GUI，否則就是文字 tty。
+
+排查連線失敗時這個很有用 — 例如 sshd 沒起、firewall 擋了 port、cloud-init 在 boot 卡住，都可以從 vnc 直接看 boot 訊息。
+
+### 5. virt-handler 看單一 VMI 的詳細 log
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+NODE=$(kubectl get vmi fedora-vm -o jsonpath='{.status.nodeName}')
+kubectl -n kubevirt logs -l kubevirt.io=virt-handler --field-selector spec.nodeName=$NODE --tail=300 | grep "fedora-vm" | head -30
+```
+
+virt-handler 的 log 比 controller 細 — 包含 libvirt event、qemu graceful shutdown 訊息、health check 結果。
+
+### 6. launcher Pod 的 events
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl describe pod $(kubectl get pod -l kubevirt.io=virt-launcher -o name | head -1) | tail -30
+```
+
+Pod 端的 event（image pull、scheduling、CSI mount）對排查啟動失敗很有用。
+
+### 7. 進 launcher 看 libvirt domain state
+
+VM 卡住但 VMI 顯示 Running 的詭異情況：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+NODE=$(kubectl get vmi fedora-vm -o jsonpath='{.status.nodeName}')
+ssh $NODE
+LAUNCHER=$(crictl pods --name virt-launcher-fedora-vm -q)
+COMPUTE=$(crictl ps --pod $LAUNCHER -q | head -1)
+crictl exec -it $COMPUTE virsh list --all
+crictl exec -it $COMPUTE virsh domstate default_fedora-vm
+```
+
+```
+running
+```
+
+如果是 `paused` / `crashed`，再用 `virsh dumpxml` 與 `virsh domblklist` 看 disk / network state。
+
+## 觀念深化
+
+KubeVirt 的觀察 surface 由多層組成：
+
+```
+最高層：kubectl get vmi / describe vmi          → KubeVirt 視角的 phase & condition
+中層 ：Prometheus metrics                       → numerical time series
+中層 ：virt-handler / virt-controller log       → 控制流程的決策過程
+低層 ：launcher Pod log + virsh                 → libvirt / qemu 看到的 VM state
+最底 ：node 上 dmesg / journal                  → kernel / device driver
+```
+
+排查時通常**從上往下**：先看 phase 與 events，再讀 controller log，最後 ssh 進 node。99% 的問題在前兩層就解決。
+
+KubeVirt metrics 是 Prometheus 標準格式，可以接進 thanos / grafana / VictoriaMetrics。Live migration 期間特別有用：`kubevirt_vmi_migration_data_processed_bytes` 可以看到當前已 copy 的 RAM 量。
+
+更深入：
+
+- [KubeVirt monitoring](https://github.com/kubevirt/monitoring)
+- [Metric reference](https://kubevirt.io/user-guide/operations/component_monitoring/)
+- [Prometheus operator + KubeVirt](https://kubevirt.io/labs/kubernetes/lab8.html)
+
+## 收穫檢查
+
+- VMI Phase 與 Pod Phase 不對等 — VMI Running 但 launcher Pod 卡住會是什麼狀況？
+- 為什麼 metrics 在 virt-handler Pod 上不在 vmi 對象上？
+- 怎麼用 metrics 找出 cluster 上 IO 最重的 VM？
+- 如果 cloud-init 失敗（network 設錯之類），最早能從哪裡發現？
+
+## 參考資料
+
+- [Component monitoring](https://kubevirt.io/user-guide/operations/component_monitoring/)
+- [KubeVirt monitoring repo](https://github.com/kubevirt/monitoring) — Grafana dashboards
+- [virsh reference](https://libvirt.org/manpages/virsh.html)
+
+## 明日預告
+
+明天 [day-30](/learning-plan/features/day-30) 是最後一天：把所有元件整合，部署一個 production-style 的 web service VM (PVC + multus + live migration 全用上)，並回顧 30 天走過的路。
