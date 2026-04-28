@@ -1,1 +1,146 @@
-[]
+[
+  {
+    "id": 1,
+    "question": "Day 1 你 ssh 到 control plane node 後發現 kube-apiserver 是 static Pod。下列哪個敘述正確？",
+    "options": [
+      "kubelet 從本機 /etc/kubernetes/manifests/ 直接讀 yaml 起 Pod，不經過 API server",
+      "kubelet 透過 API server 建立 kube-apiserver Pod",
+      "systemd 直接管理 kube-apiserver 這個 process",
+      "kube-controller-manager 啟動 kube-apiserver"
+    ],
+    "answer": 0,
+    "explanation": "Static Pod 的特色就是「不需要 API server」— kubelet watch 本機目錄，看到 yaml 就直接起 Pod。這是 bootstrapping 的解：kube-apiserver 自己也是 static Pod，所以 cluster 在還沒有 API server 時就能讓 kubelet 把它拉起來。"
+  },
+  {
+    "id": 2,
+    "question": "Day 3 你 apply 一個 Pod 但沒指定 nodeSelector，幾秒後 Pod 就 Running。誰決定它跑在哪個 node？",
+    "options": [
+      "kube-scheduler watch spec.nodeName=='' 的 Pod，跑 predicate + score 後寫回 spec.nodeName 完成 Bind",
+      "kubelet 自己投票決定要不要接 Pod",
+      "kube-controller-manager 直接呼叫 docker run",
+      "API server 隨機 round-robin 分配到 node"
+    ],
+    "answer": 0,
+    "explanation": "Scheduler 是獨立 process，watch 還沒指派 node 的 Pod，跑 predicate（過濾不可行的 node）→ priority/score（排序）→ Bind（寫 spec.nodeName）。寫入後 kubelet 才接手 Pod 的實際啟動。"
+  },
+  {
+    "id": 3,
+    "question": "Day 4 你刪掉一個 ReplicaSet 的 Pod，2 秒後新 Pod 就出現。informer / work queue 機制中下列哪個敘述正確？",
+    "options": [
+      "informer 把 watch event 放進 work queue，work queue 做 dedup 與 rate limit，所以 1 秒內 100 次 event 不會觸發 100 次 Reconcile",
+      "每個 watch event 都會立刻同步呼叫 Reconcile，所以越多 event 越快",
+      "informer 直接呼叫 kubelet 重啟 Pod，跳過 controller",
+      "work queue 是 kubelet 在維護的"
+    ],
+    "answer": 0,
+    "explanation": "informer + work queue 是 controller-runtime 的核心模式：informer 把 watch 事件丟進 work queue，queue 做 dedup（同 key 多次合併）與 rate limit（exponential backoff 防 storm）。Reconcile 是 work queue worker 取出來時被呼叫，跟 event 數量解耦。"
+  },
+  {
+    "id": 4,
+    "question": "Day 9 你看到 cilium-agent 有大量 BPF map。下列哪個敘述最精確？",
+    "options": [
+      "cilium-agent 編譯 eBPF program 並維護 BPF map（policy / endpoint / service backends），datapath 完全在 kernel 跑",
+      "cilium-agent 是個 user-space proxy，所有 packet 都先送進 agent 處理",
+      "BPF map 由 kubelet 維護，cilium 只是讀者",
+      "eBPF program 跑在 cilium-agent 行程內"
+    ],
+    "answer": 0,
+    "explanation": "Cilium 的精髓是把 control plane（agent，user-space）跟 dataplane（eBPF program in kernel）分開。Agent 編譯 + load + 維護 BPF map；packet 進來後 kernel 直接用 BPF program 查 map 決定 forward/drop，不會送進 user-space。比 iptables 高效就在這。"
+  },
+  {
+    "id": 5,
+    "question": "Day 10 你寫了一個 CiliumNetworkPolicy 限制 b → a 只能存取 /healthz。L7 enforcement 在哪裡發生？",
+    "options": [
+      "Cilium 注入 envoy proxy 到 Pod 的 network namespace，HTTP 流量先進 envoy 解析 path 後才 forward",
+      "在 cilium-agent 內 buffer 整個 request 解析 HTTP",
+      "在 BPF program 直接 parse HTTP（kernel 內）",
+      "kube-proxy 加 iptables rule 比對 HTTP path"
+    ],
+    "answer": 0,
+    "explanation": "L3/L4 規則 cilium 用 BPF map 在 kernel 直接判；L7（HTTP/Kafka/DNS）需要解析 application protocol，這超出 BPF 的能力，所以 cilium 注入 envoy proxy 到對應 Pod 的 namespace，L7 traffic redirect 進 envoy 處理。BPF 還是在外層做 L3/L4 把 HTTP 流量導進 envoy。"
+  },
+  {
+    "id": 6,
+    "question": "Day 14 你讀完 multus cmdAdd() 原始碼。下列哪個流程描述最精確？",
+    "options": [
+      "Multus 解析 Pod annotation 取得 networks 列表 → 呼叫 main delegate (cilium) 的 Add → 對每個附加網路呼叫 delegate Add → 合併所有結果回 kubelet",
+      "Multus 自己實作所有 CNI plugin，不需要呼叫其他 plugin",
+      "Multus 只支援單一附加網路",
+      "Multus 直接修改 Pod 的網路設定，不透過 CNI 介面"
+    ],
+    "answer": 0,
+    "explanation": "Multus 是 meta-plugin：自己不做網路 plumbing，而是「攔截 + 委派 + 合併」。它依次呼叫 main CNI（給主介面）跟每個 NAD 對應的 delegate plugin，然後把所有 plugin 回的 interfaces / IPs 合併成一個 CNI result 回給 kubelet。這也是為什麼 multus 自身只有約 1500 行 Go。"
+  },
+  {
+    "id": 7,
+    "question": "Day 16 你看 CRUSH map。一個 PG 對應到 OSD 的決定方式是？",
+    "options": [
+      "CRUSH 用 cluster map + rule + PG id 做 deterministic 計算，得到 OSD 列表；同樣 input 永遠出同樣 output，不需要查表",
+      "Monitor 維護一份 PG → OSD 對應表，寫入 etcd",
+      "OSD 自己投票決定要不要接 PG",
+      "MDS 動態決定 PG 該放哪個 OSD"
+    ],
+    "answer": 0,
+    "explanation": "CRUSH 的核心發明就是「不查表」 — 用 hash + bucket selection algorithm 從 cluster map 與 rule 算出 OSD 列表。所有 client / OSD 都能獨立計算同樣結果，不需要中央目錄服務。Cluster map 變動（OSD 上下線）會讓計算結果跟著動，rebalance 也是用同樣 function 算出新位置。"
+  },
+  {
+    "id": 8,
+    "question": "Day 18 你在 k8s 裝 ceph-csi-rbd。controller plugin 跟 node plugin 各自負責什麼？",
+    "options": [
+      "controller plugin 跟 ceph API 對話建/刪 RBD volume；node plugin 在 Pod 排到的 node 把 RBD 映射成 /dev/rbdX 並 mount 到 Pod",
+      "controller plugin 在每個 node 跑；node plugin 集中在一個 node",
+      "兩者沒差，都做一樣的事",
+      "controller plugin 直接 mount 到 Pod；node plugin 只做 metrics"
+    ],
+    "answer": 0,
+    "explanation": "CSI 規範把 driver 切成兩部分：controller plugin（Deployment）負責跟 storage backend API 對話做 provisioning；node plugin（DaemonSet 每 node 一個）負責 Pod 落在該 node 時的 stage/mount 動作。這個 split 讓 controller 不必在每 node 跑一份，省資源。"
+  },
+  {
+    "id": 9,
+    "question": "Day 21 你上傳一個 8 MiB 檔案到 RGW S3 bucket。在 RADOS pool 裡會看到大約幾個 object？",
+    "options": [
+      "1 個 head object (metadata + 第 1 段資料) + 1 個 tail object (剩下 4 MiB)，共 2 個 object",
+      "1 個 object，所有資料壓在裡面",
+      "8 個 object，每個 1 MiB",
+      "RGW 不會切，直接存成 1 個 8 MiB 的 BLOB 在 metadata 區"
+    ],
+    "answer": 0,
+    "explanation": "RGW 把 S3 物件切成 head + tail object：head 存 metadata 加上前面一段資料，tail 每塊預設 4 MiB（rgw_obj_stripe_size）。8 MiB 的物件 = 1 head + 1 tail = 2 個 RADOS object。head 的命名是 <bucket-marker>_<key>；tail 是 <bucket-marker>__shadow_<hash>.<seq>。"
+  },
+  {
+    "id": 10,
+    "question": "Day 25 你進 virt-launcher Pod 看到 qemu-system-x86_64 process。為什麼每個 VM 一個獨立 launcher Pod，而不是 node 上共用一個 libvirtd？",
+    "options": [
+      "獨立 Pod 讓 cgroup / namespace / capability / network 限制可以繼承 Pod 設定，並讓 VM 享有 k8s scheduling、network policy、storage mount 同樣的 lifecycle",
+      "libvirt 不支援同一個 daemon 管多個 domain",
+      "為了讓 qemu 跑得更快",
+      "歷史包袱，未來會改成共享"
+    ],
+    "answer": 0,
+    "explanation": "把每個 VM 包成獨立 Pod 讓 KubeVirt 能直接複用 k8s 既有的所有控制機制：cgroup（CPU / mem limit）、namespace 隔離、ServiceAccount、CNI / CSI、scheduling。如果共用一個 node-level libvirtd，就要重新發明這些機制 + 處理 multi-tenant 的安全邊界。Pod 隔離是更乾淨的選擇。"
+  },
+  {
+    "id": 11,
+    "question": "Day 27 你做 live migration，VM 在不停機狀態下被搬到另一個 node。cutover 那段 downtime 主要由什麼決定？",
+    "options": [
+      "memory dirty page 收斂速度 — source 不斷 copy 變動的 page 給 target，當 dirty rate < 閾值才能 cutover；高負載 VM 收斂慢，downtime 長",
+      "VM 磁碟大小，磁碟越大 downtime 越久",
+      "Pod scheduling 時間",
+      "kube-apiserver 處理 migration request 的速度"
+    ],
+    "answer": 0,
+    "explanation": "Live migration 的 downtime 不是花在「複製記憶體」(那一直在背景跑)，而是 cutover 那一刻：source 暫停、傳最後一輪 dirty page、target 解除暫停。所以 downtime ≈ 最後一輪 dirty page 量 / 網路頻寬。Memory write-heavy 的 VM 永遠收斂不了（dirty rate 大於 copy rate），KubeVirt 預設會 abort。"
+  },
+  {
+    "id": 12,
+    "question": "Day 30 整合 demo 中，VM 從 cluster 內走 ClusterIP service 跟從 LAN 走 192.168.1.100 為什麼是兩條完全不同的封包路徑？",
+    "options": [
+      "ClusterIP 走主介面 (cilium pod network) 經過 NAT 與 eBPF datapath；192.168.1.100 走第二介面 (multus bridge) 直連 vmbr0 物理橋接，繞過 cilium 完全不同的 datapath",
+      "兩條路徑底層其實一樣，只是 IP 不同",
+      "ClusterIP 走 multus，bridge IP 走 cilium",
+      "VM 內 kernel 自動 merge 兩條路徑"
+    ],
+    "answer": 0,
+    "explanation": "multus 給 VM 加的第二介面跟主介面（CNI / cilium）是分開的 datapath。主介面走 Pod network 經過 cilium eBPF；第二介面走 multus 注入的 bridge 直連物理 vmbr0，不經 cilium。這也代表 cilium NetworkPolicy 不適用第二介面，安全策略要靠物理 firewall 或 nftables 在外層做。"
+  }
+]
