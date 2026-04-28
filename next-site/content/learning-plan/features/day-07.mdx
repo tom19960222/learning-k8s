@@ -1,0 +1,247 @@
+---
+layout: doc
+title: Day 07 — 自寫 ConfigMap Watcher Operator
+description: 用 kubebuilder + controller-runtime 從零建立一個 CRD 與 operator，把整週學到的 informer / reconcile / CRD 概念全部串起來。
+---
+
+## 今日目標
+
+- 用 kubebuilder 初始化 operator 專案並建立 CRD
+- 定義 `ConfigMapWatcher` spec（`namespaceSelector`）與 status（`count`）
+- 在 `Reconcile()` 裡 List ConfigMap 並更新 status
+- 執行 `make manifests && make install && make run`，讓 operator 在本機跑
+- 親眼看到 `.status.count` 隨 ConfigMap 增減而自動更新
+
+## 今日在 30 天計畫中的位置
+
+Block 1 的最終收關。Day 1-4 我們看了 API server / etcd / scheduler / controller-manager 的原理；Day 5-6 看了 kubelet / kube-proxy 的底層實作。今天自己寫一個 operator，你會發現它的核心結構——watch → work queue → reconcile——和 Day 4 看到的 kube-controller-manager 內部 controller 完全一樣。Block 1 結束後，Day 8 起進入 Block 2：替換 CNI、深入網路層。
+
+## 前置條件
+
+- 昨日 [Day 06](/learning-plan/features/day-06) 已完成，理解 kube-proxy 原理
+- 開發機（或開發 VM）上已安裝：
+  - Go 1.22+（`go version`）
+  - kubebuilder v4（安裝見 https://book.kubebuilder.io/quick-start.html）
+  - kubectl 可存取你的 cluster（`KUBECONFIG` 設定正確）
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+go version
+kubebuilder version
+```
+
+```
+go version go1.22.x linux/amd64
+Version: main.version{...KubeBuilderVersion:"4.x.x"...}
+```
+
+## 動手做
+
+### 1. 初始化 operator 專案
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+mkdir cmwatcher && cd cmwatcher
+kubebuilder init --domain example.com --repo example.com/cmwatcher
+```
+
+這會產生 `main.go`、`go.mod`、Makefile 等骨架。
+
+### 2. 建立 API（CRD 定義）與 controller
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubebuilder create api \
+  --group demo \
+  --version v1 \
+  --kind ConfigMapWatcher \
+  --resource \
+  --controller
+```
+
+產生：
+- `api/v1/configmapwatcher_types.go` — CRD 的 Go struct
+- `internal/controller/configmapwatcher_controller.go` — reconcile 邏輯
+
+### 3. 編輯 Types：加入 spec 與 status 欄位
+
+開啟 `api/v1/configmapwatcher_types.go`，找到 `ConfigMapWatcherSpec` 與 `ConfigMapWatcherStatus`，修改如下：
+
+```go
+// 🟢 已驗證 (kind / 顯然正確)
+type ConfigMapWatcherSpec struct {
+    // NamespaceSelector is the namespace to watch for ConfigMaps.
+    NamespaceSelector string `json:"namespaceSelector"`
+}
+
+type ConfigMapWatcherStatus struct {
+    // Count is the number of ConfigMaps found in the watched namespace.
+    Count int32 `json:"count,omitempty"`
+}
+```
+
+### 4. 編輯 Reconcile：List ConfigMap 並更新 status
+
+開啟 `internal/controller/configmapwatcher_controller.go`，在 `Reconcile()` 函式裡加入以下邏輯（放在讀取 CR 物件之後）：
+
+```go
+// 🟢 已驗證 (kind / 顯然正確)
+// List all ConfigMaps in the watched namespace.
+cmList := &corev1.ConfigMapList{}
+if err := r.List(ctx, cmList,
+    client.InNamespace(watcher.Spec.NamespaceSelector),
+); err != nil {
+    return ctrl.Result{}, err
+}
+
+// Update status with the current count.
+watcher.Status.Count = int32(len(cmList.Items))
+if err := r.Status().Update(ctx, watcher); err != nil {
+    return ctrl.Result{}, err
+}
+```
+
+同時確認 `SetupWithManager` 裡 watches 了 ConfigMap：
+
+```go
+// 🟢 已驗證 (kind / 顯然正確)
+return ctrl.NewControllerManagedBy(mgr).
+    For(&demov1.ConfigMapWatcher{}).
+    Watches(
+        &corev1.ConfigMap{},
+        handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+            // Re-enqueue all ConfigMapWatcher objects when any ConfigMap changes.
+            var list demov1.ConfigMapWatcherList
+            if err := mgr.GetClient().List(ctx, &list); err != nil {
+                return nil
+            }
+            reqs := make([]reconcile.Request, len(list.Items))
+            for i, item := range list.Items {
+                reqs[i] = reconcile.Request{NamespacedName: types.NamespacedName{
+                    Name: item.Name, Namespace: item.Namespace,
+                }}
+            }
+            return reqs
+        }),
+    ).
+    Complete(r)
+```
+
+### 5. 生成 CRD manifest
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+make manifests
+```
+
+```
+/path/to/controller-gen ... 生成 config/crd/bases/demo.example.com_configmapwatchers.yaml
+```
+
+### 6. 把 CRD apply 到 cluster
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+make install
+```
+
+```
+customresourcedefinition.apiextensions.k8s.io/configmapwatchers.demo.example.com created
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get crd configmapwatchers.demo.example.com
+```
+
+```
+NAME                                        CREATED AT
+configmapwatchers.demo.example.com          ...
+```
+
+### 7. 在本機跑 controller，watch 你的 cluster
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+make run
+```
+
+```
+INFO  controller-runtime.manager  starting server  {"addr": ":8080"}
+INFO  Starting Controller  {"controller": "configmapwatcher"}
+INFO  Starting workers    {"controller": "configmapwatcher", "worker count": 1}
+```
+
+讓這個 terminal 保持開著，打開新的 terminal 繼續操作。
+
+### 8. Apply 一個 CR 並觀察 status
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<EOF
+apiVersion: demo.example.com/v1
+kind: ConfigMapWatcher
+metadata:
+  name: default-watcher
+spec:
+  namespaceSelector: default
+EOF
+```
+
+等 1-2 秒後：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get configmapwatcher default-watcher -o yaml
+```
+
+```yaml
+status:
+  count: 2    # e.g. kube-root-ca.crt + any others in default namespace
+```
+
+建立一個新 ConfigMap，count 應自動 +1：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create configmap test-cm --from-literal=hello=world
+kubectl get configmapwatcher default-watcher -o jsonpath='{.status.count}'
+```
+
+```
+3
+```
+
+## 觀念深化
+
+**Reconcile() 的觸發方式**：controller-runtime 的 informer 收到 add / update / delete event 後，把 object key 放進 work queue。Work queue 內建 dedup 和 rate-limit——即使 1 秒內 100 個 event 打進來，同一個 object key 也只會讓 Reconcile() 被叫一次（多餘的 dedup 掉）。
+
+`.For()` 登記主要 watch 對象（ConfigMapWatcher CR），`.Watches()` 登記次要 watch 對象（ConfigMap）。當次要對象有變動時，透過 `MapFunc` 把事件轉換成要 reconcile 的 ConfigMapWatcher key。
+
+整個 operator 的 Go 程式碼大約 200 行，但背後承載的是和 kube-controller-manager 完全相同的架構：shared informer factory → work queue → reconcile loop。
+
+參考：
+- [kubebuilder CronJob Tutorial](https://book.kubebuilder.io/cronjob-tutorial/controller-implementation.html)
+- [controller-runtime pkg.go.dev](https://pkg.go.dev/sigs.k8s.io/controller-runtime)
+- [controller-runtime GitHub](https://github.com/kubernetes-sigs/controller-runtime)
+
+## 收穫檢查
+
+- `make manifests` 生成的是什麼？它從哪裡讀取輸入？
+- 為什麼 Reconcile() 要是冪等的（idempotent）？
+- `.For()` 與 `.Owns()` 的差別是什麼？
+- Work queue 的 rate-limit 是為了解決什麼問題？
+- 如果 controller crash 重啟，未完成的 reconcile 會消失嗎？
+
+## 參考資料
+
+- [kubebuilder 快速入門](https://book.kubebuilder.io/quick-start.html) — 安裝與初始化
+- [controller-runtime](https://pkg.go.dev/sigs.k8s.io/controller-runtime) — Reconciler / Manager / Client 介面
+- [controller-runtime GitHub](https://github.com/kubernetes-sigs/controller-runtime) — 原始碼（特別看 `pkg/reconcile` 與 `pkg/controller`）
+- [kubebuilder book](https://book.kubebuilder.io/) — 完整 operator 開發指南
+
+## 明日預告
+
+Block 1 完成！明天 [Day 08](/learning-plan/features/day-08) 進入 Block 2——Week 2 的主題是網路層。Day 8 會安裝 Cilium 取代預設的 CNI，並用 `cilium status` 確認 eBPF datapath 正常運作。

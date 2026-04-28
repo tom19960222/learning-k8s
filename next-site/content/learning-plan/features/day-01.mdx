@@ -1,0 +1,152 @@
+---
+layout: doc
+title: Day 01 — 巡禮控制平面元件
+description: 在自己的 cluster 上找到 kube-apiserver、etcd、kube-controller-manager、kube-scheduler 這 4 個 static Pod，理解它們的啟動機制。
+---
+
+## 今日目標
+
+- 知道 control plane 由 4 個 process 組成：kube-apiserver、etcd、kube-controller-manager、kube-scheduler
+- 在自己的 cluster 上找到這 4 個 process 的實體
+- 理解它們是 static Pod 而非 systemd service
+- 看懂 `/etc/kubernetes/manifests/` 裡的 manifest YAML 結構
+- 為後續 30 天的學習建立「看得到、摸得到」的心理模型
+
+## 今日在 30 天計畫中的位置
+
+Day 1 是整個 30 天計畫的起點。今天的目標是「找到實體」——用眼睛看到 4 個 control-plane 元件實際跑在哪裡、怎麼被啟動。沒有今天打下的基礎，後面不論是 Day 2 直接讀 etcd raw key、還是 Day 4 觀察 controller-manager self-heal，都會少了一層「我知道這東西在哪裡跑」的具體感。
+
+## 開始之前
+
+本系列假設你已有以下環境：
+
+- **3 節點 Proxmox VE 9.0 叢集**（實體機或巢狀虛擬化均可）
+- **3 節點 Kubernetes 1.36.x 叢集**，跑在 Proxmox VM 上（1 個 control-plane node + 2 個 worker node，或 3 個 control-plane node）
+- **`kubectl` 已設定好**，可從你的開發機對 cluster 發指令（`KUBECONFIG` 已指向正確的 kubeconfig 檔案）
+- **SSH 存取 k8s node**，可以用 `ssh <user>@<node-ip>` 登入 control-plane node 與 worker node
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl version --short
+```
+
+```
+Client Version: v1.36.x
+Server Version: v1.36.x
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes -o wide
+```
+
+```
+NAME              STATUS   ROLES           AGE   VERSION   INTERNAL-IP     ...
+k8s-control-01   Ready    control-plane   ...   v1.36.x   192.168.x.x
+k8s-worker-01    Ready    <none>          ...   v1.36.x   192.168.x.x
+k8s-worker-02    Ready    <none>          ...   v1.36.x   192.168.x.x
+```
+
+## 動手做
+
+### 1. 在 kube-system namespace 找 4 個 control-plane Pod
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl get pods -n kube-system | grep -E "(apiserver|etcd|scheduler|controller-manager)"
+```
+
+```
+etcd-k8s-control-01                      1/1     Running   0          ...
+kube-apiserver-k8s-control-01            1/1     Running   0          ...
+kube-controller-manager-k8s-control-01   1/1     Running   0          ...
+kube-scheduler-k8s-control-01            1/1     Running   0          ...
+```
+
+這 4 個 Pod 名稱後面帶有 node 名稱，是 static Pod 的命名慣例。
+
+### 2. SSH 進 control-plane node，用 crictl 看 container
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl ps -a | head -10
+```
+
+```
+CONTAINER     IMAGE     CREATED     STATE    NAME                   ...
+<id>          ...       ...         Running  kube-apiserver         ...
+<id>          ...       ...         Running  etcd                   ...
+<id>          ...       ...         Running  kube-controller-manager...
+<id>          ...       ...         Running  kube-scheduler         ...
+```
+
+`crictl` 直接跟 containerd 的 CRI socket 對話，不需要 API server 也能列出 container。這也是為什麼 static Pod 不依賴 API server 就能跑。
+
+### 3. 看 static Pod manifest 目錄
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ls /etc/kubernetes/manifests/
+```
+
+```
+etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
+```
+
+kubelet 在啟動時（以及每隔 20 秒）會掃這個目錄，把找到的 YAML 當成 Pod spec 直接建立，完全不經過 API server。
+
+### 4. 看 kube-apiserver 的啟動參數
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+head -30 /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+    - --advertise-address=<control-plane-ip>
+    - --etcd-servers=https://127.0.0.1:2379
+    - --service-cluster-ip-range=10.96.0.0/12
+    ...
+```
+
+重點參數：`--etcd-servers` 告訴 API server 去哪裡找 etcd；`--service-cluster-ip-range` 定義 ClusterIP 的 CIDR。
+
+## 觀念深化
+
+**Static Pod 是雞生蛋蛋生雞問題的解法。** kube-apiserver 自己也是 static Pod，所以不需要 API server 就能存在——這讓 cluster 啟動成為可能。
+
+kubelet 啟動後會 watch `/etc/kubernetes/manifests/`（以及透過 `--pod-manifest-path` 指定的任意目錄）。每找到一個 YAML，kubelet 就在本地建立對應的 Pod 並維護其生命週期（crash 後自動重啟）。Static Pod 的 mirror Pod 會由 kubelet 同步到 API server，所以你在 `kubectl get pods -n kube-system` 看到的那 4 個 Pod，其實是「唯讀的 mirror」——直接用 `kubectl delete` 刪掉也沒用，kubelet 會立刻重建。
+
+詳見官方文件：
+- [Static Pods](https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/)
+- [Kubernetes Components](https://kubernetes.io/docs/concepts/overview/components/)
+
+## 收穫檢查
+
+- 這 4 個 control-plane process 是 static Pod 還是 systemd service？為什麼這樣設計？
+- 如果你直接 `kubectl delete pod kube-apiserver-xxx -n kube-system`，會發生什麼事？
+- `/etc/kubernetes/manifests/` 的掃描是 kubelet 的責任還是 API server 的責任？
+- `crictl` 與 `kubectl` 的根本差異是什麼？
+- mirror Pod 和真正的 static Pod 之間是什麼關係？
+
+## 參考資料
+
+- [Kubernetes Components](https://kubernetes.io/docs/concepts/overview/components/) — 元件總覽與架構圖
+- [Static Pods](https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/) — kubelet 如何 watch manifest 目錄
+- [kube-apiserver 進入點](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kube-apiserver/apiserver.go) — main() 原始碼
+- [kubelet static pod manager](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/kubelet/config/config.go) — kubelet 如何處理 static Pod 設定
+
+## 明日預告
+
+明天 [Day 02](/learning-plan/features/day-02) 會 SSH 進 control-plane node，用 `etcdctl` 直接讀 etcd 裡的 raw key，親眼看到 Kubernetes 所有的狀態其實都以 protobuf 格式躺在 etcd 裡。

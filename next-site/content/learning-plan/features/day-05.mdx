@@ -1,0 +1,178 @@
+---
+layout: doc
+title: Day 05 — kubelet 與 CRI
+description: 在 worker node 上用 crictl 追蹤 Pod 從 sandbox 建立到 container 啟動，並用 nsenter 進入 network namespace 看 eth0。
+---
+
+## 今日目標
+
+- 理解 kubelet 透過 gRPC / CRI 協定跟 containerd 對話
+- 用 `crictl pods` 找到 Pod 對應的 sandbox
+- 用 `crictl ps` 找到 sandbox 下的 application container
+- 用 `crictl inspectp` 看 sandbox 的 network namespace 路徑
+- 用 `nsenter` 進入 network namespace，確認 Pod 的 eth0 存在
+
+## 今日在 30 天計畫中的位置
+
+Day 4 我們看到 ReplicaSet controller 如何在 etcd 裡補建新 Pod object。今天追最後一段：kubelet watch 到 `spec.nodeName` 對應到自己，就去跟 containerd 說「幫我建這個 Pod」。理解 sandbox 與 application container 的分工，對 Day 6（kube-proxy 怎麼用 iptables 找到 Pod IP）會有直接幫助。
+
+## 前置條件
+
+- 昨日 [Day 04](/learning-plan/features/day-04) 已完成，理解 informer / work queue 機制
+- SSH 存取 worker node（需要 root 或 sudo 權限以執行 `crictl` 和 `nsenter`）
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes
+```
+
+```
+NAME              STATUS   ROLES           AGE   VERSION
+k8s-control-01   Ready    control-plane   ...   v1.36.x
+k8s-worker-01    Ready    <none>          ...   v1.36.x
+k8s-worker-02    Ready    <none>          ...   v1.36.x
+```
+
+## 動手做
+
+### 1. 確認有一個 nginx Pod 在 worker node 上
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl run nginx --image=nginx
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pod nginx -o wide
+```
+
+```
+NAME    READY   STATUS    NODE           ...
+nginx   1/1     Running   k8s-worker-01  ...
+```
+
+記下 Pod 所在的 node 名稱（例如 `k8s-worker-01`），SSH 進去。
+
+### 2. 在 worker node 找 sandbox（Pod sandbox）
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl pods --name nginx
+```
+
+```
+POD ID              CREATED         STATE     NAME    NAMESPACE   ...
+<sandbox-id>        ...             Ready     nginx   default     ...
+```
+
+Sandbox 對應到 Kubernetes Pod（不是 container）。一個 Pod 只有一個 sandbox。
+
+### 3. 看 sandbox 下的 application container
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl ps --pod <sandbox-id>
+```
+
+```
+CONTAINER           IMAGE     CREATED   STATE     NAME    ...
+<container-id>      nginx     ...       Running   nginx   ...
+```
+
+這個 `<container-id>` 就是真正跑 nginx 程序的 container。
+
+### 4. Inspect sandbox，找 network namespace 路徑
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl inspectp <sandbox-id> | head -60
+```
+
+```json
+{
+  "status": { ... },
+  "info": {
+    "runtimeSpec": {
+      "linux": {
+        "namespaces": [
+          { "type": "network", "path": "/var/run/netns/cni-<uuid>" },
+          ...
+        ]
+      }
+    }
+  }
+}
+```
+
+記下 `"path"` 的值（例如 `/var/run/netns/cni-<uuid>`）。
+
+### 5. 進入 network namespace，確認 eth0
+
+先找出 sandbox 的 PID（pause process）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl inspectp <sandbox-id> | grep -i '"pid"' | head -3
+```
+
+```
+"pid": <sandbox-pid>,
+```
+
+用 `nsenter` 進入那個 network namespace：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+nsenter -t <sandbox-pid> -n ip a
+```
+
+```
+1: lo: <LOOPBACK,UP,LOWER_UP> ...
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+    inet 10.x.x.x/24 ...
+```
+
+`eth0` 的 IP 應與 `kubectl get pod nginx -o wide` 顯示的 Pod IP 相同。
+
+### 6. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete pod nginx
+```
+
+## 觀念深化
+
+**kubelet 透過 gRPC 跟 containerd 對話，使用的 protocol 是 CRI（Container Runtime Interface）**，定義在 `runtime.v1.RuntimeService`。CRI 把「容器執行」這件事抽象化，讓 kubelet 不需要知道底層是 containerd、CRI-O 還是其他 runtime。
+
+一個 Pod 在 runtime 層面是：
+- **1 個 sandbox container**（`pause` image）：負責持有 network / IPC / （可選）PID namespace。Sandbox 的 pause process 幾乎什麼都不做，但只要它存在，這些 namespace 就不會消失。
+- **N 個 application container**：加入 sandbox 已建好的 namespace（`--network=container:<sandbox>` 的概念），共用同一個 network stack，所以它們看到相同的 eth0 與 IP。
+
+**Sandbox 存在的關鍵原因**：當某個 application container crash 並重啟時，sandbox 還在，所以 network namespace（包含 Pod IP）保留不變。外部流量不需要因為 container 重啟而更新路由。
+
+CRI protocol 參考：
+- [cri-api proto](https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto)
+- [kubelet/cri 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/cri)
+
+## 收穫檢查
+
+- pause container 的目的是什麼？少了它 namespace 怎麼維持？
+- 同一個 Pod 裡的兩個 container，可以透過 `localhost` 互相通訊嗎？為什麼？
+- `crictl` 和 `docker` 的主要差別是什麼？
+- kubelet 在 watch 到哪個欄位改變後，才開始建立 sandbox？
+- CRI 跟 OCI（runc）的關係是什麼？
+
+## 參考資料
+
+- [CRI API proto](https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto) — RuntimeService / ImageService 完整定義
+- [kubelet/cri 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/cri) — kubelet 如何呼叫 CRI
+- [containerd 文件](https://containerd.io/docs/) — containerd 的 plugin 架構與 CRI plugin
+- [crictl 使用指南](https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/) — crictl 常用指令速查
+
+## 明日預告
+
+明天 [Day 06](/learning-plan/features/day-06) 是第一個週末長時 lab（3 小時），追蹤 Service IP 封包從 client Pod 到 backend Pod 的整條 iptables / IPVS 路徑，看 kube-proxy 如何把 ClusterIP 變成 DNAT 規則。

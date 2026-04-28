@@ -1,0 +1,191 @@
+---
+layout: doc
+title: Day 06 — kube-proxy 與 iptables/IPVS
+description: 追蹤 Service ClusterIP 封包從 client Pod 到 backend Pod 的完整 iptables / IPVS 路徑，理解 kube-proxy 的角色與資料路徑。
+---
+
+## 今日目標
+
+- 建立 ClusterIP Service 並看 Endpoints
+- 在 node 上用 `iptables-save` 找到 Service 對應的 iptables chain
+- 用眼睛跟著 `KUBE-SERVICES → KUBE-SVC → KUBE-SEP → DNAT` 這條 chain 走
+- 理解 kube-proxy **不在**資料路徑上——kernel netfilter 直接做 DNAT
+- （選做）如果 cluster 用 IPVS mode，用 `ipvsadm` 看 weighted round-robin 規則
+
+## 今日在 30 天計畫中的位置
+
+Day 5 我們看到 Pod 在 node 上的 network namespace 與 eth0。今天往上一層：當多個 Pod 對外暴露成一個 Service，kube-proxy 如何讓 ClusterIP 可以被 cluster 內任何 Pod 打到？理解 kube-proxy 的 iptables 規則，是後續 Block 2 學 Cilium eBPF 取代 kube-proxy 時的對照基礎。
+
+## 前置條件
+
+- 昨日 [Day 05](/learning-plan/features/day-05) 已完成，理解 Pod network namespace
+- SSH 存取任一 node，需要 root 或 sudo 權限（執行 `iptables-save`）
+
+環境確認：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+```
+
+```
+NAME               READY   STATUS    NODE            ...
+kube-proxy-<id1>   1/1     Running   k8s-worker-01   ...
+kube-proxy-<id2>   1/1     Running   k8s-worker-02   ...
+kube-proxy-<id3>   1/1     Running   k8s-control-01  ...
+```
+
+## 動手做
+
+### 1. 建立 Deployment 與 ClusterIP Service
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create deployment kp-demo --image=nginx --replicas=3
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl expose deployment kp-demo --port=80 --type=ClusterIP
+```
+
+### 2. 確認 Service ClusterIP 與 Endpoints
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get svc kp-demo
+```
+
+```
+NAME      TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+kp-demo   ClusterIP   10.96.xxx.xxx   <none>        80/TCP    ...
+```
+
+記下 `CLUSTER-IP`（後面搜 iptables 規則要用）。
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get endpoints kp-demo
+```
+
+```
+NAME      ENDPOINTS                                         AGE
+kp-demo   10.x.x.1:80,10.x.x.2:80,10.x.x.3:80             ...
+```
+
+3 個 backend Pod IP 都在這裡。
+
+### 3. SSH 到任一 node，找 iptables 入口規則
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+iptables-save -t nat | grep <CLUSTER-IP>
+```
+
+```
+-A KUBE-SERVICES -d 10.96.xxx.xxx/32 -p tcp --dport 80 -j KUBE-SVC-<HASH>
+```
+
+這行是流量進入 Service 的入口：目標 IP 是 ClusterIP、port 是 80，就跳到 `KUBE-SVC-<HASH>` chain。
+
+### 4. 跟著 KUBE-SVC chain 看隨機選擇
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+iptables-save -t nat | grep "KUBE-SVC-<HASH>"
+```
+
+```
+-A KUBE-SVC-<HASH> -m statistic --mode random --probability 0.33333 -j KUBE-SEP-<HASH1>
+-A KUBE-SVC-<HASH> -m statistic --mode random --probability 0.50000 -j KUBE-SEP-<HASH2>
+-A KUBE-SVC-<HASH> -j KUBE-SEP-<HASH3>
+```
+
+三條規則用 `--probability` 實現等機率的隨機選擇（1/3、1/2、1/1 的連鎖等效於各 1/3）。
+
+### 5. 跟著 KUBE-SEP chain 看 DNAT
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+iptables-save -t nat | grep "KUBE-SEP-<HASH1>"
+```
+
+```
+-A KUBE-SEP-<HASH1> -j DNAT --to-destination 10.x.x.1:80
+```
+
+封包目標 IP 在這裡被 kernel 改寫成真實 Pod IP，後續 routing 就直接送到 Pod。整個過程沒有任何使用者空間程式在資料路徑上。
+
+### 6. 從另一個 Pod 驗證負載分散
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -- \
+  sh -c 'for i in $(seq 1 9); do curl -s -o /dev/null -w "%{remote_ip}\n" http://kp-demo/; done'
+```
+
+```
+10.x.x.2
+10.x.x.1
+10.x.x.3
+10.x.x.1
+...
+```
+
+9 次請求會分散到 3 個不同的 Pod IP（順序隨機）。
+
+### 7. 選做：IPVS mode
+
+如果你的 cluster 使用 IPVS mode（`kube-proxy --proxy-mode=ipvs`）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+ipvsadm -L -n | grep -A 4 <CLUSTER-IP>
+```
+
+```
+TCP  10.96.xxx.xxx:80 rr
+  -> 10.x.x.1:80    Masq    1      0          0
+  -> 10.x.x.2:80    Masq    1      0          0
+  -> 10.x.x.3:80    Masq    1      0          0
+```
+
+IPVS 用 weighted round-robin（`rr`），由 Linux kernel 的 IPVS 模組（LVS）直接處理，效能優於 iptables 的線性搜尋。
+
+### 8. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete deployment kp-demo
+kubectl delete service kp-demo
+```
+
+## 觀念深化
+
+**kube-proxy 是 per-node DaemonSet**，watch API server 上的 Service 與 EndpointSlice 物件，當有變動時重新寫 iptables（或 IPVS）規則。**kube-proxy 本身不在資料路徑上**——它只負責「事前程式化規則」，實際封包的轉發完全由 kernel netfilter（iptables）或 IPVS 模組在 kernel space 完成。
+
+iptables mode 的問題：規則是線性搜尋，當 cluster 有數千個 Service 時，每個封包都要過長達數萬行的 iptables chain，延遲顯著增加。這是 Cilium 等 eBPF-based CNI 選擇完全取代 kube-proxy 的主要動機（Block 2 的主題）。
+
+EndpointSlice（取代舊版 Endpoints）把 backend 切成多個 slice（預設每個 slice 最多 100 個 endpoint），避免單一物件過大造成 API server 壓力。
+
+參考：
+- [Virtual IPs and Service Proxies](https://kubernetes.io/docs/reference/networking/virtual-ips/)
+- [kube-proxy iptables proxier 原始碼](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/proxy/iptables/proxier.go)
+
+## 收穫檢查
+
+- kube-proxy 有沒有在封包的轉發路徑上？那封包是怎麼從 ClusterIP 到 Pod IP 的？
+- iptables mode 在 Service 數量很多時有什麼效能問題？
+- `KUBE-SEP` 的「SEP」是什麼的縮寫？
+- EndpointSlice 和舊版 Endpoints 的差別是什麼？
+- 如果新加了一個 Pod（Deployment scale up），kube-proxy 怎麼知道要更新規則？
+
+## 參考資料
+
+- [Virtual IPs and Service Proxies](https://kubernetes.io/docs/reference/networking/virtual-ips/) — iptables / IPVS / nftables 三種 mode 對比
+- [kube-proxy iptables proxier](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/proxy/iptables/proxier.go) — 規則生成邏輯
+- [EndpointSlice 文件](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/) — 為何取代舊 Endpoints
+
+## 明日預告
+
+明天 [Day 07](/learning-plan/features/day-07) 是 Block 1 的收關：用 kubebuilder + controller-runtime 從零寫出一個 ConfigMap watcher operator，把整週學到的 informer / reconcile / CRD 概念全部串起來。

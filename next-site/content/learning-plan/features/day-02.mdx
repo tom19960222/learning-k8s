@@ -1,0 +1,175 @@
+---
+layout: doc
+title: Day 02 — API Server 與 etcd
+description: 用 etcdctl 直接讀取 etcd raw key，發現 API server 只是 stateless façade，etcd 才是真正的 source of truth。
+---
+
+## 今日目標
+
+- 理解 API server 是 stateless 的：所有狀態都在 etcd
+- 用 `kubectl api-resources` 看所有 API group / version / resource
+- 用 `etcdctl` 列出 etcd 裡的所有 key prefix
+- 直接讀一個 etcd raw value，親眼看到 protobuf binary
+- 知道 Resource 在 etcd 的 key 結構（`/registry/<resource>/<namespace>/<name>`）
+
+## 今日在 30 天計畫中的位置
+
+Day 1 我們找到了 4 個 control-plane 元件的實體，知道它們是 static Pod。今天把焦點放在 kube-apiserver 與 etcd 的關係——etcd 是整個 cluster 的唯一持久化層，API server 停掉後 etcd 的資料完全不受影響。理解這個分工，是後續 Day 3（scheduler）、Day 4（controller-manager）能正確解讀「watch event」的基礎。
+
+## 前置條件
+
+- 昨日 [Day 01](/learning-plan/features/day-01) 已完成，確認 4 個 control-plane Pod 都是 Running
+- SSH 存取 control-plane node
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -n kube-system -l tier=control-plane
+```
+
+```
+NAME                                     READY   STATUS    RESTARTS   AGE
+etcd-k8s-control-01                      1/1     Running   0          ...
+kube-apiserver-k8s-control-01            1/1     Running   0          ...
+kube-controller-manager-k8s-control-01   1/1     Running   0          ...
+kube-scheduler-k8s-control-01            1/1     Running   0          ...
+```
+
+## 動手做
+
+### 1. 瀏覽所有 API resource
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl api-resources --verbs=list -o wide | head -20
+```
+
+```
+NAME                 SHORTNAMES   APIVERSION   NAMESPACED   KIND
+bindings                          v1           true         Binding
+configmaps           cm           v1           true         ConfigMap
+endpoints            ep           v1           true         Endpoints
+...
+deployments          deploy       apps/v1      true         Deployment
+...
+```
+
+每一行都是一個 REST resource。`APIVERSION` 就是 etcd key 的路徑片段之一。
+
+### 2. 用 explain 看欄位型別
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl explain deployment.spec.replicas
+```
+
+```
+KIND:       Deployment
+VERSION:    apps/v1
+
+FIELD: replicas <integer>
+
+DESCRIPTION:
+    Replicas is the number of desired pods. Defaults to 1.
+```
+
+`kubectl explain` 的資料直接來自 API server 內嵌的 OpenAPI schema，不需要連到任何外部文件。
+
+### 3. 在 control-plane node 找 etcd container ID
+
+SSH 進 control-plane node 後：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl ps | grep etcd
+```
+
+```
+CONTAINER     IMAGE   CREATED   STATE     NAME   ...
+<etcd-id>     ...     ...       Running   etcd   ...
+```
+
+記下 `<etcd-id>` 的前幾碼（後面要用）。
+
+### 4. 進入 etcd container，列所有 key
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+crictl exec -it <etcd-id> sh
+```
+
+進入 shell 後：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry --prefix --keys-only | head -20
+```
+
+```
+/registry/apiregistration.k8s.io/apiservices/v1.
+/registry/clusterroles/system:aggregate-to-admin
+/registry/configmaps/default/kube-root-ca.crt
+/registry/deployments/kube-system/coredns
+/registry/namespaces/default
+...
+```
+
+key 的結構是 `/registry/<resource-plural>/<namespace>/<name>`（cluster-scoped resource 就沒有 namespace 片段）。
+
+### 5. 讀一個 raw value 看 protobuf binary
+
+挑一個熟悉的 resource，例如 `kube-root-ca.crt` ConfigMap：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry/configmaps/default/kube-root-ca.crt
+```
+
+```
+k8s
+    v1ConfigMap...  (binary gibberish with embedded protobuf)
+```
+
+不是 JSON，是 protobuf binary。API server 在收到 `kubectl get` 請求時，把這份 binary 反序列化成物件，再序列化成 JSON 或 YAML 回給你。
+
+## 觀念深化
+
+**API server 是 stateless 的 façade。** 它負責：(1) 驗證身份（authn）與授權（authz）；(2) 跑 admission webhook pipeline；(3) 把物件序列化後寫進 etcd；(4) 把 watch event fan-out 給所有訂閱者（scheduler、controller-manager、kubelet 等）。它自己不存任何狀態——API server 程序重啟後，所有資料都還在 etcd 裡。
+
+Resource 在 etcd 裡是以 **protobuf** 序列化（非 JSON），這讓讀寫速度更快、存儲更省空間。透過 `kube_apiserver_storage_objects` Prometheus metric 可以看到每種 resource 目前的 object count。
+
+可以透過 `kubectl proxy` 直接打 REST endpoint 觀察 API server 的 HTTP 介面：`curl http://127.0.0.1:8001/api/v1/namespaces/default/configmaps`。
+
+參考：
+- [Kubernetes API Concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/)
+- [etcd data model](https://etcd.io/docs/v3.5/learning/data_model/)
+- [apiserver staging 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/staging/src/k8s.io/apiserver)
+
+## 收穫檢查
+
+- etcd 裡的 value 是 JSON 還是 protobuf？為什麼選擇這種格式？
+- 如果 kube-apiserver 程序 crash，etcd 的資料會不會消失？
+- `/registry/deployments/kube-system/coredns` 這個 key 對應的是什麼 kubectl 指令？
+- API server 的 watch 機制跟 etcd 的 watch 是什麼關係？
+- `kubectl explain` 的 schema 資料從哪裡來？
+
+## 參考資料
+
+- [Kubernetes API Concepts](https://kubernetes.io/docs/reference/using-api/api-concepts/) — watch、list、patch 語義
+- [etcd Data Model](https://etcd.io/docs/v3.5/learning/data_model/) — key space 與 revision 設計
+- [kube-apiserver staging 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/staging/src/k8s.io/apiserver) — storage 層實作
+
+## 明日預告
+
+明天 [Day 03](/learning-plan/features/day-03) 會製造一個排程事件，跟著 scheduler 的視角看它如何在 3 個 node 中挑出一個，以及當沒有 node 符合條件時，scheduler 怎麼在 events 裡留下診斷訊息。

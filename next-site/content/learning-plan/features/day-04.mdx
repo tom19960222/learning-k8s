@@ -1,0 +1,156 @@
+---
+layout: doc
+title: Day 04 — Controller Manager 與 self-heal
+description: 刪掉一個 ReplicaSet 管理的 Pod，親眼看 controller-manager 在 1-2 秒內重建，理解 informer / work queue 的角色。
+---
+
+## 今日目標
+
+- 建立 Deployment，觀察 ReplicaSet self-heal 的速度
+- 用 `kubectl get pods -w` 即時看 Pod 重建過程
+- 在 kube-controller-manager log 找到 reconcile 相關訊息
+- 理解 informer cache 與 work queue 的設計哲學
+- 知道 kube-controller-manager 裡大約有多少個 controller 在同時跑
+
+## 今日在 30 天計畫中的位置
+
+Day 3 我們看到 scheduler 如何把 Pod 綁到 node。今天的 self-heal 示範讓這條線更完整：一個 Pod 消失 → ReplicaSet controller 感知到 → 建立新 Pod（進入 etcd）→ scheduler 排程 → kubelet 啟動。每個元件各司其職，透過 API server 上的 watch event 串在一起。Day 5 會繼續追 kubelet 那一段。
+
+## 前置條件
+
+- 昨日 [Day 03](/learning-plan/features/day-03) 已完成，理解 scheduler Bind 機制
+- kubectl 正常存取 cluster
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -n kube-system -l component=kube-controller-manager
+```
+
+```
+NAME                                     READY   STATUS    RESTARTS   AGE
+kube-controller-manager-k8s-control-01   1/1     Running   0          ...
+```
+
+## 動手做
+
+### 1. 建立 Deployment 並確認 3 個 Pod
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl create deployment heal-demo --image=nginx --replicas=3
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -l app=heal-demo -o wide
+```
+
+```
+NAME                         READY   STATUS    NODE            ...
+heal-demo-<hash>-<id1>       1/1     Running   k8s-worker-01   ...
+heal-demo-<hash>-<id2>       1/1     Running   k8s-worker-02   ...
+heal-demo-<hash>-<id3>       1/1     Running   k8s-worker-01   ...
+```
+
+記下任一個 Pod 名稱（例如 `heal-demo-<hash>-<id1>`）。
+
+### 2. 刪一個 Pod，立刻 watch 重建
+
+在第一個 terminal 執行 watch：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -l app=heal-demo -w
+```
+
+在第二個 terminal 刪除 Pod：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete pod heal-demo-<hash>-<id1>
+```
+
+watch terminal 應該在 1-2 秒內看到：
+
+```
+NAME                         READY   STATUS              ...
+heal-demo-<hash>-<id1>       1/1     Running             ...
+heal-demo-<hash>-<id1>       1/1     Terminating         ...
+heal-demo-<hash>-<new>       0/1     Pending             ...
+heal-demo-<hash>-<new>       0/1     ContainerCreating   ...
+heal-demo-<hash>-<new>       1/1     Running             ...
+```
+
+從 Terminating 到新 Pod Running，通常在 5 秒以內（視 image 是否已在 node 上 cache）。
+
+### 3. 查看 ReplicaSet 確認副本數始終正確
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get replicaset -l app=heal-demo
+```
+
+```
+NAME                   DESIRED   CURRENT   READY   AGE
+heal-demo-<hash>       3         3         3       ...
+```
+
+`DESIRED` 永遠是 3，`CURRENT` 與 `READY` 也應回到 3。
+
+### 4. 在 controller-manager log 找 reconcile 痕跡
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl logs -n kube-system \
+  $(kubectl get pod -n kube-system -l component=kube-controller-manager -o jsonpath='{.items[0].metadata.name}') \
+  --tail=200 | grep -i replicaset | tail -10
+```
+
+```
+... "replicaset controller" ... "Observed a pod count of 2, need 3"
+... "replicaset controller" ... "Creating a pod" ...
+```
+
+確切的 log 格式依 kube-controller-manager 版本略有不同，但關鍵字是 `replicaset` 與 pod count 的變化。
+
+### 5. 清理
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete deployment heal-demo
+```
+
+## 觀念深化
+
+**kube-controller-manager 是單一 process，但裡面同時跑約 30 個 controller**（ReplicaSet、Deployment、Job、StatefulSet、Namespace、Node 等），每個 controller 是獨立的 goroutine。
+
+每個 controller 有三個核心元件：
+1. **Informer**：第一次啟動時對 API server 做 `List`（拿全量資料），之後轉為 `Watch`（只收 delta event）。Informer 把資料快取在本地 in-memory store，讓 controller 查詢時不用每次都打 API server。
+2. **Work Queue**：Informer 收到 event 後把 object key（`namespace/name`）放進 work queue。Work queue 內建 dedup（同一個 key 不會重複排隊）和 rate-limit（避免錯誤時 tight loop）。
+3. **Reconcile function**：從 work queue 拿出 key → 從 informer cache 讀當前狀態 → 計算與期望狀態的 diff → 呼叫 API server 補齊差距。
+
+這個 **informer → work queue → reconcile** 三角形，是整個 Kubernetes controller 生態系的共同 pattern，kubebuilder 寫的 custom operator 也完全遵循同一套。
+
+參考：
+- [kube-controller-manager 文件](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/)
+- [ReplicaSet controller 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/controller/replicaset)
+
+## 收穫檢查
+
+- 為什麼 work queue 需要 dedup？少了 dedup 會發生什麼？
+- Informer 在 Watch 連線斷掉後如何恢復？（提示：relist）
+- `kubectl delete pod` 之後，是哪個 controller 建立了新的 Pod？（ReplicaSet controller 還是 Deployment controller？）
+- controller-manager 裡的所有 controller 是跑在同一個 goroutine 嗎？
+- 如果 controller-manager crash，正在 Running 的 Pod 會受影響嗎？
+
+## 參考資料
+
+- [kube-controller-manager 命令列參考](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-controller-manager/) — 啟動參數說明
+- [ReplicaSet controller 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/controller/replicaset) — syncReplicaSet 主邏輯
+- [client-go informer 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/staging/src/k8s.io/client-go/informers) — SharedInformerFactory 實作
+
+## 明日預告
+
+明天 [Day 05](/learning-plan/features/day-05) 把鏡頭移到 worker node 上的 kubelet，用 `crictl` 追蹤 Pod 從 sandbox 建立到 container 啟動的完整過程，並進入 network namespace 看 eth0。

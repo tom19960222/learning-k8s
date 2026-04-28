@@ -1,0 +1,181 @@
+---
+layout: doc
+title: Day 03 — Scheduler 排程
+description: 觸發排程決策，用 nodeSelector 控制落點，看 scheduler 在 pending 狀態下留下的診斷 event。
+---
+
+## 今日目標
+
+- 觀察 scheduler 如何把 Pod 綁定到 node（Bind 過程）
+- 看 `kubectl get events` 裡 scheduler 留下的 Scheduled event
+- 用 `nodeSelector` 強制指定 node，確認結果
+- 故意讓 Pod 進入 Pending，讀懂 "0/3 nodes are available" 訊息
+- 瀏覽 scheduler 的內部 log
+
+## 今日在 30 天計畫中的位置
+
+Day 2 我們親眼看到所有 k8s 狀態都在 etcd 裡。今天把焦點放在 scheduler：當一個 Pod 出現在 etcd 裡且 `spec.nodeName` 是空的，scheduler 就會介入。理解排程流程後，Day 4 的 controller-manager self-heal 就能完整串起「etcd → scheduler → kubelet」這條線。
+
+## 前置條件
+
+- 昨日 [Day 02](/learning-plan/features/day-02) 已完成，熟悉 etcd key 結構
+- kubectl 正常存取 cluster
+
+環境確認：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pods -n kube-system kube-scheduler-$(kubectl get nodes --selector=node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
+```
+
+```
+NAME                              READY   STATUS    RESTARTS   AGE
+kube-scheduler-k8s-control-01    1/1     Running   0          ...
+```
+
+## 動手做
+
+### 1. 建立一個 Pod 並觀察排程事件
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl run scheduler-demo --image=busybox --command -- sleep 3600
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get events --field-selector reason=Scheduled --sort-by=.metadata.creationTimestamp | tail -5
+```
+
+```
+LAST SEEN   TYPE     REASON      OBJECT                   MESSAGE
+...         Normal   Scheduled   Pod/scheduler-demo       Successfully assigned default/scheduler-demo to k8s-worker-01
+```
+
+`Successfully assigned ... to <node>` 這行由 scheduler 寫入，代表 Bind 完成。
+
+### 2. 強制排程到指定 node（nodeSelector）
+
+先找出你的 node 名稱：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get nodes -o jsonpath='{.items[*].metadata.name}'
+```
+
+建立一個帶有 `nodeSelector` 的 Pod（把 `<your-node>` 換成實際 node 名稱）：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pinned-pod
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: <your-node>
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sleep", "3600"]
+EOF
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pod pinned-pod -o wide
+```
+
+```
+NAME         READY   STATUS    NODE          ...
+pinned-pod   1/1     Running   <your-node>   ...
+```
+
+`NODE` 欄位應完全符合你指定的 node 名稱。
+
+### 3. 故意讓 Pod 進入 Pending——看 scheduler 的診斷
+
+建立一個帶有不存在 label 的 nodeSelector：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unschedulable-pod
+spec:
+  nodeSelector:
+    disktype: nvme
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["sleep", "3600"]
+EOF
+```
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl describe pod unschedulable-pod
+```
+
+```
+Events:
+  Warning  FailedScheduling  ...  0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+```
+
+這段 message 由 scheduler 寫回 API server 的 Event，告訴你每個 filter plugin 拒絕了多少 node。
+
+### 4. 清理 Pending Pod，並查看 scheduler log
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete pod unschedulable-pod scheduler-demo pinned-pod
+```
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl logs -n kube-system \
+  $(kubectl get pod -n kube-system -l component=kube-scheduler -o jsonpath='{.items[0].metadata.name}') \
+  --tail=50
+```
+
+```
+... "Successfully assigned" ...
+... "Attempting to bind" ...
+```
+
+scheduler log 使用結構化 JSON，可以用 `| jq .msg` 過濾出可讀的訊息。
+
+## 觀念深化
+
+**Scheduler 是獨立 process，透過 watch 拿到 `spec.nodeName == ""` 的 Pod。** 排程流程分三階段：
+
+1. **Filtering（predicates）**：逐一跑 filter plugin（NodeSelector、NodeUnschedulable、PodFitsResources 等），把不符合條件的 node 排除。
+2. **Scoring（priorities）**：對剩餘 node 打分（LeastAllocated、PodTopologySpread 等），選出最高分。
+3. **Binding**：呼叫 API server，把 `spec.nodeName` 寫進 Pod object。寫完之後，kubelet watch 到這個變更，開始真正建立 sandbox 與 container。
+
+scheduler 本身不做任何 container 操作——它只負責「決定去哪裡」並寫一個欄位。
+
+參考：
+- [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)
+- [scheduler.go 進入點](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/scheduler.go)
+
+## 收穫檢查
+
+- scheduler Bind 的動作是寫什麼欄位到哪個 object？
+- "0/3 nodes are available" 裡面的數字從哪裡來？
+- scheduler 停掉之後，已經 Running 的 Pod 會受影響嗎？
+- `nodeSelector` 和 `nodeAffinity` 在 scheduling framework 裡是同一個 plugin 嗎？
+- scheduler 是如何知道有新 Pod 需要排程的？（watch 了什麼？）
+
+## 參考資料
+
+- [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/) — filter / score / bind plugin 架構
+- [Assigning Pods to Nodes](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/) — nodeSelector、nodeAffinity 用法
+- [scheduler.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/scheduler.go) — Scheduler struct 與主迴圈
+
+## 明日預告
+
+明天 [Day 04](/learning-plan/features/day-04) 把鏡頭轉到 controller-manager，透過刪除一個 Pod 來觸發 ReplicaSet controller 的 self-heal，並在 controller-manager log 裡找到 reconcile 的蹤跡。
