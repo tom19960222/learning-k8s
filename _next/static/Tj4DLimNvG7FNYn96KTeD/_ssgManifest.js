@@ -1,0 +1,1 @@
+self.__SSG_MANIFEST=new Set(["\u002F[project]","\u002F[project]\u002Ffeature-map","\u002F[project]\u002Ffeatures\u002F[slug]","\u002F[project]\u002Fquiz","\u002F[project]\u002Fsource\u002F[...filepath]","\u002F[project]\u002Fusecases\u002F[slug]"]);self.__SSG_MANIFEST_CB&&self.__SSG_MANIFEST_CB()
