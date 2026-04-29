@@ -111,6 +111,54 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'kubernetes': {
+    id: 'kubernetes',
+    displayName: 'Kubernetes',
+    shortName: 'K8s',
+    description: '容器編排平台本體：4 個 control plane process + kubelet + kube-proxy 構成的分散式系統',
+    githubUrl: 'https://github.com/kubernetes/kubernetes',
+    submodulePath: path.join(REPO_ROOT, 'kubernetes'),
+    color: 'blue',
+    accentClass: 'border-blue-500 text-blue-400',
+    features: ['architecture', 'api-server', 'controllers', 'kubelet'],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '控制平面', icon: '🧠', slugs: ['api-server', 'controllers'] },
+      { label: 'Node 端', icon: '🖥️', slugs: ['kubelet'] },
+    ],
+    usecases: [],
+    difficulty: '🟡 中階',
+    difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+    problemStatement: '你會用 kubectl 操作 cluster，但 control plane 4 個 process、kubelet、kube-proxy 在背後到底做什麼？API server 收到 request 之後怎麼走進 etcd？scheduler 怎麼挑 node？kubelet 又怎麼跟 containerd 對話？這 4 頁 MVP 從架構切入，逐層拆到 reconcile loop 與 CRI 介面。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: '會用 kubectl 大半年了，但每次有人問「Service 路由怎麼決定」、「Pod evict 是誰決定的」、「kube-controller-manager 跟 scheduler 為什麼要分開」就答不上來。今天決定從原始碼層面把它徹底拆解。',
+      scenes: [
+        { step: 1, icon: '🏗️', actor: '你', action: '讀 architecture：先建立完整地圖', detail: '搞清楚 4 個 control plane 元件加 kubelet 加 kube-proxy 各自的工作切面，知道 static Pod 怎麼解決 chicken-and-egg。' },
+        { step: 2, icon: '📦', actor: '你', action: '讀 api-server：HTTP request 到 etcd 的全程', detail: '從 handler chain 開始追，看到 admission、storage layer、watch fan-out — 終於理解 apiserver 為何是整個 cluster 的瓶頸點。' },
+        { step: 3, icon: '🔄', actor: '你', action: '讀 controllers：reconcile loop 何時被觸發', detail: 'informer cache + work queue + rate limiter 三段式幾乎是所有 k8s controller 的共同骨架。' },
+        { step: 4, icon: '🖥️', actor: '你', action: '讀 kubelet：Pod 怎麼變成 container', detail: 'CRI gRPC 介面是 docker、containerd、CRI-O 互換的契約；Pod sandbox 是 network namespace 的擁有者。' },
+      ],
+      outcome: '從此面對任何 k8s 問題，你能直覺地知道「這該由哪個 process 處理」、「應該去哪段原始碼追」。同事看你 kubectl 的眼神不一樣了。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '先建立全貌再深入單一元件' },
+        { slug: 'controllers', note: '從最直觀的 ReplicaSet reconcile 開始' },
+        { slug: 'kubelet', note: '看 Pod 在 node 上的真實長相' },
+      ],
+      intermediate: [
+        { slug: 'api-server', note: 'admission chain 與 watch fan-out 是 cluster 觀察的關鍵' },
+        { slug: 'controllers', note: '深入 informer / work queue / rate limiter' },
+        { slug: 'kubelet', note: 'CRI 介面與 Pod sandbox' },
+      ],
+      advanced: [
+        { slug: 'api-server', note: '研究 storage layer 與 etcd 互動細節' },
+        { slug: 'controllers', note: 'leader election、shared informer、跨 controller 的 ownership chain' },
+        { slug: 'kubelet', note: 'CRI 之外：device plugin、CNI、CSI 的整合面' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)

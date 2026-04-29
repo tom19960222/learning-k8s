@@ -1,0 +1,163 @@
+---
+layout: doc
+title: Kubernetes — API Server 與 etcd
+description: 一個 kubectl apply 從 HTTP request 到 etcd write 的完整路徑：handler chain → admission → storage layer → watch fan-out。
+---
+
+## 場景
+
+你 `kubectl apply -f pod.yaml`，幾秒後 Pod Running。中間 apiserver 到底做了什麼？為什麼 100 個 client 同時 watch deployments，apiserver 也撐得住？這頁拆給你看。
+
+## 從 HTTP request 進入
+
+apiserver 是個 HTTP server。所有 request 都先過一段 handler chain，才到資源邏輯。chain 的入口在這裡：
+
+```go
+// File: kubernetes/staging/src/k8s.io/apiserver/pkg/server/handler.go
+// (line 73, simplified)
+func NewAPIServerHandler(name string, s runtime.NegotiatedSerializer,
+    handlerChainBuilder HandlerChainBuilderFn,
+    notFoundHandler http.Handler) *APIServerHandler {
+    nonGoRestfulMux := mux.NewPathRecorderMux(name)
+    if notFoundHandler != nil {
+        nonGoRestfulMux.NotFoundHandler(notFoundHandler)
+    }
+
+    gorestfulContainer := restful.NewContainer()
+    ...
+    director := director{
+        name:                 name,
+        goRestfulContainer:   gorestfulContainer,
+        nonGoRestfulMux:      nonGoRestfulMux,
+    }
+
+    return &APIServerHandler{
+        FullHandlerChain:   handlerChainBuilder(director),
+        ...
+    }
+}
+```
+
+`director` 是 dispatcher：先試 go-restful 的 routes (主要是 `/api/...`、`/apis/...`)，否則 fall back 到 non-restful mux (metrics、healthz、debug)。
+
+`handlerChainBuilder` 把 director 包成「層層堆疊」的 middleware：authn → authz → audit → impersonation → max-in-flight → admission → storage。每一層裝飾上一層，最後得到一個大 `http.Handler`。
+
+## Admission：mutating → validating → schema
+
+Admission 是 **plugin chain**，不是單一 function。chain 主邏輯：
+
+```go
+// File: kubernetes/staging/src/k8s.io/apiserver/pkg/admission/chain.go
+// (line 31)
+func (admissionHandler chainAdmissionHandler) Admit(
+    ctx context.Context,
+    a Attributes,
+    o ObjectInterfaces,
+) error {
+    for _, handler := range admissionHandler {
+        if !handler.Handles(a.GetOperation()) {
+            continue
+        }
+        if mutator, ok := handler.(MutationInterface); ok {
+            err := mutator.Admit(ctx, a, o)
+            if err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
+
+順序：
+
+1. **MutatingAdmissionWebhook** chain：可以**改** request 內容 (例如 inject sidecar、設 default value)。每個 webhook 收到當前狀態並回傳新狀態，下一個 webhook 看到的是上一個改完的版本。
+2. **ValidatingAdmissionWebhook** chain：只能 reject 不能改。例如 OPA Gatekeeper、Kyverno 的 rule 都在這層拒絕不合規的 spec。
+3. **Schema validation**：用 OpenAPI schema 檢查欄位 type、required、enum。
+
+mutating 必須在 validating 前，否則 webhook 改完之後沒人檢查；schema validation 又必須在所有 webhook 後，避免 webhook 改出無效 spec。順序是 hard-coded 的。
+
+## Storage layer：generic registry → etcd v3
+
+過了 admission，request 到 storage layer。所有 built-in resource 用同一份程式碼 (generic registry)，差別只在「什麼 group/version/kind、怎麼 marshal/unmarshal」。
+
+`Store.Create` 是寫入入口：
+
+```go
+// File: kubernetes/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go
+// (line 454)
+func (e *Store) Create(
+    ctx context.Context,
+    obj runtime.Object,
+    createValidation rest.ValidateObjectFunc,
+    options *metav1.CreateOptions,
+) (runtime.Object, error) {
+    ...
+}
+```
+
+底層呼 etcd v3 client 的 `Put`。注意 store 用 **resource name** (例如 `/registry/pods/default/my-pod`) 作 etcd key，不用 UID——這樣 list 同 namespace 的 Pod 是一個 prefix scan。
+
+## Watch fan-out：apiserver 為什麼能扛大量 watcher
+
+如果每個 client 各自 watch etcd，1000 個 client → 1000 條 etcd watch connection。etcd 撐不住。所以 apiserver 內建一層 **cache + fan-out**：
+
+```
+client A ─┐
+client B ─┼─→  apiserver cacher  ─→  etcd (single watch)
+client C ─┘    (in-memory delta-FIFO + multicast)
+```
+
+cacher 程式碼在 `staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go`。它對 etcd 維持單一 watch、把 event 寫進 in-memory ring buffer，所有 client 都從 ring buffer 讀。`watch_cache.go` 還支援 **resourceVersion-based** lookup，讓 client reconnect 時可以從某個 version 開始接續、不用重 list。
+
+這也是為什麼 `kubectl get pods -w` 加 100 個 watcher 不會打掛 cluster：apiserver 會把這 100 個 watcher 都掛在自己 cache 上，etcd 端只有一條 watch。
+
+## 整段路徑
+
+```
+HTTP POST /apis/apps/v1/namespaces/default/deployments
+  │
+  ▼  (TLS terminate, parse body)
+authn  →  authz  →  audit  →  max-in-flight
+  │
+  ▼
+mutating webhooks  (chain)
+  │
+  ▼
+validating webhooks (chain)
+  │
+  ▼
+schema validation
+  │
+  ▼
+Store.Create (generic registry)
+  │
+  ▼
+etcd v3 client.Put("/registry/deployments/default/<name>", protobuf)
+  │
+  ▼
+cacher 收到 etcd watch event
+  │
+  ▼  fan-out to all watchers
+clients (kubectl -w, controllers) 收到事件
+  │
+  ▼
+return 200 to original POST
+```
+
+注意 etcd write 完到 cacher 收到 event 中間有 ~10-20ms 延遲 (取決於 watch lag)，這是 controller 看到變化的最短時間。
+
+## 收穫檢查
+
+- 為什麼 mutating 必須在 validating 前？順序顛倒會發生什麼？
+- apiserver 的 cacher 跟 client-go 的 informer 各自做的「cache」差在哪？
+- 一個 webhook timeout 30 秒會發生什麼事？apiserver 怎麼 fail-open / fail-close？
+- etcd 的 `resourceVersion` 跟 apiserver 回給 client 的版本號是同一個嗎？
+
+## 原始碼參考
+
+- [staging/src/k8s.io/apiserver/pkg/server/handler.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apiserver/pkg/server/handler.go) — handler chain 入口
+- [staging/src/k8s.io/apiserver/pkg/admission/chain.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apiserver/pkg/admission/chain.go) — admission chain
+- [staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go) — generic storage
+- [staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go) — watch fan-out
+- [API Concepts (官方)](https://kubernetes.io/docs/reference/using-api/api-concepts/)

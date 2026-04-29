@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "question": "kube-apiserver 自己也是 static Pod。誰負責在開機時把它拉起來？",
+    "options": [
+      "kubelet 從 /etc/kubernetes/manifests/ 讀 yaml 直接起 Pod，不經 API server",
+      "systemd service 直接執行 kube-apiserver binary",
+      "kube-controller-manager 啟動 apiserver",
+      "etcd 啟動 apiserver"
+    ],
+    "answer": 0,
+    "explanation": "static Pod 是 kubelet 從本機目錄直接起的 Pod，不經 API server。這正是解 chicken-and-egg 的方法：apiserver 自己也是 static Pod，所以它在沒有 apiserver 的情況下也能被 kubelet 拉起來。"
+  },
+  {
+    "id": 2,
+    "question": "100 個 client 同時 watch deployments，apiserver 為什麼能撐住？",
+    "options": [
+      "apiserver 內建 cacher：自己對 etcd 維持單一 watch，把 event 寫進 in-memory ring buffer fan-out 給所有 client",
+      "apiserver 對 etcd 開 100 條 watch connection，由 etcd 自己 fan-out",
+      "client 分別連到不同的 apiserver replica",
+      "apiserver 把所有 watch request 排隊，一個一個處理"
+    ],
+    "answer": 0,
+    "explanation": "apiserver 的 storage cacher 對 etcd 維持單一 watch、用 in-memory ring buffer 多工分送給所有 client。這就是為什麼 1000 個 client watch 也只在 etcd 端產生 1 個 watcher。code 在 staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go。"
+  },
+  {
+    "id": 3,
+    "question": "你 kubectl delete 一個 ReplicaSet 管的 Pod，2 秒後新 Pod 出現。觸發 ReplicaSet controller 跑 syncReplicaSet 的機制是什麼？",
+    "options": [
+      "informer watch 到 Pod 的 delete event，把對應的 RS key enqueue 進 work queue，worker goroutine 取出 key 後呼叫 syncReplicaSet",
+      "ReplicaSet controller 每 5 秒 polling apiserver 一次，檢查所有 RS",
+      "kubelet 直接通知 ReplicaSet controller 有 Pod 死掉",
+      "etcd 主動推 push 給 ReplicaSet controller"
+    ],
+    "answer": 0,
+    "explanation": "所有 k8s controller 都用同一套 informer + work queue 模式。Informer 對 apiserver 做 list+watch，event 觸發 enqueue (用 ownerReferences 找出對應的父資源 key)，worker goroutine 從 queue 拿 key 跑 reconcile。這是 client-go 的 cache package 實作。"
+  },
+  {
+    "id": 4,
+    "question": "scheduler 決定把 Pod 放到 node B。它怎麼把這個決定告訴 cluster？",
+    "options": [
+      "對 apiserver 發 Bind request 寫 Pod 的 spec.nodeName=node-B；後續由 node-B 上的 kubelet watch 到 Pod 接手",
+      "scheduler 直接 ssh 到 node-B 啟動 container",
+      "scheduler 直接呼叫 node-B 的 kubelet API",
+      "scheduler 改 etcd 裡 Pod 的 status.assigned"
+    ],
+    "answer": 0,
+    "explanation": "scheduler 的工作只到「寫 spec.nodeName 回 apiserver」就結束了，不直接接觸任何 node。BindingCycle 對 /api/v1/namespaces/<ns>/pods/<name>/binding 發 POST。寫完之後 node-B 的 kubelet 自己 watch 到「我這個 node 多一個 Pod」就會接手 pull image 起 container。"
+  },
+  {
+    "id": 5,
+    "question": "為什麼每個 Pod 多一個叫 pause 的 container？",
+    "options": [
+      "pause 持有 Pod 的 network/IPC/PID namespace；application container 死掉重啟時 namespace 還在，IP 不變",
+      "pause 提供 init system 給 application container 用",
+      "pause 跑 health check probe",
+      "pause 是 Pod 的 main process，application container 是它的 child"
+    ],
+    "answer": 0,
+    "explanation": "Pod 是「N 個 container 共用 namespace」。如果 application container 自己當 namespace 持有者，container 重啟時 namespace 與 IP 也消失。pause container 永遠不死 (除非 Pod 整個被砍)，由它持有 namespace；application container 加入它的 namespace。這也是為什麼你 ssh 到 node 跑 crictl ps 會看到比預期多很多 container — 每個 Pod 多一個 pause。"
+  }
+]

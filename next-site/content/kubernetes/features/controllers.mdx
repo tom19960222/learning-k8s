@@ -1,0 +1,144 @@
+---
+layout: doc
+title: Kubernetes — Controllers 與 Scheduler
+description: ReplicaSet 怎麼 self-heal、scheduler 怎麼 bind Pod 到 node、informer + work queue + rate limiter 為什麼是所有 controller 的共同骨架。
+---
+
+## 場景
+
+`kubectl delete pod my-pod`，2 秒後新 Pod 出現。中間：誰偵測到？誰決定要補一個新的？誰挑 node？誰實際把它跑起來？四個 process 接力，每一棒都用同一套 informer + work queue 模式。
+
+## informer + work queue：所有 controller 的共同骨架
+
+任何 controller 都是這個樣子：
+
+```
+                   ┌─────────────┐
+                   │  apiserver  │
+                   └──────▲──────┘
+                          │ HTTPS watch
+                          ▼
+   ┌──────────────────────────────────────────┐
+   │  Reflector → Delta FIFO → Indexer (cache)│
+   │  (這就是 informer)                        │
+   └──────────────┬───────────────────────────┘
+                  │ on add / update / delete
+                  ▼
+            ┌──────────────┐
+            │  Work Queue  │  (rate-limited, dedup)
+            └──────┬───────┘
+                   │ worker goroutine pulls
+                   ▼
+            ┌──────────────┐
+            │  Reconcile() │
+            └──────────────┘
+```
+
+要點：
+
+- **Informer** 對 apiserver 做一次 list (拿全量) 加持續 watch (拿 delta)，本機維護 indexer (in-memory cache)
+- **Work queue** 對同一個 key 做 dedup (1 秒內 100 次 update 只會 enqueue 1 次)；rate limiter 用 exponential backoff 防止 reconcile loop 對失敗一直重試
+- **Reconcile()** 是 idempotent 的——拿到 key 後從 indexer 讀當前 desired/actual state，做比對與動作
+
+informer 程式碼在 [`staging/src/k8s.io/client-go/tools/cache/`](https://github.com/kubernetes/kubernetes/tree/v1.36.0/staging/src/k8s.io/client-go/tools/cache)。所有 controller 都用 `client-go` 提供的這套 cache，不自己重寫。
+
+## ReplicaSet controller 主流程
+
+ReplicaSet 是「我要 N 個這樣的 Pod」。reconcile 入口：
+
+```go
+// File: kubernetes/pkg/controller/replicaset/replica_set.go
+// (line 755)
+func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string) error {
+    namespace, name, err := cache.SplitMetaNamespaceKey(key)
+    rs, err := rsc.rsLister.ReplicaSets(namespace).Get(name)
+    ...
+    // 1. List 屬於這個 RS 的所有 Pod (從 indexer 拿，不打 apiserver)
+    allPods, err := rsc.podLister.Pods(rs.Namespace).List(labels.Everything())
+    ...
+    // 2. 用 ControllerRef 過濾出真正屬於這個 RS 的 Pod
+    filteredPods, err := rsc.claimPods(ctx, rs, allPods)
+    ...
+    // 3. manageReplicas 做 add/delete 決策
+    var manageReplicasErr error
+    if rsNeedsSync && rs.DeletionTimestamp == nil {
+        manageReplicasErr = rsc.manageReplicas(ctx, filteredPods, rs)
+    }
+    // 4. 計算新 status 寫回 apiserver
+    newStatus := calculateStatus(rs, filteredPods, ...)
+    updatedRS, err := updateReplicaSetStatus(...)
+    ...
+}
+```
+
+`manageReplicas` 在同檔案 line 649 — 看當前 vs 期望數量，差幾個就建幾個 Pod / 刪幾個 Pod。每次只做一輪，沒達到也沒關係——因為下次 informer 收到任何 Pod / RS 變動都會再 enqueue 同個 key，再來一次 reconcile。
+
+注意：reconcile 永遠**從 informer cache 讀**，不打 apiserver；只有 mutation (Create/Update Pod、UpdateStatus) 才呼 apiserver。所以即使 1 秒鐘 50 次事件，apiserver 的負擔也不重。
+
+## Scheduler 主迴圈
+
+scheduler 跟其他 controller 形狀一樣，但 reconcile 內容是「挑 node」而不是「reconcile 子物件」：
+
+```go
+// File: kubernetes/pkg/scheduler/schedule_one.go
+// (line 99)
+func (sched *Scheduler) scheduleOnePod(ctx context.Context, podInfo *framework.QueuedPodInfo) {
+    pod := podInfo.Pod
+    fwk, err := sched.frameworkForPod(pod)
+    ...
+    // 1. SchedulingCycle: predicate (filter) + score
+    scheduleResult, assumedPodInfo, status :=
+        sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, ...)
+    ...
+    // 2. BindingCycle: 寫 spec.nodeName 回 apiserver
+    go func() {
+        sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, ...)
+    }()
+}
+```
+
+兩階段：
+
+- **SchedulingCycle (sync)**：跑 predicate plugin (例如 NodeAffinity、TaintToleration、Resources) 過濾掉不可行的 node；跑 score plugin (例如 NodeResourcesFit、ImageLocality) 排序剩下的 node；選分數最高
+- **BindingCycle (async)**：對 apiserver 發 `Bind` request 寫 `spec.nodeName=<chosen>` (POST 到 `/api/v1/namespaces/<ns>/pods/<name>/binding`)
+
+scheduler 走的是 plugin framework — predicate 與 score 都是可換的 plugin。Default 設定見 [`pkg/scheduler/framework/plugins/`](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/scheduler/framework/plugins)。
+
+> v1.36 還新增了 `scheduleOnePodGroup` (`schedule_one_podgroup.go`) 給 PodGroup gang scheduling — 一群 Pod 要一起 schedule 才有意義 (例如 ML training job)。MVP 階段先理解 single-pod 路徑即可。
+
+## kube-controller-manager 是「process 跑多 controller」
+
+kube-controller-manager 不是單一 controller — 它是個 supervisor，啟動時把 ~30 個 controller (ReplicaSet、Deployment、Job、StatefulSet、DaemonSet、Endpoint、ServiceAccount…) 各自起 goroutine，共用：
+
+- **Shared informer factory**：所有 controller 共用同一份 Pod / Node / Service 的 indexer，不用每個 controller 自己對 apiserver 開 watch
+- **Leader election**：3 個 controller-manager 同時跑時 (HA)，只有 leader 真的執行 reconcile，其他兩個 standby
+
+leader election 用 Lease object 在 apiserver 上做：每個 controller-manager 定期 update Lease 的 `holderIdentity` 與 timestamp；過期沒 update 就視為失聯，其他 standby 搶 lease。
+
+## ReplicaSet ↔ Scheduler ↔ kubelet 的接力
+
+回到開頭：刪一個 Pod，2 秒後新 Pod 出現。完整路徑：
+
+1. `kubectl delete pod my-pod` → apiserver 在 etcd 標 deletion + 觸發 watch event
+2. **ReplicaSet controller** 收到 Pod delete event → enqueue 對應 RS 的 key → `syncReplicaSet` 跑 → `manageReplicas` 發現少一個 → `Create Pod` (`spec.nodeName == ""`)
+3. apiserver 寫 etcd → 觸發新 Pod 的 watch event
+4. **scheduler** 收到 unscheduled Pod → enqueue → `scheduleOnePod` → 挑 node → `Bind` 寫 `spec.nodeName`
+5. apiserver 寫 etcd → 觸發 update event
+6. **目標 worker node 的 kubelet** 收到「我這個 node 多了一個 Pod」→ pull image → 起 container (詳見 [kubelet](/kubernetes/features/kubelet))
+
+每一段都是「watch → enqueue → reconcile」的同樣骨架，差別只在 reconcile 內容。理解了這個 pattern，所有 k8s controller 都認得了。
+
+## 收穫檢查
+
+- 為什麼 reconcile 要 idempotent？如果不 idempotent 會出什麼問題？
+- informer cache 跟 apiserver cacher (前一頁) 的關係？兩層 cache 是必要的嗎？
+- ReplicaSet 怎麼分辨「這個 Pod 是我的」？(提示：metadata.ownerReferences)
+- scheduler 跟 controller-manager 為什麼分開兩個 process？合在一起會有什麼問題？
+
+## 原始碼參考
+
+- [pkg/controller/replicaset/replica_set.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/controller/replicaset/replica_set.go) — ReplicaSet controller 主迴圈
+- [pkg/scheduler/schedule_one.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/pkg/scheduler/schedule_one.go) — scheduler `scheduleOnePod`
+- [pkg/scheduler/framework/plugins/](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/scheduler/framework/plugins) — predicate 與 score plugin
+- [staging/src/k8s.io/client-go/tools/cache/](https://github.com/kubernetes/kubernetes/tree/v1.36.0/staging/src/k8s.io/client-go/tools/cache) — informer / indexer 實作
+- [Scheduling Framework (官方)](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)

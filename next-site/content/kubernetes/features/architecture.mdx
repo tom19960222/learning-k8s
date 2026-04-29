@@ -1,0 +1,114 @@
+---
+layout: doc
+title: Kubernetes — 控制平面架構
+description: 從 kubectl apply 到 Pod 跑起來的完整路徑，4 個 control plane process 加每 node 的 kubelet 與 kube-proxy 各自負責什麼，static Pod 怎麼解決 chicken-and-egg。
+---
+
+## 場景
+
+你第一次 ssh 進 control plane node，跑 `ps -ef | grep kube`，期待看到一堆熟悉的 process。結果只有一個 kubelet 在跑。kube-apiserver、etcd、kube-scheduler、kube-controller-manager 都不見了——它們竟然是 container。整個 control plane 是 Pod。
+
+這頁把 5 個元件 (4 個 control plane + kubelet) 加 kube-proxy 的工作切面拆開來看。
+
+## 架構全貌
+
+```
+┌─────────────────── control plane node ──────────────────┐
+│                                                          │
+│  static Pod manifests in /etc/kubernetes/manifests/      │
+│  ┌────────────────┐  ┌────────────┐                      │
+│  │ kube-apiserver │  │   etcd     │                      │
+│  └───────▲────────┘  └─────▲──────┘                      │
+│          │                 │ (only apiserver talks)      │
+│          │ HTTPS           │                             │
+│  ┌───────┴────────┐  ┌─────┴────────────────────┐        │
+│  │ kube-scheduler │  │ kube-controller-manager  │        │
+│  └────────────────┘  └──────────────────────────┘        │
+│                                                          │
+│  systemd ──> kubelet ──> CRI ──> containerd ──> all above│
+└──────────────────────────────────────────────────────────┘
+                            │ HTTPS watch + report
+                            ▼
+┌─────────────────── worker node × N ─────────────────────┐
+│  systemd ──> kubelet ──┬──> CRI gRPC ──> containerd     │
+│                        └──> CNI plugin ──> pod network  │
+│           kube-proxy ──> iptables / IPVS rules          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 5 個元件的職責邊界
+
+**kube-apiserver** 是唯一可以讀寫 etcd 的 process。所有其他元件 (含 kubelet、controllers、user 端 kubectl) 都透過它的 HTTPS API 對 cluster 狀態做 CRUD。它是整個 cluster 的 source of truth proxy。進入點：
+
+```go
+// File: kubernetes/cmd/kube-apiserver/apiserver.go
+package main
+
+import "k8s.io/kubernetes/cmd/kube-apiserver/app"
+
+func main() {
+    command := app.NewAPIServerCommand()
+    code := cli.Run(command)
+    os.Exit(code)
+}
+```
+
+**etcd** 是分散式 KV store (Raft consensus)，存 cluster 全部狀態 (Pod、Node、Secret 等)。它**只**接 apiserver 的連線——沒有別的 client。架構決定它沒有 application-aware 的 schema validation；那是 apiserver 的工作。
+
+**kube-controller-manager** 是 1 個 process 跑 ~30 個 controller (ReplicaSet、Deployment、Job、Endpoint…)，每個 controller 是一個 goroutine。它們 watch apiserver、跑 reconcile loop、寫回。詳見 [controllers](/kubernetes/features/controllers)。
+
+**kube-scheduler** 也是獨立 process。它**只**做一件事：watch `spec.nodeName == ""` 的 Pod，跑 predicate + score 算法選 node，呼叫 apiserver 的 `Bind` 寫回 `spec.nodeName`。後續就是 kubelet 接手。
+
+**kubelet** 是每個 node 上的 daemon (含 control plane node 自己)。它 watch 自己 node 上要跑的 Pod、透過 CRI gRPC 跟 container runtime 對話、呼叫 CNI plugin 配網路。詳見 [kubelet](/kubernetes/features/kubelet)。
+
+**kube-proxy** 是 per-node DaemonSet (technically static Pod 也行)，watch Service + EndpointSlice，把 cluster IP → backend Pod 的對應寫成 iptables / IPVS / nftables 規則。**沒有 proxy process 在 data path**——kernel netfilter 直接做 DNAT。
+
+## kubectl apply 的旅程
+
+當你 `kubectl apply -f deployment.yaml`：
+
+1. kubectl 解析 yaml、走 `~/.kube/config` 拿 cluster URL 與 token
+2. 對 `https://<apiserver>/apis/apps/v1/namespaces/default/deployments` 發 POST
+3. **apiserver** 收到 → admission chain (mutating → validating) → schema validation → 寫 etcd → 回 200
+4. **kube-controller-manager** 裡的 Deployment controller watch 到新 Deployment → 建 ReplicaSet → 寫 apiserver
+5. **ReplicaSet controller** watch 到新 ReplicaSet → 建 N 個 Pod (`spec.nodeName == ""`) → 寫 apiserver
+6. **kube-scheduler** watch 到 unscheduled Pod → 跑算法 → 對 apiserver 發 `Bind` 寫 `spec.nodeName=worker-X`
+7. **worker-X 的 kubelet** watch 到自己 node 多了一個 Pod → 拉 image → 透過 CRI 起 sandbox → 起 application container → 呼叫 CNI 配網路
+8. kubelet 持續把 Pod status 報回 apiserver；你 `kubectl get pod` 看到 Running
+
+注意每個元件**只跟 apiserver 對話**——彼此不直接通訊。這是 k8s 的核心解耦設計。
+
+## Static Pod：control plane 自己怎麼起來
+
+雞生蛋蛋生雞的問題：apiserver 是 Pod，但建 Pod 需要 apiserver。解法是 **static Pod**：kubelet 啟動時讀本機 `/etc/kubernetes/manifests/*.yaml`，把找到的 yaml 直接當 Pod 起，**不經過** apiserver。
+
+control plane node 上裝 kubeadm 時這目錄會有 4 個 yaml：
+
+```bash
+# File: /etc/kubernetes/manifests/  (在你 control plane node 上)
+$ ls
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+```
+
+kubelet 起這 4 個 Pod 之後，apiserver 起來，整套 control plane 就可以 self-host 了。這也是為什麼 `kubectl get pods -n kube-system` 能看到 `kube-apiserver-<control-plane-node>` 這種 Pod——它真的是 Pod，但沒有 ReplicaSet 管它，是 kubelet 直接管。
+
+## 原始碼進入點
+
+| 元件 | 進入點 | v1.36.0 連結 |
+|---|---|---|
+| kube-apiserver | `cmd/kube-apiserver/apiserver.go` | [GitHub](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kube-apiserver/apiserver.go) |
+| kube-controller-manager | `cmd/kube-controller-manager/controller-manager.go` | [GitHub](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kube-controller-manager/controller-manager.go) |
+| kube-scheduler | `cmd/kube-scheduler/scheduler.go` | [GitHub](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kube-scheduler/scheduler.go) |
+| kubelet | `cmd/kubelet/kubelet.go` | [GitHub](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kubelet/kubelet.go) |
+| kube-proxy | `cmd/kube-proxy/proxy.go` | [GitHub](https://github.com/kubernetes/kubernetes/blob/v1.36.0/cmd/kube-proxy/proxy.go) |
+
+每個 `main()` 都很短：解析 flag → 建 cobra command → run。實際邏輯都在對應 `pkg/` 子目錄。
+
+## 接下來
+
+- [api-server](/kubernetes/features/api-server)：HTTP request 到 etcd write 的完整路徑
+- [controllers](/kubernetes/features/controllers)：scheduler 加 controller-manager 的 reconcile loop
+- [kubelet](/kubernetes/features/kubelet)：Pod 在 worker node 上怎麼變 container
