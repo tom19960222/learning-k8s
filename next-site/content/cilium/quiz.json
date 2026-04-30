@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "question": "cilium-agent 的啟動 log 充滿 \"starting cell\"、\"initializing cell\"。Hive cell DI 框架在 cilium 解決什麼問題？",
+    "options": [
+      "依存關係解析與正確的 startup/shutdown 順序：每個 package 宣告自己的 cell，framework 自動算依存圖",
+      "讓 cilium 跑得比直接寫 main() 更快",
+      "強迫所有 cell 都跑在獨立 goroutine，提高並發",
+      "只是重構美學，沒實際解決什麼"
+    ],
+    "answer": 0,
+    "explanation": "Hive 是 cilium 自己抽出來的 DI library。每個 package 一個 cell.go 宣告自己依存哪些 cell；framework 在啟動時算 dependency graph，按拓樸序啟動，shutdown 反向。這解決了「N 個 component 互相依存」的初始化順序問題。daemon/cmd/cells.go 是入口。"
+  },
+  {
+    "id": 2,
+    "question": "cilium 的 BPF datapath 並不是「載入 prebuilt .o」。同一個 cluster 100 個 endpoint 不會跑 100 次 clang compile。為什麼？",
+    "options": [
+      "objectCache 用 endpoint config 算 datapathHash，hash 相同的 endpoint 共用同一份編譯出的 .o，只有 config 不同才會重編",
+      "cilium 啟動時就把所有 .o 預先 compile 好，後面只是 load",
+      "BPF 物件可以動態 patch，所以一份 .o 永遠能服務所有 endpoint",
+      "只有第一個 endpoint 會 compile，後面通通靠 BPF tail call 共用"
+    ],
+    "answer": 0,
+    "explanation": "每個 endpoint 在 regeneration 時根據自己的 ID / identity / options 算 datapathHash；agent 在 objectCache (pkg/datapath/loader/cache.go:27) 找對應 template；hit → 重用 .o，miss → invoke clang 編 bpf/bpf_lxc.c 寫進 cache。這是 template-based compile：template 數量遠小於 endpoint 數量，所以實際 compile 次數有限。"
+  },
+  {
+    "id": 3,
+    "question": "你給某個 Pod 加新 label 但沒改 NetworkPolicy；過一會兒 cilium 對這個 Pod 的 policy decision 改變了。發生什麼事？",
+    "options": [
+      "label 變了 → 重算 SecurityIdentity（label set 的雜湊）→ 換 identity → endpoint 對應 PolicyMap 重算",
+      "cilium 直接根據 label string 比對 policy，不經 identity",
+      "label 變了不會重算 policy，只有 NetworkPolicy CRD 變才會",
+      "需要手動 cilium endpoint regenerate 才會生效"
+    ],
+    "answer": 0,
+    "explanation": "SecurityIdentity 是 label set 的雜湊 (pkg/identity/identity.go:27)。label 改了 → identity allocator 換一個 numeric ID → policy 是針對 identity 寫的，所以對應一組不同的 PolicyMap entry。整段是自動的，由 endpoint 的 sync goroutine 處理，不需要手動 regenerate。"
+  },
+  {
+    "id": 4,
+    "question": "PolicyMap 是 cilium 的核心 BPF data structure。它是 cluster-wide 一個 hash map，所有 node 共享嗎？",
+    "options": [
+      "不是。PolicyMap 是 per-endpoint 的 — 每個 endpoint 有自己一份 BPF hash map，bpf_lxc.c 對 endpoint 自己的 map lookup",
+      "是 cluster-wide。cilium-operator 維護一份 master，agent 從 etcd 拉同步",
+      "是 per-node。每個 cilium-agent 一份，所有該 node 上的 endpoint 共用",
+      "是 per-namespace 的"
+    ],
+    "answer": 0,
+    "explanation": "PolicyMap 是 per-endpoint 的 BPF hash map (pkg/maps/policymap/policymap.go:107 的 PolicyKey + line 155 的 PolicyEntry)。每個 endpoint regeneration 時 cilium 為它算出「我這個 endpoint 對其他 identity 各自允許哪些 (port, proto, dir)」並寫進它自己的 map。bpf_lxc.c 處理 packet 時 lookup 的是該 endpoint context 自己的 PolicyMap。為什麼 per-endpoint？因為同 cluster 內兩個 endpoint 對來自同一個 identity 的 traffic 可能允許不同 ports。"
+  },
+  {
+    "id": 5,
+    "question": "你開了 Hubble，每個 packet 都會產生 Flow event 給 hubble observe 看。為什麼這不會把 forwarding 性能拖垮？",
+    "options": [
+      "datapath 用 send_trace_notify 寫 perf event ring buffer (async, kernel-userspace 共享 memory)，forwarding fast path 完全不等 user-space",
+      "Hubble 只 sample 1% 的 packet，所以負擔輕",
+      "BPF verifier 會自動跳過 trace point 如果 CPU 高",
+      "Hubble 重啟一次會丟掉所有 buffered event，所以不累積"
+    ],
+    "answer": 0,
+    "explanation": "Hubble 觀測完全走旁路：bpf_lxc.c 的 send_trace_notify (bpf/lib/trace.h) 把 event 寫進 perf event ring buffer，是 kernel-userspace shared memory，寫入 async。forwarding fast path 不等 user-space。monitor agent (pkg/monitor/agent/agent.go) 在 user-space 慢慢從 ring 讀；ring 滿了會丟 event (counter 回報 lost packets)，但 packet 還是繼續 forward。所以開不開 Hubble 對 forwarding latency 無感。"
+  }
+]

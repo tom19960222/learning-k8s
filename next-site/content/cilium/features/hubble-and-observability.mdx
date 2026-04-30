@@ -1,0 +1,171 @@
+---
+layout: doc
+title: Cilium — Hubble 與觀測性
+description: 從 datapath 的 send_trace_notify 到 hubble observe 的完整旅程：perf event ring → monitor agent → Hubble parser → gRPC server → hubble-relay 跨 node 聚合。
+---
+
+## 場景
+
+你 `hubble observe` 跑著，看到 cluster 內 flow event 一條條跳出來：5-tuple、source/dest identity、verdict (FORWARDED / DROPPED / REDIRECTED)。資料是怎麼從 kernel datapath 一路被 stream 到 CLI 的？而且為什麼開了 Hubble 不會把 forwarding 性能拖垮？
+
+## datapath 裡的 trace point
+
+bpf_lxc.c 在 ingress / egress 處理路徑的關鍵點 (drop 前、forward 後、policy verdict 後) 會呼叫一個 macro `send_trace_notify`，把 event 寫進 perf event ring buffer：
+
+```c
+/* File: bpf/lib/trace.h (摘要) */
+/*
+ * void send_trace_notify(ctx, obs_point, src, dst, dst_id, ifindex, reason, monitor)
+ * Records a trace event into the perf event map.
+ */
+```
+
+`send_trace_notify` 並非同步 IPC——它對一個叫 `cilium_events` 的 BPF perf event array map 寫一個 record。kernel 把 record 放進 ring buffer (per-CPU)，user-space 之後再來讀。寫入是 best-effort：ring 滿了就丟 event，但 packet forwarding 不被卡住。
+
+## monitor agent：從 perf ring 讀 + fan-out
+
+monitor agent 是 cilium-agent 內的一個 cell，職責就是「讀 ring，分發給訂閱者」：
+
+```go
+// File: cilium/pkg/monitor/agent/agent.go (line 106)
+func (a *agent) AttachToEventsMap(nPages int) error {
+    // 開 perf reader (cilium/ebpf 的 perf.Reader)
+    // 設定 per-CPU buffer 大小
+}
+```
+
+開好之後另一個 goroutine 跑 `processPerfRecord` 讀出來：
+
+```go
+// File: cilium/pkg/monitor/agent/agent.go (line 376)
+func (a *agent) processPerfRecord(record perf.Record) {
+    // 解析 record 的 type byte
+    // 分發給所有 registered consumer / listener
+}
+```
+
+任何想看 datapath 事件的 component 都到這註冊：
+
+```go
+// File: cilium/pkg/monitor/agent/agent.go (line 285)
+func (a *agent) RegisterNewConsumer(newConsumer consumer.MonitorConsumer) {
+    // 加進 consumer list
+    // 後續 processPerfRecord 會 broadcast 給它
+}
+```
+
+這個 fan-out 模式跟 [k8s apiserver 的 watch fan-out](/kubernetes/features/api-server) 概念上很像：上游 (kernel perf ring / etcd) 只做一條 stream，user-space 內部多工分送。
+
+## Hubble 註冊為 monitor consumer
+
+Hubble 不是獨立 daemon——它是 cilium-agent 內的一個 cell，啟動時把自己註冊成 monitor consumer：
+
+```go
+// File: cilium/pkg/hubble/cell/hubbleintegration.go (line 89)
+func createHubbleIntegration(
+    // ... params
+) (*hubbleIntegration, error) {
+    // build parser、ring buffer、gRPC server
+}
+
+// File: cilium/pkg/hubble/cell/hubbleintegration.go (line 208)
+func (h *hubbleIntegration) launch(ctx context.Context) (*observer.LocalObserverServer, error) {
+    // 1. 起 LocalObserverServer (in-memory ring)
+    // 2. 起 parser (raw bytes → Flow protobuf)
+    // 3. 註冊 monitor consumer
+    // 4. 起 gRPC server 對外提供 Observe / GetFlows API
+    // 5. 起 metric 計算
+}
+```
+
+flow 從 raw bytes 到 protobuf 的轉換：
+
+```
+perf record (raw bytes from BPF)
+    │
+    ▼  monitor agent dispatch
+hubble parser (pkg/hubble/parser)
+    │   parse 5-tuple、verdict、identity、source/dest endpoint metadata
+    ▼
+Flow protobuf (api/v1/flow)
+    │
+    ▼  寫進 in-memory ring buffer (有限長度，舊的 evict)
+LocalObserverServer.Observe gRPC stream
+```
+
+`hubble observe` 連到 cilium-agent 的 unix socket (預設 `/var/run/cilium/hubble.sock`) 拿這份 stream。
+`hubble status` 拉 metric。
+
+## hubble-relay：跨 node 聚合
+
+單一 node 的 hubble agent 只看自己 node 的 flow。要看 cluster 全貌就要 relay：
+
+```
+node A: cilium-agent ─Hubble gRPC ─┐
+node B: cilium-agent ─Hubble gRPC ─┤
+node C: cilium-agent ─Hubble gRPC ─┴─> hubble-relay ─unified gRPC─> hubble CLI / Hubble UI
+```
+
+relay 是獨立的 Deployment process (`hubble-relay/` 子 directory)，負責 connection pool + fan-in。對外 expose 一份大的 `Observe` API；對內維持 N 個 connection 給每個 node 的 hubble agent。
+
+為什麼 relay 不在 cilium-agent 裡？因為 relay 是 cluster-wide service (要連所有 node)，做成 per-node DaemonSet 不合理；做成 cell 又跨 process boundary 太奇怪。獨立 Deployment 是最自然的拆法。
+
+## 為什麼觀測不影響 forwarding 性能
+
+這是 cilium 的核心設計選擇。關鍵在三件事：
+
+1. **datapath 寫 perf ring 是 best-effort，不等 user-space**
+   - `send_trace_notify` 對 BPF perf event array 寫一個 record，return 立刻；kernel 把它塞進 per-CPU ring buffer。整段沒有 syscall、沒有 mutex、沒有 user-space 同步。
+2. **ring 滿了會丟 event，不會反壓 datapath**
+   - user-space 慢 / 沒在讀 → ring 滿 → kernel 丟舊 record (counter 會回報 lost packets)。packet 還是繼續 forward。
+3. **觀測 component 都掛在 monitor agent 上**
+   - Hubble、cilium monitor CLI、metrics export 都是 monitor consumer。多訂閱不會影響 datapath；只會讓 user-space 內部更忙。
+
+這帶來的取捨：當系統壓力極大時，你看到的 `hubble observe` 不一定是「全部 packet」——可能漏了一些。但 packet 一定有被正確 forward。
+
+## 整段流程
+
+```
+bpf_lxc.c forwarding hot path
+       │
+       ▼  send_trace_notify (best-effort write)
+  cilium_events perf map (per-CPU ring)
+       │
+       ▼  user-space async read
+monitor agent.processPerfRecord  (agent.go:376)
+       │
+       ├─ broadcast to consumer 1 (Hubble)
+       ├─ broadcast to consumer 2 (cilium monitor CLI)
+       └─ broadcast to consumer 3 (metrics)
+       │
+       ▼ (Hubble 那條)
+hubble parser → Flow protobuf
+       │
+       ▼
+LocalObserverServer in-memory ring
+       │
+       ▼  gRPC Observe stream
+hubble agent gRPC unix socket
+       │
+       ▼
+hubble-relay (跨 node 聚合)
+       │
+       ▼  unified gRPC
+hubble CLI / Hubble UI
+```
+
+## 收穫檢查
+
+- 為什麼 hubble agent 重啟不會掉 packet 但會掉 event 視窗？
+- monitor agent 的 fan-out 跟 apiserver 的 watch fan-out 概念上像在哪、不像在哪？
+- ring buffer 滿了，cilium 怎麼讓你知道 (lost event)？
+- hubble-relay 為什麼是獨立 process 而不是 cilium-agent 內的一個 cell？
+
+## 原始碼參考
+
+- [bpf/lib/trace.h](https://github.com/cilium/cilium/blob/v1.19.3/bpf/lib/trace.h) — `send_trace_notify` macro
+- [pkg/monitor/agent/agent.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/monitor/agent/agent.go) — perf reader + consumer fan-out
+- [pkg/hubble/cell/hubbleintegration.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/hubble/cell/hubbleintegration.go) — Hubble launch
+- [pkg/hubble/observer/](https://github.com/cilium/cilium/tree/v1.19.3/pkg/hubble/observer) — gRPC server
+- [pkg/hubble/parser/](https://github.com/cilium/cilium/tree/v1.19.3/pkg/hubble/parser) — raw → Flow
+- [hubble-relay/](https://github.com/cilium/cilium/tree/v1.19.3/hubble-relay) — relay daemon

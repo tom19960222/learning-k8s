@@ -159,6 +159,55 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'cilium': {
+    id: 'cilium',
+    displayName: 'Cilium',
+    shortName: 'Cilium',
+    description: 'eBPF-based CNI 與 service mesh：把 networking、observability、policy 全部 push 進 kernel datapath',
+    githubUrl: 'https://github.com/cilium/cilium',
+    submodulePath: path.join(REPO_ROOT, 'cilium'),
+    color: 'teal',
+    accentClass: 'border-teal-500 text-teal-400',
+    features: ['architecture', 'agent-and-datapath', 'identity-and-policy', 'hubble-and-observability'],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '控制平面 + datapath', icon: '⚙️', slugs: ['agent-and-datapath'] },
+      { label: 'Policy 模型', icon: '🛡️', slugs: ['identity-and-policy'] },
+      { label: '觀測性', icon: '🔭', slugs: ['hubble-and-observability'] },
+    ],
+    usecases: [],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: 'iptables 早就撐不住現代 cluster 的 service / policy 數量，但 eBPF 又像黑魔法。Cilium 把 datapath、policy、observability 全用 eBPF 實作 — 這 4 頁從原始碼層拆開：cilium-agent 怎麼把 Pod 變成 endpoint、SecurityIdentity 怎麼取代 IP、Hubble 為什麼觀測不影響 forwarding。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: '上次 cluster 裡 iptables 規則破萬，conntrack 開始爆掉。聽說 cilium 用 eBPF 取代整套 — 但 BPF 對你還是黑盒。今天決定從 cilium-agent 的 main 函式開始追到 kernel BPF program，把 cilium 拆透。',
+      scenes: [
+        { step: 1, icon: '🏗️', actor: '你', action: '讀 architecture：先搞清楚誰是誰', detail: 'cilium-agent (per-node) / cilium-operator (cluster-wide) / hubble-relay (aggregator) 各自的職責邊界，以及 Hive cell DI 為什麼是 cilium 的核心 pattern。' },
+        { step: 2, icon: '⚙️', actor: '你', action: '讀 agent-and-datapath：BPF 從哪來', detail: 'endpoint regeneration loop、clang 動態 compile bpf_lxc.c、template cache 共用 .o、tc qdisc attach — 從 Go 那層追到 .c 那層。' },
+        { step: 3, icon: '🛡️', actor: '你', action: '讀 identity-and-policy：label 怎麼變 policy decision', detail: 'SecurityIdentity 是 label set 的雜湊；PolicyMap 是 per-endpoint BPF hash map，bpf_lxc.c 直接 lookup。L7 / FQDN policy 透過 proxy_port redirect 到 user-space proxy。' },
+        { step: 4, icon: '🔭', actor: '你', action: '讀 hubble-and-observability：trace event 從哪冒出來', detail: 'datapath send_trace_notify 寫 perf event ring → monitor agent 讀出來 fan-out → Hubble parse 成 Flow → gRPC server。觀測完全旁路，不在 fast path。' },
+      ],
+      outcome: '從此 cilium-agent 不是黑盒。你可以指出某個 packet drop 是 PolicyMap 拒的還是 routing 沒到，知道為什麼換 IP 不會破壞 policy，也理解 Hubble 為何能不影響性能地觀測每個 flow。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '先建立全貌：3 個 process + Hive cell DI' },
+        { slug: 'hubble-and-observability', note: '從 hubble observe 反推 datapath，最容易動手' },
+        { slug: 'identity-and-policy', note: '理解 cilium 的 policy model 跟 NetworkPolicy 差在哪' },
+      ],
+      intermediate: [
+        { slug: 'agent-and-datapath', note: 'endpoint regeneration + BPF 動態 compile' },
+        { slug: 'identity-and-policy', note: '深入 PolicyMap 與 L7 proxy redirect' },
+        { slug: 'hubble-and-observability', note: '從 perf event ring 到 Flow 的 parser pipeline' },
+      ],
+      advanced: [
+        { slug: 'agent-and-datapath', note: '研究 bpf_lxc.c / bpf_host.c 與 template cache 的互動' },
+        { slug: 'identity-and-policy', note: 'FQDN policy + DNS proxy 與 ipcache 的 race condition' },
+        { slug: 'architecture', note: 'Hive cell graph 與 shutdown order，以及 KPR / Cluster Mesh 第二波路徑' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)

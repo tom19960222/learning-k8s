@@ -1,0 +1,197 @@
+---
+layout: doc
+title: Cilium — Agent 與 BPF Datapath
+description: 新 Pod 變成 endpoint 後，cilium-agent 怎麼透過 endpoint regeneration loop 把 BPF programs 編譯加載到 kernel。clang 動態 compile、template cache、tc qdisc attach 全程拆解。
+---
+
+## 場景
+
+新 Pod 落到 worker node 上，半秒後就能通訊。中間 cilium-agent 跑了一輪 endpoint regeneration、可能編了一份 BPF object (或從 cache 拿)、把它 attach 到 veth 的 tc qdisc 上。為什麼是「動態 compile」而不是「載入預先 build 好的 .o」？
+
+## CNI ADD：endpoint 怎麼誕生
+
+Pod 起動時 containerd 走 CNI 介面呼 `/opt/cni/bin/cilium-cni`，後者透過 unix socket 對 cilium-agent 發請求：
+
+```
+containerd ──CNI ADD──> cilium-cni binary
+                              │  unix socket
+                              ▼
+                       cilium-agent
+                              │
+                              ├─ allocate IP (operator 發配的 IPAM pool)
+                              ├─ 建 Endpoint object
+                              └─ 啟動該 endpoint 的 sync goroutine
+```
+
+每個 endpoint 都有自己一條 sync goroutine 跑 reconciliation (跟 k8s controller 概念類似，但對的是 BPF state)。
+
+## Endpoint regeneration loop
+
+`Regenerate()` 是入口。當 endpoint 的 desired state 變動 (label 改、policy 變、新建立) 時呼叫：
+
+```go
+// File: cilium/pkg/endpoint/policy.go (line 759)
+func (e *Endpoint) Regenerate(regenMetadata *regeneration.ExternalRegenerationMetadata) <-chan bool {
+    // ...
+    // 排隊到 endpoint 自己的 regen queue
+    // worker goroutine 真正執行 regenerateBPF
+}
+```
+
+regenerate 的步驟（簡化）：
+
+1. 從 policy repository 算這個 endpoint 對所有 identity 的 ingress / egress 允許矩陣
+2. 把矩陣寫進 endpoint 自己的 PolicyMap (BPF hash map)
+3. 把 endpoint 的 ID / identity / options 寫進 BPF header file (`ep_config.h` 等)
+4. 算 `datapathHash`，去 `objectCache` 找 template object
+5. cache miss → invoke clang 編 `bpf/bpf_lxc.c` → 寫進 cache
+6. cache hit / 編好 → 把 .o load 進 kernel，attach 到 veth 的 tc qdisc
+
+整段可重入：任何 step 失敗都會被 retry，最終達到 desired state。
+
+## BPF datapath 為什麼要動態 compile
+
+如果 Pod A 跟 Pod B 跑同一個 cilium-agent，它們的 BPF program **可能** 是同一份 .o，**也可能** 不同——取決於它們 endpoint 的 config 有沒有差異 (例如 tunnel mode、proxy port、masquerade rule)。cilium 用一張 hash 表決定能不能共用：
+
+```go
+// File: cilium/pkg/datapath/loader/cache.go (line 27)
+type objectCache struct {
+    // ...
+    workingDirectory string
+    objects map[string]*cachedSpec  // hash → 已編好的 spec
+}
+```
+
+`fetchOrCompile` 是 endpoint regen 用來「拿到一份能 load 的 spec」的入口：
+
+```go
+// File: cilium/pkg/datapath/loader/cache.go (line 174)
+func (o *objectCache) fetchOrCompile(
+    ctx context.Context,
+    nodeCfg *datapath.LocalNodeConfiguration,
+    cfg datapath.EndpointConfiguration,
+    dir *directoryInfo,
+    stats *metrics.SpanStat,
+) (spec *ebpf.CollectionSpec, hash string, err error) {
+    // 1. 算 datapathHash
+    // 2. cache hit → return
+    // 3. miss → call build() → invoke clang
+}
+```
+
+`build` 內部產 header file 後呼 `compileWithOptions` invoke clang：
+
+```go
+// File: cilium/pkg/datapath/loader/compile.go (line 254)
+func compileDatapath(ctx context.Context, logger *slog.Logger, dirs *directoryInfo, isHost bool) error {
+    // 整合 endpoint header + bpf_lxc.c → 編 .o
+}
+
+// File: cilium/pkg/datapath/loader/compile.go (line 310)
+func compileWithOptions(ctx context.Context, logger *slog.Logger, src string, out string, opts []string) error {
+    // exec clang -O2 -target bpf -emit-llvm -c <src> -o <out.bc>
+    // exec llc -march=bpf -mcpu=v3 -filetype=obj <out.bc> -o <out.o>
+}
+```
+
+實務上 cluster 有 N 個 endpoint，但 template 數量遠小於 N (因為大部分 endpoint config 相同)。所以 100 個 Pod 可能只觸發幾次 clang 編譯。
+
+## eBPF programs 的種類
+
+不是只有「Pod 對 Pod」一個 BPF program。cilium 對 datapath 不同 hook 點各有一份：
+
+| 檔案 | 掛在哪 | 工作 |
+|---|---|---|
+| `bpf/bpf_lxc.c` | 每個 endpoint 的 veth (tc clsact ingress/egress) | per-Pod policy enforcement、identity 標記、轉發決策 |
+| `bpf/bpf_host.c` | host stack 的 tc/tcx ingress/egress | host network namespace 的 policy 與 routing、KPR service handling |
+| `bpf/bpf_xdp.c` | 物理網卡 XDP hook | early drop、DDoS mitigation、L4 LB 加速 |
+| `bpf/bpf_overlay.c` | overlay device (vxlan / geneve) | tunnel encap/decap |
+| `bpf/bpf_sock.c` | cgroup connect4/connect6 | socket-based LB (KPR 的 service DNAT 取代 iptables) |
+
+每份 .c 在 build 時還會 patch 上 endpoint header (`ep_config.h` 之類) 與 node 的 config，所以「同一份 .c」對不同 endpoint 出來的 .o 內容不同。
+
+bpf_lxc.c 的 entry section 看起來像：
+
+```c
+/* File: bpf/bpf_lxc.c (簡化片段) */
+__section_entry
+int cil_from_container(struct __ctx_buff *ctx)
+{
+    /* 從 Pod 內出來的 packet — egress */
+    /* 1. parse 5-tuple
+     * 2. lookup PolicyMap (egress, dst identity)
+     * 3. allow / drop / proxy redirect
+     * 4. tail-call 到下一個 program 做轉發
+     */
+}
+
+__section_entry
+int cil_to_container(struct __ctx_buff *ctx)
+{
+    /* 進 Pod 的 packet — ingress */
+    /* 對稱版本 */
+}
+```
+
+## tc qdisc attach
+
+編好的 .o 用 netlink attach 到 endpoint veth 的 tc clsact qdisc：
+
+```
+veth0 (host side of Pod's veth pair)
+  ├─ tc clsact qdisc
+  │   ├─ ingress  ←── cil_to_container (進 Pod)
+  │   └─ egress   ←── cil_from_container (出 Pod)
+```
+
+attach 操作不在 endpoint regen 內 inline，是透過 datapath loader 的 reload pipeline。完成後對應 endpoint 的 packet 就會走 BPF。
+
+## 整段流程
+
+```
+Pod 起動 → containerd CNI ADD
+         │
+         ▼
+cilium-cni binary ─unix socket─> cilium-agent
+                                       │
+                                       ▼
+                            allocate IP, build Endpoint
+                                       │
+                                       ▼
+                            啟動 endpoint sync goroutine
+                                       │
+                                       ▼
+                       Endpoint.Regenerate (policy.go:759)
+                                       │
+                                       ├─ policy compute → PolicyMap
+                                       │
+                                       ├─ 產 BPF header
+                                       │
+                                       ├─ objectCache.fetchOrCompile
+                                       │   ├─ hit  → reuse .o
+                                       │   └─ miss → compileDatapath
+                                       │            └─ clang → .o
+                                       │
+                                       ├─ ebpf.CollectionSpec.Load
+                                       │
+                                       └─ tc attach to veth qdisc
+                                       │
+                                       ▼
+                            Pod 可通訊；agent 持續 reconcile
+```
+
+## 收穫檢查
+
+- 為什麼 cilium 不直接 ship 一份 prebuilt `bpf_lxc.o`？
+- template cache 為什麼能讓多 endpoint 共用 .o？config 相同時誰決定 hash 一樣？
+- bpf_lxc 跟 bpf_host 各自掛在哪個 hook 點，為什麼分開？
+- endpoint regen 失敗 (例如 clang 不在 PATH) 會發生什麼？
+
+## 原始碼參考
+
+- [pkg/endpoint/policy.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/endpoint/policy.go) — `Endpoint.Regenerate`
+- [pkg/datapath/loader/compile.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/datapath/loader/compile.go) — clang invoke
+- [pkg/datapath/loader/cache.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/datapath/loader/cache.go) — template cache
+- [bpf/bpf_lxc.c](https://github.com/cilium/cilium/blob/v1.19.3/bpf/bpf_lxc.c) — per-pod datapath
+- [bpf/bpf_host.c](https://github.com/cilium/cilium/blob/v1.19.3/bpf/bpf_host.c) — host datapath
+- [bpf/bpf_xdp.c](https://github.com/cilium/cilium/blob/v1.19.3/bpf/bpf_xdp.c) — XDP

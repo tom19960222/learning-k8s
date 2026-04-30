@@ -1,0 +1,155 @@
+---
+layout: doc
+title: Cilium — Identity 與 Policy
+description: SecurityIdentity 為什麼能取代 IP 做 policy 主體；PolicyMap 是怎樣的 BPF map；L7 / FQDN policy 怎麼透過 proxy redirect 達成。
+---
+
+## 場景
+
+你寫 NetworkPolicy 用 `podSelector` 指定來源 Pod。Pod 換了 IP（比如 restart），policy 還是對的。Cilium 不靠 IP 做 policy decision——那靠什麼？再追一層：identity 怎麼變成 kernel 內 forwarding 時的 allow / deny？
+
+## SecurityIdentity = label set 的雜湊
+
+cilium 的 policy 主體是 **SecurityIdentity**，不是 IP，也不是 Pod name。Identity 由 Pod 的 label set 算出來：
+
+```go
+// File: cilium/pkg/identity/identity.go (line 27)
+type Identity struct {
+    ID         NumericIdentity   // 16-bit, 全 cluster 唯一
+    Labels     labels.Labels
+    LabelArray labels.LabelArray
+    // ...
+}
+```
+
+兩個 Pod 同 label → 同 identity；同 namespace 兩個 replica → 同 identity；換 IP → identity 不變；改 label → identity 換新的。所以 policy 寫「allow from `app=frontend`」實際是寫「allow from identity X」，不在乎 IP。
+
+reserved identities（不從 label 算）：
+
+```go
+// File: cilium/pkg/identity/reserved.go (節錄)
+// world (= 0)、host (= 1)、unmanaged、init、health、remote-node ...
+```
+
+`world` 是「cluster 外」、`host` 是「node 自己的 host stack」、`unmanaged` 是「不是 cilium 管的 endpoint」。policy 可以對這幾個 reserved identity 寫規則。
+
+## Identity allocator
+
+identity → numeric ID 對應是 cluster-wide 唯一的，所以需要協調者。cilium 用 kvstore (etcd 或 k8s CRD 模式) 做 allocation：
+
+```go
+// File: cilium/pkg/identity/cache/cache.go
+// CachingIdentityAllocator 起一個 cache + 一個 backend (kvstore)
+// 第一個看到某 label set 的 agent 會去 backend 申請 numeric ID
+// 其他 agent watch 到後 cache 即可
+```
+
+每個 agent 都會把自己看過的 (identity, IP) 對應寫進 ipcache (一個 BPF map + Go cache)，這樣 forwarding 時可以從 IP 反查 identity。
+
+## Policy compute：CRD → 每個 endpoint 的允許矩陣
+
+agent 監聽幾種 policy 來源：
+
+- standard `NetworkPolicy` (k8s 內建)
+- `CiliumNetworkPolicy` / `CiliumClusterwideNetworkPolicy` (CRD)
+- `CiliumEndpointSlice` (CRD，跨 node 的 endpoint metadata)
+
+對自己 node 上每個 endpoint，agent 重算「我這個 endpoint 對其他 identity 各自允許哪些 (port, proto, direction, L7 redirect)」。結果由 endpoint regeneration 寫進 endpoint 的 PolicyMap。
+
+這是 per-node 計算——operator 不算 policy；它只做 cluster-wide CRD 維護工作。
+
+## PolicyMap：per-endpoint 的 BPF hash map
+
+PolicyMap 不是 cluster-wide 一個大表，是**每個 endpoint 自己一份**。bpf_lxc.c 處理 packet 時 lookup 的是 endpoint context 自己的 map。
+
+key 與 value 結構：
+
+```go
+// File: cilium/pkg/maps/policymap/policymap.go (line 107)
+type PolicyKey struct {
+    Identity         uint32
+    DestPortNetwork  uint16
+    NextHdr          uint8   // protocol (TCP/UDP/...)
+    TrafficDirection uint8   // ingress / egress
+    PortPrefixLen    uint8   // for port ranges
+}
+
+// File: cilium/pkg/maps/policymap/policymap.go (line 155)
+type PolicyEntry struct {
+    Flags     policyEntryFlags  // deny? wildcard? ...
+    AuthType  uint8
+    ProxyPort uint16            // 非 0 → redirect 到 user-space proxy
+    // ...
+}
+```
+
+forwarding 時 bpf_lxc 算出 `(remote identity, port, proto, dir)` 去 lookup：
+
+- 找到 entry 且 deny → drop
+- 找到 entry 且 proxy_port = 0 → allow forward
+- 找到 entry 且 proxy_port ≠ 0 → redirect 到 proxy
+- 沒找到 → default policy decision (依 cluster 的 default mode)
+
+為什麼 per-endpoint 而不是 cluster-wide？同 cluster 內兩個 endpoint 對「來自 identity X 的 traffic」可能允許不同 ports；把它做成 cluster-wide 等於要 `(src endpoint, src identity)` 雙 key，map 大小爆炸。per-endpoint 還能讓 endpoint regen 只動自己的 map，不影響別人。
+
+## L7 policy：透過 proxy redirect 跳出 BPF
+
+BPF program 不解 HTTP / DNS。要做 L7 policy (例如「`GET /api/*` allow but `POST /admin` deny」)，cilium 把 entry 的 `proxy_port` 設成 user-space proxy 的 port：
+
+```
+Pod → bpf_lxc.c lookup PolicyMap
+            │
+            ▼ (proxy_port != 0)
+       redirect 進 host stack 的 proxy_port
+            │
+            ▼
+  cilium-agent 內 envoy / 內建 proxy
+            │
+            ├─ 解析 L7 (HTTP method/path/headers)
+            ├─ 比對 L7 rule
+            ├─ allow → 把 packet 重新送進 BPF datapath 繼續走
+            └─ deny → 直接丟回 deny response
+```
+
+DNS proxy 是其中一種特例：所有 Pod 的 DNS query 都被 redirect 到 cilium DNS proxy；它解析後把回應的 IP 寫進 ipcache 並關聯 identity。這支援了下面的 FQDN policy。
+
+## FQDN policy：domain 名 → identity
+
+CNP 可以寫：
+
+```yaml
+egress:
+  - toFQDNs:
+      - matchName: "github.com"
+```
+
+cilium 不能在 BPF 內做 DNS 解析。流程是：
+
+1. Pod 對 DNS server 發 query → bpf_lxc 因 L7 DNS rule 把它 redirect 到 cilium DNS proxy
+2. proxy 把 query 轉發給真的 DNS server，拿到 response
+3. proxy 把 response 內的 IP 加進 ipcache，關聯到一個臨時 identity (或 reserved fqdn identity)
+4. policy 對「toFQDNs github.com」實際是寫「allow to identity-of-fqdn-rule」
+5. Pod 之後對那個 IP 發 traffic → bpf_lxc lookup ipcache → 拿到 identity → PolicyMap allow
+
+```go
+// File: cilium/pkg/fqdn/  (整個 package 是 FQDN 邏輯)
+// 包含 DNS proxy、ipcache 注入、TTL expire 等
+```
+
+race condition 注意：DNS response 寫進 ipcache 跟 Pod 發 traffic 之間有時序差；cilium 在 proxy 釋放 response packet 給 Pod 之前先確保 ipcache update 完成 (用 future / channel 同步)。這是 FQDN policy 進階故事。
+
+## 收穫檢查
+
+- 為什麼 cilium 換 IP 不會破壞 policy？
+- 改 label 會不會觸發 endpoint regen？(提示：identity 換了)
+- PolicyMap 為什麼是 per-endpoint 而非 cluster-wide？
+- L7 規則怎麼從 BPF (kernel) 跳出去到 user-space？
+- FQDN policy 為什麼依賴 DNS proxy 而不是直接攔截 packet 解析？
+
+## 原始碼參考
+
+- [pkg/identity/identity.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/identity/identity.go) — `Identity`
+- [pkg/identity/reserved.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/identity/reserved.go) — reserved identities
+- [pkg/identity/cache/cache.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/identity/cache/cache.go) — identity allocator
+- [pkg/maps/policymap/policymap.go](https://github.com/cilium/cilium/blob/v1.19.3/pkg/maps/policymap/policymap.go) — PolicyKey / PolicyEntry
+- [pkg/fqdn/](https://github.com/cilium/cilium/tree/v1.19.3/pkg/fqdn) — FQDN proxy

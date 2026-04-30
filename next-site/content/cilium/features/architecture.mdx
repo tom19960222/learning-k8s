@@ -1,0 +1,161 @@
+---
+layout: doc
+title: Cilium — 控制平面與整體架構
+description: cilium-agent / cilium-operator / hubble-relay 三個 process 的職責邊界，Hive cell DI 為什麼是 cilium 的核心 pattern，CNI plugin 怎麼跟 agent 對話。
+---
+
+## 場景
+
+你 ssh 進 cilium 跑著的 cluster，跑 `kubectl -n kube-system get pods`，看到三組東西：cilium-agent (DaemonSet)、cilium-operator (Deployment)、hubble-relay (Deployment)。三個 process 各做什麼？為什麼 cilium-agent 啟動 log 全是 `starting cell`、`initializing cell`？為什麼套 CNI 不是把一個 binary 丟進 `/opt/cni/bin/` 就好？
+
+## 整體 process map
+
+```
+┌─────────────── control plane ────────────────┐
+│                                               │
+│  cilium-operator (Deployment, HA leader)      │
+│   └─ IPAM、CRD GC、cluster-wide watch         │
+│                                               │
+│  hubble-relay (Deployment, optional)          │
+│   └─ aggregate N nodes 的 hubble agent gRPC   │
+└───────────────────────────────────────────────┘
+                       │
+                       │ all talk via apiserver only
+                       ▼
+┌─────────────── worker node × N ──────────────┐
+│                                               │
+│  cilium-agent (DaemonSet, per node)           │
+│   ├─ endpoint manager                         │
+│   ├─ BPF compile/load (clang + libbpf)        │
+│   ├─ policy compute → PolicyMap (BPF)         │
+│   ├─ monitor agent (perf event ring)          │
+│   └─ Hubble parser + gRPC server              │
+│                                               │
+│  /opt/cni/bin/cilium-cni (binary)             │
+│   └─ unix socket ──> cilium-agent             │
+└───────────────────────────────────────────────┘
+```
+
+## 三個 process 的職責邊界
+
+**cilium-agent**：DaemonSet，每個 node 一個。是真正動腦的人——管 endpoint、compile/load BPF、跑 policy compute、被 CNI plugin 呼叫。多數 cilium 抽象 (endpoint、identity、policy、ipcache) 都在 agent process 裡。進入點：
+
+```go
+// File: cilium/cmd/daemon/main.go (透過 daemon/cmd cobra)
+// 真實邏輯在 daemon/cmd/daemon_main.go 與 daemon/cmd/cells.go
+```
+
+**cilium-operator**：Deployment + leader election，1 instance 在動 (HA 部署 3 個只有 1 leader)。負責 cluster-wide 工作：
+
+- IP 配發 (IPAM modes: cluster-pool / kubernetes / cloud-provider)
+- CiliumIdentity / CiliumEndpoint 等 CRD 的 garbage collection
+- 跨 node 的 metadata 同步
+
+```go
+// File: operator/cmd/root.go
+```
+
+**hubble-relay**：Deployment，optional。把 N node 上的 hubble agent gRPC stream aggregate 起來，給 hubble CLI / Hubble UI 用。是「join all nodes' observability」的 fan-in。
+
+## Hive cell DI：為什麼 cilium 不直接寫 main()
+
+cilium-agent 啟動 log 滿滿都是 `cell:`、`module:`，不像一般 Go server。原因：cilium 用自己抽出來的 [Hive](https://github.com/cilium/hive) 做 dependency injection。每個 package 自己寫一個 `cell.go` 宣告：
+
+- 我提供什麼物件 (`Provide`)
+- 我依存哪些物件 (`Invoke` / 函式參數)
+- 啟動 / shutdown hook
+
+framework 在啟動時跑拓樸排序，按依存順序起 cell；shutdown 時反向。這解的是「N 個 component 互相依存」的初始化順序問題——不寫 Hive 的話，會在 main() 裡寫一坨 if-else 決定哪個先 init。
+
+agent 的 cell graph 入口：
+
+```go
+// File: daemon/cmd/cells.go (前段 import 加 Module 宣告)
+package cmd
+
+var Agent = cell.Module(
+    "agent",
+    "Cilium Agent",
+    // ...
+    endpoint.Cell,
+    policy.Cell,
+    hubble.Cell,
+    // ...
+)
+```
+
+這份 cell 列表巨大 (上百個)，但每個 cell 自己只看自己的 dependency；framework 把整體拼起來。
+
+## CNI plugin 的位置：為什麼是兩個 binary
+
+`/opt/cni/bin/cilium-cni` 是一支 thin binary，由 containerd 在 Pod 起動時呼叫 (CNI ADD)。它的工作只是「轉一手」：
+
+```
+containerd ──CNI ADD──> /opt/cni/bin/cilium-cni
+                              │
+                              │ unix socket
+                              ▼
+                       cilium-agent (DaemonSet Pod)
+                              │
+                              ├─ allocate IP
+                              ├─ create endpoint object
+                              ├─ trigger BPF compile/load
+                              └─ return IP/MAC to cilium-cni
+                              │
+cilium-cni 回給 containerd──┘
+```
+
+binary 拆兩段是因為 CNI plugin 是個短命 process (containerd 跑完即關)，但 cilium-agent 是長駐 daemon——把 endpoint state 留在 daemon 才合理。binary 跟 agent 約定的協定是 cilium 自己的 API spec，code 在：
+
+```go
+// File: plugins/cilium-cni/main.go
+package main
+```
+
+## kubectl apply CiliumNetworkPolicy 的整段流程
+
+```
+kubectl apply -f cnp.yaml
+        │
+        ▼  HTTPS POST
+   apiserver ──> etcd
+        │
+        ▼  watch event
+┌─ cilium-operator ─┐    ┌─ cilium-agent (per node) ─┐
+│ 監聽 CNP CRD       │    │ 監聽 CNP CRD                │
+│ 做 cluster-wide    │    │ 對自己 node 上每個 endpoint │
+│ validation/GC      │    │ 跑 policy compute           │
+└────────────────────┘    │ 重新算 PolicyMap content   │
+                          │ trigger endpoint regen     │
+                          │ 寫 BPF map                  │
+                          └────────────────────────────┘
+```
+
+每個 node 的 agent 各自算自己 node 上 endpoint 的 PolicyMap——不是 operator 算完丟下去。所以 policy 生效是 per-node 的。policy 細節留到 [identity-and-policy](/cilium/features/identity-and-policy)。
+
+## 跟 kube-proxy 的關係
+
+cilium 可以做 **KPR (kube-proxy replacement)**：用 BPF (`bpf_sock.c` 的 socket-based LB 與 `bpf_host.c` 的 service routing) 取代 iptables-based service routing。啟用後可以直接停掉 kube-proxy DaemonSet。
+
+KPR 的詳細路徑 (Service / EndpointSlice → BPF map → kernel hook) 不在這頁範圍內，第二波 SP-4b 再展開。
+
+## 收穫檢查
+
+- 為什麼 cilium-agent 是 DaemonSet 而不是 single Deployment？
+- Hive cell DI 換成手寫 main() 會出什麼問題？
+- CNI plugin 跟 cilium-agent 為什麼一定要是兩個 binary？
+- cilium-operator 跟 controller-manager 概念上像不像？
+
+## 原始碼進入點
+
+- [daemon/cmd/daemon_main.go](https://github.com/cilium/cilium/blob/v1.19.3/daemon/cmd/daemon_main.go) — agent main
+- [daemon/cmd/cells.go](https://github.com/cilium/cilium/blob/v1.19.3/daemon/cmd/cells.go) — Hive cell graph 入口
+- [operator/cmd/root.go](https://github.com/cilium/cilium/blob/v1.19.3/operator/cmd/root.go) — operator main
+- [plugins/cilium-cni/main.go](https://github.com/cilium/cilium/blob/v1.19.3/plugins/cilium-cni/main.go) — CNI binary
+- [Hive lib](https://github.com/cilium/hive) — DI framework
+
+## 接下來
+
+- [agent-and-datapath](/cilium/features/agent-and-datapath)：endpoint regeneration 與 BPF 動態 compile
+- [identity-and-policy](/cilium/features/identity-and-policy)：SecurityIdentity 與 PolicyMap
+- [hubble-and-observability](/cilium/features/hubble-and-observability)：trace event 怎麼從 datapath 跳到 hubble observe
