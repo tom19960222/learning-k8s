@@ -1,0 +1,89 @@
+---
+layout: doc
+title: Kubernetes — runtime 文章知識地圖
+description: 從 9 篇 Kubernetes 原理分析文章提取知識點，整理成本專案可延伸的學習地圖：介面化、OCI、namespace、CRI、containerd、CRI-O、安全 runtime 與 VM runtime。
+---
+
+## 場景
+
+這組文章不是單純教你「怎麼裝 Kubernetes」，而是在回答一個更底層的問題：Kubernetes 為什麼能同時接上不同 container runtime、CNI、CSI、Device Plugin，甚至把 VM workload 納入同一套調度模型？
+
+答案是：Kubernetes 把會快速變化、跟硬體或 OS 實作高度相關的部分抽成介面。核心控制平面只管理 API object、期望狀態與調度；真正把 Pod 變成可執行 workload 的細節，交給 kubelet 背後的 CRI runtime、OCI runtime、CNI、CSI 與其他 plugin。
+
+## 逐篇知識點
+
+| 文章 | 主題 | 提取出的知識點 | 放進本專案的分析角度 |
+|---|---|---|---|
+| Day1 — 淺談 Kubernetes 設計原理 | Kubernetes 介面化設計 | Kubernetes 不可能把 GPU、storage、network、runtime 全部綁死在核心 repo；CRI/CNI/CSI/Device Plugin 讓第三方各自 release、各自演進。 | [extension-interfaces](/kubernetes/features/extension-interfaces) 從「為什麼要抽介面」補上架構理由。 |
+| Day2 — Container 與 OCI | OCI runtime spec / image spec | Container 是概念，Docker 是其中一種產品；OCI 把 image 格式與 runtime 行為標準化，讓 image 與 runtime 可以互通。 | [oci-container-primitives](/kubernetes/features/oci-container-primitives) 補上 kubelet 之下的標準層。 |
+| Day3 — OCI 實作與 Docker stack | runc、libcontainer、containerd-shim | Docker CLI 不是 runtime；真正的路徑是 client -> dockerd -> containerd -> shim -> runc。shim 讓 container 可脫離 dockerd 存活。 | 同一頁用 process tree 方式拆出 Docker 與 containerd 的邊界。 |
+| Day4 — Namespace 隔離 | network namespace / mount namespace | Container 隔離不是魔法，是 Linux namespace 加 cgroup；network namespace 隔離 NIC、route、iptables，mount namespace 隔離掛載視圖。 | 同一頁補上「Pod sandbox / pause container 為何能持有 namespace」的前置概念。 |
+| Day5 — Kubernetes & CRI I | CRI gRPC API | Kubernetes 管 Pod，不直接綁 Docker；kubelet 透過 RuntimeService / ImageService 跟 runtime 溝通。 | [cri-runtime-stack](/kubernetes/features/cri-runtime-stack) 把 kubelet 到 runtime 的 API 邊界畫清楚。 |
+| Day6 — Kubernetes & CRI II | containerd runtime cluster | kubelet 可直接連 containerd 的 CRI endpoint；`crictl` 是看 runtime 真實狀態的工具；containerd namespace 隔離 `k8s.io` 與 `moby`。 | 同一頁加入現代版本的 containerd 路徑與觀察指令。 |
+| Day7 — CRI-O | Kubernetes-native runtime | CRI-O 從一開始就只服務 Kubernetes：接 CRI、拉 image、產生 OCI spec、呼叫 runc/Kata，並由 conmon 監控 container。 | 同一頁比較 containerd 與 CRI-O 的角色差異。 |
+| Day8 — Security Container | gVisor / Kata Containers | 同樣符合 OCI runtime，上層仍可用 Pod；gVisor 用 user-space kernel 攔截 syscall，Kata 用輕量 VM 隔離 host kernel。 | [runtime-alternatives](/kubernetes/features/runtime-alternatives) 補上安全性與效能取捨。 |
+| Day9 — Virtual Machine runtime | Virtlet / VM workload | CRI 的抽象也能接到 VM runtime；舊系統、NFV、Windows workload 都是 VM-in-Kubernetes 的動機。 | 同一頁把 Virtlet 的歷史路徑連到本專案既有 [KubeVirt](/kubevirt/features/architecture) 分析。 |
+
+## 這 9 篇的共同主軸
+
+**第一層：Kubernetes core 不直接處理所有底層差異。**  
+API server、scheduler、controller-manager 管的是 object 與 reconcile，不應該知道每一種 runtime、CNI 或儲存陣列的細節。
+
+**第二層：kubelet 是 node 端整合點。**  
+kubelet 收到 Pod 後，透過 CRI 建 Pod sandbox / container，runtime 再透過 OCI runtime、CNI plugin、filesystem snapshotter 等機制完成真正執行。
+
+**第三層：OCI 是 runtime 共同語言。**  
+containerd、CRI-O、Docker stack 最後都會把 container 轉成 OCI runtime bundle，再交給 runc、crun、Kata、gVisor 這類 OCI runtime 執行。
+
+**第四層：runtime 可以因需求替換。**  
+一般 workload 用 runc 類 runtime 取得密度與效能；高隔離需求可用 gVisor 或 Kata；VM workload 則由 KubeVirt 這類 CRD/operator 方案接手，而不是只靠舊式 CRI proxy。
+
+## 本專案採用的分析方式
+
+這組文章的角色是提供「問題意識與知識地圖」，不是最終答案。本專案會把它們轉成 source-first 分析：
+
+1. 先從使用者看到的 Pod / RuntimeClass / image pull 症狀切入。
+2. 再進 Kubernetes 原始碼找真正的邊界：API type、kubelet manager、CRI client、generated CRI gRPC stub。
+3. 最後才回到 runtime 實作，例如 containerd / CRI-O / Kata / gVisor 的差異。
+
+新增頁面的 source anchor 如下：
+
+| 主題 | 先讀哪裡 | 為什麼 |
+|---|---|---|
+| CRI API | `kubernetes/staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto` | 這是 kubelet 與 runtime 的正式 gRPC contract。 |
+| Pod -> sandbox | `kubernetes/pkg/kubelet/kuberuntime/kuberuntime_manager.go` 的 `SyncPod()` | 這是 kubelet 把 desired Pod 轉成 sandbox/container action 的主入口。 |
+| RuntimeClass -> runtime handler | `kubernetes/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go` 的 `createPodSandbox()` | 這裡會 lookup `runtimeClassName`，再把 handler 傳進 `RunPodSandbox()`。 |
+| Container lifecycle | `kubernetes/pkg/kubelet/kuberuntime/kuberuntime_container.go` 的 `startContainer()` | 這裡明確分成 pull image、create container、start container。 |
+| RuntimeClass API | `kubernetes/staging/src/k8s.io/api/node/v1/types.go` 的 `RuntimeClass` | 這裡定義 `handler`、`overhead`、`scheduling`，不是文章想像出來的概念。 |
+
+## 用現代 Kubernetes 修正舊文章脈絡
+
+這組文章寫於 2019 年，核心概念仍然有效，但有幾個版本差異要更新：
+
+- `dockershim` 已在 Kubernetes 1.24 從 kubelet 移除；現在 kubelet 需要 CRI-compatible runtime，例如 containerd 或 CRI-O。
+- Kubernetes 1.26 之後要求 runtime 支援 CRI `v1` API；不再把舊版 CRI negotiation 當作可長期依賴的路徑。
+- `RuntimeClass` 已是 stable；選 gVisor、Kata 等 alternate runtime 時，現代做法通常是在 node runtime 設定 handler，再讓 Pod 指定 `runtimeClassName`。
+- VM workload 的主流學習路徑應該轉向 KubeVirt：VM 是 CRD 與 virt-launcher Pod，不只是把 kubelet CRI request proxy 到 VM backend。
+
+## 接下來怎麼讀
+
+1. 先讀 [extension-interfaces](/kubernetes/features/extension-interfaces)，理解 Kubernetes 為什麼大量依賴介面。
+2. 再讀 [oci-container-primitives](/kubernetes/features/oci-container-primitives)，把 container 的 Linux 與 OCI 基礎補齊。
+3. 接著讀 [cri-runtime-stack](/kubernetes/features/cri-runtime-stack)，理解 kubelet 怎麼真的呼叫 runtime。
+4. 最後讀 [runtime-alternatives](/kubernetes/features/runtime-alternatives)，把安全 runtime 與 VM runtime 放進同一張決策圖。
+
+## 參考資料
+
+- [Day1 — 淺談 Kubernetes 設計原理](https://ithelp.ithome.com.tw/articles/10215384)
+- [Day2 — 淺談 Container 實現原理，以 Docker 為例 I](https://ithelp.ithome.com.tw/articles/10216215)
+- [Day3 — 淺談 Container 實現原理，探討 OCI 實作](https://ithelp.ithome.com.tw/articles/10216880)
+- [Day4 — 淺談 Container 實現原理，初探 Namespace 隔離](https://ithelp.ithome.com.tw/articles/10217583)
+- [Day5 — Kubernetes & CRI I](https://ithelp.ithome.com.tw/articles/10218127)
+- [Day6 — Kubernetes & CRI II](https://ithelp.ithome.com.tw/articles/10218570)
+- [Day7 — Container Runtime - CRI-O](https://ithelp.ithome.com.tw/articles/10219102)
+- [Day8 — Container Runtime - Security Container](https://ithelp.ithome.com.tw/articles/10219590)
+- [Day9 — Container Runtime - Virtual Machine](https://ithelp.ithome.com.tw/articles/10220046)
+- [Kubernetes Container Runtime Interface](https://kubernetes.io/docs/concepts/containers/cri/)
+- [Kubernetes Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- [Kubernetes RuntimeClass](https://kubernetes.io/docs/concepts/containers/runtime-class/)
+- [Open Container Initiative overview](https://opencontainers.org/about/overview)

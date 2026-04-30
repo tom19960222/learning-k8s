@@ -58,5 +58,53 @@
     ],
     "answer": 0,
     "explanation": "Pod 是「N 個 container 共用 namespace」。如果 application container 自己當 namespace 持有者，container 重啟時 namespace 與 IP 也消失。pause container 永遠不死 (除非 Pod 整個被砍)，由它持有 namespace；application container 加入它的 namespace。這也是為什麼你 ssh 到 node 跑 crictl ps 會看到比預期多很多 container — 每個 Pod 多一個 pause。"
+  },
+  {
+    "id": 6,
+    "question": "Kubernetes 把 runtime、network、storage 抽成 CRI/CNI/CSI 的主要原因是什麼？",
+    "options": [
+      "讓 Kubernetes core 專注 API 與期望狀態，底層實作由第三方按介面獨立演進",
+      "讓所有 plugin 都必須跟 Kubernetes 同一個 release 週期",
+      "讓 kube-apiserver 直接管理每張網卡與每顆磁碟",
+      "避免 kubelet 參與 node 上的任何整合工作"
+    ],
+    "answer": 0,
+    "explanation": "CRI/CNI/CSI/Device Plugin 的價值是把高變動、強硬體相依的能力外部化。Kubernetes core 維持 API、reconcile 與調度語義，第三方元件只要遵守介面即可獨立 release。"
+  },
+  {
+    "id": 7,
+    "question": "CRI 與 OCI 的關係哪個說法正確？",
+    "options": [
+      "kubelet 對 containerd/CRI-O 講 CRI；containerd/CRI-O 往下產生 OCI runtime config 並呼叫 runc/crun/Kata 等 runtime",
+      "CRI 是 image 格式，OCI 是 kubelet gRPC API",
+      "CRI 和 OCI 是同一層的競爭標準，只能選一個",
+      "OCI 只適用 Docker，不適用 Kubernetes"
+    ],
+    "answer": 0,
+    "explanation": "CRI 是 kubelet 與 container runtime 的 gRPC contract。OCI 是更底層的 image/runtime 標準；CRI runtime 通常會把 container 轉成 OCI bundle，再交給 OCI runtime 執行。"
+  },
+  {
+    "id": 8,
+    "question": "Kubernetes 1.24 之後，為什麼不能再假設 kubelet 直接使用 Docker Engine？",
+    "options": [
+      "dockershim 已從 Kubernetes 移除；kubelet 需要 CRI-compatible runtime，例如 containerd 或 CRI-O",
+      "Docker image 格式已被 Kubernetes 禁止",
+      "kubelet 改成只能直接呼叫 runc",
+      "Pod 不再需要 container runtime"
+    ],
+    "answer": 0,
+    "explanation": "Kubernetes 1.24 移除了 kubelet 內建 dockershim。現代 cluster 應使用 CRI-compatible runtime；若要搭 Docker Engine，需額外 CRI adapter，而不是 kubelet 直接講 Docker API。"
+  },
+  {
+    "id": 9,
+    "question": "想讓部分 Pod 用 Kata 或 gVisor 這類 alternate runtime，現代 Kubernetes 應優先使用哪個 API？",
+    "options": [
+      "RuntimeClass，讓 Pod 透過 runtimeClassName 選擇 runtime handler",
+      "Service，讓 kube-proxy 選 runtime",
+      "IngressClass，讓 Ingress controller 選 runtime",
+      "ConfigMap，讓 apiserver 動態替換 kubelet binary"
+    ],
+    "answer": 0,
+    "explanation": "RuntimeClass 是穩定 API，用來選擇 container runtime configuration。cluster admin 在 node runtime 設好 handler 後，Pod 可用 spec.runtimeClassName 指定。"
   }
 ]

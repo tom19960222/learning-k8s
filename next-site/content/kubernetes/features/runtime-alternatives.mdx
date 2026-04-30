@@ -1,0 +1,189 @@
+---
+layout: doc
+title: Kubernetes — 安全 runtime 與 VM workload
+description: 用 gVisor、Kata Containers、Virtlet 與 KubeVirt 理解 runtime 替換的三種方向：一般 container、高隔離 container、真正 VM workload。
+---
+
+## 場景
+
+不是所有 workload 都適合同一種 runtime。一般 web service 追求密度與啟動速度；不可信多租戶 workload 追求更強隔離；NFV、Windows、舊式 appliance 可能根本不能改成 container image。
+
+Kubernetes 的 runtime 介面讓這些選擇可以放在同一個 cluster 思考，但每種方案的抽象層不同。
+
+## 三種 runtime 方向
+
+| 方向 | 代表方案 | 使用者提供 | 底層實作 | 適合情境 |
+|---|---|---|---|---|
+| 一般 container | runc / crun | container image | Linux namespace + cgroup，共用 host kernel | 高密度、一般微服務 |
+| 高隔離 container | gVisor / Kata Containers | container image | user-space kernel 或輕量 VM，但仍呈現 container runtime 行為 | 多租戶、不可信程式、隔離優先 |
+| 真正 VM workload | KubeVirt | VM disk image + VMI/VM CRD | libvirt / QEMU / KVM，被包成 Kubernetes object | Legacy VM、Windows、NFV、需要完整 guest OS |
+
+Day8-Day9 的重要貢獻是把這三種方向分清楚：Kata 是「看起來像 container、底下用 VM 隔離」；Virtlet/KubeVirt 則是「真的要管理 VM workload」。
+
+## gVisor：user-space kernel
+
+gVisor 的 OCI runtime 是 `runsc`。它在 application 與 host kernel 之間放一層 user-space kernel，攔截大部分 Linux syscall surface。
+
+```
+application process
+      │ syscall
+      ▼
+runsc / user-space kernel
+      │ reduced host syscall surface
+      ▼
+host kernel
+```
+
+優點是隔離面比傳統 runc 更強，不需要為每個 Pod 啟完整 VM。代價是 syscall-heavy workload 可能付出較高 overhead，且 Linux syscall 相容面不是完整 host kernel。
+
+## Kata Containers：lightweight VM
+
+Kata 也是 OCI runtime，但它用輕量 VM 做隔離：
+
+```
+containerd / CRI-O
+      │ OCI runtime handler
+      ▼
+kata-runtime
+      │
+      ▼
+lightweight VM
+  └─ guest kernel + kata-agent + container process
+```
+
+對 Kubernetes 來說，Pod 還是 Pod，image 還是 container image；但實際執行時每個 sandbox 有更接近 VM 的 kernel boundary。代價是啟動時間、資源密度與 node 硬體支援需求。
+
+## RuntimeClass：現代選 runtime 的入口
+
+現代 Kubernetes 不應該靠舊式 annotation 讓 CRI proxy 決定 runtime。常見做法是由 cluster admin 設定 runtime handler，建立 `RuntimeClass`：
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
+```
+
+Pod 使用時指定：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: isolated-workload
+spec:
+  runtimeClassName: kata
+  containers:
+  - name: app
+    image: nginx:1.27
+```
+
+如果 runtime handler 不存在或 node runtime 無法執行，Pod 會失敗。這讓 runtime selection 成為明確的 Kubernetes API，而不是隱藏在 runtime side 的私有判斷。
+
+## 從原始碼看 RuntimeClass 怎麼生效
+
+`staging/src/k8s.io/api/node/v1/types.go` 裡的 `RuntimeClass` 很薄，核心欄位是 `Handler`：
+
+```go
+type RuntimeClass struct {
+    metav1.TypeMeta `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+    Handler string `json:"handler" protobuf:"bytes,2,opt,name=handler"`
+    Overhead *Overhead `json:"overhead,omitempty" protobuf:"bytes,3,opt,name=overhead"`
+    Scheduling *Scheduling `json:"scheduling,omitempty" protobuf:"bytes,4,opt,name=scheduling"`
+}
+```
+
+這表示 `RuntimeClass` 本身不會啟動 gVisor 或 Kata。它只是 Kubernetes API object，用來把 Pod 的 `runtimeClassName` 轉成 runtime handler 字串。
+
+轉換位置在 `pkg/kubelet/runtimeclass/runtimeclass_manager.go`：
+
+```go
+func (m *Manager) LookupRuntimeHandler(runtimeClassName *string) (string, error) {
+    if runtimeClassName == nil || *runtimeClassName == "" {
+        return "", nil
+    }
+
+    name := *runtimeClassName
+    rc, err := m.lister.Get(name)
+    if err != nil {
+        return "", err
+    }
+
+    return rc.Handler, nil
+}
+```
+
+接著 kubelet 在 `pkg/kubelet/kuberuntime/kuberuntime_sandbox.go` 的 `createPodSandbox()` 把 handler 傳進 CRI：
+
+```go
+runtimeHandler := ""
+if m.runtimeClassManager != nil {
+    runtimeHandler, err = m.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+}
+
+podSandBoxID, err := m.runtimeService.RunPodSandbox(ctx, podSandboxConfig, runtimeHandler)
+```
+
+所以真正切換到 `runc`、`runsc`、`kata` 或其他 handler 的決策點在 CRI runtime。Kubernetes source 做的事是：驗證並傳遞 `handler`，讓 runtime 用自己的設定把 handler 對到具體 OCI runtime。
+
+## VM workload：從 Virtlet 到 KubeVirt
+
+Day9 文章以 Virtlet 說明：只要實作 CRI，就能讓 kubelet 把某些 Pod request 轉成 VM。當時的思路是 CRI proxy 根據 annotation 決定要走 container backend 還是 VM backend。
+
+這條路徑的概念價值是：它證明 Kubernetes 的 workload API 可以被延伸到非 container runtime。但今天的主流方向更偏向 KubeVirt：
+
+```
+VirtualMachine CRD
+      │ desired state
+      ▼
+virt-controller
+      │ creates
+      ▼
+VirtualMachineInstance
+      │ creates
+      ▼
+virt-launcher Pod
+      │ contains
+      ▼
+libvirt + QEMU/KVM
+```
+
+KubeVirt 不只是 CRI backend，而是用 CRD/operator 把 VM lifecycle、migration、console、disk、network 都放進 Kubernetes control plane。這跟本專案的 [KubeVirt 架構頁](/kubevirt/features/architecture) 可以直接串起來。
+
+## 決策準則
+
+| 你要解的問題 | 優先考慮 |
+|---|---|
+| 一般 stateless service，信任程式碼來源 | runc / crun |
+| 同 cluster 跑不可信 tenant code | gVisor 或 Kata，搭配 RuntimeClass |
+| 需要更強 kernel boundary，但仍想用 container image | Kata |
+| 想降低 syscall attack surface，不想每個 sandbox 都是一台 VM | gVisor |
+| 需要完整 guest OS、VM image、live migration | KubeVirt |
+| 需要 GPU / SR-IOV / DPDK | runtime 選擇之外，還要同時看 Device Plugin、CNI、NUMA/CPU pinning |
+
+## 觀念深化
+
+**安全 runtime 不是免費升級。**  
+隔離更強通常意味著啟動時間、memory overhead、syscall latency、debuggability 或硬體要求的成本。RuntimeClass 應該用在需要的 workload，而不是全 cluster 無差別套用。
+
+**VM workload 不是 container 的替代品。**  
+KubeVirt 的目標不是把所有 container 換成 VM，而是讓真的需要 VM 的 workload 能被 Kubernetes 調度、觀測、網路與儲存系統管理。
+
+## 收穫檢查
+
+- gVisor 與 Kata 都可以當 OCI runtime，但隔離策略差在哪裡？
+- RuntimeClass 的 `handler` 對應到哪一層設定？
+- Kata 跑的是 container image 還是 VM disk image？
+- KubeVirt 為什麼比較適合完整 VM workload，而不是單純靠 CRI proxy？
+- 什麼情境下你會願意犧牲密度與啟動速度來換隔離？
+
+## 參考資料
+
+- [Day8 — Container Runtime - Security Container](https://ithelp.ithome.com.tw/articles/10219590)
+- [Day9 — Container Runtime - Virtual Machine](https://ithelp.ithome.com.tw/articles/10220046)
+- [Kubernetes RuntimeClass](https://kubernetes.io/docs/concepts/containers/runtime-class/)
+- [Kubernetes Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- [KubeVirt Architecture](/kubevirt/features/architecture)

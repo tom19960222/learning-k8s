@@ -1,0 +1,139 @@
+---
+layout: doc
+title: Kubernetes — OCI 與 container 基礎
+description: Container 不是 Docker。從 OCI runtime/image spec、runc、containerd-shim、Linux namespace 與 mount namespace 理解 kubelet 之下的基礎層。
+---
+
+## 場景
+
+你在 Kubernetes 上看到 Pod，但 node 上看到的是 process、network namespace、mount namespace、containerd-shim、runc。這頁把「Pod 為什麼能變成隔離的 process group」往下拆到 OCI 與 Linux 原語。
+
+## Container、Docker、OCI 的關係
+
+```
+Docker / Podman / nerdctl / Kubernetes
+              │
+              ▼
+       container runtime
+              │
+              ▼
+        OCI runtime spec
+              │
+              ▼
+ runc / crun / kata-runtime / runsc
+              │
+              ▼
+ Linux namespaces + cgroups + mount + seccomp
+```
+
+Container 是一組 OS-level isolation 技術組合；Docker 是讓這些技術變得好用的產品；OCI 是讓不同產品能互通的標準。
+
+## 先把層級跟 Kubernetes source 對上
+
+Kubernetes repo 不實作 runc 或 containerd，但 kubelet source 會清楚告訴你 OCI 層在哪裡「消失」到 runtime 之下。
+
+```go
+// File: kubernetes/pkg/kubelet/kuberuntime/kuberuntime_container.go
+func (m *kubeGenericRuntimeManager) startContainer(...) (string, error) {
+    // Step 1: pull the image.
+    imageRef, msg, err := m.imagePuller.EnsureImageExists(...)
+
+    // Step 2: create the container.
+    containerID, err := m.runtimeService.CreateContainer(ctx, podSandboxID, containerConfig, podSandboxConfig)
+
+    // Step 3: start the container.
+    err = m.runtimeService.StartContainer(ctx, containerID)
+}
+```
+
+`startContainer()` 沒有直接處理 runc、mount namespace 或 containerd-shim。它只組 `ContainerConfig`，然後透過 CRI 的 `CreateContainer` / `StartContainer` 發給 runtime。OCI runtime bundle、shim、namespace 建立這些事，是 CRI runtime 再往下銜接 OCI runtime 時完成。
+
+這也是為什麼本頁要先講 OCI：不是因為 kubelet 直接呼叫 OCI，而是因為 CRI runtime 的下一層共同語言通常就是 OCI。
+
+## OCI 定義了什麼
+
+**Runtime Specification** 定義如何從一個 unpacked filesystem bundle 啟動 container，包括 process 參數、mount、Linux namespace、cgroup、capability、seccomp、hook 與 lifecycle 操作。
+
+**Image Specification** 定義 image 如何由 manifest、config、layer、descriptor 組成。這就是為什麼不同工具可以 push/pull/build 同一類 image，runtime 又可以把 image 解成 filesystem bundle。
+
+現在 OCI 也包含 **Distribution Specification**，補上 registry / content distribution 的標準化。
+
+## Docker stack 拆解
+
+Day3 文章的重點是：`docker run` 不是直接呼叫 kernel 起 container。典型路徑是：
+
+```
+docker CLI
+  -> dockerd
+    -> containerd
+      -> containerd-shim
+        -> runc
+          -> Linux kernel namespaces / cgroups
+```
+
+`containerd-shim` 的價值在於把 container process 跟 daemon lifecycle 解耦。`runc` 建好 container 後可以退出；shim 留下來管理 stdio、exit status 與 re-parenting。這也是為什麼 dockerd 或 containerd 維護作業不一定要殺掉已存在的 container。
+
+## Linux namespace 是 container 的隔離基礎
+
+| Namespace | 隔離的東西 | 在 Kubernetes 裡的直覺 |
+|---|---|---|
+| `pid` | process ID space | Pod 內 process 看不到 host 上所有 process |
+| `net` | network stack、interface、route、iptables view | Pod 有自己的 IP 與 veth |
+| `mnt` | mount table | container 看到自己的 rootfs 與 volume mount |
+| `ipc` | IPC objects | Pod 內 IPC scope 可跟 host 分開 |
+| `uts` | hostname / domain name | Pod 內 hostname 可不同 |
+| `user` | UID/GID mapping | rootless container 的基礎 |
+| `cgroup` | cgroup hierarchy view | resource accounting / limit 的隔離視圖 |
+
+Kubernetes 的 Pod sandbox 本質上就是先建立一個穩定的 namespace holder，常見實作是 `pause` container。Application container 加入 sandbox 的 namespace，而不是每個 container 各自拿一個獨立 network namespace。
+
+在 kubelet 的 `createPodSandbox()` 裡，你看不到 `pause` 字串，因為 sandbox image 與 namespace 建立是 runtime 端的實作細節；kubelet 只要求 CRI runtime 執行 `RunPodSandbox`。這個分層很重要：Kubernetes 定義「要有 sandbox」，但不把 sandbox 如何由 pause container / VM sandbox / user-space kernel 實作寫死。
+
+## Network namespace 怎麼觀察
+
+Day4 文章示範的核心技巧是：container 的 network namespace 雖然不一定出現在 `/var/run/netns/`，但可以從 host 上的 process namespace handle 找回。
+
+```bash
+container_id=<container-id>
+pid=$(docker inspect -f '{{.State.Pid}}' "${container_id}")
+sudo ln -sfT /proc/${pid}/ns/net /var/run/netns/${container_id}
+sudo ip netns exec "${container_id}" ip addr
+```
+
+在 Kubernetes node 上，現代環境通常改用 CRI 工具查 container / sandbox，再回到 `/proc/<pid>/ns/net` 觀察。觀念相同：namespace 是 kernel object，工具只是幫你拿 handle。
+
+## Mount namespace 與 volume
+
+Container 看到的 filesystem 不是另一台機器，而是 mount namespace 裡的一組 mount view。`docker run -v /host:/container` 或 Kubernetes volume mount，最後都會反映在 container process 的 mount namespace 中。
+
+```bash
+pid=<container-main-process-pid>
+sudo cat /proc/${pid}/mountinfo
+```
+
+這個觀察對 CSI 除錯很重要：CSI driver 會把 volume publish 到 node 路徑，kubelet 再把它 bind mount 到 container namespace。PVC 卡住時，問題可能在 external provisioner、node publish、kubelet mount，也可能在 container namespace 內是否真的看到目標路徑。
+
+## 觀念深化
+
+**OCI 是 Kubernetes runtime 可替換性的底座。**  
+CRI 讓 kubelet 可以換 containerd / CRI-O；OCI 讓這些 CRI runtime 可以再往下換 runc / crun / Kata / gVisor。
+
+**Container 的安全邊界不是絕對的 VM 邊界。**  
+一般 runc 類 container 與 host 共用 kernel，所以 kernel bug、capability、mount、device、seccomp 設定都會影響隔離強度。這正是 [runtime-alternatives](/kubernetes/features/runtime-alternatives) 裡 gVisor / Kata 存在的理由。
+
+## 收穫檢查
+
+- Docker、containerd、runc 各自在哪一層？哪一個最接近 OCI runtime？
+- OCI image spec 與 OCI runtime spec 分別解決什麼問題？
+- 為什麼 containerd 需要 shim，而不是直接讓 runc 長期管理 container？
+- network namespace 隔離了哪些資源？`hostNetwork: true` 會改變什麼？
+- volume mount 最後是存在於 host 全域 mount table，還是 container process 的 mount namespace view？
+
+## 參考資料
+
+- [Day2 — Container 與 OCI](https://ithelp.ithome.com.tw/articles/10216215)
+- [Day3 — OCI 實作與 Docker stack](https://ithelp.ithome.com.tw/articles/10216880)
+- [Day4 — Namespace 隔離](https://ithelp.ithome.com.tw/articles/10217583)
+- [Open Container Initiative overview](https://opencontainers.org/about/overview)
+- [OCI Runtime Specification](https://github.com/opencontainers/runtime-spec)
+- [OCI Image Specification](https://specs.opencontainers.org/image-spec/)

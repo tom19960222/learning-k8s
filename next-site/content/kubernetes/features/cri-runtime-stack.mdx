@@ -1,0 +1,246 @@
+---
+layout: doc
+title: Kubernetes — CRI runtime stack
+description: kubelet 如何透過 CRI 呼叫 containerd 或 CRI-O：RuntimeService、ImageService、PodSandbox、crictl、containerd namespace 與 dockershim 移除後的現代路徑。
+---
+
+## 場景
+
+你在 node 上跑 `kubectl get pod` 看到 Pod Running，但 `docker ps` 看不到任何 Kubernetes container。這不是壞掉，而是現代 Kubernetes 已經不靠 dockershim。真正的除錯入口通常是 `crictl`、containerd socket、CRI-O socket 與 kubelet log。
+
+## CRI 在哪一層
+
+```
+kubelet
+  │ gRPC (CRI v1)
+  ├─ RuntimeService: PodSandbox / Container lifecycle / exec / log / stats
+  └─ ImageService: pull / list / inspect / remove images
+        │
+        ▼
+containerd or CRI-O
+        │
+        ▼
+OCI runtime + CNI + snapshotter
+```
+
+CRI 是 kubelet 與 runtime 之間的主要協定。kubelet 是 client，runtime 提供 gRPC endpoint。Kubernetes 1.26 之後，runtime 必須支援 CRI `v1` API，否則 kubelet 不會成功註冊 node。
+
+## 從 CRI proto 開始讀
+
+這一篇不是先背 containerd 或 CRI-O，而是先看 Kubernetes source 裡 kubelet 被允許呼叫 runtime 的邊界。
+
+`staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto` 把 CRI 切成兩個 service：
+
+```protobuf
+service RuntimeService {
+    rpc Version(VersionRequest) returns (VersionResponse) {}
+    rpc RunPodSandbox(RunPodSandboxRequest) returns (RunPodSandboxResponse) {}
+    rpc StopPodSandbox(StopPodSandboxRequest) returns (StopPodSandboxResponse) {}
+    rpc RemovePodSandbox(RemovePodSandboxRequest) returns (RemovePodSandboxResponse) {}
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {}
+    rpc StartContainer(StartContainerRequest) returns (StartContainerResponse) {}
+    rpc StopContainer(StopContainerRequest) returns (StopContainerResponse) {}
+    rpc RemoveContainer(RemoveContainerRequest) returns (RemoveContainerResponse) {}
+}
+
+service ImageService {
+    rpc ListImages(ListImagesRequest) returns (ListImagesResponse) {}
+    rpc ImageStatus(ImageStatusRequest) returns (ImageStatusResponse) {}
+    rpc PullImage(PullImageRequest) returns (PullImageResponse) {}
+    rpc RemoveImage(RemoveImageRequest) returns (RemoveImageResponse) {}
+}
+```
+
+這段 source 先定義了深層心智模型：kubelet 不知道 runc 怎麼建 process，也不直接操作 CNI。它只知道可以要求 runtime 建 sandbox、拉 image、建 container、啟 container、查狀態與停止清理。
+
+## CRI 的基本單位是 PodSandbox
+
+Day5 文章提醒一個關鍵差異：CRI runtime 不只是「起 container」，而是以 Pod 為中心。
+
+典型順序：
+
+```text
+RunPodSandbox
+  -> 建 pause / sandbox container
+  -> 建 network namespace
+  -> 呼叫 CNI ADD
+PullImage
+CreateContainer
+StartContainer
+PodSandboxStatus / ContainerStatus
+StopContainer / StopPodSandbox / Remove*
+```
+
+PodSandbox 是 Pod network namespace 的持有者。Application container 死掉重啟時，sandbox 不一定要重建，所以 Pod IP 與 network namespace 可以保持穩定。
+
+## kubelet 的實際呼叫鏈
+
+`pkg/kubelet/kuberuntime/kuberuntime_manager.go` 的 `SyncPod()` 是把 desired Pod 狀態同步到 runtime 的主流程。原始碼裡先算出要殺掉什麼、sandbox 是否改變，然後才建立新的 sandbox 與 container：
+
+```go
+podContainerChanges := m.computePodActions(ctx, pod, podStatus)
+if podContainerChanges.KillPod {
+    if err := m.killPodWithSyncResult(ctx, pod, kubecontainer.ConvertPodStatusToRunningPod(m.runtimeName, podStatus), nil, podContainerChanges.UpdatePodResources, gracePeriodOverride, nil, nil); err != nil {
+        return
+    }
+}
+
+if podContainerChanges.CreateSandbox {
+    podSandboxID, msg, err = m.createPodSandbox(ctx, pod, podContainerChanges.Attempt)
+}
+
+for _, idx := range podContainerChanges.ContainersToStart {
+    start(ctx, "container", metrics.Container, containerStartSpec(container))
+}
+```
+
+`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go` 的 `createPodSandbox()` 會先決定 runtime handler，最後才透過 CRI 呼叫 `RunPodSandbox`：
+
+```go
+runtimeHandler := ""
+if m.runtimeClassManager != nil {
+    runtimeHandler, err = m.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+}
+
+podSandBoxID, err := m.runtimeService.RunPodSandbox(ctx, podSandboxConfig, runtimeHandler)
+```
+
+接著 `pkg/kubelet/kuberuntime/kuberuntime_container.go` 的 `startContainer()` 才處理 image 與 container：
+
+```go
+imageRef, msg, err := m.imagePuller.EnsureImageExists(ctx, pod, container, pullSecrets, podSandboxConfig, podRuntimeHandler, ...)
+containerID, err := m.runtimeService.CreateContainer(ctx, podSandboxID, containerConfig, podSandboxConfig)
+err = m.runtimeService.StartContainer(ctx, containerID)
+```
+
+所以從 source 看，Pod startup 不是「啟 container」一件事，而是：
+
+1. kubelet 判斷 Pod 目前狀態與 desired state。
+2. 必要時停止舊 sandbox / container。
+3. 透過 `RunPodSandbox` 建立 Pod 層級 sandbox。
+4. 透過 image path 拉 image。
+5. 在 sandbox 裡 `CreateContainer`。
+6. `StartContainer` 啟動 application container。
+
+## CRI client 怎麼連 runtime socket
+
+`staging/src/k8s.io/cri-client/pkg/remote_runtime.go` 裡的 `NewRemoteRuntimeService()` 會用 kubelet 設定的 endpoint 建立 gRPC connection：
+
+```go
+addr, dialer, err := util.GetAddressAndDialer(endpoint)
+conn, err := grpc.DialContext(ctx, addr, dialOpts...)
+service := &remoteRuntimeService{
+    timeout:      timeout,
+    runtimeClient: runtimeapi.NewRuntimeServiceClient(conn),
+}
+```
+
+同一個檔案裡還會檢查 runtime 是否真的能回應：
+
+```go
+if _, err := r.runtimeClient.Version(ctx, &runtimeapi.VersionRequest{}); err != nil {
+    return fmt.Errorf("validate service connection: %w", err)
+}
+```
+
+Image path 則在 `staging/src/k8s.io/cri-client/pkg/remote_image.go`，`PullImage()` 最後就是 CRI `ImageService` RPC：
+
+```go
+resp, err := r.imageClient.PullImage(ctx, &runtimeapi.PullImageRequest{
+    Image:         image,
+    Auth:          auth,
+    SandboxConfig: podSandboxConfig,
+})
+```
+
+這也是為什麼除錯 runtime 時要看 socket、CRI API version、image service 與 runtime service，而不是只看某個 container CLI。
+
+## containerd 路徑
+
+現代 Kubernetes 常見路徑：
+
+```text
+kubelet
+  -> /run/containerd/containerd.sock
+    -> containerd CRI plugin
+      -> containerd task / shim
+        -> runc / crun / alternate OCI runtime
+```
+
+`crictl` 是跟 CRI endpoint 對話的 debug CLI。常用觀察：
+
+```bash
+sudo crictl info
+sudo crictl pods
+sudo crictl ps -a
+sudo crictl images
+sudo crictl inspectp <pod-sandbox-id>
+sudo crictl logs <container-id>
+```
+
+Day6 文章中的重要觀察仍然有效：containerd 有 namespace 概念。Kubernetes 透過 CRI plugin 使用 `k8s.io` namespace；Docker / Moby 使用自己的 namespace。這就是為什麼不同 client 可以共用 containerd，但彼此列出的 container 不一定混在一起。
+
+```bash
+sudo ctr namespaces list
+sudo ctr -n k8s.io containers list
+```
+
+## CRI-O 路徑
+
+CRI-O 從設計上就是 Kubernetes-native runtime：
+
+```text
+kubelet
+  -> CRI-O gRPC endpoint
+    -> pull image via containers/image
+    -> unpack rootfs via containers/storage
+    -> generate OCI runtime config
+    -> start runc / crun / Kata
+    -> conmon monitors container
+```
+
+跟 containerd 相比，CRI-O 的產品範圍更窄：它不是通用 container platform，而是專注滿足 kubelet CRI。這讓它在 OpenShift 等環境常被當作預設 runtime。
+
+## 舊文章脈絡的現代修正
+
+Day5-Day7 寫作時，dockershim、CRI-containerd、containerd CRI plugin 的演進還是正在轉換的故事。現在要更新成以下結論：
+
+- Kubernetes 1.24 起移除 kubelet 內建 dockershim。
+- 直接安裝 Docker Engine 不等於 kubelet 可直接使用 Docker；若要走 Docker Engine，需額外 CRI adapter，例如 `cri-dockerd`。
+- 一般新 cluster 優先選 containerd 或 CRI-O。
+- kubelet 設定重點是 `containerRuntimeEndpoint` / `--container-runtime-endpoint`，而不是舊版 `--container-runtime=docker|remote` 心智模型。
+
+## 除錯路徑
+
+| 現象 | 優先查哪裡 | 常用指令 |
+|---|---|---|
+| Node NotReady，runtime network not ready | kubelet + runtime socket | `journalctl -u kubelet`, `crictl info` |
+| ImagePullBackOff | ImageService / registry auth | `crictl pull`, `kubectl describe pod` |
+| Pod 卡 ContainerCreating | sandbox、CNI、volume mount | `crictl pods`, `crictl inspectp`, kubelet log |
+| container crash | container status/log | `crictl ps -a`, `crictl logs` |
+| `docker ps` 看不到 Pod | 不是問題，工具錯層 | 改用 `crictl` 或 `ctr -n k8s.io` |
+
+## 觀念深化
+
+**CRI 把 Kubernetes 從 Docker 綁定中拿出來。**  
+Kubernetes 管的是 Pod API 與 lifecycle，不應該依賴 Docker Engine 的產品 API。CRI 讓 kubelet 對 runtime 的需求變成明確 gRPC contract。
+
+**CRI 跟 OCI 是上下層，不是二選一。**  
+kubelet 對 containerd / CRI-O 講 CRI；containerd / CRI-O 往下產生 OCI runtime config，再呼叫 runc、crun、Kata 或 gVisor。
+
+## 收穫檢查
+
+- CRI 的 RuntimeService 與 ImageService 分別管什麼？
+- PodSandbox 跟 application container 的關係是什麼？
+- 為什麼 Kubernetes 1.24 之後不能再假設 kubelet 直接使用 Docker Engine？
+- containerd 的 `k8s.io` namespace 跟 Docker/Moby namespace 解決了什麼隔離問題？
+- CRI-O 與 containerd 的共同點與差異是什麼？
+
+## 參考資料
+
+- [Day5 — Kubernetes & CRI I](https://ithelp.ithome.com.tw/articles/10218127)
+- [Day6 — Kubernetes & CRI II](https://ithelp.ithome.com.tw/articles/10218570)
+- [Day7 — Container Runtime - CRI-O](https://ithelp.ithome.com.tw/articles/10219102)
+- [Kubernetes Container Runtime Interface](https://kubernetes.io/docs/concepts/containers/cri/)
+- [Kubernetes Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
+- [Dockershim and CRI-compatible runtimes](https://kubernetes.io/docs/reference/node/topics-on-dockershim-and-cri-compatible-runtimes/)

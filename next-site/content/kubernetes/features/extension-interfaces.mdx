@@ -1,0 +1,129 @@
+---
+layout: doc
+title: Kubernetes — 擴充介面設計
+description: Kubernetes 為什麼把 runtime、network、storage、device 抽成 CRI/CNI/CSI/Device Plugin：release 週期、責任邊界與第三方生態系。
+---
+
+## 場景
+
+你想讓 cluster 支援 GPU、換掉 container runtime、導入新的 CNI，或把 Ceph RBD 當 PVC 使用。直覺上可以把這些功能都寫進 Kubernetes core，但這會讓 core repo 變成硬體、網路、儲存、runtime 的大雜燴。
+
+Kubernetes 的設計選擇剛好相反：核心只定義介面與期望狀態，底層實作由外部元件提供。
+
+## 架構全貌
+
+```
+User / Controller
+      │
+      ▼
+kube-apiserver ── etcd
+      │
+      ▼ watch Pod
+kubelet on node
+      │
+      ├─ CRI ── containerd / CRI-O ── OCI runtime ── runc / crun / Kata / gVisor
+      │
+      ├─ CNI ── Cilium / Calico / Flannel / Multus
+      │
+      ├─ CSI ── Rook Ceph / cloud disk driver / NFS driver
+      │
+      └─ Device Plugin ── GPU / SR-IOV / FPGA / other node devices
+```
+
+每條線都是「Kubernetes 定義契約，外部實作契約」。這讓 Kubernetes 可以穩定地管理 Pod、Service、PVC、Resource request，但不需要把每種底層技術都直接綁進核心 release。
+
+## 為什麼要抽介面
+
+**Release 週期解耦。**  
+如果 GPU、storage array、CNI feature 都必須等 Kubernetes minor release，第三方創新會被 core release gate 卡住。介面化後，CNI/CSI/runtime vendor 可以照自己的節奏 release，只要遵守相容 API。
+
+**專業領域外部化。**  
+Kubernetes 維護者不需要精通每張網卡、每套儲存陣列、每種 hypervisor。core 維護的是 API semantics、reconcile model、node integration point。
+
+**替換成本降低。**  
+同一個 Pod object 可以由 containerd 或 CRI-O 執行；同一個 NetworkPolicy model 可以由不同 CNI 實作；同一個 PVC 可以由不同 CSI driver provision。
+
+**故障邊界更清楚。**  
+Pod Pending、ImagePullBackOff、CNI ADD failed、PVC Pending、GPU alloc failed 代表不同層的問題。介面化讓除錯時可以順著邊界定位：API object、scheduler、kubelet、runtime、plugin。
+
+## 介面職責表
+
+| 介面 | 誰呼叫 | 誰實作 | 負責什麼 | 不負責什麼 |
+|---|---|---|---|---|
+| CRI | kubelet | containerd、CRI-O | Pod sandbox、container lifecycle、image pull、exec/log/port-forward | 高階 Deployment/Service 語義 |
+| CNI | runtime | Cilium、Calico、Flannel、Multus | network namespace 配 IP、veth、route、policy datapath | 建 Pod、拉 image |
+| CSI | kubelet + external CSI sidecars | Ceph、cloud disk、NFS driver | volume provision、attach、mount、snapshot | 決定 Pod 排到哪個 node |
+| Device Plugin | kubelet | NVIDIA GPU、SR-IOV、FPGA plugin | discover node device、advertise allocatable、allocate device | container lifecycle 本身 |
+
+## 從原始碼看邊界
+
+先不要背 CRI/CNI/CSI 的定義，直接從 kubelet source 看「誰負責把 Pod 變成 node 上的東西」。
+
+`kubernetes/pkg/kubelet/kuberuntime/kuberuntime_manager.go` 的 `SyncPod()` 是 runtime manager 的主入口。它的步驟註解已經把邊界寫出來：
+
+```go
+// File: kubernetes/pkg/kubelet/kuberuntime/kuberuntime_manager.go
+func (m *kubeGenericRuntimeManager) SyncPod(...) (...) {
+    // Step 1: Compute sandbox and container changes.
+    // Step 2: Kill the pod if the sandbox has changed.
+    // Step 4: Create a sandbox for the pod if necessary.
+    podSandboxID, msg, err = m.createPodSandbox(ctx, pod, podContainerChanges.Attempt)
+    ...
+    msg, err = m.startContainer(ctx, podSandboxID, podSandboxConfig, spec, pod, ...)
+}
+```
+
+這段 code 對應到介面化設計的核心：kubelet 自己決定「要不要建 sandbox / container」，但真正建 sandbox 的事情丟給 CRI runtime。
+
+再往下一層，`createPodSandbox()` 會產生 `PodSandboxConfig`、查 RuntimeClass handler，最後呼叫 CRI：
+
+```go
+// File: kubernetes/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go
+runtimeHandler := ""
+if m.runtimeClassManager != nil {
+    runtimeHandler, err = m.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+}
+
+podSandBoxID, err := m.runtimeService.RunPodSandbox(ctx, podSandboxConfig, runtimeHandler)
+```
+
+所以 Kubernetes 的擴充不是抽象口號，而是具體的 call boundary：`runtimeService.RunPodSandbox()` 之後就離開 kubelet 的核心邏輯，交給 containerd / CRI-O 這類 runtime。
+
+## 一個 Pod 跑起來時介面怎麼接力
+
+```
+1. scheduler bind Pod to node
+2. kubelet watch 到 Pod
+3. kubelet -> CRI RunPodSandbox
+4. runtime 建 network namespace
+5. runtime -> CNI ADD
+6. CNI 配 IP / route / datapath
+7. kubelet -> CRI PullImage + CreateContainer + StartContainer
+8. 若 Pod 有 volume，kubelet 呼叫 CSI node publish
+9. 若 Pod 要 GPU，kubelet 先請 device plugin allocate
+```
+
+這條路徑說明了 Kubernetes 的一個重要性格：core control plane 很少直接碰 node 上的實體細節，node 上的細節由 kubelet 與 plugin/runtimes 接力完成。
+
+## 觀念深化
+
+**介面不是附加功能，而是 Kubernetes 可擴充性的主體。**  
+Day1 文章的核心觀察是：Kubernetes 涉及運算、網路、儲存、特殊裝置，如果全部進 core，維護與 release 會失控。CRI/CNI/CSI/Device Plugin 不是後來的補丁，而是讓 Kubernetes 能跨領域擴張的架構手段。
+
+**介面抽象也會帶來版本與相容成本。**  
+例如 Kubernetes 1.26 之後 kubelet 要求 runtime 支援 CRI `v1` API；driver 或 runtime 一旦 API 不相容，node 可能無法註冊或 Pod 無法建立。介面降低耦合，但不代表沒有契約成本。
+
+## 收穫檢查
+
+- Kubernetes 為什麼不把每種 runtime、CNI、CSI 都直接放進 core repo？
+- CRI 與 OCI 的邊界在哪裡？哪一個是 kubelet 直接呼叫的？
+- CNI 是 kubelet 直接呼叫，還是 container runtime 呼叫？
+- 如果 `kubectl describe pod` 看到 CNI ADD failed，應該先查 apiserver 還是 node runtime/CNI？
+- Device Plugin 回報的是高階業務能力，還是 node 上可分配的實體/虛擬裝置？
+
+## 參考資料
+
+- [Day1 — 淺談 Kubernetes 設計原理](https://ithelp.ithome.com.tw/articles/10215384)
+- [Kubernetes Container Runtime Interface](https://kubernetes.io/docs/concepts/containers/cri/)
+- [Kubernetes Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)
+- [Kubernetes CSI Drivers](https://kubernetes-csi.github.io/docs/)
