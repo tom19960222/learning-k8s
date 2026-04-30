@@ -18,3 +18,6 @@
 	url = https://github.com/ceph/ceph.git
 	branch = v19.2.3
 	shallow = true
+[submodule "multus-cni"]
+	path = multus-cni
+	url = https://github.com/k8snetworkplumbingwg/multus-cni.git
