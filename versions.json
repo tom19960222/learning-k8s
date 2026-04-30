@@ -18,5 +18,10 @@
     "commit": "c92aebb279828e9c3c1f5d24613efca272649e62",
     "tag": "v19.2.3",
     "analyzed_at": "2026-04-30"
+  },
+  "multus": {
+    "commit": "705a59eaf96c86e1e977a2fe7b4f5cb19c96c4e6",
+    "tag": "v4.2.4",
+    "analyzed_at": "2026-04-30"
   }
 }
