@@ -1,0 +1,170 @@
+---
+layout: doc
+title: Ceph — CRUSH 與 Placement
+description: 為什麼 client 能自己算 object 該存哪而不需要中央 metadata server。CRUSH 演算法、PG (Placement Group) 中介層、stable property 與 straw2 算法。
+---
+
+## 場景
+
+HDFS 用 NameNode 集中記「block X 在 DataNode 5、12、27」。Ceph 沒有這個東西。client 拿一個 object name 怎麼知道該寫到哪幾個 OSD？答：自己算。每個 client 拿 OSDMap (含 CRUSHMap) 後，本機跑 CRUSH 演算法直接得出 `[osd.5, osd.12, osd.27]`。為什麼這能 scale？
+
+## PG 是中介層
+
+直接 `object → OSD` 不可行：cluster 有 trillion 個 object，每個都要算/cache 一次 placement，成本太高。Ceph 加了一層 **PG (Placement Group)**：
+
+```
+N 個 object  ──hash──>  K 個 PG (per pool)  ──CRUSH──>  OSD set [primary, secondary, ...]
+
+(N ≈ trillion)            (K ≈ hundreds~thousands per pool)
+```
+
+```
+pg_id = pool_id + (hash(object_name) % pg_num)
+osd_set = CRUSH(CRUSHMap, pg_id, rule, num_replicas)
+```
+
+- 第一步是 cheap hash（client 自己算）
+- 第二步才是 CRUSH 演算法
+- CRUSH 的 input 是 PG ID，不是 object name → 計算量取決於 PG 數，不取決於 object 數
+
+`pg_num` 在 pool 創建時設定，可以動態 scale up（會引發部分 PG 的 placement 變動）。
+
+**PG 也是 OSD 內部的工作單位**：OSD 不單獨追每個 object 的 status，而是追每個 PG 的 status (active+clean / degraded / undersized / inconsistent / scrubbing)。`ceph -s` 看的 PG 狀態統計就是這個。
+
+## CRUSH = Controlled Replication Under Scalable Hashing
+
+input：
+
+- **object 識別**：實際是 `(pg_id, ...)`（前面 hash 過了）
+- **CRUSHMap**：cluster 拓樸樹（root → datacenter → rack → host → osd）
+- **rule**：「對 pool X 用幾個 replica，要跨哪個 bucket type 散開」（例如「3 replica，跨不同 host」）
+
+output：
+
+- 一組有序 OSD ID list `[primary, secondary_1, secondary_2, ...]`
+
+```c
+/* File: src/crush/mapper.c (line 2016) */
+int crush_do_rule(const struct crush_map *map,
+                  int ruleno,
+                  int x,           /* the input value (PG id) */
+                  int *result,     /* output: chosen OSD ids */
+                  int result_max,
+                  const __u32 *weight,
+                  int weight_max,
+                  void *cwin,
+                  const struct crush_choose_arg *choose_args)
+{
+    /* ... CRUSH 演算法主體 ... */
+}
+```
+
+C++ 包裝：
+
+```cpp
+// File: src/crush/CrushWrapper.h (line 51)
+class CrushWrapper {
+    // 維護 in-memory CRUSHMap、提供 rule edit、do_rule 對 mapper.c 的 wrapper
+};
+```
+
+## CRUSH 的四個關鍵 property
+
+1. **Deterministic**：同 input 永遠出同 output。不需要中央 server 維持 mapping table。
+2. **Balanced**：經過大量 PG，object 大致均勻分布到所有 OSD（按 weight 比例）。
+3. **Decentralized**：任何 client 拿 CRUSHMap 後本機算，不打 server。
+4. **Stable** (最重要)：cluster 拓樸變動時，**只有少數 PG 需要重 placement**。加一塊 OSD 不會把所有 PG 都洗牌。
+
+stable property 來自 **straw2** 算法（每個 bucket 內部用的 weighted random sampling）。straw2 的特性：
+
+- 給定 bucket 內 N 個 item 與各自 weight，挑出一個 item
+- 加新 item 時，**只有 1/(N+1) 機率讓某 PG 改挑新 item**
+- 拔 item 時，被影響的 PG 重新挑（且大致均勻分散到剩餘 item）
+
+對比 modular hashing (`item = hash(x) % N`)：N 變了所有 mapping 都改。straw2 把這個「要 reshuffle 多少」最小化。
+
+```c
+/* File: src/crush/mapper.c (straw2 邏輯) */
+/* bucket 內部用 ln(uniform random) / weight，挑最大那個 */
+```
+
+## CRUSHMap 的三個元素
+
+```
+1. Devices (leaf)
+   osd.0, osd.1, ..., osd.99    — 每個 OSD 一個 device
+
+2. Buckets (internal nodes, hierarchy)
+   root default {
+       region taipei {
+           datacenter dc1 {
+               rack r1 {
+                   host node-01 { osd.0, osd.1 }
+                   host node-02 { osd.2, osd.3 }
+               }
+               rack r2 { ... }
+           }
+       }
+   }
+
+3. Rules
+   rule replicated_rule {
+       type replicated
+       step take default
+       step chooseleaf firstn 0 type host    ← 跨 host 挑 leaf (osd)
+       step emit
+   }
+```
+
+`chooseleaf firstn 0 type host` 意思：「往下走，每挑一個 host，再從那個 host 內挑一個 osd；總共挑 `replicas` 個 osd（`0` 表示用 rule 設的數量）」。
+
+換成 `type rack` 就變「跨 rack」，故障域提升到 rack 等級。
+
+## stable + balanced 的代價：CRUSH 不能保證完美平衡
+
+實務上：
+
+- 不同 OSD weight 不同 → 不同 PG count
+- straw2 是 random sampling，**大致** 平衡但 outlier 會出現
+- 解法：`reweight-by-utilization` 自動補 weight；或啟用 **upmap** (OSDMap 內可帶 explicit override，把特定 PG 強制 remap 到別的 OSD)
+- pg_autoscaler MGR 模組會根據實際 utilization 自動調 pg_num
+
+這就是為什麼 `ceph osd df` 看 OSD utilization 不會剛好一樣，差幾 percent 是 CRUSH 的固有 noise。
+
+## PG 的常見狀態
+
+```
+active           — primary 與必要的 replica 都在線，可服務 IO
+active+clean     — 完美，所有 replica 一致
+degraded         — 缺 replica（其中一個 OSD 掛或 lag）但還能服務
+undersized       — replica 數 < pool size（缺更多）
+inconsistent     — scrub 發現 primary/secondary checksum 對不上
+remapped         — 應該的 OSD set 與目前 acting set 不同（recovery 中）
+backfilling      — 在 copy 整個 PG 到新 OSD
+scrubbing        — 在做 metadata cross-check
+deep             — 在做 data 級 cross-check
+```
+
+`ceph -s` 列的 PG 狀態統計就是這些 enum 的 count。
+
+## 不靠中央 server 的代價
+
+- **CRUSHMap 必須廣播**：任何 OSD 上下線 → MON 算新 OSDMap → broadcast 給所有 client。`Objecter` (上一頁提到的 client dispatcher) 在 OSDMap 變動時自動重 route in-flight op
+- **client 必須能看 cluster 拓樸**：rule + 物理拓樸對 client 可見（沒有保密）
+- **拓樸變動時計算負擔分散**：cluster 內所有 client 各自重算 placement，不是中央 server 一次重算
+
+## 收穫檢查
+
+- 為什麼要有 PG 這層？直接 `object → OSD` (跳過 PG) 可不可行？
+- 同 cluster 加一塊 OSD，理論上有多少比例的 PG 會被影響？
+- 你的 cluster 想做「跨 datacenter 的 3 replica，每個 datacenter 至少 1 份」，rule 怎麼寫？
+- straw2 比 modular hashing 好在哪？
+
+## 原始碼參考
+
+- [src/crush/mapper.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/mapper.c) — `crush_do_rule` (line 2016)
+- [src/crush/CrushWrapper.h](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/CrushWrapper.h) — `class CrushWrapper` (line 51)
+- [src/crush/builder.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/builder.c) — CRUSHMap 建構
+- [src/crush/hash.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/hash.c) — bucket hash 函式
+- [src/crush/types.h](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/types.h) — bucket types
+- [CRUSH paper (2006)](https://ceph.io/assets/pdfs/weil-crush-sc06.pdf) — 原始 paper

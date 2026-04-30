@@ -1,0 +1,242 @@
+---
+layout: doc
+title: Ceph — OSD daemon 與 BlueStore
+description: OSD 內部結構：PG / PrimaryLogPG 處理 op、replicate 到 secondary、recovery / scrubbing。BlueStore 為什麼直接管 raw block 而不用 filesystem。
+---
+
+## 場景
+
+primary OSD 收到 client write op，到資料真的落盤、replicate 到 secondary、回 ack 給 client，這中間 OSD 內部跑了什麼？BlueStore 為什麼不直接寫 ext4/xfs，而是自己管 raw block？
+
+## OSD daemon 大致結構
+
+```
+┌─────────────── ceph-osd process ──────────────┐
+│                                                │
+│  Messenger (network thread pool)               │
+│   └─ 收 client / peer OSD 的 op                │
+│                                                │
+│  OpThreadPool                                  │
+│   └─ 把 op 分發給對應 PG                       │
+│                                                │
+│  PG instances (~hundreds, primary or replica)  │
+│   ├─ PrimaryLogPG    (replicated pool)         │
+│   ├─ ECBackend       (erasure coded)           │
+│   └─ peering / recovery / scrub state machine  │
+│                                                │
+│  ObjectStore                                   │
+│   └─ BlueStore                                 │
+│        ├─ raw block device                     │
+│        ├─ RocksDB (metadata, PG log, omap)     │
+│        └─ BlueFS (極簡 FS, 給 RocksDB)         │
+└────────────────────────────────────────────────┘
+```
+
+主入口：
+
+```cpp
+// File: src/osd/OSD.h (line 1062)
+class OSD : public Dispatcher,
+            public md_config_obs_t {
+    // ...
+    // tick timer, op queue, pg map, peering state, ...
+};
+```
+
+```cpp
+// File: src/osd/OSD.cc (line 6337)
+void OSD::tick()
+{
+    // periodic housekeeping: heartbeat, peering, OSDMap subscription
+}
+```
+
+## PG / PrimaryLogPG
+
+PG (Placement Group) 既是 placement 抽象，也是 OSD 內部的工作單位。每個 PG instance 在某個 OSD 是 primary，在其他幾個 OSD 是 secondary（依 pool size，預設 3）。
+
+```cpp
+// File: src/osd/PG.h (line 166)
+class PG : public DoutPrefixProvider, ... {
+    // 抽象 PG: peering、acting set、pg log、history
+};
+```
+
+預設 replicated pool 用 `PrimaryLogPG`：
+
+```cpp
+// File: src/osd/PrimaryLogPG.h (line 60)
+class PrimaryLogPG : public PG, ... {
+    // op handling: do_op / do_request / execute_ctx
+    // replication: send sub-op to secondary OSDs, wait for ack
+    // pg log management: each op recorded for recovery
+};
+```
+
+erasure-coded pool 用 `ECBackend`（`src/osd/ECBackend.h`）。本 SP 不展開 EC algebra；只說「對 EC pool，PG 的『replica』實際是 N+M chunk，replication flow 由 ECBackend 處理」。
+
+## Write op 完整 flow
+
+```
+1. client → primary OSD (RADOS write op)
+              │  Messenger 收到
+              ▼
+2. OpThreadPool dispatch 到對應 PG
+              │
+              ▼
+3. PrimaryLogPG.do_op
+   ├─ build OpContext (transaction)
+   ├─ apply ops (set/get/append/...) on object
+   ├─ generate PG log entry
+   │
+   ▼ 4. fan-out to peers
+   ├─ 對每個 secondary 發 MOSDRepOp (sub-op write)
+   │   ├─ 帶 PG log entry + object diff
+   │   └─ secondary 也走 ObjectStore 寫 BlueStore
+   │
+   ▼ 5. 等所有 secondary 回 commit ack
+   │
+   ▼ 6. primary 自己 commit
+   │
+   ▼ 7. 回 ack client (write applied + committed)
+```
+
+關鍵：**RADOS 是 strongly consistent**。primary 不會在 secondary commit 完成之前回 ack。萬一 secondary 失聯，primary 會把那個 op 標進 PG log 等 recovery。
+
+## ObjectStore：抽象的 storage backend
+
+PG 不直接動 disk，而是透過 `ObjectStore` 介面。歷史上有兩種實作：
+
+- **FileStore**：每個 RADOS object 存成 xfs filesystem 的 file (`/var/lib/ceph/osd-N/current/<pg>/...`)
+- **BlueStore**：直接管 raw block + RocksDB metadata
+
+v19 (Squid) 預設且唯一推薦的就是 BlueStore。FileStore 已 deprecated。
+
+## 為什麼 FileStore 被換掉
+
+```
+RADOS write op                 RADOS write op
+      │                             │
+      ▼                             ▼
+FileStore                        BlueStore
+  ├─ open/write file             ├─ allocate raw block
+  ├─ filesystem journal          ├─ write data 直接 raw block
+  ├─ object journal (ceph 自己)  ├─ RocksDB transaction (metadata)
+  ├─ fsync filesystem            └─ commit
+  ├─ fsync object journal
+  └─ commit
+
+problem:
+- double write (filesystem + object journal)
+- filesystem fsync 太粗（影響 latency tail）
+- filesystem on-disk format 不可控
+- xattr 限制（FileStore 用 xattr 存 metadata）
+```
+
+BlueStore 拿掉中間 filesystem layer 解決這些問題。
+
+## BlueStore 結構
+
+```
+┌──────────── raw block device (e.g. /dev/sdb) ────────────┐
+│                                                            │
+│  ┌──── data extents ────────────────────────────────┐    │
+│  │  RADOS object data (variable-sized extents)      │    │
+│  │  managed by Allocator                            │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                            │
+│  ┌──── BlueFS (極簡 FS) ────────────────────────────┐    │
+│  │  RocksDB SST files                               │    │
+│  │  RocksDB WAL                                     │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                            │
+│  ┌──── Allocator metadata ─────────────────────────┐    │
+│  │  free space bitmap / AVL tree                   │    │
+│  └──────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────┘
+```
+
+```cpp
+// File: src/os/bluestore/BlueStore.h (line 236)
+class BlueStore : public ObjectStore,
+                  public md_config_obs_t {
+    // ...
+    Allocator *alloc;
+    BlueFS *bluefs;
+    KeyValueDB *db;  // RocksDB instance
+    // ...
+};
+```
+
+三個關鍵元件：
+
+**Allocator**：管 raw block 的 free space。給 BlueStore 一個「我要 N bytes」的 request，Allocator 回 `[(offset, length), ...]` 的 extent list。多種策略：
+
+```cpp
+// File: src/os/bluestore/Allocator.h (line 24)
+class Allocator {
+    // ... abstract interface
+};
+```
+
+實作：`BitmapAllocator` (free space bitmap)、`AvlAllocator` (AVL tree of free extents)。
+
+**BlueFS**：極簡 user-space filesystem，**只給 RocksDB 用**。為什麼要這層？RocksDB 需要 filesystem API (open/write/sync file) 才能跑；BlueStore 自己沒提供 POSIX。BlueFS 提供「夠用」的 file/directory abstraction，metadata 也存在 raw block 內。
+
+```cpp
+// File: src/os/bluestore/BlueFS.h (line 249)
+class BlueFS {
+    // ...
+};
+```
+
+**RocksDB (db)**：存所有 metadata：
+- object metadata (size, omap, xattr)
+- PG log
+- collection state
+- OSD's local OSDMap epoch
+- Allocator state (periodic snapshot)
+
+RocksDB 的 LSM tree 結構適合 OSD 的工作 pattern (大量小 metadata write)。
+
+## 三條後台流程：recovery / backfill / scrubbing
+
+OSD 不只服務 client op，還有三條後台 pipeline：
+
+**recovery**：peer 短暫掛了再回來（典型：daemon restart、network blip）。primary 用 PG log 回放缺漏的 ops 給該 peer，無需重抄整 PG。
+
+**backfill**：peer 永久消失（OSD 拔了 / 壞了），新 peer 加入 PG。沒辦法用 log 回放（log 太短不涵蓋全部歷史），必須整個 PG 的 object 從現存 replica copy 過去。比 recovery 慢得多。
+
+**scrubbing**：定期主動 cross-check primary 與 secondary 的 metadata 是否一致。`deep-scrub` 連 object data 都比對 (用 checksum)。發現不一致 → PG state 變 `inconsistent`，operator 介入修。
+
+這三條都受 `osd_max_backfills`、`osd_recovery_max_active`、`osd_scrub_*` 等 throttle 控制，避免吃光 cluster bandwidth。
+
+## Crimson：下一代 OSD（提一句）
+
+v19 OSD 是 classic：多 thread + Messenger + ObjectStore，傳統 multi-thread 設計。NVMe SSD 流行後，bottleneck 從 disk IO 移到 CPU/syscall overhead。Crimson 是新一代 OSD，用 [Seastar](http://seastar.io/) framework：
+
+- Shared-nothing：每個 CPU core 獨立 reactor，無 cross-core lock
+- DPDK / SPDK 整合：bypass kernel network/storage stack
+- 對 NVMe SSD 大幅提升 IOPS
+
+v19 Crimson 還是 experimental，預設不啟用。不在本 SP 範圍。
+
+## 收穫檢查
+
+- 為什麼 BlueStore 要自帶 BlueFS 而不是直接寫 raw block？
+- recovery 跟 backfill 的差別在哪？什麼狀況觸發 backfill？
+- ECBackend 用在什麼 pool？跟 PrimaryLogPG 的差別在哪？
+- 你的 OSD 看 RocksDB compaction 卡很慢，可能影響什麼？
+
+## 原始碼參考
+
+- [src/ceph_osd.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/ceph_osd.cc) — OSD main (line 120)
+- [src/osd/OSD.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/OSD.h) — `class OSD` (line 1062)
+- [src/osd/OSD.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/OSD.cc) — `OSD::tick` (line 6337)
+- [src/osd/PG.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PG.h) — `class PG` (line 166)
+- [src/osd/PrimaryLogPG.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PrimaryLogPG.h) — `class PrimaryLogPG` (line 60)
+- [src/osd/ECBackend.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/ECBackend.h) — erasure-coded backend
+- [src/os/bluestore/BlueStore.h](https://github.com/ceph/ceph/blob/v19.2.3/src/os/bluestore/BlueStore.h) — `class BlueStore` (line 236)
+- [src/os/bluestore/BlueFS.h](https://github.com/ceph/ceph/blob/v19.2.3/src/os/bluestore/BlueFS.h) — `class BlueFS` (line 249)
+- [src/os/bluestore/Allocator.h](https://github.com/ceph/ceph/blob/v19.2.3/src/os/bluestore/Allocator.h) — `class Allocator` (line 24)
+- [BlueStore paper](https://www.usenix.org/system/files/conference/fast17/fast17-aghayev.pdf) — BlueStore 設計細節

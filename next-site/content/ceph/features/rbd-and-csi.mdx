@@ -1,0 +1,224 @@
+---
+layout: doc
+title: Ceph — RBD 與 ceph-csi
+description: 50 GB RBD image 在 RADOS 是一坨什麼。librbd 怎麼把 block read/write 翻成 object op。ceph-csi 把 librbd 包成 k8s PVC backend；rook 把整個 ceph cluster 當 CRD 管。
+---
+
+## 場景
+
+你 KubeVirt VM 跑著，guest OS 看到 50 GB 的硬碟，背後是 ceph 給的 RBD volume。這個 image 在 ceph 那邊長什麼樣？50 GB 是不是真的佔了 50 GB？ceph-csi 怎麼把它變成 k8s PVC？rook 又是什麼？
+
+## RBD = RADOS Block Device
+
+RBD 不是真的 block device，是「把一個 block volume 映射成一坨 RADOS object」的 abstraction。
+
+```
+你看到的 RBD image                         RADOS pool 內存的東西
+┌─────────────────────┐                   ┌───────────────────────────────┐
+│  /dev/rbd0  (50 GB)│                   │  rbd_header.<image_id>        │  ← 1 個 metadata object
+│  block 0  ─────────┼──────────────────>│  └─ image size, stripe info,  │
+│  block 1                                │     snapshot list, features   │
+│  ...                                    │                               │
+│  block 12,799,999  │                    │  rbd_data.<image_id>.0000     │  ← data chunk 0 (4MB)
+└─────────────────────┘                   │  rbd_data.<image_id>.0001     │  ← data chunk 1
+                                          │  ...                          │
+                                          │  rbd_data.<image_id>.0BFF     │  ← chunk 3071 (50GB / 4MB)
+                                          │                               │
+                                          │  thin provision: 只有寫過    │
+                                          │  的 chunk 才真的有 object    │
+                                          └───────────────────────────────┘
+```
+
+預設 `object_size = 4 MB`。一個 50 GB 的 image 邏輯上對應 12800 個 4MB chunk，但實際只有「寫過的 chunk」才會在 RADOS 落 object（thin provisioned）。
+
+```
+chunk_index = block_offset / object_size
+object_name = "rbd_data." + image_id + "." + hex(chunk_index)
+```
+
+## librbd：client-side 把 block op 翻成 object op
+
+librbd 是 user-space C++ library，提供「對某個 RBD image 做 block read/write」的 API。它把 IO request 翻成 RADOS object op：
+
+```cpp
+// File: src/librbd/  (主目錄)
+// Image class、IoCtx、AioCompletion 等
+```
+
+簡化的 read flow：
+
+```
+guest OS write at offset 100MB, length 8KB
+              │
+              ▼
+guest kernel → /dev/rbd0
+              │
+              ▼ (rbd kernel module 或 nbd-rbd user-space)
+librbd
+   ├─ chunk_index = 100MB / 4MB = 25
+   ├─ chunk_offset = 100MB % 4MB = 0
+   ├─ object_name = "rbd_data.<image_id>.0019"
+   │
+   ▼
+librados → Objecter → primary OSD (用 CRUSH 算)
+   │
+   ▼
+RADOS object 8KB 寫進該 chunk's offset 0
+```
+
+如果 8KB write 跨 chunk boundary (例如 offset 在 4MB - 4KB)，librbd 會自動切成兩個 RADOS op，分送不同 primary OSD（每個 chunk 的 primary OSD 不同，因為 CRUSH input 不同）。
+
+## librbd 用到的 server-side class extension
+
+librbd 有些操作（snapshot create、object map maintenance、watch/notify）需要 OSD 那邊配合。Ceph 用 **class extension** 機制：在 OSD 內 load 一個 `.so`，提供 client 可呼叫的 RPC。
+
+```cpp
+// File: src/cls/rbd/cls_rbd.cc  (RBD 的 server-side class)
+// 提供例如 cls_rbd.create, cls_rbd.snap_create, cls_rbd.set_snapshot_namespace ...
+```
+
+client 端 librbd 透過 `librados` 對 OSD 發 `EXEC` op 呼叫這些 class method。class 的 code 在 OSD 那邊跑，操作 metadata object 的內容。
+
+## snapshot / clone：copy-on-write 透過 RADOS 的 object snapshot
+
+RBD snapshot **不立刻 copy data**：
+
+1. 對 metadata object 加一個 snapshot ID 進 snapshot list
+2. 後續 write to chunk → 在 OSD 那邊先 snapshot 那個 RADOS object 再 write (CoW，由 RADOS 提供的 object snapshot operation 處理)
+3. 沒被 write 的 chunk 永遠不需要 copy
+
+clone：基於 parent snapshot 建一個新 image。新 image 的 chunk read：
+
+- 如果新 image 自己有 → 讀新的
+- 如果沒 → 讀 parent snapshot 的對應 chunk
+
+flatten：把 parent dependency 切斷（把所有 parent chunk copy 到新 image），讓新 image 獨立。
+
+整段 CoW + clone 邏輯都在 librbd + OSD class extension 完成，沒有中央 metadata。
+
+## ceph-csi：k8s 的 CSI driver
+
+ceph-csi 不在 ceph 本 repo，在 [github.com/ceph/ceph-csi](https://github.com/ceph/ceph-csi)。它是 k8s 的 CSI driver，做兩件事：
+
+```
+┌──────────── ceph-csi ────────────────────────────┐
+│                                                   │
+│  controller plugin (Deployment, 1 replica)       │
+│   ├─ CreateVolume   → 對 ceph 建 RBD image       │
+│   ├─ DeleteVolume   → 對 ceph 砍 RBD image       │
+│   ├─ CreateSnapshot → cls_rbd.snap_create         │
+│   └─ ControllerExpandVolume → 對 ceph 改 size    │
+│                                                   │
+│  node plugin (DaemonSet, 每 node 一個)           │
+│   ├─ NodeStageVolume    → map RBD image 成本機   │
+│   │                       block device (kernel    │
+│   │                       rbd 或 rbd-nbd)         │
+│   ├─ NodePublishVolume  → bind-mount 給 Pod      │
+│   ├─ NodeUnpublishVolume                          │
+│   └─ NodeUnstageVolume  → unmap                  │
+└───────────────────────────────────────────────────┘
+```
+
+PVC bind 的整段：
+
+```
+1. user 寫 PVC yaml, storageClassName: ceph-rbd
+        │
+        ▼
+   k8s PV controller 看到 PVC
+        │
+        ▼
+2. external-provisioner sidecar (跟 ceph-csi controller 一起跑)
+   ├─ 對 ceph-csi controller plugin 發 CreateVolume gRPC
+        │
+        ▼
+3. ceph-csi controller plugin
+   ├─ rados_create_pool 或用既有 pool
+   ├─ rbd create — 對 ceph 建 image
+   └─ 回 volume handle (含 image id, pool name)
+        │
+        ▼
+4. k8s PV controller 建 PV 物件 with that handle, bind 給 PVC
+        │
+        ▼
+5. user Pod schedule 到 node X, kubelet 看到 Pod 要 mount PV
+        │
+        ▼
+6. kubelet 對 ceph-csi node plugin (on node X) 發 NodeStage + NodePublish
+   ├─ NodeStage: map RBD image 成 /dev/rbdN (用 kernel rbd module 或 rbd-nbd)
+   └─ NodePublish: bind-mount /dev/rbdN 進 Pod 的 volume path
+        │
+        ▼
+   Pod 看到 mounted filesystem，可以 read/write
+```
+
+`map RBD image 成 /dev/rbdN` 走兩種：
+
+- **kernel `rbd` module**：把 librbd 的功能放在 kernel space，性能好但需要 host kernel 支援
+- **rbd-nbd** (user-space)：用 nbd 介面，librbd 在 user-space 跑；性能略差但兼容性好
+
+KubeVirt 的 VM 用 RBD 時就是這條 path：cdc 把 RBD 變 block device 進 virt-launcher Pod，再透過 libvirt 把 block device 當 disk 給 QEMU。
+
+## rook：把整套 ceph 當 k8s CRD 管
+
+rook 也不在 ceph 本 repo，在 [github.com/rook/rook](https://github.com/rook/rook)。它是 operator，把 ceph cluster 部署/維護的整個生命週期收進 k8s CRD：
+
+```
+CRD                    Operator 對應動作
+─────────────────────  ─────────────────────────────────────────
+CephCluster            起 ceph-mon Deployment + ceph-osd DaemonSet
+                       (用 hostPath 或 PVC 給 OSD 用)
+                       管 cephadm-style 的 daemon lifecycle
+
+CephBlockPool          對 ceph create pool (replicated 或 EC)
+                       設 CRUSH rule、failure domain
+
+CephObjectStore        deploy radosgw + create RGW user/pool
+
+CephFilesystem         deploy MDS
+
+CephClient             create ceph user + secret in k8s
+```
+
+rook 的 reconcile loop 觀察這些 CRD，呼 ceph CLI / mgmt API 同步狀態。它跟 ceph-csi 是「兩個獨立 component」：
+
+- rook 起 ceph daemon 為 k8s Pod
+- ceph-csi 提供 PVC backend
+- 用 `StorageClass` 把兩者串起來
+
+實務最常見的部署：用 helm/operator 一鍵裝 rook + ceph-csi → 給 KubeVirt 一個 ceph-rbd 的 StorageClass → KubeVirt VM 拿 PVC 就能跑。
+
+## 整段對齊 lab Day 18
+
+你的 KubeVirt VM 啟動：
+
+```
+1. VMI yaml 帶 dataVolumeTemplate, storageClassName: ceph-rbd
+2. CDI / k8s 對 ceph-csi 要 PVC
+3. ceph-csi 對 ceph cluster create RBD image (50 GB thin)
+4. PVC bind, virt-launcher Pod schedule 到 worker-N
+5. worker-N 的 ceph-csi node plugin 把 RBD image map 成 /dev/rbdN
+6. virt-launcher 內 libvirt 把 /dev/rbdN 當 disk 餵給 QEMU
+7. QEMU 跑 guest OS, 看到 /dev/sda
+8. guest 寫 disk → QEMU → /dev/rbdN → kernel rbd → librbd
+        → CRUSH 算 PG → 寫 primary OSD → BlueStore 落 raw block
+```
+
+整條 path 跨：kubevirt 的 [virt-handler-and-launcher](/kubevirt/features/virt-handler-and-launcher) → ceph-csi → librbd → ceph 的 [crush-and-placement](/ceph/features/crush-and-placement) → [osd-and-bluestore](/ceph/features/osd-and-bluestore)。
+
+## 收穫檢查
+
+- 你建一個 50 GB RBD image 但只寫了 1 GB，ceph 那邊實際佔多少 raw space？(別忘了 replication factor)
+- snapshot 是不是立刻 copy data？
+- ceph-csi 的 controller plugin 跟 node plugin 各自做什麼？為什麼分兩個？
+- rook 跟 ceph-csi 的職責怎麼分？兩個都不裝行不行？
+
+## 原始碼參考
+
+- [src/librbd/](https://github.com/ceph/ceph/tree/v19.2.3/src/librbd) — librbd 主目錄
+- [src/cls/rbd/cls_rbd.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/cls/rbd/cls_rbd.cc) — server-side RBD class extension
+- [src/librados/](https://github.com/ceph/ceph/tree/v19.2.3/src/librados) — librados client
+- [src/osdc/Objecter.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osdc/Objecter.h) — RADOS dispatcher
+- [github.com/ceph/ceph-csi](https://github.com/ceph/ceph-csi) — CSI driver
+- [github.com/rook/rook](https://github.com/rook/rook) — operator
+- [github.com/rook/rook/tree/master/pkg/operator/ceph](https://github.com/rook/rook/tree/master/pkg/operator/ceph) — rook-ceph operator core

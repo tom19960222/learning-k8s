@@ -1,0 +1,190 @@
+---
+layout: doc
+title: Ceph — 架構與 RADOS
+description: MON / OSD / MGR 三類 daemon 的職責邊界，RADOS 為何是底層的 object store，client 拿 OSDMap 後直接連 OSD 不需要中央 metadata server。
+---
+
+## 場景
+
+你 ssh 進 ceph cluster 任一台 host，跑 `ps -ef | grep ceph`，看到一堆 ceph-mon、ceph-osd、ceph-mgr (可能還有 ceph-mds、radosgw)。這些 daemon 各自做什麼？client 寫一個 RBD volume，整段路徑經過誰？最反直覺的：ceph 為什麼不需要中央 metadata server？
+
+## 三類 daemon
+
+```
+┌─────────────────── ceph cluster ───────────────────┐
+│                                                     │
+│  ceph-mon × 3 (or 5, 奇數)                          │
+│   ├─ Paxos quorum                                   │
+│   └─ 維護 cluster maps:                             │
+│       MONmap / OSDmap / MGRmap / PGmap / CRUSHMap   │
+│                                                     │
+│  ceph-mgr × 2 (1 active + standby)                  │
+│   ├─ metric aggregation                             │
+│   ├─ dashboard / Prometheus exporter                │
+│   └─ orchestrator (cephadm)                         │
+│                                                     │
+│  ceph-osd × N (典型每 disk 一個)                    │
+│   ├─ 實際存 RADOS object (4MB chunk)                │
+│   ├─ replication (primary → secondary)              │
+│   └─ recovery / scrubbing                           │
+│                                                     │
+│  ceph-mds (僅 CephFS)                               │
+│  radosgw (僅 S3/Swift)                              │
+└─────────────────────────────────────────────────────┘
+```
+
+**MON** (Monitor)：cluster 的「state quorum」。所有 cluster-wide state 由 MON 用 **Paxos** 達成 consensus 後 publish 出去。任何 daemon (OSD/MGR/MDS) 加入或變動 → MON 算出新 OSDMap → broadcast。client 與 daemon 必須先連 MON 拿到 map 才能定位 object。3 或 5 個 MON 可容忍 1 或 2 fail（quorum > N/2）。
+
+```cpp
+// File: src/ceph_mon.cc (line 249)
+int main(int argc, const char **argv) {
+    // ... bootstrap monitor, join Paxos quorum, serve clients
+}
+```
+
+```cpp
+// File: src/mon/Monitor.h (line 108)
+class Monitor : public Dispatcher,
+                public AuthClient,
+                public AuthServer,
+                public md_config_obs_t {
+    // ...
+    std::unique_ptr<Paxos> paxos;
+    // ...
+};
+```
+
+**OSD** (Object Storage Daemon)：典型「per disk 一個」。每個 OSD 服務一塊磁碟（或一個 LVM 邏輯 volume）。負責：
+
+- 真正存 RADOS object（用 BlueStore 引擎，詳見 [osd-and-bluestore](/ceph/features/osd-and-bluestore)）
+- 對 PG (placement group) 內的 object 做 replication
+- recovery（peer 短暫掛掉再回來）/ backfill（peer 永久消失）/ scrubbing（cross-check）
+
+```cpp
+// File: src/ceph_osd.cc (line 120)
+int main(int argc, const char **argv) {
+    // ... bootstrap OSD, get OSDMap from MON, register PG instances
+}
+```
+
+**MGR** (Manager)：metric aggregation + dashboard + orchestrator。所有 OSD 把 metric (utilization, latency, op count) push 到 MGR，MGR 算 cluster 整體 metric，提供 Prometheus exporter、dashboard、orchestrator API (cephadm 用來 deploy/upgrade)。1 active + N standby（active fail 時 standby 接管）。
+
+**MDS** (Metadata Server)：**只有用 CephFS 才需要**。負責 POSIX filesystem 的 directory tree / inode metadata。RADOS 本身只 key-value，POSIX semantics 不靠 MDS。本 SP 不展開。
+
+**RGW** (Radosgw)：S3 / Swift gateway。把 HTTP S3 request 翻成 RADOS object op。本 SP 不展開。
+
+## RADOS 是底層 object store
+
+RADOS = Reliable Autonomic Distributed Object Store。它是 ceph 所有上層 (RBD / CephFS / RGW) 的下層：
+
+```
+┌──────────────────────────────────────────────────┐
+│   Apps                                            │
+│   ├─ OpenStack Nova / KubeVirt → RBD            │
+│   ├─ Linux app → CephFS (POSIX)                  │
+│   └─ S3 client → RGW                             │
+└─────────────────────┬────────────────────────────┘
+                      │
+                      ▼
+   ┌──────────────────────────────────────────┐
+   │  librbd          libcephfs       librgw  │  ← user-space libraries
+   └─────────┬─────────┬──────────────┬───────┘
+             │         │              │
+             ▼         ▼              ▼
+        ┌────────────────────────────────┐
+        │       librados                  │  ← RADOS client API (C/C++/Python/Java/...)
+        └────────────┬────────────────────┘
+                     │ (network)
+                     ▼
+        ┌────────────────────────────────┐
+        │       RADOS                     │  ← MON cluster + OSD cluster
+        │  (object store, replicated,     │
+        │   eventually consistent? — NO,  │
+        │   strongly consistent per PG)   │
+        └────────────────────────────────┘
+```
+
+關鍵：**RADOS 是 strongly consistent 在 per-object 層級**。primary OSD ack write 之前必定 replicate 到 size 個 OSD（典型 size=3）。讀寫只跟 primary OSD 對話。
+
+## client 寫 object 的完整 path
+
+```
+1. Client 啟動：連任一 MON → 拿 OSDMap (含 CRUSHMap)
+                              ⏐
+                              ▼
+2. Client 要寫 object "myimg.0001":
+   ├─ pool_id = lookup pool 在 OSDMap
+   ├─ pg_id = pool_id.hash("myimg.0001") % pg_num
+   ├─ osd_set = CRUSH(CRUSHMap, pg_id) → [osd.5, osd.12, osd.27]
+   │   (osd.5 是 primary，osd.12/27 是 secondary)
+   │
+   ▼
+3. Client 直連 osd.5 發 write
+                ⏐
+                ▼
+4. osd.5 (primary)：
+   ├─ 對 osd.12 發 sub-op write
+   ├─ 對 osd.27 發 sub-op write
+   ├─ 等兩個 secondary commit
+   ├─ 自己 commit
+   └─ ack client (write applied + committed)
+```
+
+**注意**：MON 不在 data path 上。client 拿 OSDMap 後就**直接連 OSD**，MON 只在「OSDMap 變動時」要再聯絡一次。這就是為什麼 MON 不是 SPOF for throughput——它只負責 cluster state 的 consensus，data path 完全 decentralized。
+
+## 客戶端用什麼跟 OSD 對話
+
+`librados` 提供 C/C++/Python/Java 的 RADOS client API。內部用 `Objecter` 做 dispatch：
+
+```cpp
+// File: src/osdc/Objecter.h (line 1689)
+class Objecter : public md_config_obs_t, public Dispatcher {
+    // ...
+    // 維護 OSDMap epoch、pending ops、retry on map change
+    // 把 op 送到對應的 primary OSD
+};
+```
+
+`Objecter` 會在 OSDMap 變動時自動把 in-flight op 重新 route（例如 primary OSD 換了），對上層 lib 透明。
+
+## 為什麼這設計重要
+
+對比 HDFS / GFS：
+
+| | HDFS NameNode | Ceph |
+|---|---|---|
+| metadata location | 中央 NameNode 記每個 block 在哪 | client 用 CRUSH 算式自己算 |
+| metadata SPOF | NameNode（HA 用 standby）| MON quorum，但 MON 不在 data path |
+| placement lookup latency | NameNode round-trip | O(1) 算式，本機算完 |
+| add OSD/DataNode | NameNode 重平衡 | CRUSH stable property，只動少數 PG |
+
+CRUSH 細節留 [crush-and-placement](/ceph/features/crush-and-placement)。
+
+## 跟 k8s 的接點預告
+
+- **rook** 是 operator：把 ceph cluster 當 k8s CRD 管 (`CephCluster`, `CephBlockPool`, `CephObjectStore`...)
+- **ceph-csi** 是 CSI driver：把 librbd / libcephfs 包成 k8s PVC backend
+- 兩者組合：rook 起整套 ceph daemon 為 Pod；ceph-csi 提供 PVC → RBD image 的綁定
+- 詳見 [rbd-and-csi](/ceph/features/rbd-and-csi)
+
+## 收穫檢查
+
+- 為什麼 MON 不是 data path 的 bottleneck？
+- 3 MON 可以容忍幾個 fail？4 MON 呢？(提示：quorum > N/2)
+- client 拿到 OSDMap 後，OSDMap 變動時 (例如 OSD 掛了) client 怎麼知道？
+- MGR 跟 MON 的職責邊界？
+
+## 原始碼進入點
+
+- [src/ceph_mon.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/ceph_mon.cc) — MON main
+- [src/ceph_osd.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/ceph_osd.cc) — OSD main
+- [src/ceph_mgr.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/ceph_mgr.cc) — MGR main
+- [src/mon/Monitor.h](https://github.com/ceph/ceph/blob/v19.2.3/src/mon/Monitor.h) — `class Monitor`
+- [src/osdc/Objecter.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osdc/Objecter.h) — client RADOS dispatcher
+- [src/librados/](https://github.com/ceph/ceph/tree/v19.2.3/src/librados) — librados implementation
+
+## 接下來
+
+- [crush-and-placement](/ceph/features/crush-and-placement)：CRUSH 算法、PG、為什麼 client 能自己算
+- [osd-and-bluestore](/ceph/features/osd-and-bluestore)：OSD daemon 內部 + BlueStore
+- [rbd-and-csi](/ceph/features/rbd-and-csi)：RBD image 與 k8s PVC 接點

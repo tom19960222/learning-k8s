@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "question": "ceph-mon 通常部署 3 或 5 個 (奇數)。為什麼？4 個 MON 可以容忍幾個 fail？",
+    "options": [
+      "MON 用 Paxos quorum，只要過半在線即可服務。3 MON 容忍 1 fail，5 MON 容忍 2 fail；4 MON 也只能容忍 1 fail (要 quorum=3 才過半)，所以多花一台沒換來容錯，奇數最 cost-effective",
+      "MON 必須奇數，否則 quorum 算不出 leader",
+      "5 MON 可以容忍 2 fail，但 4 MON 因為偶數會直接拒絕啟動",
+      "MON 不用 quorum，奇偶都行；3/5 是慣例"
+    ],
+    "answer": 0,
+    "explanation": "MON 用 Paxos consensus，需要 quorum (>N/2) 才能 commit 新 cluster state。3 MON: quorum=2，容忍 1 fail；5 MON: quorum=3，容忍 2 fail；4 MON: quorum=3，仍只能容忍 1 fail (3 個過半)。所以多一台 MON 沒提升容錯反而增加 latency (要等多一票)。3 或 5 是 cost/容錯最佳組合。MON Paxos 實作在 src/mon/Monitor.h:108 與 src/mon/Paxos.h。"
+  },
+  {
+    "id": 2,
+    "question": "Ceph client 寫 object 時不需要連中央 metadata server 就能定位 object 該存在哪幾個 OSD。為什麼能做到？",
+    "options": [
+      "client 從 MON 拿 OSDMap (含 CRUSHMap) 後，本機跑 CRUSH 演算法算出 OSD set。CRUSH 是 deterministic 的 hash-based 演算法，input (object, CRUSHMap, rule) 相同就出相同 output；client 與 OSD 都算同樣結果",
+      "ceph 用一致性雜湊 (consistent hash)，client 直接 modulo 算",
+      "client 第一次寫 object 時隨機選 OSD，OSD 自動 record",
+      "MON 在後台同步一份 mapping table 給所有 client"
+    ],
+    "answer": 0,
+    "explanation": "CRUSH (Controlled Replication Under Scalable Hashing) 是 deterministic 演算法 (src/crush/mapper.c:2016 的 crush_do_rule)。client 從 MON 拿 OSDMap 後在本機算，不需要查 server。MON 不在 data path 上 — client 拿 map 後直接連 primary OSD。CRUSH 還有 stable property: 加/拔 OSD 時只有少數 PG 需要重 placement (來自 straw2 weighted random sampling)。對比 HDFS 用中央 NameNode 記每個 block 位置，CRUSH 把這個 lookup 變成 O(1) 算式。"
+  },
+  {
+    "id": 3,
+    "question": "ceph 加了一層 PG (Placement Group)：object → PG (hash) → OSD set (CRUSH)。為什麼不直接 object → OSD？",
+    "options": [
+      "cluster 可能有 trillion 個 object，per-object 算 CRUSH 與追狀態成本太高。PG 把 N 個 object 分組 (典型 hundreds~thousands per pool)，CRUSH 算的是 PG → OSD，計算量取決於 PG 數而非 object 數；OSD 內部也以 PG 為工作單位 (peering / recovery / scrubbing 都對 PG)",
+      "object 名字太長無法直接 hash，必須先映射到 PG ID",
+      "PG 是給用戶分類用的，跟 placement 無關",
+      "PG 是歷史包袱，未來會移除"
+    ],
+    "answer": 0,
+    "explanation": "trillion 個 object 直接 object→OSD 的話，每個 object 都要 CRUSH 一次 + 個別追狀態，OSD 內部 metadata 爆炸。PG 是中介 grouping：(1) CRUSH input 是 PG ID 不是 object name，計算量取決於 PG 數；(2) OSD 不單獨追每個 object 狀態，而是追 PG 狀態 (active+clean / degraded / scrubbing 等，就是 ceph -s 看的)；(3) recovery / backfill / scrubbing 都以 PG 為單位執行。pg_num 在 pool 創建時設定，可動態 scale (pg_autoscaler 可自動調)。"
+  },
+  {
+    "id": 4,
+    "question": "BlueStore 取代了舊的 FileStore (xfs + 自管 journal)。為什麼 ceph 要直接管 raw block 而不繼續用 filesystem？",
+    "options": [
+      "FileStore 雙寫 (filesystem journal + object journal)、filesystem fsync 太粗影響 latency tail、on-disk format 不可控、xattr 大小限制；BlueStore 直接管 raw block + RocksDB metadata，少一層 + 控制力高",
+      "filesystem 不能存 ceph object 因為太大",
+      "BlueStore 性能完全靠它能 bypass kernel",
+      "filesystem 不支援多 thread 寫入"
+    ],
+    "answer": 0,
+    "explanation": "FileStore (xfs 之上) 有結構性問題：每筆 object write 走 (1) filesystem write+journal (2) ceph 的 object journal，雙寫；filesystem 的 fsync 是粗顆粒，影響 latency tail；on-disk format 由 filesystem 決定，ceph 控制不到；FileStore 用 xattr 存 metadata 受 filesystem xattr 大小限制。BlueStore (src/os/bluestore/BlueStore.h:236) 直接寫 raw block + 用 RocksDB 存所有 metadata (object metadata, PG log, omap)，BlueFS 是極簡 user-space FS 只給 RocksDB 用。少一層中間人 + 完全可控。v19 (Squid) 預設且唯一推薦。"
+  },
+  {
+    "id": 5,
+    "question": "你建了一個 50 GB 的 RBD image 給 KubeVirt VM。它在 ceph 那邊長什麼樣？",
+    "options": [
+      "1 個 metadata object (rbd_header.<image_id> 含 size/stripe/snap list) + N 個 4MB data object (rbd_data.<image_id>.<chunk_index>)。thin provisioned: 只有真寫過的 chunk 才在 RADOS 落物件",
+      "ceph 預先配 50 GB 連續 raw block，map 到一個大 RADOS object",
+      "ceph 為這個 image 建一個 dedicated pool，pool 內存 50 GB raw",
+      "RBD 直接用 host filesystem 的 file，ceph 不參與"
+    ],
+    "answer": 0,
+    "explanation": "RBD image = 1 個 metadata object (rbd_header.<image_id>，含 size、object_size 預設 4MB、stripe、snapshot list、features) + 邏輯上 N=size/object_size 個 data object (rbd_data.<image_id>.<chunk_index>)。50 GB / 4MB = 12800 個 chunk。但 thin provisioned: 只有真寫過的 chunk 才在 RADOS 落 object。寫入時 librbd 算 chunk_index = offset / object_size、object_name = rbd_data.<id>.<hex(idx)>，再透過 librados → CRUSH → primary OSD。不同 chunk 的 primary OSD 不同 (CRUSH input 不同)，所以大 IO 自動 parallelize 到多 OSD。實際佔用 raw space 還要乘 replication factor (預設 3)。"
+  }
+]
