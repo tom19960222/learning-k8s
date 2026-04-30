@@ -1,0 +1,132 @@
+---
+layout: doc
+title: Kubernetes — Pod network lifecycle
+description: Pod 從 kubelet SyncPod 到 CRI RunPodSandbox，再到 runtime 呼叫 CNI ADD 的責任邊界；同時修正 dockershim 時代與現代 Kubernetes 的差異。
+---
+
+## 場景
+
+你建立一個 Pod，幾秒後它拿到 `10.244.x.y` 這類 Pod IP。這個 IP 不是 scheduler 決定的，也不是 apiserver 下 kernel route。真正的路徑是：
+
+```
+kubelet
+  -> CRI RunPodSandbox
+    -> containerd / CRI-O 建 sandbox network namespace
+      -> runtime 呼叫 CNI ADD
+        -> CNI plugin 配 IP / veth / route / datapath
+```
+
+先抓住這個邊界，Kubernetes network 就不再像魔法。
+
+## CNI 是什麼，不是什麼
+
+CNI 的核心不是「某個 Kubernetes controller」，而是一個 binary execution protocol。runtime 執行 CNI binary，透過 env vars 傳入 `CNI_COMMAND`、`CNI_CONTAINERID`、`CNI_NETNS`、`CNI_IFNAME`、`CNI_PATH`，再把 network configuration JSON 丟到 stdin。
+
+最重要的幾個操作：
+
+| 操作 | 意義 |
+|---|---|
+| `ADD` | 把某個 container / sandbox 加進 network，通常包含建立 interface、配 IP、寫 route。 |
+| `DEL` | 清掉 `ADD` 建立的資源，釋放 IP。 |
+| `CHECK` | 檢查現有 network attachment 是否仍符合預期。 |
+| `STATUS` | plugin 自己是否 ready，例如外部 daemon 或 IP pool 是否可用。 |
+| `GC` | 清理 stale resources，但不能取代正常 `DEL`。 |
+| `VERSION` | 回報支援的 CNI spec version。 |
+
+這裡的重點是：CNI spec 定義「怎麼呼叫與回傳」，不定義一定要用 bridge、VXLAN、BGP、eBPF、SR-IOV 或 cloud VPC。
+
+## 從 Kubernetes source 看 kubelet 邊界
+
+`kubernetes/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go` 的 `createPodSandbox()` 最後呼叫的是 CRI：
+
+```go
+podSandBoxID, err := m.runtimeService.RunPodSandbox(ctx, podSandboxConfig, runtimeHandler)
+```
+
+再往 CRI client 看，`kubernetes/staging/src/k8s.io/cri-client/pkg/remote_runtime.go` 只是把這件事包成 gRPC request：
+
+```go
+resp, err := r.runtimeClient.RunPodSandbox(ctx, &runtimeapi.RunPodSandboxRequest{
+    Config: config,
+    RuntimeHandler: runtimeHandler,
+})
+```
+
+這兩段 source 說明了現代 Kubernetes 的關鍵邊界：kubelet 不直接執行 `/opt/cni/bin/flannel`、`/opt/cni/bin/cilium-cni` 或 `bridge`。它只要求 CRI runtime 建 Pod sandbox。runtime 在 sandbox 建立過程中再呼叫 CNI。
+
+## CRI proto 裡已經把 network 語義藏好
+
+`staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto` 的 `RunPodSandbox` 註解說明 runtime 必須建立並啟動 pod-level sandbox；`StopPodSandbox` 則要回收 sandbox 的 network resources，例如 IP。
+
+同一份 proto 還定義 `NamespaceOption`：
+
+```protobuf
+message NamespaceOption {
+    NamespaceMode network = 1;
+    NamespaceMode pid = 2;
+    NamespaceMode ipc = 3;
+}
+```
+
+`network` 可以是 `POD` 或 `NODE`。一般 Pod 是 `POD` network namespace；`hostNetwork: true` 的 Pod 則走 node namespace。這解釋了為什麼 CNI 最重要的參數是 `CNI_NETNS`：plugin 需要知道要進哪個 network namespace 下手。
+
+## Pause container 的角色
+
+Pod 不是每個 app container 各自有 IP，而是同一個 Pod 內的 container 共用一個 network namespace。Kubernetes 用 sandbox / pause container 承載這個 namespace，讓 app container 可以重啟但 Pod IP 不必跟著消失。
+
+`kubernetes/build/pause/linux/pause.c` 的核心很小：設 signal handler、reap child、然後一直 `pause()`。它不是 proxy，也不轉封包；它的價值是穩定地持有 namespace。
+
+所以當你在 node 上看到每個 Pod 多出一個 sandbox / pause container，這不是多餘 process，而是 Pod network namespace 的 anchor。
+
+## NetworkReady 怎麼影響 Node
+
+CRI runtime 會在 `Status()` 裡回報 conditions。`api.proto` 把 required conditions 分成 `RuntimeReady` 與 `NetworkReady`。`NetworkReady` 的意思是 runtime network 已經能接受需要 container network 的 Pod。
+
+`kubernetes/pkg/kubelet/kubelet.go` 的 `updateRuntimeUp()` 會檢查這個 condition：
+
+```go
+networkReady := s.GetRuntimeCondition(kubecontainer.NetworkReady)
+if networkReady == nil || !networkReady.Status {
+    kl.runtimeState.setNetworkState(...)
+}
+```
+
+這就是常見錯誤訊息 `container runtime network not ready` 的 source-level 來源。CNI conf 不存在、CNI daemon 沒 ready、plugin binary 缺失、IPAM 失敗，都可能讓 runtime network condition 不 ready，最後反映成 Node / Pod 狀態異常。
+
+## 現代修正：dockershim 時代與現在不同
+
+Day11 文章的觀察在 2019 年是正確的：kubelet/dockershim 會直接看 `--network-plugin=cni`、`--cni-bin-dir`、`--cni-conf-dir`。但 Kubernetes 1.24 移除 dockershim 後，這條路已經不是現代主線。
+
+現在要這樣看：
+
+| 舊脈絡 | 現代脈絡 |
+|---|---|
+| kubelet 內建 dockershim，直接管理 CNI config / bin dir。 | kubelet 連 CRI runtime endpoint，例如 containerd / CRI-O。 |
+| kubelet flag `--network-plugin=cni` 是主要入口。 | CNI 位置通常在 runtime config，例如 containerd 的 CRI CNI 設定。 |
+| debug 時可能看 `docker ps`、dockershim log。 | debug 時優先看 `crictl`、containerd/CRI-O log、CNI daemon log、`/etc/cni/net.d`。 |
+
+這不改變 CNI 的 Linux datapath 原理，但會改變你除錯時該找哪個 process。
+
+## 除錯路徑
+
+| 現象 | 先查哪裡 | 典型原因 |
+|---|---|---|
+| Node `NetworkReady=false` | kubelet log、runtime log、`crictl info` | runtime 找不到 CNI config/bin，或 CNI daemon 未 ready。 |
+| Pod 卡 `ContainerCreating` 並出現 CNI ADD failed | runtime log、CNI log、`/etc/cni/net.d` | CNI plugin 執行失敗、IPAM 沒 IP、netns 不存在。 |
+| Pod 有 IP 但不能跨 node | route、ARP/FDB、overlay device、CNI daemon | CNI datapath 沒寫好 route/FDB，或 underlay node-to-node 不通。 |
+| Service 可解析但連不到 backend | kube-proxy / Cilium service datapath | Service routing 不是 CNI spec 本身。 |
+
+## 收穫檢查
+
+- kubelet 是直接呼叫 CNI binary，還是透過 CRI runtime 間接觸發？
+- `CNI_NETNS` 為什麼比 Pod name 更接近 datapath 真相？
+- pause container 真的有在轉封包嗎？
+- `NetworkReady=false` 是 apiserver 問題，還是 node runtime/CNI 問題？
+
+## 參考資料
+
+- [Day10 — Container Network Interface 介紹](https://ithelp.ithome.com.tw/articles/10220626)
+- [Day11 — Kubernetes - Container Network Interface](https://ithelp.ithome.com.tw/articles/10221034)
+- [CNI Specification](https://github.com/containernetworking/cni/blob/main/SPEC.md)
+- [Kubernetes Container Runtime Interface](https://kubernetes.io/docs/concepts/containers/cri/)
+- [Kubernetes Network Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/)

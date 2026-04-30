@@ -1,0 +1,151 @@
+---
+layout: doc
+title: Kubernetes — Pod-to-Pod datapath
+description: 用 flannel VXLAN 作為範例，把 Pod 跨 node 通訊拆成 veth、bridge、route、ARP、FDB、VXLAN outer packet 與 underlay node-to-node 傳輸。
+---
+
+## 場景
+
+Pod A 在 node-a，IP 是 `10.244.0.5`。Pod B 在 node-c，IP 是 `10.244.2.7`。你從 Pod A ping Pod B，封包真的怎麼走？
+
+以 flannel VXLAN 為例，最簡化路徑：
+
+```
+Pod A eth0
+  -> veth host end
+    -> cni bridge
+      -> route to remote PodCIDR via flannel.1
+        -> ARP says remote subnet gateway maps to remote VTEP MAC
+          -> FDB says remote VTEP MAC is behind node-c public IP
+            -> VXLAN encapsulation
+              -> underlay node-a IP -> node-c IP
+                -> node-c flannel.1 decapsulates
+                  -> route/bridge/veth
+                    -> Pod B eth0
+```
+
+這裡沒有超自然現象；只有 Linux kernel table 被 CNI daemon 寫好。
+
+## 先分清楚 original packet 與 outer packet
+
+Pod 看到的是 original packet：
+
+```text
+src = 10.244.0.5
+dst = 10.244.2.7
+```
+
+underlay 網路看到的是 VXLAN outer packet：
+
+```text
+src = node-a underlay IP
+dst = node-c underlay IP
+udp dst port = VXLAN port
+payload = VXLAN header + original Ethernet frame
+```
+
+overlay 的價值是：underlay 不需要知道 `10.244.0.0/16` 裡每個 Pod 在哪台 node。underlay 只要能把 node IP 互相送達。
+
+## flannel.1 是 kernel VXLAN device
+
+`flannel-io/flannel/pkg/backend/vxlan/vxlan.go` 的 `RegisterNetwork()` 會建立 VXLAN device，取得 subnet lease，並把 device 設成 `/32` source address。Linux 實作 VXLAN，所以 flanneld 不是 user-space packet forwarder；它主要負責設定 kernel。
+
+`device.go` 用 netlink 建 VXLAN link；`vxlan_network.go` watch subnet lease events，新增/刪除 route、ARP、FDB。
+
+這點很關鍵：封包 fast path 在 kernel，不是每顆 packet 都送進 flannel Pod。
+
+## flannel 怎麼教 kernel 遠端 node 在哪
+
+Day16 文章提到三個表，source 裡也能對上：
+
+| Linux state | flannel source 動作 | 解決問題 |
+|---|---|---|
+| route | `netlink.RouteReplace(&vxlanRoute)` | 目的 PodCIDR 要走 `flannel.1`。 |
+| ARP / neighbor | `dev.AddARP(...)` | remote subnet gateway IP 對應哪個 VTEP MAC。 |
+| FDB | `dev.AddFDB(...)` | VTEP MAC 對應哪個 underlay node IP。 |
+
+`vxlan_network.go` 的 `handleSubnetEvents()` 會在 lease added 時做這些事；lease removed 時則清掉對應 state。
+
+這就是「10.244.2.7 位於 node-c」這件事的實作：不是 DNS，不是 apiserver 直接轉送，而是 flanneld 從 Kubernetes Node / lease 資訊算出 remote subnet，再把 route / ARP / FDB 寫到 kernel。
+
+## 同 node 與跨 node 路徑不同
+
+同 node Pod 通常不需要 VXLAN：
+
+```
+pod-a eth0 -> veth -> bridge/eBPF/route -> veth -> pod-b eth0
+```
+
+跨 node 才需要處理 remote PodCIDR：
+
+```
+pod-a -> bridge -> flannel.1 -> VXLAN -> underlay -> remote flannel.1 -> pod-b
+```
+
+所以 debug 時第一個問題是：來源與目的 Pod 是否在同一個 node？同 node 不通和跨 node 不通，通常是兩種不同問題。
+
+## Service datapath 是另一條路
+
+CNI 讓 Pod 有 IP 並能互通，但 `Service` 的 ClusterIP / NodePort 不是 CNI spec 的必備功能。
+
+預設 Kubernetes 通常由 kube-proxy 實作 Service datapath：
+
+```
+Service / EndpointSlice watch
+  -> kube-proxy
+    -> iptables / IPVS / nftables rules
+      -> DNAT ClusterIP to backend Pod IP
+```
+
+Cilium kube-proxy replacement 則用 eBPF map 與 BPF programs 取代 kube-proxy rules。這也是為什麼高性能或繞過 kernel network stack 的方案，會遇到 Day17 提到的問題：如果 workload 走 SR-IOV / DPDK / RDMA 直接避開普通 kernel datapath，Kubernetes Service / NetworkPolicy 可能就不會自然生效。
+
+## 排障 checklist
+
+跨 node Pod-to-Pod 不通時，按 datapath 往下切：
+
+| 檢查點 | 指令方向 | 代表意義 |
+|---|---|---|
+| Pod IP 與 Node | `kubectl get pod -o wide` | 確認是否跨 node、目的 PodCIDR。 |
+| Node PodCIDR | `kubectl get node -o wide/yaml` | 看 `spec.podCIDR` / `podCIDRs` 是否存在。 |
+| CNI daemon | `kubectl -n kube-system logs ds/...` | flannel / cilium / calico 是否同步成功。 |
+| CNI conf | `/etc/cni/net.d` | runtime 呼叫哪個 plugin chain。 |
+| runtime CNI result | `crictl inspectp` | sandbox 是否有 IP。 |
+| Linux route | `ip route` | remote PodCIDR 是否有 route。 |
+| VXLAN device | `ip -d link show flannel.1` | VNI、MTU、underlay interface 是否正確。 |
+| neighbor / FDB | `ip neigh`, `bridge fdb show` | remote VTEP MAC 與 underlay IP mapping。 |
+| underlay | `ping nodeIP`, firewall | node-to-node IP 是否互通。 |
+
+## 選型時要問的問題
+
+CNI 不只是在 Pod 裡放一張 `eth0`，它同時決定 cluster 的封包語義：
+
+- 你能接受 overlay MTU overhead 嗎？
+- underlay 能不能加 route，還是只能用 overlay？
+- NetworkPolicy 是否必須？
+- Service datapath 要 kube-proxy、IPVS、nftables，還是 eBPF replacement？
+- Pod IP 要不要跟 VPC / 企業網路同網段？
+- 是否需要多網卡、SR-IOV、DPDK、RDMA、固定 IP？
+- observability 要做到 packet/flow 層，還是只需要 Pod-level metrics？
+
+這也是 Day17 的核心：沒有「最好的 CNI」，只有跟你的 network requirements 對齊的 CNI。
+
+## 本專案延伸閱讀
+
+- [Cilium architecture](/cilium/features/architecture)：Cilium CNI plugin 為什麼要轉給 cilium-agent。
+- [Cilium agent-and-datapath](/cilium/features/agent-and-datapath)：eBPF program 怎麼 attach 到 Pod veth。
+- [Cilium identity-and-policy](/cilium/features/identity-and-policy)：NetworkPolicy 如何變成 BPF map lookup。
+
+## 收穫檢查
+
+- overlay network 中 underlay router 看到的是 Pod IP 還是 node IP？
+- route、ARP、FDB 在 flannel VXLAN 中分別回答哪個問題？
+- 為什麼 flannel fast path 不需要每個 packet 進 flanneld user-space process？
+- 為什麼 SR-IOV / DPDK 這類高速網路可能讓 Kubernetes Service 變麻煩？
+
+## 參考資料
+
+- [Day16 — CNI - Flannel 封包傳輸原理 - VXLAN分析](https://ithelp.ithome.com.tw/articles/10223308)
+- [Day17 — CNI 經驗談](https://ithelp.ithome.com.tw/articles/10223798)
+- [flannel VXLAN backend](https://github.com/flannel-io/flannel/tree/master/pkg/backend/vxlan)
+- [Linux VXLAN reference](https://vincent.bernat.ch/en/blog/2017-vxlan-linux)
+- [Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/)

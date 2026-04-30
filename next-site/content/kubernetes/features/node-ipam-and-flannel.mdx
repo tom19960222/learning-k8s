@@ -1,0 +1,160 @@
+---
+layout: doc
+title: Kubernetes — NodeIPAM 與 Flannel
+description: controller-manager 如何把 cluster CIDR 分成 Node PodCIDR，flanneld 如何讀取 Node、寫 subnet.env，flannel CNI 如何 delegate 到 bridge 與 host-local。
+---
+
+## 場景
+
+flannel 的常見 Pod IP 長這樣：
+
+```
+node-a PodCIDR: 10.244.0.0/24
+node-b PodCIDR: 10.244.1.0/24
+node-c PodCIDR: 10.244.2.0/24
+```
+
+這不是 flannel 隨機挑的，也不是 host-local 自己跨 node 協調出來的。source-first 的答案是：
+
+```
+kube-controller-manager NodeIPAM
+  -> patch Node.spec.podCIDR / podCIDRs
+    -> flanneld watch/read Node
+      -> write /run/flannel/subnet.env
+        -> flannel CNI ADD reads subnet.env
+          -> delegate bridge + host-local
+```
+
+## Kubernetes 先分每個 Node 的 PodCIDR
+
+`kubernetes/staging/src/k8s.io/api/core/v1/types.go` 的 `NodeSpec` 定義：
+
+```go
+PodCIDR  string
+PodCIDRs []string
+```
+
+這是 Node object 上的 API 欄位。controller-manager 若啟用 `--allocate-node-cidrs`，會由 NodeIPAM controller 負責把 cluster CIDR 切成每個 node 的 PodCIDR。
+
+`kubernetes/pkg/controller/nodeipam/node_ipam_controller.go` 會檢查：只要不是 cloud allocator，就必須指定 cluster CIDR，且 cluster CIDR mask 不能比 node CIDR mask 還窄。
+
+真正分配發生在 `kubernetes/pkg/controller/nodeipam/ipam/range_allocator.go`：
+
+```go
+podCIDR, err := r.cidrSets[idx].AllocateNext()
+...
+return r.updateCIDRsAllocation(ctx, node.Name, allocatedCIDRs)
+```
+
+最後 `staging/src/k8s.io/component-helpers/node/util/cidr.go` 的 `PatchNodeCIDRs()` 會 patch Node：
+
+```go
+Spec: {
+    PodCIDR: cidrs[0],
+    PodCIDRs: cidrs,
+}
+```
+
+所以 Kubernetes 自己做的是「分配 node-level subnet」，不是直接分配每個 Pod 的 IP。
+
+## flanneld 讀 Node PodCIDR
+
+flannel 有兩個角色要分清楚：
+
+| 元件 | 生命週期 | 工作 |
+|---|---|---|
+| `flanneld` | DaemonSet 裡的長駐 process | watch/read Node、註冊 subnet lease、建立 overlay device、寫 kernel route/ARP/FDB。 |
+| `flannel` CNI plugin | runtime 呼叫的短命 binary | 讀 `/run/flannel/subnet.env`，組出 delegate config，再叫 bridge/host-local。 |
+
+`flannel-io/flannel/pkg/subnet/kube/kube.go` 的 `AcquireLease()` 會等到本 node 存在，檢查 `n.Spec.PodCIDR`，再把 backend type、public IP、VTEP MAC 等資料寫回 Node annotations。
+
+這段邏輯對應 Day15 的觀察：flannel 不是自己憑空知道每個 node 的 subnet，而是讀 Kubernetes Node API。
+
+## subnet.env 是 flanneld 與 CNI binary 的交接點
+
+flanneld 會把取得的 subnet 資訊寫到本機檔案，常見內容像：
+
+```bash
+FLANNEL_NETWORK=10.244.0.0/16
+FLANNEL_SUBNET=10.244.0.1/24
+FLANNEL_MTU=1450
+FLANNEL_IPMASQ=true
+```
+
+這個檔案在 host filesystem 上，讓 runtime 呼叫的短命 CNI binary 可以讀到。它是 DaemonSet 長駐狀態與 CNI ADD 短命操作之間的橋。
+
+## flannel CNI 怎麼 delegate
+
+`flannel-io/cni-plugin/flannel.go` 是 meta-plugin：它自己不做 bridge/veth/IPAM 的全部事情，而是讀取 `subnet.env` 後委派給其他 plugin。
+
+`flannel_linux.go` 裡的邏輯可以簡化成：
+
+```text
+if delegate.type missing:
+  delegate.type = "bridge"
+if ipam.type missing:
+  ipam.type = "host-local"
+ipam.ranges = FLANNEL_SUBNET
+ipam.routes = FLANNEL_NETWORK
+delegateAdd(...)
+```
+
+這就是 Day15 的核心：flannel 對 IP 管理的做法不是取代 host-local，而是讓每個 node 的 host-local 看到不同 subnet。host-local 繼續處理單 node 內不重複，跨 node 不重複則由 Kubernetes NodeIPAM + flanneld 保證。
+
+## ConfigMap 與 DaemonSet 為什麼必要
+
+Day14 的安裝 YAML 觀察可以轉成三個責任：
+
+1. ConfigMap 提供 CNI conflist 與 flannel network config。
+2. DaemonSet 確保每台 node 都有 flanneld。
+3. init container 或 hostPath mount 把 CNI config 放到每台 node 的 CNI conf dir。
+
+CNI 是 node-local 設定，不是 apiserver 裡的一個全域開關。新 node 加入 cluster 後，如果沒有 DaemonSet 幫它放 config、啟 daemon，runtime 就可能 NetworkReady=false。
+
+## 整段 IP 分配鏈
+
+```
+cluster CIDR: 10.244.0.0/16
+  │
+  ▼
+NodeIPAM range allocator
+  │
+  ├─ node-a spec.podCIDR = 10.244.0.0/24
+  ├─ node-b spec.podCIDR = 10.244.1.0/24
+  └─ node-c spec.podCIDR = 10.244.2.0/24
+        │
+        ▼
+flanneld on node-b
+  │
+  └─ /run/flannel/subnet.env = 10.244.1.1/24
+        │
+        ▼
+flannel CNI ADD
+  │
+  └─ bridge + host-local gets 10.244.1.0/24 range
+        │
+        ▼
+Pod gets 10.244.1.x
+```
+
+## 版本與架構注意
+
+- `PodCIDR` 是舊單值欄位；`PodCIDRs` 支援 dual-stack，但第 0 個值要和 `PodCIDR` 相容。
+- 不同 CNI 不一定使用 Kubernetes NodeIPAM。Calico、Cilium、cloud CNI 都可能有自己的 IPAM 模式。
+- flannel VXLAN backend 需要 node-to-node underlay IP 可達；overlay 不是讓不通的 underlay 變通。
+- `FLANNEL_MTU=1450` 不是任意值；VXLAN 會增加封裝 overhead，MTU 要避免 fragmentation。
+
+## 收穫檢查
+
+- host-local 為什麼只保證單 node 內唯一？
+- Kubernetes NodeIPAM 分的是 Pod IP，還是 node-level subnet？
+- flanneld 與 flannel CNI binary 差在哪？
+- `/run/flannel/subnet.env` 如果不存在，Pod CNI ADD 會在哪一層失敗？
+
+## 參考資料
+
+- [Day14 — CNI - Flannel 安裝與設定原理](https://ithelp.ithome.com.tw/articles/10222308)
+- [Day15 — CNI - Flannel IP 管理問題](https://ithelp.ithome.com.tw/articles/10222753)
+- [Kubernetes Node IPAM source](https://github.com/kubernetes/kubernetes/tree/master/pkg/controller/nodeipam)
+- [flannel kube subnet manager](https://github.com/flannel-io/flannel/blob/master/pkg/subnet/kube/kube.go)
+- [flannel CNI plugin](https://github.com/flannel-io/cni-plugin)

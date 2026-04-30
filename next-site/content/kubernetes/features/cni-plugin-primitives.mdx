@@ -1,0 +1,149 @@
+---
+layout: doc
+title: Kubernetes — CNI plugin primitives
+description: 從 CNI spec、skel.CmdArgs、bridge plugin、host-local IPAM 拆解 CNI binary 如何把 network namespace 接上 Linux bridge、veth、route 與 IPAM。
+---
+
+## 場景
+
+如果你把 Kubernetes 拿掉，只留下一個 network namespace，CNI plugin 仍然可以被手動呼叫。這很重要：CNI 最底層不是 Kubernetes object，而是 Linux networking 操作。
+
+最小模型：
+
+```
+host netns
+  ├─ bridge: cni0
+  └─ veth-host ───── veth-container: eth0
+                         │
+                         ▼
+                    pod netns
+```
+
+CNI 的工作就是把這張圖從「沒有」變成「存在」，再把 IP、route、DNS、portmap 等結果回傳給 runtime。
+
+## CNI binary 收到什麼
+
+官方 `containernetworking/cni/pkg/skel/skel.go` 的 `CmdArgs` 幾乎就是 CNI spec 參數的 Go 版本：
+
+```go
+type CmdArgs struct {
+    ContainerID string
+    Netns       string
+    IfName      string
+    Args        string
+    Path        string
+    StdinData   []byte
+}
+```
+
+這讓 CNI plugin 作者不用自己解析 env var 與 stdin。你的 `cmdAdd(args)` 只要讀 `args.Netns`、`args.IfName`、`args.StdinData`，就能知道要進哪個 netns、建立什麼 interface、依照哪份 JSON config。
+
+## bridge plugin 實際做什麼
+
+`containernetworking/plugins/plugins/main/bridge/bridge.go` 是理解 CNI 的好入口，因為它幾乎沒有魔法：
+
+1. 讀 network configuration。
+2. 確認或建立 Linux bridge。
+3. 打開 `args.Netns` 指向的 network namespace。
+4. 在 Pod netns 建 veth pair，host 端移回 host netns。
+5. 把 host veth 接到 bridge。
+6. 若有 IPAM，呼叫 IPAM plugin 取得 IP。
+7. 在 Pod netns 裡把 IP / route 設到 `args.IfName`。
+8. 回傳 CNI Result。
+
+對應 source 裡的幾個重要動作：
+
+| 動作 | Source anchor | Linux 意義 |
+|---|---|---|
+| `ns.GetNS(args.Netns)` | bridge `cmdAdd` | 打開目標 netns。 |
+| `ip.SetupVeth(...)` | bridge `setupVeth` | 建一對 veth，一端在 Pod netns，一端回 host。 |
+| `netlink.LinkSetMaster(hostVeth, br)` | bridge `setupVeth` | 把 host veth 接到 bridge。 |
+| `ipam.ExecAdd(...)` | bridge `cmdAdd` | 呼叫 delegated IPAM plugin。 |
+| `ipam.ConfigureIface(args.IfName, result)` | bridge `cmdAdd` | 在 Pod netns 設 IP 與 routes。 |
+
+所以一個 Pod 拿到 IP，不是 kubelet 幫它 `ip addr add`，而是 CNI plugin 透過 netlink 對 Linux kernel 下指令。
+
+## IPAM 是 delegated plugin
+
+Day13 提到的重點需要保留：IPAM 也是 CNI plugin。CNI spec 沒有規定 IPAM 一定要怎麼做，只是常見 main plugin 會從 config 的 `ipam.type` 找出另一支 binary。
+
+以 bridge + host-local 為例：
+
+```
+bridge ADD
+  ├─ 建 bridge / veth
+  ├─ delegate: host-local ADD
+  │     └─ 回傳可用 IP / gateway / routes
+  └─ 把 IP / routes 設進 Pod netns
+```
+
+`containernetworking/plugins/plugins/ipam/host-local/main.go` 會載入 IPAM config、開啟 disk store，然後為每個 range 建 allocator。allocator 的核心在 `backend/allocator/allocator.go`：
+
+- 有 requested IP 時，先檢查該 IP 是否在 range 內且未被保留。
+- 沒有 requested IP 時，從 `LastReservedIP` 後面開始 round-robin。
+- 每次分配都呼叫 local store 的 `Reserve`。
+- `DEL` 時用 container ID 與 ifname 釋放。
+
+## host-local 的能力邊界
+
+host-local 這個名字很誠實：它只用本機檔案系統記錄分配狀態，所以只保證「同一個 node 上」不重複。
+
+```
+/var/lib/cni/networks/<network-name>/
+  ├─ 10.244.0.2        -> container ID
+  ├─ 10.244.0.3        -> container ID
+  └─ last_reserved_ip.0
+```
+
+如果三台 node 都用同一份 `10.244.0.0/24` host-local config，它們各自看不到對方的 local disk state，仍然可能分到相同 IP。這就是為什麼 flannel 需要先讓每台 node 拿不同 PodCIDR，再把該 subnet 丟給 host-local。
+
+## CNI result 不是裝飾，是 runtime 的事實來源
+
+CNI `ADD` 成功後需要回傳 JSON result，通常包含：
+
+- interface list
+- assigned IPs
+- routes
+- DNS
+
+後續 plugin chain 會把前一個 result 當 `prevResult` 傳下去，例如 `bridge -> tuning -> portmap`。`CHECK` / `DEL` 也會依賴先前 result 判斷或清理資源。
+
+這就是為什麼 CNI plugin chain 不是「一堆 binary 隨便跑」，而是有順序、有結果傳遞、有補償清理語義的 pipeline。
+
+## Linux datapath 對照
+
+| 你看到的 Kubernetes 現象 | Linux 層實際物件 |
+|---|---|
+| Pod 有 `eth0` | Pod netns 裡的 veth peer。 |
+| Pod 有 IP | CNI/IPAM 回傳 IP 後，main plugin 用 netlink 設上去。 |
+| 同 node Pod 互通 | veth 接到同一個 bridge 或 eBPF/route datapath。 |
+| Pod 可出外網 | route + SNAT / masquerade / cloud route。 |
+| hostPort 生效 | `portmap` plugin 寫 host netfilter 規則。 |
+
+## 為什麼這對 Kubernetes 除錯很重要
+
+當你看到 `CNI ADD failed`，不要只看 Pod YAML。你要能往下問：
+
+- runtime 是否找到正確 CNI config？
+- `type` 對應的 binary 是否在 CNI path？
+- `CNI_NETNS` 指向的 namespace 是否還存在？
+- IPAM 是否還有可用 IP？
+- plugin 是否需要長駐 daemon，例如 DHCP daemon、Cilium agent、flanneld？
+- plugin chain 的前一段是否回傳合法 result？
+
+這些問題都比「Kubernetes 網路壞了」更可操作。
+
+## 收穫檢查
+
+- CNI plugin 為什麼要拿到 netns path，而不是只拿 Pod name？
+- bridge plugin 中 veth 的 host 端與 container 端分別在哪個 namespace？
+- host-local 為什麼不能單獨解決跨 node IP 唯一性？
+- `prevResult` 在 plugin chain 裡解決什麼問題？
+
+## 參考資料
+
+- [Day12 — 使用 golang 打造一個基本 CNI](https://ithelp.ithome.com.tw/articles/10221514)
+- [Day13 — 初探 CNI 的 IP 分配問題](https://ithelp.ithome.com.tw/articles/10221970)
+- [CNI skel.go](https://github.com/containernetworking/cni/blob/main/pkg/skel/skel.go)
+- [CNI bridge plugin](https://github.com/containernetworking/plugins/blob/main/plugins/main/bridge/bridge.go)
+- [host-local IPAM](https://github.com/containernetworking/plugins/tree/main/plugins/ipam/host-local)

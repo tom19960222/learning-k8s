@@ -106,5 +106,65 @@
     ],
     "answer": 0,
     "explanation": "RuntimeClass 是穩定 API，用來選擇 container runtime configuration。cluster admin 在 node runtime 設好 handler 後，Pod 可用 spec.runtimeClassName 指定。"
+  },
+  {
+    "id": 10,
+    "question": "現代 Kubernetes 中，一般 Pod 的 CNI ADD 主要是誰觸發的？",
+    "options": [
+      "CRI runtime 在 RunPodSandbox 流程中建立 sandbox network namespace 後呼叫 CNI plugin",
+      "kube-apiserver 收到 Pod POST 後直接執行 CNI binary",
+      "scheduler bind Pod 後直接寫 Linux route",
+      "etcd watch 到 Pod 後呼叫 /opt/cni/bin"
+    ],
+    "answer": 0,
+    "explanation": "kubelet 透過 CRI 呼叫 RunPodSandbox，containerd/CRI-O 這類 runtime 在 sandbox 建立流程中呼叫 CNI。dockershim 時代 kubelet 有直接 CNI integration，但 Kubernetes 1.24 後這不是現代主線。"
+  },
+  {
+    "id": 11,
+    "question": "CNI plugin 最需要 CNI_NETNS 的原因是什麼？",
+    "options": [
+      "它要進入目標 network namespace 建 interface、設定 IP 與 route",
+      "它要查詢 apiserver 裡 Pod 的 labels",
+      "它要讓 scheduler 決定 Pod 放在哪台 node",
+      "它要更新 Deployment replica 數量"
+    ],
+    "answer": 0,
+    "explanation": "CNI 是 node-local network 操作。CNI_NETNS 指向 sandbox 的 network namespace，plugin 會在那個 namespace 裡建立 eth0、設定 IP、route 等 Linux network state。"
+  },
+  {
+    "id": 12,
+    "question": "host-local IPAM 為什麼不能單獨保證整個 cluster 的 Pod IP 不重複？",
+    "options": [
+      "它把分配狀態存在本機檔案系統，只能保證同一台 node 內不重複",
+      "它完全不會記錄已分配 IP",
+      "它只支援 IPv6，不支援 IPv4",
+      "它必須直接連到 etcd 才能分配 IP"
+    ],
+    "answer": 0,
+    "explanation": "host-local 的狀態是 node-local，例如 /var/lib/cni/networks。flannel 這類方案會先讓每台 node 拿不同 PodCIDR，再把該 subnet 給 host-local，讓單 node 內的分配不重複。"
+  },
+  {
+    "id": 13,
+    "question": "flannel VXLAN 模式中，跨 node Pod-to-Pod 流量的 outer packet 目的 IP 是誰？",
+    "options": [
+      "目的 Pod 所在 node 的 underlay IP",
+      "目的 Pod IP",
+      "kube-apiserver ClusterIP",
+      "Service ClusterIP"
+    ],
+    "answer": 0,
+    "explanation": "VXLAN overlay 會把 Pod-to-Pod original packet 包進 Node-to-Node outer packet。underlay 網路看到的是 node IP 之間的傳輸，不需要知道 PodCIDR。"
+  },
+  {
+    "id": 14,
+    "question": "在 flannel VXLAN 中，route、ARP、FDB 三者共同解決什麼問題？",
+    "options": [
+      "讓 kernel 知道 remote PodCIDR 要走哪個 VXLAN device、next-hop VTEP MAC 是誰、該 VTEP MAC 對應哪個 underlay node IP",
+      "讓 kubelet 知道 Deployment 要幾個 replicas",
+      "讓 CoreDNS 決定 Service 名稱怎麼解析",
+      "讓 apiserver 直接把封包轉發到另一台 node"
+    ],
+    "answer": 0,
+    "explanation": "flanneld watch subnet lease 後，會在 kernel 寫 route、neighbor/ARP 與 bridge FDB。封包 fast path 由 Linux kernel VXLAN device 處理，不是每顆 packet 都進 flanneld。"
   }
 ]

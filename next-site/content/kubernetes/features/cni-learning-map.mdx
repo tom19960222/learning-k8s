@@ -1,0 +1,96 @@
+---
+layout: doc
+title: Kubernetes — CNI 文章知識地圖
+description: 從 8 篇 CNI 文章抽取知識點，整理成從 CNI contract、kubelet/CRI 邊界、bridge/veth/IPAM、NodeIPAM、flannel VXLAN 到 CNI 選型的學習路徑。
+---
+
+## 場景
+
+你有網路背景，所以 Kubernetes network 最容易讓人覺得「魔法」的地方不是 IP、route、ARP、VXLAN 本身，而是這些熟悉的東西突然被 kubelet、container runtime、CNI plugin、controller-manager、DaemonSet、Node annotation 串在一起。
+
+這組 CNI 文章剛好可以拆成兩條線：
+
+1. Kubernetes 把「Pod 要有 network namespace 與 IP」抽成 CNI contract。
+2. 真正的 datapath 仍然是 Linux network stack：veth、bridge、route、iptables、ARP、FDB、VXLAN、netlink。
+
+本專案會把文章內容轉成 source-first 的分析：先找 Kubernetes source 裡的責任邊界，再把邊界之外的 CNI plugin / flannel / Linux datapath 補上。
+
+## 逐篇知識點
+
+| 文章 | 主題 | 提取出的知識點 | 放進本專案的分析角度 |
+|---|---|---|---|
+| Day10 — Container Network Interface 介紹 | CNI contract | CNI 不是 daemon API，而是 binary execution protocol；runtime 透過環境變數與 stdin 呼叫 plugin；Pod sandbox 持有 network namespace。 | [pod-network-lifecycle](/kubernetes/features/pod-network-lifecycle) 先把 kubelet、CRI、CNI 的邊界釐清。 |
+| Day11 — Kubernetes CNI | Kubernetes 整合 | 舊版 kubelet/dockershim 有 `--network-plugin`、`--cni-bin-dir`、`--cni-conf-dir`；現代 Kubernetes 由 CRI runtime 管 CNI 設定並回報 NetworkReady。 | 同一頁用 Kubernetes source 修正 2019 年文章脈絡。 |
+| Day12 — 用 Go 寫基本 CNI | bridge / veth / netns | 一個最小 CNI 會讀 config、建 Linux bridge、建 veth pair、把一端移進 netns、設定 IP。 | [cni-plugin-primitives](/kubernetes/features/cni-plugin-primitives) 拆 CNI spec、`skel.CmdArgs`、bridge plugin 與 netlink。 |
+| Day13 — IPAM | DHCP / static / host-local | IPAM 也是 CNI plugin；host-local 只保證單 node 內唯一，跨 node 需要每個 node 拿不同 subnet。 | 同一頁把 host-local 的 local state 與 Kubernetes NodeIPAM 的差異拆開。 |
+| Day14 — Flannel 安裝 | DaemonSet / ConfigMap | flannel 透過 DaemonSet 把 CNI config 寫到每個 node，flanneld 長駐處理 subnet 與 kernel 狀態。 | [node-ipam-and-flannel](/kubernetes/features/node-ipam-and-flannel) 拆 controller-manager、flannel daemon 與 flannel CNI binary。 |
+| Day15 — Flannel IP 管理 | PodCIDR / subnet.env | controller-manager 寫 Node `spec.podCIDR`；flanneld 讀 Node PodCIDR，寫 `/run/flannel/subnet.env`；flannel CNI 再 delegate 到 host-local。 | 同一頁用 Kubernetes `nodeipam` source 與 flannel source 串起來。 |
+| Day16 — Flannel VXLAN | overlay datapath | VXLAN 把 Pod-to-Pod original packet 包進 Node-to-Node outer packet；flannel 用 route、ARP、FDB 教 kernel 怎麼封裝。 | [pod-to-pod-datapath](/kubernetes/features/pod-to-pod-datapath) 用封包路徑拆掉「魔法感」。 |
+| Day17 — CNI 經驗談 | 選型與特殊需求 | 沒有通用最佳 CNI；NetworkPolicy、Service、低延遲、多網卡、SR-IOV、DPDK、固定 IP 都是不同取捨。 | 同一頁補上選型矩陣，並連到本專案 Cilium / Multus / KubeVirt 後續路徑。 |
+
+## 本專案採用的分析方式
+
+CNI 不能只從一個 repo 讀完，因為責任被刻意拆散：
+
+| 層級 | Source anchor | 讀它是為了回答什麼 |
+|---|---|---|
+| Kubernetes API | `kubernetes/staging/src/k8s.io/api/core/v1/types.go` 的 `NodeSpec.PodCIDR` / `PodCIDRs` | Node 上的 Pod subnet 是 Kubernetes API object 的哪個欄位？ |
+| kubelet / CRI | `kubernetes/staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto` 的 `RunPodSandbox`、`NamespaceOption`、`NetworkReady` | kubelet 怎麼把「建 Pod network」交給 CRI runtime？ |
+| kubelet health | `kubernetes/pkg/kubelet/kubelet.go` 的 `updateRuntimeUp()` | runtime network 沒 ready 時，Node 為什麼會 NotReady？ |
+| NodeIPAM | `kubernetes/pkg/controller/nodeipam/ipam/range_allocator.go` | controller-manager 怎麼把 cluster CIDR 切成每 node PodCIDR？ |
+| CNI spec | `containernetworking/cni/SPEC.md` | ADD / DEL / CHECK / STATUS / GC / VERSION、stdin、env var、plugin chain 的正式 contract。 |
+| CNI plugin | `containernetworking/plugins/plugins/main/bridge/bridge.go`、`plugins/ipam/host-local` | bridge、veth、IPAM 是怎麼真的落到 Linux kernel？ |
+| flannel | `flannel-io/flannel` 與 `flannel-io/cni-plugin` | flanneld 怎麼讀 Node、寫 annotation、建立 VXLAN route/ARP/FDB？ |
+
+## 先建立全局心智模型
+
+```
+Pod object
+  │
+  ▼
+kubelet SyncPod
+  │
+  ▼
+CRI RunPodSandbox
+  │
+  ▼
+containerd / CRI-O
+  │
+  ├─ 建 Pod sandbox / network namespace
+  ├─ 呼叫 CNI ADD
+  │     ├─ bridge / veth / IPAM / route / portmap
+  │     └─ Cilium / Calico / Flannel / Multus / cloud CNI
+  └─ 回報 PodSandboxStatus 與 runtime NetworkReady
+```
+
+所以 Kubernetes network 不是 apiserver 在轉封包，也不是 scheduler 在決定 route。control plane 管的是期望狀態與分配資訊；node 上真正改 kernel datapath 的通常是 runtime、CNI plugin、CNI daemon 與 kube-proxy / Cilium 這類 per-node agent。
+
+## 用現代 Kubernetes 修正舊文章脈絡
+
+這組文章寫於 2019 年，概念仍然有價值，但有幾個地方需要更新：
+
+- `dockershim` 已在 Kubernetes 1.24 移除；現代 kubelet 透過 CRI runtime endpoint 連 containerd / CRI-O。
+- 舊文提到的 kubelet `--network-plugin`、`--cni-bin-dir`、`--cni-conf-dir` 屬於 dockershim 時代的 kubelet 直接 CNI integration；現在 CNI conf/bin 位置通常是 containerd / CRI-O 的設定。
+- CNI spec 已不是文章中的 `0.4.0` 脈絡；目前 spec 文件標示 `1.1.0`，多了 `STATUS`、`GC` 等現代操作語義。
+- NetworkPolicy 不是 CNI spec 的必備欄位，而是 Kubernetes policy API 加上特定 CNI controller/datapath 的實作。
+- Service routing 也不是 CNI spec 的基本責任；iptables/IPVS kube-proxy 或 Cilium kube-proxy replacement 是另一條 datapath。
+
+## 接下來怎麼讀
+
+1. 先讀 [pod-network-lifecycle](/kubernetes/features/pod-network-lifecycle)，釐清 kubelet、CRI、CNI 誰呼叫誰。
+2. 再讀 [cni-plugin-primitives](/kubernetes/features/cni-plugin-primitives)，把 CNI binary、veth、bridge、IPAM 變成可觀察的 Linux 動作。
+3. 接著讀 [node-ipam-and-flannel](/kubernetes/features/node-ipam-and-flannel)，看 Kubernetes 怎麼分 PodCIDR，flannel 怎麼把它交給 host-local。
+4. 最後讀 [pod-to-pod-datapath](/kubernetes/features/pod-to-pod-datapath)，把跨 node 封包一路拆到 route、ARP、FDB、VXLAN。
+
+## 參考資料
+
+- [Day10 — Container Network Interface 介紹](https://ithelp.ithome.com.tw/articles/10220626)
+- [Day11 — Kubernetes - Container Network Interface](https://ithelp.ithome.com.tw/articles/10221034)
+- [Day12 — 使用 golang 打造一個基本 CNI](https://ithelp.ithome.com.tw/articles/10221514)
+- [Day13 — 初探 CNI 的 IP 分配問題](https://ithelp.ithome.com.tw/articles/10221970)
+- [Day14 — CNI - Flannel 安裝與設定原理](https://ithelp.ithome.com.tw/articles/10222308)
+- [Day15 — CNI - Flannel IP 管理問題](https://ithelp.ithome.com.tw/articles/10222753)
+- [Day16 — CNI - Flannel 封包傳輸原理 - VXLAN分析](https://ithelp.ithome.com.tw/articles/10223308)
+- [Day17 — CNI 經驗談](https://ithelp.ithome.com.tw/articles/10223798)
+- [CNI Specification](https://github.com/containernetworking/cni/blob/main/SPEC.md)
+- [Kubernetes Network Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/)
