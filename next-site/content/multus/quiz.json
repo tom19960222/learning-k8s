@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "question": "multus 是 meta-plugin。為什麼一個 CNI plugin 還要 wrap 其他 CNI plugin？kubelet 不能自己 invoke N 個 CNI 嗎？",
+    "options": [
+      "CNI spec 規定 kubelet 一次只 invoke 一個 plugin (單一 binary 從 stdin 讀 config、回單一 Result)。要在同一個 Pod 接多張獨立 NIC，就需要把多個 CNI op fan-out 給某個 plugin 自己處理；multus 就是把自己塞進那個唯一位置，內部再 libcni invoke 多個 delegate",
+      "kubelet 支援 multi-CNI 但太慢，multus 是優化",
+      "multus 是給 namespace isolation 用的，不是 multi-NIC",
+      "multus 自己做 networking，delegate plugin 是 fallback"
+    ],
+    "answer": 0,
+    "explanation": "CNI spec (https://github.com/containernetworking/cni/blob/main/SPEC.md) 規定：CNI runtime exec 一個 plugin binary，stdin 餵 config、env 帶 CNI_COMMAND/CNI_CONTAINERID/...，stdout 拿單一 Result。kubelet 走 dockershim/containerd 都遵守這條 — 沒有 multi-CNI 的概念。chained config (`type: list`) 只能 layer 在同一張 interface (例: macvlan + portmap)，不能加多張獨立 NIC。multus 解法：把自己當「the CNI」(`/etc/cni/net.d/00-multus.conf`)，再用 libcni invoke 真正的 plugin (cilium/macvlan/sriov...)。multus 自己不做 veth/route/IPAM，只做 fan-out。實作見 cmd/multus/main.go (thin) 或 cmd/multus-shim/main.go (thick)。"
+  },
+  {
+    "id": 2,
+    "question": "NAD (NetworkAttachmentDefinition) CRD 的 spec.config 是 stringified JSON。為什麼不是 typed yaml struct？",
+    "options": [
+      "CRD validator 對 unknown plugin 沒辦法定 schema。multus 不能預測使用者會用哪個 CNI (macvlan/ipvlan/sriov/bridge/第三方)，每家 schema 不同。用 string 把 schema 推給 delegate 自己 parse；升級 plugin schema 也不需要動 CRD definition",
+      "CRD 不能存 nested object，只能存 string",
+      "歷史包袱，未來會換成 typed",
+      "效能考量：CRD parse typed yaml 比 string 慢"
+    ],
+    "answer": 0,
+    "explanation": "CRD schema (OpenAPI) 必須事先定義所有欄位才能 validate；但 multus 是 meta-plugin，不知道你要插哪個 delegate。macvlan 要 master/mode/mtu，sriov 要 deviceID/vlan，bridge 要 bridge/isGateway/ipMasq — 沒有 superset。把 spec.config 當 opaque string 是務實取捨：CRD 只 validate 有限欄位，真正的 schema check 交給 delegate plugin 在 libcni invoke 時 stdin parse 失敗才報錯。代價：寫錯 config 要等實際 ADD 才會發現，CRD 階段看不出。multus 內部對應流程：getKubernetesDelegate (pkg/k8sclient/k8sclient.go:291) 拿 NAD 物件後直接 LoadDelegateNetConf raw bytes，不做欄位 validation。"
+  },
+  {
+    "id": 3,
+    "question": "thick mode (multus-shim + multus-daemon DaemonSet) 比 thin mode 多了一個 daemon。換來什麼？",
+    "options": [
+      "shim 變成極小 binary 只 POST 到 unix socket；daemon 跑在 DaemonSet Pod 持有 pod/NAD informer cache。每次 CNI ADD/DEL 命中 cache = 0 apiserver call。high-churn cluster 不會把 apiserver 打爆，且省 TLS handshake 與 listwatch 反覆建立的開銷",
+      "thick mode 性能比 thin 慢但比較穩定",
+      "thick mode 必選，thin mode 已棄用",
+      "thick mode 是給多租戶 isolation 用的"
+    ],
+    "answer": 0,
+    "explanation": "thin mode 每次 CNI invocation 都 exec 一個新 process：建 k8s clientset (TLS handshake)、GET pod、GET 每個 NAD、PATCH annotation、退出。100 nodes × 50 Pod/s × 3 NAD = 15000 RPS 純 multus 對 apiserver 的 load。thick mode 把這層拆掉：multus-shim (cmd/multus-shim/main.go) 是 ~200 行 binary 只把 args 序列化 POST 到 /run/multus/multus.sock；multus-daemon (cmd/multus-daemon/main.go) 在 DaemonSet 持續跑、用 client-go informer (pod 限 spec.nodeName 自身、NAD 全 cluster) 持有 cache。pkg/server/server.go:152 informerObjectTrim 還砍掉 Volumes/Command/Env 等 multus 不需要的欄位降 cache 記憶體。代價是部署多一個 daemon Pod、多一個 socket 故障點。但對任何 production cluster 都是必選。"
+  },
+  {
+    "id": 4,
+    "question": "Pod 帶 annotation k8s.v1.cni.cncf.io/networks: \"sriov-net\"。multus 收到 ADD 之後，怎麼把 sriov-net 變成可以 invoke 的 delegate config？同時 SR-IOV plugin 要的 PCI deviceID 從哪來？",
+    "options": [
+      "k8sclient 從 informer cache 拿 NAD CRD 物件，spec.config 是 stringified JSON 直接當 raw config。SR-IOV 的 deviceID 走兩段：NAD 帶 annotation k8s.v1.cni.cncf.io/resourceName 對到某個 device-plugin (例 intel.com/sriov_vf)；multus 對 kubelet 的 PodResources gRPC 查這個 Pod 拿到的 deviceID list，注入 raw config 餵給 sriov plugin",
+      "multus 自己用 lspci 找 PCI device，亂選一個",
+      "deviceID 必須在 Pod annotation 寫死",
+      "multus 不支援 SR-IOV，要另外 CNI"
+    ],
+    "answer": 0,
+    "explanation": "流程在 pkg/k8sclient/k8sclient.go:291 getKubernetesDelegate：(1) client.GetNetAttachDef(net.Namespace, net.Name) 從 informer cache 或 apiserver 拿 NAD 物件 (2) 讀 NAD.Annotations[k8s.v1.cni.cncf.io/resourceName] 如果有就走 SR-IOV path (3) kubeletclient.GetResourceClient + GetPodResourceMap 對 kubelet 的 /var/lib/kubelet/pod-resources/kubelet.sock gRPC 端點查這個 Pod 的 device 配額；entry.DeviceIDs 是該 resourceName 分到的 PCI list (4) 用 entry.Index 挑下一個 (同 resourceName 多次申請時 round-robin)，然後 entry.Index++ (5) types.LoadDelegateNetConf(configBytes, net, deviceID, resourceName) 把 deviceID 注入到 raw config 餵給 sriov plugin。device-plugin (例 sriov-network-device-plugin) 自己負責「分 VF 給 Pod」，multus 只做「把 VF ID 串接到 CNI plugin」。"
+  },
+  {
+    "id": 5,
+    "question": "你的 Pod 有三個 interface：cilium (default, eth0)、macvlan (net1)、sriov (net2)。multus 回給 kubelet 的 CNI Result 用哪個 delegate 的 result？其他兩個的 IP/interface 資訊跑哪去？",
+    "options": [
+      "回 master plugin (cilium / default network) 的 result。CNI spec 規定 plugin stdout 是單一 Result，kubelet 用它更新 pod.status.podIP；Service/kube-proxy/NetworkPolicy 都建在這 IP。其他 delegate 的 result 累積成 NetworkStatus list 寫進 k8s.v1.cni.cncf.io/network-status annotation 給外部 tool 看",
+      "回所有 delegate 的 result 合併",
+      "回最後一個 delegate (sriov)",
+      "kubelet 只看 annotation，不看 CNI Result"
+    ],
+    "answer": 0,
+    "explanation": "CNI spec 規定 plugin 回單一 Result struct (interfaces[]、ips[]、routes[]、dns)。kubelet 拿這份去設 pod.status.podIP、pod.status.podIPs。Service/kube-proxy/NetworkPolicy/CoreDNS resolution 全建在 podIP 上 — 必須是 default network 的 IP，不能是 macvlan 或 sriov 的。pkg/multus/multus.go 的主迴圈 (line 825 起) 對每個 delegate 跑 DelegateAdd 拿 tmpResult，然後：if delegate.MasterPlugin || result == nil { result = tmpResult }；只有 master 的 result 進 result 變數最後 return。其他 delegate 的 result 進 nadutils.CreateNetworkStatuses 累積到 netStatus；CmdAdd 結尾呼 SetNetworkStatus (pkg/k8sclient/k8sclient.go:130) 寫 k8s.v1.cni.cncf.io/network-status annotation。外部 tool (KubeVirt status reporter、observability、ServiceMesh) 從這個 annotation 拿到完整多 NIC 資訊。MasterPlugin flag 在 pkg/multus/multus.go:784 設 — 第一個 delegate 永遠是 master。"
+  }
+]

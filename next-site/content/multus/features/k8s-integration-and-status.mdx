@@ -1,0 +1,354 @@
+---
+layout: doc
+title: Multus — K8s 整合：annotation、NAD、network-status 寫回
+description: pod annotation 是 input、network-status annotation 是 output；NAD spec.config 為什麼 string；SR-IOV resourceName + deviceID 從 device-plugin 一路傳到 delegate；namespace isolation。
+---
+
+## 場景
+
+你 Pod 起來了，shell 進去 `ip a` 看到三張 NIC。但外部 (kubectl get pod -o yaml、observability tool、operator) 怎麼知道哪張是 cilium 的、哪張是 macvlan 的、各自分到什麼 IP？multus 對 k8s 的兩個 annotation：input (`networks`) 與 output (`network-status`)。
+
+## annotation 兩個方向
+
+```
+                   ┌──────── Pod metadata.annotations ────────┐
+                   │                                            │
+   input  ────────▶│  k8s.v1.cni.cncf.io/networks              │   (使用者寫)
+                   │  k8s.v1.cni.cncf.io/default-network       │   (option)
+                   │                                            │
+   output ◀────────│  k8s.v1.cni.cncf.io/network-status        │   (multus 回寫)
+                   │  k8s.v1.cni.cncf.io/networks-status       │   (deprecated alias)
+                   │                                            │
+                   └────────────────────────────────────────────┘
+```
+
+annotation key 在 `pkg/k8sclient/k8sclient.go:51`：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 51)
+const (
+    resourceNameAnnot      = "k8s.v1.cni.cncf.io/resourceName"
+    defaultNetAnnot        = "v1.multus-cni.io/default-network"
+    networkAttachmentAnnot = "k8s.v1.cni.cncf.io/networks"
+)
+```
+
+## input：annotation `networks` 兩種格式
+
+簡寫格式（comma-delimited）：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: "macvlan-conf,sriov-net@net2"
+```
+
+每個 element 可以寫 `<namespace>/<name>@<interface>`：
+
+- `<namespace>/`：跨 namespace 引用 NAD（受 `namespaceIsolation` 限制）
+- `@<interface>`：要求 Pod 內這張介面叫什麼名字
+
+詳細 grammar 在 `parsePodNetworkObjectName`：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 175)
+func parsePodNetworkObjectName(podnetwork string) (string, string, string, error) {
+    // 切 / 拿 namespace
+    // 切 @ 拿 interface name
+    // 名字必須符合 DNS-1123 label format
+    // interface 名字 < 15 字元 (kernel IFNAMSIZ - 1)
+}
+```
+
+JSON 格式（功能完整版）：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {"name": "macvlan-conf", "interface": "net1"},
+        {
+          "name": "sriov-net",
+          "interface": "net2",
+          "ips": ["192.168.1.100/24"],
+          "mac": "0a:58:0a:14:00:64",
+          "default-route": ["192.168.1.1"]
+        }
+      ]
+```
+
+JSON 才能寫 `ips`、`mac`、`default-route`、`portMappings` 等細節。Parser 自動偵測 (`strings.ContainsAny(podNetworks, "[{\"")`)：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 222)
+func parsePodNetworkAnnotation(podNetworks, defaultNamespace string)
+                                ([]*types.NetworkSelectionElement, error) {
+    if strings.ContainsAny(podNetworks, "[{\"") {
+        // JSON 格式：直接 Unmarshal
+        json.Unmarshal([]byte(podNetworks), &networks)
+    } else {
+        // 簡寫：split 逗號 + parsePodNetworkObjectName
+        for _, item := range strings.Split(podNetworks, ",") {
+            netNsName, networkName, netIfName, err := parsePodNetworkObjectName(item)
+            networks = append(networks, &types.NetworkSelectionElement{
+                Name:             networkName,
+                Namespace:        netNsName,
+                InterfaceRequest: netIfName,
+            })
+        }
+    }
+    // ... default namespace fallback、validate MAC、etc.
+}
+```
+
+## NetworkSelectionElement：annotation 解析後的型別
+
+```go
+// File: pkg/types/types.go (line 130)
+type NetworkSelectionElement struct {
+    Name                  string                  `json:"name"`
+    Namespace             string                  `json:"namespace,omitempty"`
+    IPRequest             []string                `json:"ips,omitempty"`
+    MacRequest            string                  `json:"mac,omitempty"`
+    InfinibandGUIDRequest string                  `json:"infiniband-guid,omitempty"`
+    InterfaceRequest      string                  `json:"interface,omitempty"`
+    PortMappingsRequest   []*PortMapEntry         `json:"portMappings,omitempty"`
+    BandwidthRequest      *BandwidthEntry         `json:"bandwidth,omitempty"`
+    DeviceID              string                  `json:"deviceID,omitempty"`
+    CNIArgs               *map[string]interface{} `json:"cni-args"`
+    GatewayRequest        *[]net.IP               `json:"default-route,omitempty"`
+}
+```
+
+這個型別連結兩塊：annotation 的 user input → `DelegateNetConf` 的 internal config。`getKubernetesDelegate` (`k8sclient.go:291`) 把 `NetworkSelectionElement` + NAD 物件 + Pod resourceMap 合起來生 `DelegateNetConf`。
+
+## NAD: `spec.config` 是 stringified JSON
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-conf
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "ipam": { "type": "host-local", "subnet": "10.20.0.0/24" }
+    }
+```
+
+`spec.config` 用 string 不用 typed struct，因為：
+
+1. multus 不能預測你會用哪個 CNI plugin（macvlan / ipvlan / sriov / bridge / 第三方），各家 schema 不同
+2. CRD validation 只能定 schema 已知的欄位 — 用 string 把 schema 完全推給 delegate 自己 parse
+3. 升級 delegate plugin 的 config schema 不需要動 NAD CRD definition
+
+代價：CRD level 看不出 config 寫錯，得等實際 CNI invoke 才會壞。但這對 plugin 多樣性的取捨是合理的。
+
+## SR-IOV 整合：resourceName + deviceID
+
+SR-IOV plugin 拿到的不是「拿一片網卡」而是「拿這個 PCI device ID」(VF)。device 從 device-plugin 分配，跟 NAD 用 annotation 連起來：
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sriov-net
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: intel.com/sriov_vf   # ← 這個
+spec:
+  config: |
+    { "cniVersion": "0.3.1", "type": "sriov", ... }
+```
+
+Pod spec 用同樣 resource name 申請：
+
+```yaml
+spec:
+  containers:
+  - name: app
+    resources:
+      limits:
+        intel.com/sriov_vf: 1   # ← 跟 NAD annotation 對齊
+```
+
+multus 怎麼把 device-plugin 分配的 PCI device 傳給 sriov plugin？看 `getKubernetesDelegate`：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 291 起)
+func getKubernetesDelegate(client *ClientInfo, net *types.NetworkSelectionElement,
+                           confdir string, pod *v1.Pod,
+                           resourceMap map[string]*types.ResourceInfo)
+                           (*types.DelegateNetConf, ...) {
+    // 1. 從 NAD.Annotations 拿 resourceName
+    deviceID := ""
+    resourceName, ok := customResource.GetAnnotations()[resourceNameAnnot]
+    if ok && pod != nil && ... {
+        // 2. 還沒拿過 → 對 kubelet 的 PodResources gRPC API 問
+        if resourceMap == nil {
+            ck, _ := kubeletclient.GetResourceClient("")
+            resourceMap, _ = ck.GetPodResourceMap(pod)
+        }
+        // 3. 從 resourceMap 拿這 Pod 拿到的 deviceID list，挑下一個
+        entry, ok := resourceMap[resourceName]
+        if ok {
+            if idCount := len(entry.DeviceIDs); idCount > 0 && idCount > entry.Index {
+                deviceID = entry.DeviceIDs[entry.Index]
+                entry.Index++   // ← 同 resourceName 多次申請時用 index 配對
+            }
+        }
+    }
+
+    configBytes, _ := netutils.GetCNIConfig(customResource, confdir)
+    delegate, _ := types.LoadDelegateNetConf(configBytes, net, deviceID, resourceName)
+    return delegate, resourceMap, nil
+}
+```
+
+`LoadDelegateNetConf` 會把 deviceID 注入到 raw config bytes 裡（在 `type` 之外加 `deviceID` 欄位），sriov plugin 自己 parse。`kubeletclient.GetPodResourceMap` 走 [PodResources gRPC](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/apis/podresources/) 從本機 kubelet 的 `/var/lib/kubelet/pod-resources/kubelet.sock` 拿配額。
+
+## output：network-status annotation
+
+ADD 完後 multus 把每個 delegate 的 result 收集成 `[]NetworkStatus` 寫回 Pod：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 130)
+func SetNetworkStatus(client *ClientInfo, k8sArgs *types.K8sArgs,
+                      netStatus []nettypes.NetworkStatus,
+                      conf *types.NetConf) error {
+    podName := string(k8sArgs.K8S_POD_NAME)
+    podNamespace := string(k8sArgs.K8S_POD_NAMESPACE)
+    podUID := string(k8sArgs.K8S_POD_UID)
+    return SetPodNetworkStatusAnnotation(client, podName, podNamespace, podUID, netStatus, conf)
+}
+
+// File: pkg/k8sclient/k8sclient.go (line 139)
+func SetPodNetworkStatusAnnotation(client *ClientInfo, podName, podNamespace,
+                                   podUID string,
+                                   netStatus []nettypes.NetworkStatus,
+                                   conf *types.NetConf) error {
+    pod, err := client.GetPod(podNamespace, podName)
+    // 防 race: 確認 pod UID 對應 (Pod 可能已被刪 + 同名重建)
+    if podUID != "" && string(pod.UID) != podUID && !IsStaticPod(pod) {
+        return logging.Errorf("SetNetworkStatus: expected pod %s/%s UID %q but got %q ...", ...)
+    }
+    if netStatus != nil {
+        err = netutils.SetNetworkStatus(client.Client, pod, netStatus)
+    }
+    return nil
+}
+```
+
+最終 Pod 看起來像：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/network-status: |
+      [{
+          "name": "cilium",
+          "interface": "eth0",
+          "ips": ["10.0.1.42"],
+          "mac": "0a:58:0a:00:01:2a",
+          "default": true              ← master plugin
+      },{
+          "name": "default/macvlan-conf",
+          "interface": "net1",
+          "ips": ["10.20.0.5"],
+          "mac": "ee:11:22:33:44:55"
+      },{
+          "name": "default/sriov-net",
+          "interface": "net2",
+          "ips": ["192.168.1.100"],
+          "device-info": {
+              "type": "pci",
+              "version": "1.0.0",
+              "pci": { "pci-address": "0000:af:01.4" }
+          }
+      }]
+```
+
+外部 tool（observability、KubeVirt status、ServiceMesh）就靠這個 annotation 知道 Pod 有幾個 NIC、各自分到什麼。
+
+## namespace isolation
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 479)
+func isValidNamespaceReference(targetns string, allowednamespaces []string) bool {
+    // multusNetconf.NamespaceIsolation = true 時：
+    // 跨 namespace 引用 NAD 必須 targetns 在 NonIsolatedNamespaces (globalNamespaces) 列表內
+}
+```
+
+`namespaceIsolation: true` (`NetConf` 欄位)：Pod 只能用同 namespace 的 NAD，或 `globalNamespaces` 白名單內 namespace 的 NAD。多租戶共享 cluster 時必開。
+
+## 與 cilium / KubeVirt 的整合點
+
+### cilium 是 default network
+
+cilium 通常做 default network（Pod 的 eth0），多 cluster 都這樣設定：
+
+```json
+{
+  "type": "multus",
+  "clusterNetwork": "/etc/cni/net.d/05-cilium.conflist",
+  "defaultNetworks": []
+}
+```
+
+multus 第一個 delegate 就是 cilium (走 conflist 模式 — `ConfListPlugin = true`)，cilium 的 result 回給 kubelet 做 podIP / Service。
+
+### KubeVirt VM 多 NIC
+
+KubeVirt 把 multus 的 annotation 透過 VMI spec 包出來：
+
+```yaml
+spec:
+  networks:
+    - name: default
+      pod: {}
+    - name: storage
+      multus:
+        networkName: sriov-storage   ← VMI 自動加到 Pod annotation
+  domain:
+    devices:
+      interfaces:
+        - name: default
+          masquerade: {}
+        - name: storage
+          sriov: {}                   ← libvirt 把 VF 接進 QEMU
+```
+
+virt-launcher Pod 起來時帶 `k8s.v1.cni.cncf.io/networks: sriov-storage`，multus 走完前述 flow 把 VF 給 Pod，virt-launcher 內 libvirt 再把 VF passthrough 進 QEMU 給 guest。
+
+詳見 [/kubevirt/features/virt-handler-and-launcher](/kubevirt/features/virt-handler-and-launcher) 的 sidecar 接點。
+
+## 整段 1 句話
+
+multus 對 k8s 的介面是兩個 annotation (input `networks`、output `network-status`) + NAD CRD；SR-IOV 走 NAD `resourceName` + Pod resource limits，deviceID 透過 PodResources gRPC 從 kubelet 拿，注入 delegate config。
+
+## 收穫檢查
+
+- 簡寫 annotation `"namespaceA/foo,bar"` 的 `bar` 屬於哪個 namespace？(看 `parsePodNetworkAnnotation` 最後)
+- NAD 加 `resourceName` annotation 但 Pod 沒在 `resources.limits` 申請那個 device 會怎樣？
+- `network-status` annotation 在哪一刻被寫？ADD 失敗 reverse-DEL 後會留下半成品 status 嗎？
+- `namespaceIsolation: true` 怎麼讓 NAD 變成「namespace local」資源？
+
+## 原始碼參考
+
+- [pkg/k8sclient/k8sclient.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/k8sclient/k8sclient.go)
+  - annotation key constants (line 51)
+  - `SetNetworkStatus` (line 130)
+  - `SetPodNetworkStatusAnnotation` (line 139)
+  - `parsePodNetworkObjectName` (line 175)
+  - `parsePodNetworkAnnotation` (line 222)
+  - `getKubernetesDelegate` (line 291)
+  - `TryLoadPodDelegates` (line 361)
+  - `GetNetworkDelegates` (line 448)
+  - `isValidNamespaceReference` (line 479)
+- [pkg/types/types.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/types/types.go) — `NetworkSelectionElement` (line 130)
+- [k8snetworkplumbingwg/network-attachment-definition-client](https://github.com/k8snetworkplumbingwg/network-attachment-definition-client) — NAD CRD types & helpers
+- [k8s PodResources API](https://kubernetes.io/docs/reference/instrumentation/node-metrics/#podresources-api) — kubelet device 配額查詢

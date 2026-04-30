@@ -21,3 +21,5 @@
 [submodule "multus-cni"]
 	path = multus-cni
 	url = https://github.com/k8snetworkplumbingwg/multus-cni.git
+	branch = v4.2.4
+	shallow = true

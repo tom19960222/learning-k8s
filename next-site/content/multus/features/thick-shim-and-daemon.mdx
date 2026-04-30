@@ -1,0 +1,287 @@
+---
+layout: doc
+title: Multus — Thick mode：shim 與 daemon 拆分
+description: thin mode 每次 CNI ADD 都打 apiserver。thick 把 CNI binary 縮成 shim 只 POST 到 unix socket，daemon 跑 in DaemonSet 持有 informer cache。socket protocol、chroot exec、informer trim。
+---
+
+## 場景
+
+你的 cluster Pod churn 很高 (大量 batch job、CI runner、KubeVirt VM live migration)。thin mode 每個 CNI ADD/DEL 都對 apiserver 起一次連線，listwatch 反覆建立。kube-apiserver 開始抱怨。換 thick mode — 多了一個 daemon、shim 變很瘦，apiserver 壓力消失。
+
+## thin 的痛點
+
+```
+thin mode 每次 CNI ADD：
+  exec /opt/cni/bin/multus
+       ├─ 讀 kubeconfig
+       ├─ 建 k8s clientset (TLS handshake!)
+       ├─ GET pod (apiserver round trip)
+       ├─ GET NAD (apiserver round trip × N delegates)
+       ├─ 解析 + libcni invoke
+       ├─ PATCH pod annotation (network-status)
+       └─ 退出 (clientset 與所有連線丟掉)
+  ← 每個 Pod 至少 (2 + N) 次 apiserver call
+```
+
+cluster 100 nodes、每秒 churn 50 個 Pod、每 Pod 有 3 個 NAD → 約 200 RPS 純由 multus 打。再加上 thin 沒有 informer cache 也不能 share connection (每次 exec 都是新 process)。
+
+## thick 把 daemon 拆出來
+
+```
+┌──────────── multus-daemon DaemonSet (per node, long-lived Pod) ────────────┐
+│                                                                              │
+│  pod informer (listwatch /api/v1/pods?fieldSelector=spec.nodeName=$node)    │
+│  netdef informer (listwatch /apis/k8s.cni.cncf.io/v1/networkattachmentdefs) │
+│                                                                              │
+│  HTTP server on /run/multus/multus.sock                                     │
+│   ├─ POST /cni       → HandleCNIRequest → s.cmdAdd / cmdDel / ...            │
+│   ├─ POST /delegate  → HandleDelegateRequest (給 dynamic networks API)       │
+│   ├─ GET  /healthz                                                           │
+│   └─ GET  /readyz                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                       ▲
+                                       │ unix socket (一次 ADD = 1 round trip)
+                                       │ 不打 apiserver — 全在 daemon 的 informer cache 裡
+                                       │
+┌─────── multus-shim (CNI binary，每次 ADD/DEL 由 kubelet exec) ────────┐
+│                                                                          │
+│  package main; func main() { skel.PluginMainFuncs(api.CmdAdd, ...) }    │
+│                                                                          │
+│  api.CmdAdd:                                                             │
+│   ├─ 把 args 序列化成 HTTP body                                          │
+│   ├─ POST http://dummy/cni unix-socket-at /run/multus/multus.sock        │
+│   └─ stdout 印 daemon 回的 CNI Result                                    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+shim binary 不到 200 行（`cmd/multus-shim/main.go` + `pkg/server/api/shim.go`），完全沒有 k8s clientset，連 logging 都最少。daemon 在 DaemonSet Pod 內持有 informer，cache 命中 = 0 apiserver call。
+
+## shim 端：post 到 socket
+
+```go
+// File: pkg/server/api/shim.go (line 48)
+func CmdAdd(args *skel.CmdArgs) error {
+    response, cniVersion, err := postRequest(args, WaitUntilAPIReady)
+    if err != nil {
+        return logging.Errorf("CmdAdd (shim): %v", err)
+    }
+    return cnitypes.PrintResult(response.Result, cniVersion)
+}
+
+func postRequest(args *skel.CmdArgs, readinessCheck readyCheckFunc) (*Response, string, error) {
+    multusShimConfig, _ := shimConfig(args.StdinData)
+    if err := readinessCheck(multusShimConfig.MultusSocketDir); err != nil { ... }
+    cniRequest, _ := newCNIRequest(args)
+    body, err = DoCNI("http://dummy/cni", cniRequest, SocketPath(multusShimConfig.MultusSocketDir))
+    // ... unmarshal Response
+}
+```
+
+`DoCNI` 在 `pkg/server/api/api.go:50`：
+
+```go
+// File: pkg/server/api/api.go (line 50)
+func DoCNI(url string, req interface{}, socketPath string) ([]byte, error) {
+    // 用 net.Dial("unix", socketPath) 起 HTTP client
+    // POST <url> 帶 req body
+    // 讀完整 response 回去
+}
+```
+
+URL 上的 host (`http://dummy/`) 是 fake；實際傳輸走 unix domain socket。`SocketPath`：
+
+```go
+// File: pkg/server/api/socket.go (line 26)
+const serverSocketName = "multus.sock"
+
+func SocketPath(rundir string) string {
+    return filepath.Join(rundir, serverSocketName)
+}
+```
+
+預設 `rundir` 是 `/run/multus/` (見 daemon config `socketDir`)，所以 socket path 就是 `/run/multus/multus.sock`。
+
+## DEL 與 ADD 的 readiness 差別
+
+```go
+// File: pkg/server/api/shim.go (line 48 起)
+func CmdAdd(args *skel.CmdArgs) error {
+    response, cniVersion, err := postRequest(args, WaitUntilAPIReady)  // ← 等
+    // ...
+}
+
+func CmdDel(args *skel.CmdArgs) error {
+    _, _, err := postRequest(args, CheckAPIReadyNow)  // ← 不等
+    if err != nil {
+        // No error in DEL (as of CNI spec)
+        logging.Errorf("CmdDel (shim): %v", err)
+    }
+    return nil
+}
+```
+
+ADD 時 daemon 還沒 ready 就 wait（不然 Pod 會卡）；DEL 時 daemon 不在不等 (CNI spec 規定 DEL 必須 idempotent，且不能因 daemon 掉而擋 Pod 刪除)。`CmdDel` 還故意忽略所有錯誤，只 log — 因為「Pod 拆乾淨」比「report 問題」優先。
+
+## daemon 端：HTTP handler
+
+```go
+// File: pkg/server/server.go (line 87)
+func (s *Server) HandleCNIRequest(cmd string, k8sArgs *types.K8sArgs,
+                                  cniCmdArgs *skel.CmdArgs) ([]byte, error) {
+    switch cmd {
+    case "ADD":
+        return s.cmdAdd(cniCmdArgs, k8sArgs)
+    case "DEL":
+        err := s.cmdDel(cniCmdArgs, k8sArgs)
+        return nil, err
+    case "CHECK":
+        // ...
+    case "GC":
+        // ...
+    case "STATUS":
+        // ...
+    }
+}
+```
+
+daemon 自己呼的是 `pkg/multus/multus.CmdAdd`（同一個 thin 用的）— 但傳進去的 `kubeClient` 是 daemon 啟動時就建好的，且帶 informer，所以 `GetPod` / `GetNetAttachDef` 走 cache 不打 apiserver。
+
+```go
+// File: pkg/server/server.go (line 264)
+func newCNIServer(rundir string, kubeClient *k8s.ClientInfo, exec invoke.Exec,
+                  servConfig []byte, ignoreReadinessIndicator bool) (*Server, error) {
+    informerFactory, podInformer := newPodInformer(kubeClient.Client, os.Getenv("MULTUS_NODE_NAME"))
+    netdefInformerFactory, netdefInformer := newNetDefInformer(kubeClient.NetClient)
+    kubeClient.SetK8sClientInformers(podInformer, netdefInformer)
+
+    router := http.NewServeMux()
+    s := &Server{ /* ... */ }
+
+    router.HandleFunc(api.MultusCNIAPIEndpoint, /* /cni */ ...)
+    router.HandleFunc(api.MultusDelegateAPIEndpoint, /* /delegate */ ...)
+    router.HandleFunc(api.MultusHealthAPIEndpoint, /* /healthz */ ...)
+    return s, nil
+}
+```
+
+## informer 的小心機：trim
+
+```go
+// File: pkg/server/server.go (line 152)
+func informerObjectTrim(obj interface{}) (interface{}, error) {
+    if accessor, err := meta.Accessor(obj); err == nil {
+        accessor.SetManagedFields(nil)
+    }
+    if pod, ok := obj.(*kapi.Pod); ok {
+        pod.Spec.Volumes = []kapi.Volume{}
+        for i := range pod.Spec.Containers {
+            pod.Spec.Containers[i].Command = nil
+            pod.Spec.Containers[i].Args = nil
+            pod.Spec.Containers[i].Env = nil
+            pod.Spec.Containers[i].VolumeMounts = nil
+        }
+    }
+    return obj, nil
+}
+```
+
+informer cache 把每個 Pod 物件存住 — 如果不修剪，cache 包括 managedFields、env、volume、command 那一坨，每 Pod 幾 KB，全 cluster 累積出 GB 級記憶體。`informerObjectTrim` 在 cache 寫入前砍掉 multus 用不到的欄位，只留 metadata + annotations + 少數 spec 必要值。**這是 informer 寫過量級 cache 的典型優化**。
+
+`newPodInformer` 也只 listwatch 自己 node 的 Pod (`fieldSelector=spec.nodeName=$node`)：
+
+```go
+// File: pkg/server/server.go (line 183)
+func newPodInformer(kubeClient kubernetes.Interface, nodeName string)
+                    (internalinterfaces.SharedInformerFactory, cache.SharedIndexInformer) {
+    // ... fieldSelector spec.nodeName == nodeName
+}
+```
+
+## chroot exec：daemon 在 Pod 內，CNI binary 在 host
+
+daemon 跑在 DaemonSet Pod 內 — 它的 filesystem view 是 container 的 (有 `/etc/multus`、`/run/multus` 等 mount)。但 delegate CNI binary 在 host 的 `/opt/cni/bin/`、kubelet 也期待 plugin 從 host 看 host 的 `/etc/cni/net.d`、`/var/lib/cni/`。怎麼辦？
+
+```go
+// File: pkg/server/exec_chroot.go
+type ChrootExec struct {
+    Stderr    io.Writer
+    chrootDir string
+    version.PluginDecoder
+}
+
+func (e *ChrootExec) ExecPlugin(ctx context.Context, pluginPath string,
+                                stdinData []byte, environ []string) ([]byte, error) {
+    c := exec.CommandContext(ctx, pluginPath)
+    c.SysProcAttr = &syscall.SysProcAttr{
+        Chroot: e.chrootDir,    // ← chroot 進 host root
+    }
+    c.Env = environ
+    c.Stdin = bytes.NewBuffer(stdinData)
+    // ... Run, retry on "text file busy"
+}
+```
+
+DaemonSet yaml 把 host `/` mount 進 daemon Pod 的某個路徑（例如 `/host`），daemon 啟動時把那個路徑當 `chrootDir`，每次 exec delegate 用 `Chroot` syscall 進那個 namespace。delegate 看到的 filesystem 就是真正的 host。
+
+## /delegate endpoint：dynamic networks API
+
+```go
+// File: pkg/server/server.go (line 112)
+func (s *Server) HandleDelegateRequest(cmd string, k8sArgs *types.K8sArgs,
+                                       cniCmdArgs *skel.CmdArgs,
+                                       interfaceAttributes *api.DelegateInterfaceAttributes)
+                                       ([]byte, error) {
+    // 直接帶 raw delegate config + Pod context 做 ADD/DEL
+    // 不需要去查 NAD CRD
+}
+```
+
+這條走「不透過 kubelet，由其他 controller (例如 [dynamic-networks-controller](https://github.com/k8snetworkplumbingwg/multus-dynamic-networks-controller)) 直接呼 daemon 加/減 Pod 的 secondary interface」。本 SP 不展開。
+
+## 部署：daemonset thick 範例
+
+```
+deployments/multus-daemonset-thick.yml 重點：
+  hostPath:
+    /etc/cni/net.d   → /host/etc/cni/net.d   (CNI conf dir)
+    /opt/cni/bin     → /opt/cni/bin           (注意 mount 路徑必須一致)
+    /run             → /host/run              (socket dir)
+
+  args:
+    - "-cni-bin-dir"
+    - "/host/opt/cni/bin"
+    - "-t"
+    - "thick"
+```
+
+`/opt/cni/bin` 必須 host 與 daemon 一致 — 因為 chroot 後 daemon 跑 `/opt/cni/bin/macvlan`，這個 path 要在兩邊都成立。其他路徑可以差 (host `/run` mount 進 `/host/run`)，但 cnibin 這條不能差。
+
+## 整段 1 句話
+
+thick mode = 把 CNI 部分縮成最小的 shim，把所有重活 (informer、apiserver 連線、libcni invoke)集中到 daemon DaemonSet；shim 只透過 unix socket 跟 daemon 講話。代價是部署多一個 daemon，但 high-churn 大 cluster 必選。
+
+## 收穫檢查
+
+- 為什麼 `CmdDel` 在 shim 端故意忽略所有 error？
+- daemon 啟動時 wait informer cache sync 最多 20s — 這個 timeout 怎麼選來的？
+- daemon Pod 重啟時，已經跑著的 Pod 的 CNI ADD 為什麼會卡？
+- `informerObjectTrim` 為什麼把 Volumes / Command / Env 砍掉？
+
+## 原始碼參考
+
+- [cmd/multus-shim/main.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/cmd/multus-shim/main.go) — shim binary entry
+- [cmd/multus-daemon/main.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/cmd/multus-daemon/main.go) — daemon binary entry
+- [pkg/server/server.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/server/server.go) — HTTP server
+  - `HandleCNIRequest` (line 87)
+  - `HandleDelegateRequest` (line 112)
+  - `informerObjectTrim` (line 152)
+  - `newNetDefInformer` (line 168)
+  - `newPodInformer` (line 183)
+  - `NewCNIServer` (line 219)
+  - `newCNIServer` (line 264)
+  - `Start` (line 365)
+- [pkg/server/api/api.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/server/api/api.go) — endpoint constants `MultusCNIAPIEndpoint = "/cni"` (line 39), `DoCNI` (line 50)
+- [pkg/server/api/shim.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/server/api/shim.go) — shim CNI handlers
+- [pkg/server/api/socket.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/server/api/socket.go) — `SocketPath` (line 26)
+- [pkg/server/exec_chroot.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/server/exec_chroot.go) — `ChrootExec`
+- [deployments/multus-daemonset-thick.yml](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/deployments/multus-daemonset-thick.yml) — DaemonSet 範例

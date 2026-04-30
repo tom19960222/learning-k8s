@@ -1,0 +1,233 @@
+---
+layout: doc
+title: Multus — 架構與 NAD CRD
+description: kubelet 一次只能 invoke 一個 CNI plugin，multus 把自己塞進那個位置再 fan-out。NetworkAttachmentDefinition CRD 把「別的 CNI 的 config」存進 k8s。
+---
+
+## 場景
+
+你 KubeVirt VM 要兩個介面：cilium 的 pod network + 一張連到 storage VLAN 的 SR-IOV VF。打開 CNI spec 才發現：CNI 規範規定「kubelet 一次只 invoke 一個 CNI binary」。multus 怎麼解？答：把自己塞進那個唯一位置，內部再對任意數量的 delegate plugin 各自呼叫一次。
+
+## CNI 的 1:1 限制
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  kubelet 啟動 Pod 時 CNI exec 流程                           │
+│                                                              │
+│  1. kubelet 讀 /etc/cni/net.d/*.conf 拿到 "the CNI"        │
+│  2. exec /opt/cni/bin/<that-cni-binary>                     │
+│  3. stdin 餵 netconf, 環境變數帶 CNI_COMMAND=ADD            │
+│  4. 一個 binary 一次 ADD 一個 Pod (1 Pod ↔ 1 CNI 位置)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+CNI runtime 沒有「對一個 Pod 跑多個 plugin」的概念。chained config (`type: list`) 只能 layer 在同一個 namespace（例如 plugin → portmap），不能加多張獨立 NIC。
+
+## multus 是 meta-plugin
+
+```
+                     ┌────────────────────┐
+                     │  /etc/cni/net.d/   │
+                     │  00-multus.conf    │  ← multus 是 "the CNI"
+                     └────────┬───────────┘
+                              │ kubelet exec
+                              ▼
+                     ┌────────────────────┐
+                     │  /opt/cni/bin/     │
+                     │    multus  (thin)  │
+                     │      or            │
+                     │    multus-shim     │  (thick)
+                     └────────┬───────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            ▼                 ▼                 ▼
+       ┌─────────┐       ┌─────────┐       ┌─────────┐
+       │ cilium  │       │ macvlan │       │ sriov   │ ← 真正的 CNI plugin
+       │ (default│       │ (NAD)   │       │ (NAD)   │
+       │  net)   │       └─────────┘       └─────────┘
+       └─────────┘
+```
+
+multus 自己**不**做 veth、route、IPAM。它只做兩件事：
+
+1. 從 Pod annotation 推出「我要哪些網路」
+2. 對每個網路，用 [libcni](https://github.com/containernetworking/cni) 呼叫真正的 CNI binary（exec `/opt/cni/bin/<name>`，餵那個 plugin 自己的 config）
+
+## NAD CRD：把「別的 CNI 的 config」存進 k8s
+
+`NetworkAttachmentDefinition` (NAD) 是 [k8s network-plumbing-wg](https://github.com/k8snetworkplumbingwg/multi-net-spec) 標準 CRD：
+
+```yaml
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: macvlan-conf
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "macvlan",
+      "master": "eth1",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "10.20.0.0/24"
+      }
+    }
+```
+
+`spec.config` 是 **stringified JSON**，內容是「另一個 CNI plugin 的標準 config」。為什麼是 string 不是 typed yaml？因為 multus 不能預測你會用哪個 CNI plugin (macvlan / ipvlan / sriov / bridge / 第三方)，每家 plugin 的 config schema 都不同。CRD 只能定 schema 已知的欄位，所以這欄走「opaque string，丟給 delegate 自己 parse」。
+
+## Pod 怎麼選 NAD：annotation
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-vm
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {"name": "macvlan-conf", "interface": "net1"},
+        {"name": "sriov-net", "interface": "net2", "ips": ["192.168.1.100/24"]}
+      ]
+```
+
+或用簡寫：`k8s.v1.cni.cncf.io/networks: "macvlan-conf,sriov-net"`。
+
+簡寫格式 parser 在 `pkg/k8sclient/k8sclient.go:175` 的 `parsePodNetworkObjectName`，annotation 主 parser 在同檔案 line 222 `parsePodNetworkAnnotation`。
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 51)
+const (
+    resourceNameAnnot      = "k8s.v1.cni.cncf.io/resourceName"
+    defaultNetAnnot        = "v1.multus-cni.io/default-network"
+    networkAttachmentAnnot = "k8s.v1.cni.cncf.io/networks"
+)
+```
+
+## default network vs additional networks
+
+multus config 裡有兩個關鍵欄位：
+
+```json
+{
+  "cniVersion": "0.3.1",
+  "name": "multus-cni-network",
+  "type": "multus",
+  "clusterNetwork": "cilium",         // ← default network (eth0)
+  "delegates": []                     // ← 另一種寫法：直接列 default
+}
+```
+
+兩種互斥（見 `pkg/types/types.go:46`），擇一即可：
+
+- `clusterNetwork`: 指向某個 NAD 的 name (or `/etc/cni/net.d` 內某個 conf 檔名)
+- `delegates`: 直接 inline 列 default 的 CNI config
+
+**default network = Pod 的 eth0**。每個 Pod 至少要有一個（不然 kube-proxy / Service 都壞了）。Annotation 列的是 *additional networks*，分到 net1 / net2 / ...。
+
+只有 default network 的 CNI Result（IP/route）會被 kubelet 寫進 Pod status。Additional networks 走 [k8s network-plumbing-wg spec](https://github.com/k8snetworkplumbingwg/multi-net-spec) 規定的 `k8s.v1.cni.cncf.io/network-status` annotation 寫回。
+
+## 兩種部署：thin vs thick
+
+```
+┌──────────────────────────────┬──────────────────────────────┐
+│  thin                        │  thick                       │
+├──────────────────────────────┼──────────────────────────────┤
+│  /opt/cni/bin/multus         │  /opt/cni/bin/multus-shim    │
+│  (~單一 binary)              │  (~極小 binary，只做 POST)   │
+│                              │  ┌─────────────────────────┐ │
+│  每次 CNI invocation:        │  │ multus-daemon DaemonSet │ │
+│  - exec multus               │  │ (pod 持續跑)            │ │
+│  - 連 apiserver 查 Pod/NAD   │  │ - informer cache        │ │
+│  - 呼 delegate               │  │ - HTTP server on        │ │
+│  - 退出                      │  │   /run/multus/multus.sock│
+│                              │  └─────────────────────────┘ │
+│                              │  shim 只 POST 到 socket      │
+│                              │                              │
+│  ✓ 部署簡單 (一個 binary)    │  ✓ 不打 apiserver (informer) │
+│  ✗ high-churn cluster 把     │  ✓ 大 cluster 性能好         │
+│    apiserver 打爆            │  ✗ 多一個 daemon 要維護      │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+兩個 binary 對應 entry point：
+
+```go
+// File: cmd/multus/main.go (thin entry)
+// 直接呼叫 multus.CmdAdd / CmdDel / CmdCheck / CmdGC / CmdStatus
+```
+
+```go
+// File: cmd/multus-shim/main.go (thick CNI binary)
+// 只呼叫 api.CmdAdd / CmdDel / CmdCheck / CmdGC / CmdStatus
+// 這些 api.* 把 args 包成 HTTP POST 送到 unix socket
+```
+
+```go
+// File: cmd/multus-daemon/main.go (thick server, runs in DaemonSet)
+// pkg/server/server.go 的 HTTP server，handle /cni 與 /delegate endpoint
+```
+
+細節在 [thick-shim-and-daemon](/multus/features/thick-shim-and-daemon)。
+
+## NetConf 結構
+
+multus 自己讀的 config 用 `pkg/types/types.go:29` 的 `NetConf`：
+
+```go
+// File: pkg/types/types.go (line 29)
+type NetConf struct {
+    types.NetConf
+
+    RawPrevResult *map[string]interface{} `json:"prevResult"`
+    PrevResult    *cni100.Result          `json:"-"`
+
+    ConfDir string `json:"confDir"`
+    CNIDir  string `json:"cniDir"`
+    BinDir  string `json:"binDir"`
+    RawDelegates []map[string]interface{} `json:"delegates"`
+    Delegates       []*DelegateNetConf  `json:"-"`
+    ClusterNetwork  string              `json:"clusterNetwork"`
+    DefaultNetworks []string            `json:"defaultNetworks"`
+    Kubeconfig      string              `json:"kubeconfig"`
+    // ...
+    NamespaceIsolation       bool     `json:"namespaceIsolation"`
+    AuxiliaryCNIChainName    string   `json:"auxiliaryCNIChainName,omitempty"`
+    // ...
+    RetryDeleteOnError bool `json:"retryDeleteOnError"`
+}
+```
+
+幾個值得記的選項：
+
+- `namespaceIsolation`: NAD 只能被同 namespace 的 Pod 用（避免跨租戶 NAD 偷接）
+- `defaultNetworks`: 給每個 Pod 預設都掛上的 NAD list（即使 annotation 沒列）
+- `kubeconfig`: 連 apiserver 用的 kubeconfig 路徑（thick 模式 daemon 自己拿，thin 模式每次重讀）
+
+## 整段 1 句話
+
+multus 是「在 CNI 1:1 限制下，把多 CNI 變成 1 個 CNI」的薄包裝；NAD CRD 是「把別的 CNI 的 config 存進 k8s」的標準。所有真正做 networking 的事都還是 cilium / sriov / macvlan 這些原本就有的 plugin。
+
+## 收穫檢查
+
+- 為什麼 multus 不能直接寫成「kubelet 支援 multi-CNI」的 patch？
+- NAD `spec.config` 為什麼是 string 不是 typed yaml？
+- Pod 不帶 `k8s.v1.cni.cncf.io/networks` annotation 還會接 multus 嗎？接幾個 interface？
+- `clusterNetwork` 跟 `delegates` 兩個欄位的關係？
+
+## 原始碼參考
+
+- [cmd/multus/main.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/cmd/multus/main.go) — thin CNI binary entry
+- [cmd/multus-shim/main.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/cmd/multus-shim/main.go) — thick CNI binary entry
+- [cmd/multus-daemon/main.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/cmd/multus-daemon/main.go) — thick server entry
+- [pkg/types/types.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/types/types.go) — `NetConf` (line 29), `DelegateNetConf` (line 100), `NetworkSelectionElement` (line 130)
+- [deployments/multus-daemonset-thick.yml](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/deployments/multus-daemonset-thick.yml) — thick DaemonSet 範例
+- [k8snetworkplumbingwg/multi-net-spec](https://github.com/k8snetworkplumbingwg/multi-net-spec) — NAD CRD 標準
+
+## 接下來
+
+- [delegate-and-cmdadd](/multus/features/delegate-and-cmdadd) — `CmdAdd` 怎麼 fan-out 到多個 delegate
+- [thick-shim-and-daemon](/multus/features/thick-shim-and-daemon) — thick mode 的 socket protocol
+- [k8s-integration-and-status](/multus/features/k8s-integration-and-status) — annotation parse 與 status 寫回

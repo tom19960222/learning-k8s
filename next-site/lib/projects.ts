@@ -341,6 +341,56 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+
+  'multus': {
+    id: 'multus',
+    displayName: 'Multus CNI',
+    shortName: 'Multus',
+    description: 'CNI meta-plugin：kubelet 一次只 invoke 一個 CNI，multus 把這個位置霸佔住，再 fan-out 到任意數量的 delegate plugin',
+    githubUrl: 'https://github.com/k8snetworkplumbingwg/multus-cni',
+    submodulePath: path.join(REPO_ROOT, 'multus-cni'),
+    color: 'green',
+    accentClass: 'border-green-500 text-green-400',
+    features: ['architecture', 'delegate-and-cmdadd', 'thick-shim-and-daemon', 'k8s-integration-and-status'],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: 'Delegate 機制', icon: '🔀', slugs: ['delegate-and-cmdadd'] },
+      { label: 'Thick mode 部署', icon: '🧵', slugs: ['thick-shim-and-daemon'] },
+      { label: 'K8s 整合', icon: '🔌', slugs: ['k8s-integration-and-status'] },
+    ],
+    usecases: [],
+    difficulty: '🟡 中階',
+    difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+    problemStatement: 'CNI spec 規定 kubelet 一次只 invoke 一個 plugin。但 KubeVirt VM 同時要 cilium pod network + SR-IOV storage VLAN，怎麼辦？multus 把自己塞進那個唯一位置，再對 list of delegate plugin 各自呼叫一次。這 4 頁從原始碼拆：meta-plugin 概念、CmdAdd 的 fan-out flow、thick mode 為什麼用 socket 取代 thin、annotation 與 NAD CRD 的關係。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: '你的 KubeVirt VM 要同時接 cilium 的 pod network 跟 storage 廠商給的 SR-IOV VLAN。CNI spec 不允許多個 CNI plugin — 但 multus 把自己包成「the one CNI」再 fan-out。今天從 cmd/multus/main.go 開始，把 multus 對 NAD 的整套邏輯拆透。',
+      scenes: [
+        { step: 1, icon: '🏗️', actor: '你', action: '讀 architecture：meta-plugin 是什麼', detail: 'kubelet → CNI plugin 是 1:1 規定。multus 把自己塞進那個位置，內部再呼叫實際的 CNI plugin。NAD CRD 把「另一個 CNI 的 config」存進 k8s API。' },
+        { step: 2, icon: '🔀', actor: '你', action: '讀 delegate flow：CmdAdd 怎麼 fan-out', detail: 'pkg/multus/multus.go:742 CmdAdd 解析 pod annotation → 查 NAD CRD → 對每個 delegate 走 libcni invoke。master plugin 的 result 才回給 kubelet。' },
+        { step: 3, icon: '🧵', actor: '你', action: '讀 thick mode：shim + daemon 的拆分', detail: 'thin mode 每次 ADD/DEL 都打 apiserver。thick 把 CNI binary 縮成 shim 只 POST 到 unix socket，daemon 用 informer cache 接住。' },
+        { step: 4, icon: '🔌', actor: '你', action: '讀 k8s 整合：annotation in / status out', detail: 'k8s.v1.cni.cncf.io/networks 是 input，network-status 是 output。SR-IOV 的 deviceID 透過 resourceName annotation 從 device-plugin 傳進 delegate config。' },
+      ],
+      outcome: '從此 multus 不是黑盒。你看 Pod 拿了多 IP 知道哪個 delegate 給的；多 NIC VM 失敗時知道該追 NAD config 還是 delegate plugin；cilium + SR-IOV 共存的設計能講清楚誰負責什麼。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '先建立全貌：CNI 限制與 meta-plugin 概念' },
+        { slug: 'k8s-integration-and-status', note: 'annotation 與 NAD CRD 是面對使用者的介面' },
+        { slug: 'delegate-and-cmdadd', note: 'CmdAdd flow 是核心邏輯' },
+      ],
+      intermediate: [
+        { slug: 'delegate-and-cmdadd', note: '深入 fan-out 與 master plugin' },
+        { slug: 'thick-shim-and-daemon', note: 'thick 模式 socket protocol' },
+        { slug: 'k8s-integration-and-status', note: 'SR-IOV deviceID 整合' },
+      ],
+      advanced: [
+        { slug: 'thick-shim-and-daemon', note: 'informer cache 設計與 chroot exec' },
+        { slug: 'delegate-and-cmdadd', note: 'reverse-DEL on partial failure 的 idempotence' },
+        { slug: 'k8s-integration-and-status', note: 'NAD spec.config 為何 string + namespace isolation' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)

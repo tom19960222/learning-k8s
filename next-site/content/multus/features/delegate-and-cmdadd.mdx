@@ -1,0 +1,256 @@
+---
+layout: doc
+title: Multus — Delegate 機制與 CmdAdd flow
+description: pod annotation → NAD lookup → DelegateNetConf list → 對每個 delegate 走 libcni invoke。master plugin 的 result 才回給 kubelet。失敗時 reverse-DEL 已成功的 delegate。
+---
+
+## 場景
+
+Pod 帶 annotation `k8s.v1.cni.cncf.io/networks: "macvlan-conf,sriov-net"`。kubelet 對 multus 發 ADD。multus 內部到底怎麼把這變成 net1 macvlan、net2 sriov 兩個 interface？哪個 result 會回給 kubelet？第二個 delegate 失敗了第一個怎麼辦？
+
+## 整體 flow
+
+```
+kubelet → multus(-shim).CmdAdd
+              │
+              ▼
+   ┌──────────────────────────────────────┐
+   │  pkg/multus/multus.go:742            │
+   │  CmdAdd(args, exec, kubeClient)      │
+   └──┬───────────────────────────────────┘
+      │
+      ▼ 1. types.LoadNetConf(args.StdinData)
+      │
+      ▼ 2. k8s.GetK8sClient + GetK8sArgs
+      │     (CNI args 帶 K8S_POD_NAME / K8S_POD_NAMESPACE)
+      │
+      ▼ 3. GetPod(kubeClient, k8sArgs)
+      │     拿到 Pod object
+      │
+      ▼ 4. GetDefaultNetworks  (建立 delegates[0] = master)
+      │
+      ▼ 5. TryLoadPodDelegates(pod, n, kubeClient, resourceMap)
+      │     - 解析 annotation k8s.v1.cni.cncf.io/networks
+      │     - 對每個 element 查 NAD CRD
+      │     - 包成 DelegateNetConf 加進 n.Delegates
+      │
+      ▼ 6. for idx, delegate := range n.Delegates:
+      │      tmpResult, err = DelegateAdd(...)
+      │      if delegate.MasterPlugin: result = tmpResult
+      │      累積 netStatus
+      │
+      ▼ 7. SetNetworkStatus(kubeClient, ..., netStatus, n)
+      │     寫 k8s.v1.cni.cncf.io/network-status annotation
+      │
+      ▼ 8. return result    // master plugin 的 result
+```
+
+## DelegateNetConf 是什麼
+
+```go
+// File: pkg/types/types.go (line 100)
+type DelegateNetConf struct {
+    Conf                  types.NetConf
+    ConfList              types.NetConfList
+    CNINetworkConfigList  libcni.NetworkConfigList
+    Name                  string
+    IfnameRequest         string          `json:"ifnameRequest,omitempty"`
+    MacRequest            string          `json:"macRequest,omitempty"`
+    InfinibandGUIDRequest string          `json:"infinibandGUIDRequest,omitempty"`
+    IPRequest             []string        `json:"ipRequest,omitempty"`
+    GatewayRequest        *[]net.IP       `json:"default-route,omitempty"`
+    // ...
+    MasterPlugin bool `json:"-"`
+    ConfListPlugin bool `json:"-"`
+    DeviceID string `json:"deviceID,omitempty"`
+    ResourceName string `json:"resourceName,omitempty"`
+    Bytes []byte
+}
+```
+
+幾個欄位的角色：
+
+- `Conf` / `ConfList`: parse 過的 CNI config。`ConfListPlugin == true` 表示這個 delegate 用 CNI conflist 形式（多個 plugin 串成 chain）
+- `Bytes`: raw config bytes（要原樣餵給實際的 CNI binary 的 stdin）
+- `MasterPlugin`: 第一個 delegate (default network) — 它的 result 會被回給 kubelet
+- `IfnameRequest`: 在 Pod 內這張 interface 想叫什麼名字（net1, net2, eth1 ...）
+- `IPRequest` / `MacRequest`: 透過 CNI args 機制傳給 plugin (走 `CNI_ARGS` env var)
+- `DeviceID` / `ResourceName`: SR-IOV 用，從 device-plugin 分配的 PCI device 一路傳到 plugin
+
+## NAD 怎麼變成 DelegateNetConf
+
+`pkg/k8sclient/k8sclient.go:291` 的 `getKubernetesDelegate`：
+
+```go
+// File: pkg/k8sclient/k8sclient.go (line 291)
+func getKubernetesDelegate(client *ClientInfo, net *types.NetworkSelectionElement,
+                           confdir string, pod *v1.Pod,
+                           resourceMap map[string]*types.ResourceInfo) (*types.DelegateNetConf, ...) {
+    // 1. client.GetNetAttachDef(net.Namespace, net.Name)
+    //    從 informer cache 或 apiserver 拿 NAD CRD 物件
+    // 2. 從 NAD.Annotations 讀 resourceName (給 SR-IOV)
+    // 3. NAD.Spec.Config 是 stringified JSON; parse 它
+    // 4. 把 net.IPRequest / net.MacRequest / net.InterfaceRequest 等
+    //    從 Pod annotation 帶過來的偏好塞進 DelegateNetConf
+}
+```
+
+`spec.config` 為什麼是 string？因為 multus 不能預測你會用哪個 CNI（macvlan, ipvlan, sriov, bridge, 第三方），各家 plugin 的 schema 不同。CRD 只能定 schema 已知的欄位，所以 `spec.config` 走 opaque string「丟給 delegate 自己 parse」。
+
+## libcni 的 invoke
+
+`DelegateAdd` (`multus.go:396`) 是核心：
+
+```go
+// File: pkg/multus/multus.go (line 396)
+func DelegateAdd(exec invoke.Exec, kubeClient *k8s.ClientInfo, pod *v1.Pod,
+                 delegate *types.DelegateNetConf, rt *libcni.RuntimeConf,
+                 multusNetconf *types.NetConf) (cnitypes.Result, error) {
+
+    if err := validateIfName(rt.NetNS, rt.IfName); err != nil { ... }
+
+    // ... handle MacRequest / IPRequest 寫進 CNI_ARGS
+
+    var result cnitypes.Result
+    if delegate.ConfListPlugin {
+        result, err = conflistAdd(rt, delegate.Bytes, &delegate.CNINetworkConfigList, multusNetconf, exec)
+    } else {
+        result, err = confAdd(rt, delegate.Bytes, multusNetconf, exec)
+    }
+    // ... emit kube event "AddedInterface", return result
+}
+```
+
+`confAdd` (`multus.go:203`) 與 `conflistAdd` (`multus.go:299`) 都是對 `libcni`（[github.com/containernetworking/cni](https://github.com/containernetworking/cni)）的薄包裝。實際 exec 路徑：
+
+```
+multus → libcni → exec /opt/cni/bin/<delegate-binary>
+                  (例如 /opt/cni/bin/macvlan)
+                  stdin = delegate.Bytes (那個 plugin 自己的 config)
+                  env CNI_COMMAND=ADD, CNI_ARGS=..., CNI_IFNAME=net1
+                  ↓
+                  binary 自己做 veth / route / IPAM
+                  ↓
+                  stdout = CNI Result JSON (interfaces, IPs, routes)
+```
+
+multus 不知道 macvlan 內部怎麼運作 — 它只知道 exec 完該拿到一份 CNI Result。
+
+## CmdAdd 的主迴圈
+
+```go
+// File: pkg/multus/multus.go (line 825 起的 for 迴圈)
+for idx, delegate := range n.Delegates {
+    ifName := getIfname(delegate, args.IfName, idx)
+    rt, _ := types.CreateCNIRuntimeConf(args, k8sArgs, ifName, n.RuntimeConfig, delegate)
+
+    tmpResult, err := DelegateAdd(exec, kubeClient, pod, delegate, rt, n)
+    if err != nil {
+        // 失敗 → 對前面 0..idx 的 delegate 全部 reverse-DEL
+        _ = delPlugins(exec, nil, args, k8sArgs, n.Delegates, idx, n.RuntimeConfig, n)
+        return nil, cmdPluginErr(k8sArgs, netName, "error adding container to network %q: %v", netName, err)
+    }
+
+    // Master plugin result is always used if present
+    if delegate.MasterPlugin || result == nil {
+        result = tmpResult
+    }
+
+    // ... 累積 netStatus list (給後面寫回 annotation)
+}
+```
+
+`getIfname` (`multus.go:94`)：第一個 delegate 用 `args.IfName`（kubelet 傳進來的，通常 `eth0`），其它 delegate 用 `IfnameRequest` 或 default `net1, net2, ...`。
+
+```go
+// File: pkg/multus/multus.go (line 94)
+func getIfname(delegate *types.DelegateNetConf, argif string, idx int) string {
+    if idx == 0 {
+        return argif
+    }
+    if delegate.IfnameRequest != "" {
+        return delegate.IfnameRequest
+    }
+    return fmt.Sprintf("net%d", idx)
+}
+```
+
+## 為什麼只有 master plugin 的 result 回 kubelet
+
+CNI spec 規定 plugin 的 stdout result 結構是「**一個** interface set + IP set」。kubelet 拿這份去更新 Pod status (`pod.status.podIP`)。
+
+如果回 macvlan 的 result，kubelet 會以為 Pod 的 podIP 是 macvlan 配的 IP — 但 Service / kube-proxy / NetworkPolicy 都建在 default network 的 IP 上。所以 master (default) plugin 的 result 才是 kubelet 期待的。
+
+額外的 interface 怎麼讓外部看見？走 `k8s.v1.cni.cncf.io/network-status` annotation（`SetNetworkStatus`）。詳見 [k8s-integration-and-status](/multus/features/k8s-integration-and-status)。
+
+## 失敗處理：reverse-DEL
+
+```go
+// File: pkg/multus/multus.go (line 601)
+func delPlugins(exec invoke.Exec, pod *v1.Pod, args *skel.CmdArgs,
+                k8sArgs *types.K8sArgs, delegates []*types.DelegateNetConf,
+                lastIdx int, netRt *types.RuntimeConfig,
+                multusNetconf *types.NetConf) error {
+    // 從 lastIdx 倒著走，對 0..lastIdx-1 都呼 DelegateDel
+    // 忽略個別 DEL 的 error (DEL 必須 idempotent)
+}
+```
+
+第 N 個 delegate 失敗時，前 N-1 個已經把 interface 接好了。如果不清，Pod 重試 ADD 會留下殘餘介面、IP 沒回到 IPAM pool。`delPlugins` 對 0..N-1 倒序呼 `DelegateDel`（CNI spec 規定 DEL 必須 idempotent — 即使重複呼或對不存在的 interface 呼，都應該成功）。
+
+`RetryDeleteOnError` (NetConf 欄位) 控制：DEL 內部失敗時要不要繼續往下試。預設 false（嚴格模式）；true 時忽略個別 plugin 的 DEL 錯誤繼續清。
+
+## CmdDel 反向
+
+```go
+// File: pkg/multus/multus.go (line 1002)
+func CmdDel(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) error {
+    // 1. 從 cniDir 讀回之前 ADD 時 saveDelegates 的結果
+    //    (因為 DEL 時 Pod 可能已經消失，沒辦法重 query annotation)
+    // 2. 對每個 delegate 倒序呼 DelegateDel
+    // 3. ConsumeScratchNetConf 清 cniDir 內的 cache file
+}
+```
+
+關鍵 trick: ADD 時 `saveDelegates` (`multus.go:123`) 把 delegate list 寫到 `n.CNIDir/<containerID>` (預設 `/var/lib/cni/multus/`)，DEL 時直接讀回。這樣即使 Pod 已被 etcd 刪了，DEL 還能正確清介面。
+
+```go
+// File: pkg/multus/multus.go (line 123)
+func saveDelegates(containerID, dataDir string, delegates []*types.DelegateNetConf) error {
+    delegatesBytes, err := json.Marshal(delegates)
+    // ... write to <dataDir>/<containerID>
+}
+```
+
+## CmdGC：垃圾回收
+
+CNI v1.1 加了 `GC` operation：cluster 列出所有「應該還活著」的 attachment，CNI plugin 自己掃 cache，砍掉沒列在內的。multus 在 `CmdGC` (`multus.go:1185`) 把 cache 內每個 saved delegates 倒給每個 delegate 自己 GC。
+
+對長 lived cluster 防止 cache 累積殘餘。
+
+## 整段 1 句話
+
+multus 的 CmdAdd 是「parse → resolve → loop-and-libcni-invoke → master result + status annotation」的 pipeline；錯誤處理走 reverse-DEL；DEL/GC 靠 cniDir cache 撐起 idempotence。
+
+## 收穫檢查
+
+- 第一個 delegate (master) ADD 失敗 vs 第二個 ADD 失敗，差別在哪？
+- `IfnameRequest` 沒寫，第三個 delegate 進 Pod 內叫什麼名字？
+- 為什麼 ADD 時要 `saveDelegates` 寫 cache？DEL 為什麼不直接重 parse Pod annotation？
+- `RetryDeleteOnError = true` 時 risk 在哪？
+
+## 原始碼參考
+
+- [pkg/multus/multus.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/multus/multus.go) — 主邏輯
+  - `CmdAdd` (line 742)
+  - `CmdDel` (line 1002)
+  - `CmdGC` (line 1185)
+  - `DelegateAdd` (line 396)
+  - `DelegateDel` (line 565)
+  - `delPlugins` (line 601)
+  - `getIfname` (line 94)
+  - `saveDelegates` (line 123)
+  - `confAdd` (line 203) / `conflistAdd` (line 299)
+- [pkg/types/types.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/types/types.go) — `DelegateNetConf` (line 100)
+- [pkg/k8sclient/k8sclient.go](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/k8sclient/k8sclient.go) — `getKubernetesDelegate` (line 291), `TryLoadPodDelegates` (line 361), `GetNetworkDelegates` (line 448)
+- [github.com/containernetworking/cni](https://github.com/containernetworking/cni) — libcni invoke API
