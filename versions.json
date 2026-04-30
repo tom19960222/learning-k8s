@@ -13,5 +13,10 @@
     "commit": "3203e9d1ce77af32f6a9ce72b9f954830666f72c",
     "tag": "v1.8.2",
     "analyzed_at": "2026-04-30"
+  },
+  "ceph": {
+    "commit": "c92aebb279828e9c3c1f5d24613efca272649e62",
+    "tag": "v19.2.3",
+    "analyzed_at": "2026-04-30"
   }
 }
