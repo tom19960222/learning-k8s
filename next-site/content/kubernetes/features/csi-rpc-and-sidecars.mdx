@@ -1,0 +1,144 @@
+---
+layout: doc
+title: Kubernetes — CSI RPC 與 Sidecars
+description: 從 CSI spec 與 Kubernetes CSI sidecar 原始碼拆解 Controller/Node/Identity RPC、external-provisioner、external-attacher、node-driver-registrar 與 Kubernetes storage API 的接線方式。
+---
+
+## 場景
+
+CNI 是 container runtime 執行 binary。CSI 不一樣：CSI driver 是 gRPC server。
+
+Day19 把 CSI 拆成 `Controller` 與 `Node`，這是理解 CSI 的主軸：
+
+- `Controller`：儲存系統的控制平面操作，例如 create/delete volume、attach/detach node、snapshot、expand。
+- `Node`：每台 node 上的資料路徑準備，例如 stage、publish、unpublish、stats。
+- `Identity`：driver identity、capability、health probe。
+
+Kubernetes 不直接要求 driver 自己 watch 所有 Kubernetes object。它用 CSI sidecar 把 Kubernetes controller pattern 轉成 CSI gRPC。
+
+## CSI spec 的三組核心 service
+
+`container-storage-interface/spec` 的 `csi.proto` 定義了三組基本 service：
+
+| Service | 常見 RPC | Kubernetes 中的意義 |
+|---|---|---|
+| `Identity` | `GetPluginInfo`、`GetPluginCapabilities`、`Probe` | 認出 driver name、能力與健康狀態。 |
+| `Controller` | `CreateVolume`、`DeleteVolume`、`ControllerPublishVolume`、`ControllerUnpublishVolume`、`ValidateVolumeCapabilities`、`ControllerExpandVolume` | 由 controller-side sidecar 或 controller-manager 間接觸發，處理 volume lifecycle。 |
+| `Node` | `NodeStageVolume`、`NodeUnstageVolume`、`NodePublishVolume`、`NodeUnpublishVolume`、`NodeGetVolumeStats`、`NodeExpandVolume`、`NodeGetCapabilities`、`NodeGetInfo` | 由 kubelet 在 node 上呼叫，讓 volume 最終可被 Pod 使用。 |
+
+2019 文章列出的 RPC 到今天仍是主軸，但 modern spec 已加入更多延伸，例如 group snapshot、modify volume 等。學習時先抓基本 lifecycle，不需要一開始就吞完全部 spec。
+
+## Lifecycle: create、attach、stage、publish
+
+CSI lifecycle 可以用四個動詞理解：
+
+| 動詞 | RPC | 對應現實 |
+|---|---|---|
+| create | `CreateVolume` | 在 storage backend 建立 volume，例如雲端 disk、Ceph RBD image、NFS subdir。 |
+| attach | `ControllerPublishVolume` | 讓某個 node 有能力存取該 volume，例如把 cloud disk attach 到 VM。 |
+| stage | `NodeStageVolume` | 在 node 上做一次性準備，例如格式化 block device，mount 到 global staging path。 |
+| publish | `NodePublishVolume` | 把 staged volume 或 mountable source bind/mount 到 Pod 專屬 target path。 |
+
+不是每個 driver 都需要四步。例如 NFS 這種 mountable volume 可能沒有 attach，也可能直接在 `NodePublishVolume` mount `server:/share` 到 target path。block device 或 cloud disk 則常需要 attach 與 stage。
+
+## Sidecar 是 Kubernetes controller adapter
+
+Day20 的架構圖把 driver container 與 sidecar container 放在同一個 Pod。這不是部署風格而已，而是責任切割：
+
+| Sidecar | Watch 的 Kubernetes object | 呼叫的 CSI RPC | 作用 |
+|---|---|---|---|
+| external-provisioner | PVC / StorageClass / PV | `CreateVolume`、`DeleteVolume` | dynamic provisioning，建立或刪除 PV 背後的 volume。 |
+| external-attacher | `VolumeAttachment` | `ControllerPublishVolume`、`ControllerUnpublishVolume` | attach/detach volume 到 node，更新 `VolumeAttachment.status`。 |
+| node-driver-registrar | kubelet plugin watcher socket | kubelet plugin registration API，不是 CSI spec RPC | 把 driver socket 註冊給 kubelet。 |
+| external-resizer | PVC / PV resize 狀態 | `ControllerExpandVolume` | controller-side expansion。 |
+| external-snapshotter | VolumeSnapshot CRD | `CreateSnapshot`、`DeleteSnapshot` | snapshot lifecycle。 |
+
+所以 CSI driver 作者最核心要寫的是 storage backend 的 RPC 實作。Kubernetes informer/workqueue/leader election/retry 這些 controller plumbing，盡量由 sidecar 承擔。
+
+## Dynamic provisioning source path
+
+`kubernetes/pkg/controller/volume/persistentvolume/pv_controller.go` 的 `provisionClaimOperationExternal()` 不會呼叫 `CreateVolume`。它只在 PVC 上標出 external provisioner name，並發 event。
+
+`kubernetes-csi/external-provisioner/pkg/controller/controller.go` 的 `Provision()` 才會：
+
+1. 檢查 PVC annotation 裡的 provisioner 是否等於自己的 driver name。
+2. 處理 topology / selected node。
+3. 組 `CreateVolumeRequest`。
+4. 呼叫 `p.csiClient.CreateVolume(...)`。
+5. 用回傳的 volume ID / context 建立 Kubernetes PV。
+
+這是 Day20 最重要的細節：Kubernetes core 與 CSI driver 中間隔著 external-provisioner，不是 kube-controller-manager 直接呼叫 vendor driver。
+
+## Attach source path
+
+attach 也分兩段：
+
+1. Kubernetes attach/detach controller 透過 in-tree CSI volume plugin 建立 `VolumeAttachment`。
+2. external-attacher watch `VolumeAttachment`，呼叫 CSI `ControllerPublishVolume`，成功後更新 `status.attached=true`。
+
+`kubernetes/pkg/volume/csi/csi_attacher.go` 的 `Attach()` 會建立 `storage.k8s.io/v1 VolumeAttachment`，其中 `Spec.Attacher` 是 CSI driver name，`Spec.NodeName` 是目標 Kubernetes node。
+
+`kubernetes-csi/external-attacher/pkg/controller/csi_handler.go` 的 `syncAttach()` 會呼叫 driver attach，然後 `markAsAttached()`。這就是 Day21 看到 `kubectl get volumeattachments` 的來源。
+
+## node-driver-registrar source path
+
+node side 的第一步不是 mount，而是註冊。
+
+`kubernetes-csi/node-driver-registrar` 會提供 kubelet plugin registration API。它的 `GetInfo()` 回傳：
+
+- `Type: CSIPlugin`
+- `Name: driverName`
+- `Endpoint: driver socket`
+- `SupportedVersions`
+
+Kubernetes 端在 `kubernetes/pkg/volume/csi/csi_plugin.go` 裡的 `RegistrationHandler.RegisterPlugin()` 會：
+
+1. 驗證 CSI version。
+2. 把 driver name 與 socket endpoint 存進 `DriversStore`。
+3. 建 CSI client。
+4. 呼叫 CSI `NodeGetInfo()`。
+5. 用 node ID、topology、volume limit 更新 `CSINode`。
+
+這解釋了 `CSINode`：它不是 driver 自己直接創的工作紀錄，而是 kubelet 在 plugin registration 後寫入 Kubernetes API 的 node storage capability。
+
+## CSIDriver 影響 Kubernetes 行為
+
+`storage.k8s.io/v1 CSIDriver` 是 driver 對 Kubernetes 宣告行為偏好的地方：
+
+| 欄位 | 影響 |
+|---|---|
+| `attachRequired` | 是否需要 attach/detach controller 與 `VolumeAttachment`。 |
+| `podInfoOnMount` | kubelet 是否把 Pod name/namespace/UID 放進 `NodePublishVolume` 的 volume context。 |
+| `volumeLifecycleModes` | 支援 `Persistent`、`Ephemeral` 或兩者。 |
+| `fsGroupPolicy` | Kubernetes 是否要幫 volume 套 fsGroup 權限。 |
+| `tokenRequests` | kubelet 是否替 driver 取得 service account token。 |
+| `requiresRepublish` | kubelet 是否週期性再呼叫 `NodePublishVolume` 更新 volume 內容。 |
+
+Day21 範例裡 `kubectl get csidrivers` 沒看到 object，這在舊範例可以發生。現代 driver 應該明確建立 `CSIDriver`，否則 Kubernetes 只能採用預設行為，排障也比較不直觀。
+
+## Debug 入口
+
+| 問題 | 看哪裡 |
+|---|---|
+| PVC 沒動態建立 PV | external-provisioner log、PVC event、StorageClass `provisioner`。 |
+| `VolumeAttachment` 一直 `attached=false` | external-attacher log、CSI Controller `ControllerPublishVolume`、node ID/topology。 |
+| kubelet 找不到 driver | node-driver-registrar log、`/var/lib/kubelet/plugins_registry`、`CSINode`。 |
+| driver name 不一致 | `StorageClass.provisioner`、`PV.spec.csi.driver`、`CSIDriver.metadata.name`、registrar `Name`。 |
+| inline CSI volume 不能用 | `CSIDriver.spec.volumeLifecycleModes` 是否含 `Ephemeral`。 |
+
+## 收穫檢查
+
+- external-provisioner 和 CSI Controller plugin 的差別是什麼？
+- `VolumeAttachment` 是 CSI spec 物件，還是 Kubernetes API 物件？
+- node-driver-registrar 呼叫的是 CSI RPC 還是 kubelet plugin registration RPC？
+- `CSIDriver.attachRequired=false` 會讓哪一段流程被跳過？
+
+## 參考資料
+
+- [Day19 — Container Storage Interface 標準介紹](https://ithelp.ithome.com.tw/articles/10224554)
+- [Day20 — Container Storage Interface(CSI) - kubernetes](https://ithelp.ithome.com.tw/articles/10224945)
+- [CSI Specification](https://github.com/container-storage-interface/spec)
+- [CSI Sidecar Containers](https://kubernetes-csi.github.io/docs/sidecar-containers.html)
+- [external-provisioner](https://github.com/kubernetes-csi/external-provisioner)
+- [external-attacher](https://github.com/kubernetes-csi/external-attacher)
+- [node-driver-registrar](https://github.com/kubernetes-csi/node-driver-registrar)

@@ -55,6 +55,8 @@ Pod Pending、ImagePullBackOff、CNI ADD failed、PVC Pending、GPU alloc failed
 | CSI | kubelet + external CSI sidecars | Ceph、cloud disk、NFS driver | volume provision、attach、mount、snapshot | 決定 Pod 排到哪個 node |
 | Device Plugin | kubelet | NVIDIA GPU、SR-IOV、FPGA plugin | discover node device、advertise allocatable、allocate device | container lifecycle 本身 |
 
+這一頁是總覽。要往下拆實作邊界，可以接著讀 [runtime-learning-map](/kubernetes/features/runtime-learning-map)、[cni-learning-map](/kubernetes/features/cni-learning-map) 與 [csi-learning-map](/kubernetes/features/csi-learning-map)。
+
 ## 從原始碼看邊界
 
 先不要背 CRI/CNI/CSI 的定義，直接從 kubelet source 看「誰負責把 Pod 變成 node 上的東西」。

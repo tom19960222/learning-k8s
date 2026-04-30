@@ -1,0 +1,156 @@
+---
+layout: doc
+title: Kubernetes — Storage API 與 PV/PVC Binding
+description: 從 Kubernetes source 拆解 PV、PVC、StorageClass 與 CSI PV 欄位，說明 static provisioning、dynamic provisioning、external provisioner 與 binding 的責任邊界。
+---
+
+## 場景
+
+使用者通常只看到三段 YAML：
+
+```
+StorageClass -> PersistentVolumeClaim -> Pod volumeMount
+```
+
+或是 static provisioning：
+
+```
+PersistentVolume -> PersistentVolumeClaim -> Pod volumeMount
+```
+
+這容易讓人以為 Kubernetes 會「建立硬碟」。實際上，Kubernetes core 的主要工作是：
+
+- 保存 storage intent。
+- 找到符合條件的 PV。
+- 把 PVC 與 PV 綁定。
+- 對 external provisioner 發出 provisioning 信號。
+- 在 Pod scheduled 之後協調 attach/mount。
+
+真正建立 volume、格式化、snapshot、replication、HA、備份，是 storage backend 與 CSI driver 的工作。
+
+## API 先定義抽象
+
+`kubernetes/staging/src/k8s.io/api/core/v1/types.go` 裡，`PersistentVolume` 被註解成 cluster storage resource；`PersistentVolumeClaim` 則是 user's request。這兩個物件的差異很重要：
+
+| 物件 | 語義 | 關鍵欄位 |
+|---|---|---|
+| `PersistentVolume` | cluster 擁有的一塊 storage | `capacity`、`persistentVolumeSource`、`accessModes`、`claimRef`、`reclaimPolicy`、`storageClassName`、`mountOptions`、`volumeMode`、`nodeAffinity` |
+| `PersistentVolumeClaim` | namespace 內的 storage request | `accessModes`、`resources.requests.storage`、`volumeName`、`storageClassName`、`volumeMode`、`dataSource` |
+| `StorageClass` | dynamic provisioning template | `provisioner`、`parameters`、`reclaimPolicy`、`mountOptions`、`allowVolumeExpansion`、`volumeBindingMode`、`allowedTopologies` |
+
+Day18 說 PV/PVC/StorageClass 是 Kubernetes storage 的使用者層抽象。source 裡可以看到這不是 CSI 專屬；CSI 只是 `PersistentVolumeSource` 的其中一種實作。
+
+## CSI PV 欄位是 driver contract
+
+同一個檔案裡的 `CSIPersistentVolumeSource` 是 CSI persistent volume 的核心：
+
+| 欄位 | 意義 |
+|---|---|
+| `driver` | CSI driver name，必須對到已安裝 driver。 |
+| `volumeHandle` | CSI `CreateVolume` 回傳的 volume ID，後續 RPC 都靠它指認同一個 volume。 |
+| `readOnly` | 傳給 `ControllerPublishVolumeRequest`。 |
+| `fsType` | filesystem type，例如 `ext4`、`xfs`；對 raw block 不同。 |
+| `volumeAttributes` | driver-specific 參數，例如 NFS 的 server/share。 |
+| `controllerPublishSecretRef` | attach 階段 secret。 |
+| `nodeStageSecretRef` | stage 階段 secret。 |
+| `nodePublishSecretRef` | publish/mount 到 Pod target path 階段 secret。 |
+| `controllerExpandSecretRef` / `nodeExpandSecretRef` | volume expansion 階段 secret。 |
+
+文章用 NFS 範例說 `driver` 很像 CNI config 的 `type`。這個比喻可以用，但要補一點：CSI driver 不是單一 binary execution protocol，而是長駐 gRPC endpoint，通常由多個 Kubernetes sidecar 幫它接上 Kubernetes API。
+
+## Binding 不是 CSI 做的
+
+`kubernetes/pkg/controller/volume/persistentvolume/pv_controller.go` 的 `syncClaim()` 是 PVC reconcile 入口。它把 PVC 分成兩類：
+
+| 狀態 | source 行為 |
+|---|---|
+| PVC 沒有 `AnnBindCompleted` | 進 `syncUnboundClaim()`，找符合的 PV，或嘗試 provisioning。 |
+| PVC 已經 bind 過 | 進 `syncBoundClaim()`，確認 PV/PVC reference 仍然一致。 |
+
+`syncUnboundClaim()` 的邏輯是：
+
+1. 如果 PVC 沒指定 `spec.volumeName`，先查現有 PV cache。
+2. 找到符合 capacity/accessMode/storageClass/volumeMode 的 PV 就 bind。
+3. 找不到 PV，就看 StorageClass 是否能 dynamic provisioning。
+4. 如果 PVC 指定了 `spec.volumeName`，就只嘗試跟那個 PV bind。
+
+所以 CSI driver 不負責挑 PV/PVC 誰配誰；這是 Kubernetes PV controller 的責任。
+
+## Dynamic provisioning 的分工
+
+`provisionClaim()` 會呼叫 `findProvisionablePlugin()`。在 modern CSI 路徑，Kubernetes PV controller 不直接呼叫 CSI `CreateVolume`。source 裡的分支很清楚：
+
+```text
+plugin == nil  -> provisionClaimOperationExternal()
+plugin != nil  -> provisionClaimOperation()
+```
+
+`provisionClaimOperationExternal()` 只做三件事：
+
+1. 根據 `StorageClass.provisioner` 決定 provisioner name。
+2. 在 PVC 上加 provisioner annotation。
+3. 發 event 說正在等待 external provisioner 或管理者建立 volume。
+
+真正的 CSI dynamic provisioning 在 `kubernetes-csi/external-provisioner`。它 watch PVC，確認 PVC annotation 對到自己的 driver name 後，呼叫 CSI `CreateVolume`，再建立對應的 Kubernetes PV。
+
+這解釋了 Day20 說的 sidecar 價值：driver 作者不用把 Kubernetes PVC informer、work queue、retry、topology、PV creation 都寫在 driver 裡；external-provisioner 幫它做 Kubernetes controller 那半邊。
+
+## Static provisioning 的分工
+
+static PV 走另一條路：
+
+1. 管理者先建立 `PersistentVolume`，裡面有 `spec.csi.driver`、`volumeHandle`、`volumeAttributes`。
+2. 使用者建立 PVC。
+3. PV controller 找到符合條件的 PV，把 PV `claimRef` 與 PVC `spec.volumeName` / status 綁起來。
+4. Pod 使用 PVC。
+5. Pod 到 node 之後，attach/mount 流程才開始。
+
+這種模式下不會有 CSI `CreateVolume`。`volumeHandle` 代表外部 storage system 裡已存在的 volume ID。
+
+## WaitForFirstConsumer 為什麼重要
+
+`StorageClass.volumeBindingMode` 有兩個值：
+
+| 模式 | 行為 |
+|---|---|
+| `Immediate` | PVC 建立後就 provisioning/binding。 |
+| `WaitForFirstConsumer` | 等到使用該 PVC 的 Pod 進入 scheduling，才把 selected node/topology 納入 provisioning。 |
+
+對 zonal disk、local storage、拓撲敏感的 SAN/NAS，這會決定 volume 建在哪個 zone、哪台 node 可用。Day22 提到 storage 選型要看 workload profile；在 Kubernetes 裡，這種「位置限制」會落在 `StorageClass.allowedTopologies`、PV `nodeAffinity`、CSI `NodeGetInfo` topology、scheduler volume binding plugin 的交會點。
+
+## CSI migration 的現代狀態
+
+Day20 的文章把 CSI migration 放在 alpha 背景下理解，這符合 2019 年時空。這份 Kubernetes `v1.36.0` source 裡，`pkg/volume/csimigration/plugin_manager.go` 已明確把多個 in-tree plugin migration 視為 enabled/complete，例如 AWS EBS、GCE PD、Azure Disk/File、Cinder、vSphere、Portworx。
+
+這代表現代 Kubernetes 的方向不是「in-tree 與 CSI 長期並行」，而是：
+
+- Kubernetes core 保留通用 PV/PVC/StorageClass/volume manager 語義。
+- vendor-specific storage integration 逐步外移到 CSI driver。
+- 舊 in-tree API 透過 translation / migration shim 導到 CSI。
+
+## Debug 入口
+
+PVC 卡住時，先分辨是 binding 還是 provisioning：
+
+| 現象 | 應該看哪裡 |
+|---|---|
+| PVC Pending，沒有 StorageClass | PVC `spec.storageClassName`、default StorageClass。 |
+| PVC Pending，event 顯示 waiting for first consumer | StorageClass `volumeBindingMode`，看是否有 Pod 使用它。 |
+| PVC Pending，event 顯示 external provisioning | external-provisioner Pod log、driver name 是否對上 StorageClass `provisioner`。 |
+| PV 已建立但 PVC 未 bound | capacity/accessMode/storageClass/volumeMode/selector 是否 mismatch。 |
+| PVC Bound 但 Pod 掛不上 | 進入 attach/mount 問題，讀後面的 CSI lifecycle 頁。 |
+
+## 收穫檢查
+
+- `StorageClass.provisioner` 與 `PersistentVolume.spec.csi.driver` 差在哪？
+- Dynamic provisioning 時，Kubernetes PV controller 何時直接建立 volume，何時只標記 PVC 等 external provisioner？
+- Static CSI PV 為什麼需要 `volumeHandle`？
+- `WaitForFirstConsumer` 解的是容量問題、權限問題，還是 topology 問題？
+
+## 參考資料
+
+- [Day18 — Container Storage Interface 基本介紹](https://ithelp.ithome.com.tw/articles/10224183)
+- [Day19 — Container Storage Interface 標準介紹](https://ithelp.ithome.com.tw/articles/10224554)
+- [Kubernetes Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+- [Kubernetes Storage Classes](https://kubernetes.io/docs/concepts/storage/storage-classes/)
+- [Kubernetes CSI Developer Documentation](https://kubernetes-csi.github.io/docs/)

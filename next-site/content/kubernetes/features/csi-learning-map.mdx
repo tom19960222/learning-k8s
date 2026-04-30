@@ -1,0 +1,103 @@
+---
+layout: doc
+title: Kubernetes — CSI 文章知識地圖
+description: 從 5 篇 CSI 文章抽取知識點，整理成從 PV/PVC/StorageClass、CSI protobuf、sidecar controller、VolumeAttachment、kubelet Node RPC 到 mount propagation 的學習路徑。
+---
+
+## 場景
+
+CSI 比 CRI/CNI 更容易被誤解，因為它橫跨三個世界：
+
+1. Kubernetes API：`PersistentVolume`、`PersistentVolumeClaim`、`StorageClass`、`CSIDriver`、`CSINode`、`VolumeAttachment`。
+2. CSI gRPC contract：`Identity`、`Controller`、`Node` 三組 service。
+3. Linux storage/mount 現實：block device、filesystem、NFS、bind mount、mount namespace、mount propagation。
+
+文章的主軸是「Kubernetes 不提供真正的儲存系統」。Kubernetes 只把 Pod 對 storage 的需求轉成 API object 與 CSI RPC，真正的耐久性、快照、複寫、效能、HA、備份，都由儲存後端與 CSI driver 負責。
+
+## 逐篇知識點
+
+| 文章 | 主題 | 提取出的知識點 | 放進本專案的分析角度 |
+|---|---|---|---|
+| Day18 — CSI 基本介紹 | 為什麼需要 CSI | in-tree volume plugin 讓儲存廠商必須跟 Kubernetes release 綁在一起；CSI 把第三方 storage integration 移出 Kubernetes core。PV/PVC/StorageClass 是使用者層抽象，CSI 是 Kubernetes 與 driver 的實作邊界。 | [storage-api-and-binding](/kubernetes/features/storage-api-and-binding) 從 API type 與 PV controller 開始拆。 |
+| Day19 — CSI 標準介紹 | CSI protobuf / lifecycle | CSI 至少分成 `Controller` 與 `Node` service，外加 `Identity`；常見流程是 `CreateVolume`、`ControllerPublishVolume`、`NodeStageVolume`、`NodePublishVolume`。mount volume 與 raw block volume 對 `NodePublishVolume` 的期待不同。 | [csi-rpc-and-sidecars](/kubernetes/features/csi-rpc-and-sidecars) 對照 CSI spec 與 Kubernetes sidecar。 |
+| Day20 — CSI in Kubernetes | Kubernetes 整合 | Kubernetes 透過 sidecar container 把 API watch 與 CSI gRPC 分開；controller Pod 常見 sidecar 是 external-provisioner / external-attacher；node Pod 常見 sidecar 是 node-driver-registrar。 | 同一頁拆 sidecar 不是裝飾品，而是 Kubernetes controller 與 CSI driver 的 adapter。 |
+| Day21 — NFS CSI 初體驗 | 實際部署觀察 | CSI Node DaemonSet 會掛 hostPath：driver socket、kubelet pod volume dir、plugin registry；NFS driver 的 `NodePublishVolume` 最後仍是把 `server:/share` mount 到 kubelet target path。 | [kubelet-csi-mount-path](/kubernetes/features/kubelet-csi-mount-path) 追 kubelet volume manager 到 Node RPC 與 `/var/lib/kubelet/pods/...`。 |
+| Day22 — CSI 雜談 | 選型與 mount propagation | CSI 選型必須先看 workload storage profile；CSI Node container 需要 mount propagation，因為它在 container 內建立的 mount 必須傳回 host / kubelet 可見的 mount namespace。 | 同一頁把 `MountPropagationBidirectional`、CRI mount propagation 與 CSI Node Pod 的 hostPath 設計串起來。 |
+
+## 本專案採用的分析方式
+
+這一組內容不是把文章改寫成筆記，而是用文章提出的問題回到 source 找責任邊界：
+
+| 層級 | Source anchor | 讀它是為了回答什麼 |
+|---|---|---|
+| Kubernetes storage API | `kubernetes/staging/src/k8s.io/api/core/v1/types.go` 的 `PersistentVolume`、`PersistentVolumeClaim`、`CSIPersistentVolumeSource` | 使用者寫的 YAML 最後進到哪個 API field？ |
+| Kubernetes CSI API | `kubernetes/staging/src/k8s.io/api/storage/v1/types.go` 的 `StorageClass`、`VolumeAttachment`、`CSIDriver`、`CSINode` | CSI driver 如何被 Kubernetes 發現、調整行為、記錄 attach intent？ |
+| PV controller | `kubernetes/pkg/controller/volume/persistentvolume/pv_controller.go` 的 `syncClaim()`、`provisionClaim()`、`provisionClaimOperationExternal()` | PVC Pending 時，Kubernetes 是自己建立 volume，還是交給 external provisioner？ |
+| Attach/detach | `kubernetes/pkg/volume/csi/csi_attacher.go` 與 `kubernetes/pkg/controller/volume/attachdetach` | `VolumeAttachment` 誰建立，誰更新 `status.attached`？ |
+| kubelet volume manager | `kubernetes/pkg/kubelet/volumemanager` 與 `kubernetes/pkg/volume/csi/csi_mounter.go` | Pod scheduled 到 node 後，kubelet 如何把 volume mount 進 Pod？ |
+| kubelet plugin registration | `kubernetes/staging/src/k8s.io/kubelet/pkg/apis/pluginregistration/v1/api.proto` 與 `kubernetes/pkg/volume/csi/csi_plugin.go` | node-driver-registrar 怎麼讓 kubelet 知道某個 CSI driver socket 存在？ |
+| CSI spec | `container-storage-interface/spec` 的 `csi.proto` / `spec.md` | `CreateVolume`、`ControllerPublishVolume`、`NodeStageVolume`、`NodePublishVolume` 的正式 contract。 |
+| CSI sidecars | `kubernetes-csi/external-provisioner`、`external-attacher`、`node-driver-registrar` | 為什麼 driver 作者不用自己 watch 所有 Kubernetes object？ |
+| NFS driver | `kubernetes-csi/csi-driver-nfs/pkg/nfs/nodeserver.go` | `NodePublishVolume` 對 NFS 這類 mountable volume 最後實際做了什麼？ |
+
+## 先建立全局心智模型
+
+```
+PVC + StorageClass
+  │
+  ▼
+PV controller 標記 external provisioner
+  │
+  ▼
+external-provisioner -> CSI Controller CreateVolume
+  │
+  ▼
+建立 PV，PV 綁定 PVC
+  │
+  ▼
+Pod scheduled 到某個 node
+  │
+  ├─ attach/detach controller 建 VolumeAttachment
+  │   └─ external-attacher -> CSI ControllerPublishVolume
+  │
+  └─ kubelet volume manager
+      ├─ node-driver-registrar / plugin watcher 找到 CSI socket
+      ├─ CSI NodeStageVolume (如果 driver 支援)
+      └─ CSI NodePublishVolume -> Pod volume target path
+```
+
+這條鏈路裡，Kubernetes API object 是「意圖與狀態」，CSI RPC 是「對儲存 driver 的命令」，Linux mount 是「Pod 最終能看到檔案或 block device 的原因」。
+
+## 用現代 Kubernetes 修正舊文章脈絡
+
+這組文章寫於 2019 年，概念仍然很有用，但幾個地方需要更新：
+
+- 文章範例使用 Kubernetes 1.15 與 `storage.k8s.io/v1beta1`；本專案對照的 Kubernetes checkout 是 `v1.36.0`，`CSIDriver`、`CSINode`、`VolumeAttachment` 都已在 `storage.k8s.io/v1`。
+- 文章說 CSI persistent volume 不能直接在 Pod 內引用，對「持久 volume」仍然正確：正常路徑是 PV/PVC。現代 Kubernetes 另有 inline CSI ephemeral volume，但需要 driver 宣告支援 `Ephemeral` lifecycle，語義與 PV/PVC 不同。
+- CSI migration 在文章中還是 alpha 脈絡；在本專案 checkout 裡，`pkg/volume/csimigration/plugin_manager.go` 已直接把 AWS EBS、GCE PD、Azure Disk/File、Cinder、vSphere、Portworx 等 migration 視為 enabled/complete。
+- 舊範例的 sidecar image、API version 與 driver manifest 不應直接照抄；學的是架構與資料流，實作時要以你要部署的 driver 官方 manifest 為準。
+- `MountPropagation` 不是 CSI 專有功能，而是 Kubernetes/CRI/Linux mount namespace 的能力；CSI Node Pod 常需要它，是因為 driver 在 container 裡做 mount，結果必須傳回 host。
+
+## 接下來怎麼讀
+
+1. 先讀 [storage-api-and-binding](/kubernetes/features/storage-api-and-binding)，把 PV/PVC/StorageClass 與 binding/provisioning 釐清。
+2. 再讀 [csi-rpc-and-sidecars](/kubernetes/features/csi-rpc-and-sidecars)，理解 CSI RPC 與 external-provisioner / external-attacher / node-driver-registrar。
+3. 最後讀 [kubelet-csi-mount-path](/kubernetes/features/kubelet-csi-mount-path)，從 kubelet volume manager 追到 NodeStage/NodePublish、NFS mount 與 mount propagation。
+
+## 收穫檢查
+
+- Kubernetes 的 PV/PVC/StorageClass 解決的是哪一層問題？CSI driver 又解決哪一層？
+- 為什麼 `ControllerPublishVolume` 不是把 volume mount 進 Pod？
+- `VolumeAttachment` 是誰建立、誰更新 `status.attached`？
+- 為什麼 NFS 這種 volume 可能沒有 `NodeStageVolume`，但 block device 常需要 stage？
+- CSI Node Pod 為什麼常用 privileged、hostPath、Bidirectional mount propagation？
+
+## 參考資料
+
+- [Day18 — Container Storage Interface 基本介紹](https://ithelp.ithome.com.tw/articles/10224183)
+- [Day19 — Container Storage Interface 標準介紹](https://ithelp.ithome.com.tw/articles/10224554)
+- [Day20 — Container Storage Interface(CSI) - kubernetes](https://ithelp.ithome.com.tw/articles/10224945)
+- [Day21 — Container Storage Interface(CSI) - NFS 初體驗](https://ithelp.ithome.com.tw/articles/10225180)
+- [Day22 — Container Storage Interface(CSI) - 雜談](https://ithelp.ithome.com.tw/articles/10225623)
+- [CSI Specification](https://github.com/container-storage-interface/spec)
+- [Kubernetes CSI Developer Documentation](https://kubernetes-csi.github.io/docs/)

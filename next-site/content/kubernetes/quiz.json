@@ -166,5 +166,65 @@
     ],
     "answer": 0,
     "explanation": "flanneld watch subnet lease 後，會在 kernel 寫 route、neighbor/ARP 與 bridge FDB。封包 fast path 由 Linux kernel VXLAN device 處理，不是每顆 packet 都進 flanneld。"
+  },
+  {
+    "id": 15,
+    "question": "CSI 引入 Kubernetes 的核心目的最接近哪個說法？",
+    "options": [
+      "把 vendor-specific storage integration 從 Kubernetes core 移出去，讓儲存廠商用標準 gRPC 介面獨立實作與發布 driver",
+      "讓 kube-apiserver 直接格式化每顆硬碟",
+      "讓所有 Pod 都不再需要 PVC",
+      "讓 CNI plugin 同時負責磁碟掛載"
+    ],
+    "answer": 0,
+    "explanation": "CSI 的價值是把第三方 storage implementation 從 in-tree volume plugin 移到 out-of-tree driver。Kubernetes 保留 PV/PVC/StorageClass 與 volume lifecycle 語義，driver 負責後端儲存能力。"
+  },
+  {
+    "id": 16,
+    "question": "CSI dynamic provisioning 中，現代 Kubernetes 通常是誰真正呼叫 CreateVolume？",
+    "options": [
+      "external-provisioner sidecar watch PVC 後呼叫 CSI Controller 的 CreateVolume",
+      "kube-apiserver 在儲存 PVC 時直接呼叫 CreateVolume",
+      "scheduler 在 bind Pod 時直接建立 volume",
+      "node-driver-registrar 在註冊 socket 時建立 volume"
+    ],
+    "answer": 0,
+    "explanation": "PV controller 會在 PVC 上標記 external provisioner 並等待。external-provisioner 才是 watch PVC、組 CreateVolumeRequest、呼叫 CSI driver、再建立 PV 的 controller。"
+  },
+  {
+    "id": 17,
+    "question": "VolumeAttachment 在 CSI 流程中的角色是什麼？",
+    "options": [
+      "Kubernetes API object，用來表達某個 volume 應 attach 到某個 node，並由 external-attacher 更新 attached 狀態",
+      "CSI spec 定義的 protobuf message，用來取代 PersistentVolume",
+      "NFS server 上的真實目錄",
+      "kubelet 用來存放 Pod log 的本機檔案"
+    ],
+    "answer": 0,
+    "explanation": "Kubernetes CSI attacher 建立 storage.k8s.io/v1 VolumeAttachment；external-attacher watch 它，呼叫 ControllerPublishVolume，成功後更新 status.attached。"
+  },
+  {
+    "id": 18,
+    "question": "NodeStageVolume 和 NodePublishVolume 的差異是什麼？",
+    "options": [
+      "NodeStageVolume 在 node 上準備可重用的 staging path；NodePublishVolume 把 volume 放到特定 Pod 的 target path",
+      "NodeStageVolume 是 scheduler 呼叫；NodePublishVolume 是 apiserver 呼叫",
+      "NodeStageVolume 只負責刪除 volume；NodePublishVolume 只負責建立 PV",
+      "兩者都是 CNI plugin 設定 Pod IP 的步驟"
+    ],
+    "answer": 0,
+    "explanation": "支援 STAGE_UNSTAGE_VOLUME 的 driver 會先讓 kubelet 呼叫 NodeStageVolume 準備 global path，再呼叫 NodePublishVolume mount/bind 到 Pod 專屬路徑。NFS 這類 mountable volume 可能直接在 NodePublishVolume 完成。"
+  },
+  {
+    "id": 19,
+    "question": "CSI Node DaemonSet 為什麼常需要 mountPropagation: Bidirectional？",
+    "options": [
+      "driver container 內建立的 mount 必須傳回 host/kubelet 可見，host 新 mount 也可能要被 container 看見",
+      "讓 Pod 可以跨 namespace 讀取 Secret",
+      "讓 kube-proxy 把 Service 流量導到 NFS server",
+      "讓 scheduler 可以修改 PVC capacity"
+    ],
+    "answer": 0,
+    "explanation": "CSI Node driver 常在 container 內執行 mount，但 target path 位於 host 的 /var/lib/kubelet/pods。Bidirectional mount propagation 對應 Linux rshared，能讓後續 mount event 在 host 與 container 之間傳播。"
   }
 ]

@@ -1,0 +1,192 @@
+---
+layout: doc
+title: Kubernetes — kubelet CSI Mount Path
+description: 從 kubelet volume manager、CSI registration、NodeStageVolume、NodePublishVolume、NFS driver 與 mount propagation 拆解 CSI volume 如何真正出現在 Pod 裡。
+---
+
+## 場景
+
+PVC Bound 不代表 Pod 已經能讀寫。Bound 只代表 Kubernetes API 層面上 PVC 找到 PV。Pod 真正看到檔案或 block device，要等 kubelet 在目標 node 上完成 mount。
+
+這頁從 kubelet 角度追：
+
+```
+Pod scheduled 到 node
+  -> kubelet desired state of world 收集 Pod volumes
+  -> reconciler 決定要 MountVolume
+  -> operationExecutor 取得 CSI mounter
+  -> 等 attach 完成
+  -> NodeStageVolume (如果需要)
+  -> NodePublishVolume
+  -> container runtime 把 hostPath mount 進 container mount namespace
+```
+
+## kubelet volume manager 是 node 端主流程
+
+`kubernetes/pkg/kubelet/volumemanager/volume_manager.go` 建立三個核心物件：
+
+| 元件 | 責任 |
+|---|---|
+| desired state of world populator | 從 PodManager 找出這台 node 上 Pod 需要哪些 volume。 |
+| actual state of world | 記錄目前哪些 volume 已 attach、已 mount、mount 到哪些 Pod。 |
+| reconciler | 定期比較 desired/actual，觸發 attach、mount、unmount、detach。 |
+
+`reconciler_common.go` 裡，當某個 desired volume 還沒 mount 時，會呼叫 `operationExecutor.MountVolume()`。
+
+這跟 controller pattern 很像：不是 Pod 一建立就同步阻塞地 mount，而是 kubelet 有自己的 desired/actual state loop。
+
+## MountVolume 會先等 attach
+
+`pkg/volume/util/operationexecutor/operation_generator.go` 的 `GenerateMountVolumeFunc()` 做了幾件事：
+
+1. 用 `FindPluginBySpec()` 找到 volume plugin。CSI PV 會對到 in-tree shim plugin `kubernetes.io/csi`。
+2. 建立 `volumeMounter`。
+3. 如果 volume plugin attachable，就呼叫 `WaitForAttach()`。
+4. 如果 driver 支援 device mount，就呼叫 `MountDevice()`，這對 CSI 可能對應 `NodeStageVolume`。
+5. 最後呼叫 `volumeMounter.SetUp()`，這對 CSI 對應 `NodePublishVolume`。
+
+因此 `ControllerPublishVolume` 與 `NodePublishVolume` 不是同一件事：
+
+| 階段 | 位置 | 目的 |
+|---|---|---|
+| `ControllerPublishVolume` | controller-side driver | 讓 node 能 access volume，例如 attach disk。 |
+| `NodeStageVolume` | node-side driver | 在 node 上準備 global staging path，可被多個 Pod reuse。 |
+| `NodePublishVolume` | node-side driver | 把 volume 放到某個 Pod 的 target path。 |
+
+## CSI mounter target path
+
+`kubernetes/pkg/volume/csi/csi_mounter.go` 的 `getTargetPath()` 會用 kubelet host API 建出 Pod volume dir。對 persistent CSI volume，典型路徑長這樣：
+
+```text
+/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~csi/<volume-name>/mount
+```
+
+Day21 文章在 NFS 範例觀察到：
+
+```text
+/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~csi/data-nfsplugin/mount
+/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~csi/data-nfsplugin/vol_data.json
+```
+
+這跟 source 對上。`csi_mounter.go` 在 `SetUpAt()` 裡會先保存 `vol_data.json`，記錄：
+
+- `specVolID`
+- `volumeHandle`
+- `driverName`
+- `nodeName`
+- `attachmentID`
+- `volumeLifecycleMode`
+
+這讓 kubelet 後續 teardown、reconstruct volume state 時有足夠資訊。
+
+## NodePublishVolume 的 request 內容
+
+`kubernetes/pkg/volume/csi/csi_client.go` 的 `NodePublishVolume()` 組出 CSI request，重點欄位如下：
+
+| 欄位 | 來源 |
+|---|---|
+| `VolumeId` | PV `spec.csi.volumeHandle` 或 ephemeral volume handle。 |
+| `TargetPath` | kubelet pod volume target path。 |
+| `StagingTargetPath` | 如果 driver 支援 `STAGE_UNSTAGE_VOLUME`，就是 global staging path。 |
+| `Readonly` | PV/PVC/Pod mount 設定。 |
+| `PublishContext` | attach 階段 external-attacher 回傳的 metadata。 |
+| `VolumeContext` | PV `volumeAttributes`，也可能加上 Pod info 或 service account token。 |
+| `Secrets` | `nodePublishSecretRef` 或 token secret。 |
+| `VolumeCapability` | filesystem 或 block，access mode，fsType，mount flags。 |
+
+這代表 CSI Node driver 收到的不是 Kubernetes Pod YAML 原文，而是 kubelet 已經整理好的 CSI request。
+
+## NFS driver 最後仍是 mount
+
+`kubernetes-csi/csi-driver-nfs/pkg/nfs/nodeserver.go` 的 `NodePublishVolume()` 做的事很直覺：
+
+1. 檢查 `volumeID`、`targetPath`、`VolumeCapability`。
+2. 從 `VolumeContext` 讀 `server`、`share`、`subDir` 等參數。
+3. 組出 NFS source，例如 `server:/share`。
+4. 確認 target path 存在。
+5. 呼叫 mounter 把 NFS source mount 到 target path。
+6. `NodeUnpublishVolume()` 則 cleanup/unmount target path。
+
+所以 Day21 的結論是對的：CSI 把 Kubernetes 與 NFS driver 接起來，但最後能看到檔案，是因為 Linux mount table 裡真的多了一個 NFS mount。
+
+## Mount propagation 為什麼必要
+
+Day22 的 mount propagation 範例回答了一個 CSI Node Pod 的核心問題：
+
+> 如果 driver container 裡面做 mount，host 上的 kubelet 看得到嗎？
+
+預設 mount propagation 是 private。container 內後續新增的 mount point 不會傳到 host，host 也不會傳到 container。CSI Node driver 常需要把 host 的 `/var/lib/kubelet/pods` 掛進 driver container，並讓 driver container 裡建立的 mount 回到 host 可見，所以 manifest 常見：
+
+```yaml
+volumeMounts:
+  - name: pods-mount-dir
+    mountPath: /var/lib/kubelet/pods
+    mountPropagation: Bidirectional
+```
+
+Kubernetes API 在 `core/v1/types.go` 定義三種：
+
+| API 值 | Linux 語義 | 效果 |
+|---|---|---|
+| `None` | private | host/container 後續 mount 不互相傳播。 |
+| `HostToContainer` | rslave | host mount 會傳進 container，container mount 不會傳回 host。 |
+| `Bidirectional` | rshared | host 與 container mount 雙向傳播。 |
+
+`kubernetes/pkg/kubelet/kubelet_pods.go` 的 `translateMountPropagation()` 會把這些值轉成 CRI runtime 的 `MountPropagation` enum。
+
+## 為什麼 CSI Node Pod 常 privileged
+
+CSI Node driver 不只是一般應用程式。它可能需要：
+
+- 讀寫 `/var/lib/kubelet/plugins/<driver>/csi.sock`。
+- 讀寫 `/var/lib/kubelet/plugins_registry` 的 registration socket。
+- 在 `/var/lib/kubelet/pods` 下建立 mount。
+- 呼叫 `mount(2)`、`umount(2)`、`mknod(2)`、操作 block device。
+- 讓 mount propagation 雙向生效。
+
+因此許多 CSI Node DaemonSet 會用 hostPath、privileged、`SYS_ADMIN` capability、Bidirectional mount propagation。這是安全上很大的權限面，部署前要把 driver 視為 node-level agent，而不是普通 workload。
+
+## 排障 checklist
+
+| 檢查點 | 指令方向 | 代表意義 |
+|---|---|---|
+| PVC/PV | `kubectl get pvc,pv` | 是否已 Bound，PV 是否有 `spec.csi`。 |
+| VolumeAttachment | `kubectl get volumeattachments -o wide` | attach 是否成功，node 是否正確。 |
+| CSINode | `kubectl get csinode <node> -o yaml` | kubelet 是否註冊到 driver，node ID/topology 是否存在。 |
+| CSIDriver | `kubectl get csidriver <driver> -o yaml` | attachRequired、fsGroupPolicy、lifecycle mode 是否符合預期。 |
+| node driver socket | `/var/lib/kubelet/plugins/<driver>/csi.sock` | CSI Node gRPC endpoint 是否存在。 |
+| registration socket | `/var/lib/kubelet/plugins_registry` | node-driver-registrar 是否有註冊入口。 |
+| kubelet pod volume dir | `/var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/...` | kubelet target path 與 `vol_data.json` 是否存在。 |
+| mount table | `mount`, `findmnt` | NFS/block/filesystem 是否真的 mount 到 target path。 |
+| node plugin log | CSI Node DaemonSet logs | `NodeStageVolume` / `NodePublishVolume` 失敗細節。 |
+
+## 選型時要先問 storage 問題
+
+Day22 說 CSI 是 CRI/CNI/CSI 裡最難選的，原因是 storage 需求差異比「能不能跑 container」大很多。選 driver 前先問：
+
+- workload 是 random I/O 還是 sequential I/O？
+- 需要 block device 還是 shared filesystem？
+- access mode 是 RWO、RWOP、ROX、RWX？
+- latency、IOPS、throughput 哪個最重要？
+- snapshot、clone、expand、backup、restore 是否是硬需求？
+- failure domain 是單 node、rack、AZ、region？
+- storage backend 是雲端代管、企業 SAN/NAS，還是自管 Ceph/Rook？
+- CSI driver 的 release、issue、sidecar 相容性是否跟你的 Kubernetes 版本對齊？
+
+Kubernetes 只能替你標準化接線方式，不能替你補足儲存系統本身的能力。
+
+## 收穫檢查
+
+- PVC Bound 後，為什麼 Pod 仍可能卡在 `ContainerCreating`？
+- `NodeStageVolume` 與 `NodePublishVolume` 的 target path 有什麼差異？
+- NFS driver 的 `NodePublishVolume` 為什麼不需要先 attach cloud disk？
+- `mountPropagation: Bidirectional` 解的是 Kubernetes API 問題，還是 Linux mount namespace 問題？
+- 為什麼 CSI Node DaemonSet 的權限面比一般應用 Pod 大很多？
+
+## 參考資料
+
+- [Day21 — Container Storage Interface(CSI) - NFS 初體驗](https://ithelp.ithome.com.tw/articles/10225180)
+- [Day22 — Container Storage Interface(CSI) - 雜談](https://ithelp.ithome.com.tw/articles/10225623)
+- [Kubernetes Volumes](https://kubernetes.io/docs/concepts/storage/volumes/)
+- [Kubernetes Mount Propagation](https://kubernetes.io/docs/concepts/storage/volumes/#mount-propagation)
+- [csi-driver-nfs](https://github.com/kubernetes-csi/csi-driver-nfs)
