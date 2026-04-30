@@ -8,3 +8,6 @@
 	url = https://github.com/cilium/cilium.git
 	branch = v1.19.3
 	shallow = true
+[submodule "kubevirt"]
+	path = kubevirt
+	url = https://github.com/kubevirt/kubevirt.git
