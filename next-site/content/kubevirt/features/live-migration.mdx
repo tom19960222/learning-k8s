@@ -1,0 +1,226 @@
+---
+layout: doc
+title: KubeVirt — Live Migration
+description: VirtualMachineInstanceMigration → target Pod → libvirt MigrateVMI 整段。precopy / postcopy / paused fallback、dirty page tracking、cutover 的 downtime 從哪來、migration-proxy 為什麼存在。
+---
+
+## 場景
+
+你 web service VM 跑在 source node，下一道指令 live migrate 到 target node，downtime 187ms。背景是真的把整顆 RAM 抄了一份過去？dirty page 怎麼追？什麼時候 cutover？這頁從 VMIM CRD 一路追到 libvirt MigrateVMI 的 flag。
+
+## VMIM 的生命週期
+
+```
+你 kubectl create -f migration.yaml
+        │
+        ▼
+   VirtualMachineInstanceMigration (VMIM) created
+        │  spec.vmiName = "my-vm"
+        │
+        ▼  apiserver watch event
+   Migration controller (pkg/virt-controller/watch/migration/migration.go:120)
+        │
+        ├─ validate VMI 處於可 migrate 狀態 (Running、Pod Ready、有 LiveMigratable condition)
+        ├─ 建 target virt-launcher Pod
+        │   └─ 跟 source 一樣的 VMI spec, 但帶 migrationTarget annotation
+        ├─ 等 target Pod scheduled + virt-handler 通知 ready
+        │
+        ▼  Migration controller patch VMI:
+        VMI.status.migrationState = {
+            sourceNode: "worker-A",
+            targetNode: "worker-B",
+            targetPod:  "virt-launcher-my-vm-xyz",
+            startTimestamp: ...,
+        }
+        │
+        ▼  worker-A 的 virt-handler watch 到 migrationState
+        ├─ 對 source virt-launcher 發 MigrateVMI gRPC
+        │   └─ source virt-launcher 對 libvirt MigrateVMI
+        │       └─ libvirt 跨 node 把 memory copy 到 target
+        │
+        ▼  worker-B 的 virt-handler 也看到 migrationState
+        ├─ 對 target virt-launcher 發 PrepareMigrationTarget
+        │   └─ target virt-launcher 等 incoming migration
+        │
+        ▼  libvirt cutover 完成 (source pause → target resume)
+        ├─ source virt-launcher 通知 virt-handler 結束
+        ├─ virt-handler patch VMI: status.nodeName = "worker-B"
+        │
+        ▼
+   Migration controller 看到 VMI.status.migrationState.completed = true
+   ├─ 把 source virt-launcher Pod 砍掉
+   └─ VMIM.status.phase = Succeeded
+```
+
+注意：Migration controller **本身不做 memory copy**——它只是 orchestrator。memory copy 在 source virt-launcher 內由 libvirt 跨 node 對 target libvirt 直接做。
+
+## libvirt MigrateVMI 的入口
+
+```go
+// File: pkg/virt-launcher/virtwrap/manager.go (line 683)
+func (l *LibvirtDomainManager) MigrateVMI(vmi *v1.VirtualMachineInstance, options *cmdclient.MigrationOptions) error {
+    // 算 migration flags
+    // 起 monitor goroutine
+    // call l.startMigration
+}
+```
+
+具體流程在 `live-migration-source.go`：
+
+```go
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 285)
+func (l *LibvirtDomainManager) startMigration(vmi *v1.VirtualMachineInstance, options *cmdclient.MigrationOptions) error {
+    // 1. classify volumes (shared / generated / local-to-migrate)
+    // 2. 計算 disk migration target list (block migration)
+    // 3. 設 migration metadata
+    // 4. 啟動 migrationMonitor
+    // 5. 對 libvirt 發 dom.MigrateToURI3(targetURI, params, flags)
+}
+```
+
+migration flags 由 `generateMigrationFlags` 產出：
+
+```go
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 96)
+func generateMigrationFlags(isBlockMigration, migratePaused bool, options *cmdclient.MigrationOptions) libvirt.DomainMigrateFlags {
+    // 組 LIVE | PEER2PEER | TUNNELLED | AUTO_CONVERGE | POSTCOPY | ... 等 flag
+}
+```
+
+flag 的關鍵：
+
+| Flag | 意思 |
+|---|---|
+| `LIVE` | live migration（對 running VM）|
+| `PEER2PEER` | source libvirt 直連 target libvirt（不需要中介）|
+| `TUNNELLED` | 走 libvirt 自己的 tunnel（不要打開額外 port）|
+| `AUTO_CONVERGE` | dirty rate 太高時自動降頻 vCPU 強迫收斂 |
+| `POSTCOPY` | 允許 post-copy fallback |
+| `NON_SHARED_DISK` | 連 disk 一起 copy（block migration）|
+
+## precopy：iterative dirty page copy
+
+預設模式。流程：
+
+```
+iter 1: 全量 copy memory (例如 8GB)
+        │
+        ▼
+iter 2: copy 在 iter 1 期間被改寫的 page (dirty pages)
+        │
+        ▼
+iter 3: copy iter 2 期間 dirty 的 page (理論上更少)
+        │
+        ▼
+   ...
+        │
+        ▼
+最後一輪：估算「剩 dirty + bandwidth → 暫停時間 < downtimeMs」就 cutover
+        ├─ pause source VM
+        ├─ 抄最後一輪 dirty + CPU state + device state
+        ├─ resume on target
+        └─ done
+
+最後一輪暫停的時間 = 你 ping 看到的 downtime
+```
+
+「最後一輪暫停時間」上限由 `downtimeMs` 控制（migration policy / default）。如果 dirty rate 太高一直收不到那個門檻，預設會：
+
+- 觸發 `AUTO_CONVERGE`（降 vCPU 頻率）
+- 仍不收斂 → 切 postcopy（如果 flag 開了）
+- 都沒開 → migration 失敗 abort
+
+## postcopy：先切換，再補 page
+
+跟 precopy 相反的策略：source 直接 pause、resume target；target 缺哪個 page 就 page-fault 拉回來。
+
+```
+source: 抄一輪 (state + 部分 page)
+        │
+        ▼
+   立刻切換到 postcopy mode
+        ├─ source pause
+        ├─ target resume (running with partial memory)
+        │
+        ▼  guest access page → kernel page fault →
+        ▼  從 source 抄那個 page → 補到 target
+        │
+        ▼ 慢慢把所有 page 補完
+        target 完整接管
+        source 可以砍
+```
+
+優點：downtime 短（常見 < 100ms），收斂保證。
+缺點：guest 在缺 page 時會卡（page fault 延遲）；source 突然死 → migration 失敗（剩餘 page 拿不到）。
+
+## paused fallback
+
+如果 precopy 不收斂、又不想用 postcopy，可以「先 pause source、慢慢抄完最後一輪、再 resume target」——換 downtime 換 reliability。
+
+## migrationMonitor：判斷收不收斂
+
+```go
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 407)
+func newMigrationMonitor(vmi *v1.VirtualMachineInstance, l *LibvirtDomainManager, options *cmdclient.MigrationOptions, migrationErr chan error) *migrationMonitor {
+    // 起一個 goroutine 定時 query libvirt migration job stat
+    // 看 iteration 次數、dirty rate、bytes transferred
+    // 觸發 postcopy / cancel / continue
+}
+```
+
+monitor 邏輯關鍵點：
+
+- 監控每次 iteration 的 dirty rate（每秒被改寫多少 byte）
+- 算 `dirty_rate / bandwidth` — 接近 1 就會收不到
+- 達到 `progressTimeout`、`completionTimeout` 等門檻時觸發 fallback
+
+## migration-proxy：libvirt 的跨 node 通道
+
+libvirt 預設只 listen unix socket（cluster 環境連 TCP 又要憑證設定一堆）。但 live migration 必須 source libvirt 對 target libvirt 直連。KubeVirt 的解法：在 virt-handler 內起一個 socket→TCP proxy。
+
+```go
+// File: pkg/virt-handler/migration-proxy/  (整個 package)
+```
+
+source virt-launcher 發 MigrateVMI 時，libvirt 看到的是「對 unix socket 連線」，但 unix socket 那一頭是 migration-proxy，把流量包成 TCP 傳到 target node 的 migration-proxy，後者再寫進 target libvirt 的 unix socket。對 libvirt 來說這跟 local 一樣。
+
+這個設計避免了：
+
+- libvirt 跨 node TCP 設定的繁複
+- 在 virt-launcher Pod 內開額外 listen port (Pod network 配置麻煩)
+- 認證 / cert 問題（在 migration-proxy 那層處理）
+
+## 為什麼 downtime 是這個數字
+
+回到開頭「downtime 187ms」這數字。它是：
+
+- 最後一輪 dirty memory 的 byte 數 / bandwidth
+- 加 CPU state + device state 的 freeze + 抄寫時間
+- 加 source pause / target resume 的指令切換時間
+- 加 network DNAT 重新路由時間（ARP refresh、cilium policy 重算）
+
+`AUTO_CONVERGE` 與 `POSTCOPY` 的取捨直接決定這個數字落在哪：
+
+| 模式 | 典型 downtime | 風險 |
+|---|---|---|
+| precopy + auto-converge | 100ms~5s | dirty 太高可能 abort |
+| postcopy | 50~200ms | 切換後 source 失敗 → VM 失敗 |
+| paused | 整輪 transfer time | downtime 大但保證成功 |
+
+實務 Lab Day 27 看到 `187ms` → 大概是 precopy + auto-converge 模式、且 dirty rate 在合理範圍。
+
+## 收穫檢查
+
+- precopy 的 iteration 為什麼會「不收斂」？什麼條件下會發生？
+- postcopy 為什麼能保證收斂但有 reliability 風險？
+- migration-proxy 為什麼存在？換成 libvirt TCP listen 不行嗎？
+- Migration controller 怎麼判斷 migration 結束？
+
+## 原始碼參考
+
+- [pkg/virt-controller/watch/migration/migration.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migration.go) — Migration controller
+- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/manager.go) — `MigrateVMI` (line 683)
+- [pkg/virt-launcher/virtwrap/live-migration-source.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/live-migration-source.go) — flags (line 96)、startMigration (line 285)、monitor (line 407)
+- [pkg/virt-handler/migration-proxy/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-handler/migration-proxy) — socket→TCP proxy
+- [pkg/virt-controller/watch/migration/migrationpolicy.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migrationpolicy.go) — migration policy CRD handling
+- [libvirt MigrateToURI3](https://libvirt.org/html/libvirt-libvirt-domain.html#virDomainMigrateToURI3) — libvirt 官方 doc

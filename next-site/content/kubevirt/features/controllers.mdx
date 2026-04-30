@@ -1,0 +1,190 @@
+---
+layout: doc
+title: KubeVirt — Controllers
+description: virt-controller 的三條核心 reconcile pipeline — VM controller、VMI controller、Migration controller — 如何用標準 informer + work queue 模式把 VM CR 變成 virt-launcher Pod。
+---
+
+## 場景
+
+你 `kubectl apply -f vm.yaml`，幾秒後 `kubectl get vmi` 看到 Running、`kubectl get pod` 看到 virt-launcher Pod 跑著。中間 virt-controller 跑了三條接力：VM → VMI → Pod (再加上 live migration 的 VMIM → target Pod)。每條都是標準的 informer + work queue + Execute 模式，跟 [k8s 內建 controller](/kubernetes/features/controllers) 同骨架。
+
+## virt-controller 是「process 跑多 controller」
+
+跟 kube-controller-manager 一樣：1 process 起 N 個 goroutine，每個 goroutine 跑一個 controller，共用 shared informer factory + leader election。framework 在這裡：
+
+```go
+// File: pkg/virt-controller/watch/application.go
+// VirtControllerApp 設定所有 controller、起 informer、跑 leader election
+```
+
+Leader 拿到後，每個 controller 用標準 `Run(threadiness, stopCh)` 啟動 worker goroutines；每個 worker 跑同一個迴圈：從 work queue 取 key → 呼 `sync()` → 把錯放回 queue 等 retry。
+
+## VM controller：VM → VMI
+
+把 VirtualMachine (desired state) 翻成 VirtualMachineInstance (一次 run)。
+
+```go
+// File: pkg/virt-controller/watch/vm/vm.go (line 282)
+type Controller struct {
+    // ... informers, lister, queue
+}
+
+// File: pkg/virt-controller/watch/vm/vm.go (line 335)
+func (c *Controller) Execute() bool {
+    // pop key, call sync, requeue on error
+}
+
+// File: pkg/virt-controller/watch/vm/vm.go (line 3173)
+func (c *Controller) sync(vm *virtv1.VirtualMachine,
+    vmi *virtv1.VirtualMachineInstance,
+    key string,
+) (*virtv1.VirtualMachine, *virtv1.VirtualMachineInstance, common.SyncError, error) {
+    // 1. 看 spec.runStrategy
+    // 2. 如果該存在 VMI 但不存在 → create VMI
+    // 3. 如果 VMI 存在但 spec 不一致 → 看 strategy 決定 update/restart
+    // 4. 維護 status (conditions, ready replicas, ...)
+}
+```
+
+`spec.runStrategy` 有四種:
+
+| 值 | 行為 |
+|---|---|
+| `Always` | VMI 不存在或 Failed 就建一個；最常用 |
+| `RerunOnFailure` | 跑完正常終止 → 不重建；異常終止 → 重建 |
+| `Manual` | 只跟著 `spec.running` flag 起停；不自動重建 |
+| `Halted` | 不建 VMI；用來表達「這個 VM 暫時停著」|
+
+VM controller 不直接接觸 Pod；它只管 VMI 的存在與狀態。
+
+## VMI controller：VMI → virt-launcher Pod
+
+把 VMI 翻成 virt-launcher Pod (含正確 spec)。
+
+```go
+// File: pkg/virt-controller/watch/vmi/vmi.go (line 221)
+type Controller struct { ... }
+
+// File: pkg/virt-controller/watch/vmi/vmi.go (line 283)
+func (c *Controller) Execute() bool { ... }
+```
+
+sync 邏輯重點：
+
+1. 看 VMI status.phase
+   - `Pending` → 還沒建 Pod，呼 templateService 算 spec、create Pod
+   - `Scheduling` / `Scheduled` → Pod 已建，等 scheduler / kubelet
+   - `Running` → 已 boot；維護 status 但不主動操作
+   - `Succeeded` / `Failed` → terminal，可能要 cleanup
+2. **templateService.RenderLaunchManifest** 是 Pod spec 的算式：
+   - container image 用 virt-launcher
+   - command/args 帶 VMI uid
+   - 加 sidecar 的 volume mount (cloud-init、container disk、hotplug...)
+   - 套用 VMI 的 nodeSelector / tolerations / affinity
+   - CNI annotation (主網路 + 可能的 multus secondary network)
+
+```go
+// File: pkg/virt-controller/services/  (templateService 的 home)
+// RenderLaunchManifest 把 VMI 翻成 *k8sv1.Pod
+```
+
+3. ownerReferences chain：建出來的 Pod `metadata.ownerReferences[0]` 指 VMI；VMI 自己的 ownerReferences 指 VM (如果是從 VM 建來的)。
+
+VMI 從 Pod 那邊得到的反饋透過 status：Pod Running → virt-handler 啟動 SyncVMI → libvirt 起 QEMU → QEMU 報 Running event → virt-launcher 透過 NotifyClient 通知 virt-handler → virt-handler patch VMI status.phase = Running。VMI controller 看到 status 變化進一步同步 VM。
+
+## Migration controller：VMIM → target Pod
+
+VirtualMachineInstanceMigration (VMIM) 是「我要把某個 VMI live migrate」一次性 job。
+
+```go
+// File: pkg/virt-controller/watch/migration/migration.go (line 120)
+type Controller struct { ... }
+
+// File: pkg/virt-controller/watch/migration/migration.go (line 304)
+func (c *Controller) Execute() bool { ... }
+
+// File: pkg/virt-controller/watch/migration/migration.go (line 1769)
+func (c *Controller) sync(key string,
+    migration *virtv1.VirtualMachineInstanceMigration,
+    vmi *virtv1.VirtualMachineInstance,
+    pods []*k8sv1.Pod,
+) error {
+    // 1. validate VMI 處於可 migrate 狀態
+    // 2. 若還沒 target Pod → 建 target virt-launcher Pod (mode=target)
+    // 3. 等 target Pod ready → 寫 VMI.status.migrationState 開始 migration
+    // 4. 監看 VMI.status.migrationState 從 source 那邊回傳的 progress
+    // 5. completed → cleanup source Pod 或 target Pod (依結果)
+}
+```
+
+關鍵是「Migration controller 不直接做 memory copy」——它只是個 orchestrator：
+
+```
+VMIM created
+   │
+   ▼ Migration controller sync
+   ├─ 建 target virt-launcher Pod (跟 source 一樣的 VMI spec, 標記為 target mode)
+   ├─ 等 target ready
+   ├─ 設 VMI.status.migrationState.targetNode = target-X
+   │
+   ▼ source node 的 virt-handler 看到 migrationState
+   ├─ 對 source virt-launcher 發 MigrateVMI gRPC
+   │   └─ source virt-launcher 對 libvirt 呼 MigrateVMI
+   │       └─ libvirt 跨 node 把 memory dirty page copy 到 target
+   │
+   ▼ target node 的 virt-launcher 在 PrepareMigrationTarget 等 incoming
+   │
+   ▼ libvirt cutover 完成，virt-launcher 通知 virt-handler
+   ├─ virt-handler patch VMI: vmi.status.nodeName = target-X
+   │
+   ▼ Migration controller 看到 phase=Succeeded
+   └─ 清掉 source Pod，VMIM.status.phase = Succeeded
+```
+
+memory copy 細節留 [live-migration](/kubevirt/features/live-migration)。
+
+## 所有 controller 的共同骨架
+
+回到開頭：三條 controller 都用同一套：
+
+```
+              ┌────────────┐
+              │ apiserver  │
+              └─────▲──────┘
+                    │ list+watch
+                    ▼
+        ┌─────────────────────┐
+        │ Informer (cache)    │
+        └──────────┬──────────┘
+                   │ on add/update/delete
+                   ▼
+              ┌─────────┐
+              │  queue  │ (rate-limited)
+              └────┬────┘
+                   │ workers pull key
+                   ▼
+              ┌─────────┐
+              │ sync()  │  ← idempotent
+              └─────────┘
+```
+
+- 從 informer cache 讀 desired & actual state，**不打 apiserver**
+- 用 ownerReferences 找父子關係 (VM 與 VMI、VMI 與 Pod、VMIM 與 Pod)
+- sync 一定要 idempotent — 同一個 key 可能被 enqueue 多次
+
+跟 [k8s 內建 ReplicaSet controller](/kubernetes/features/controllers) 用的是同一份 `client-go/tools/cache/`。所以理解了那邊的 pattern，這邊也通。
+
+## 收穫檢查
+
+- VM controller 的 sync 為什麼不直接管 Pod？
+- VMI 的 ownerReferences 指 VM；那 VM 自己的 ownerReferences 指誰？
+- 如果同時有兩個 VMIM 對同一個 VMI 發 migrate，會發生什麼？
+- Migration controller 怎麼知道 migration 結束？
+
+## 原始碼參考
+
+- [pkg/virt-controller/watch/application.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/application.go) — controller manager 主框架
+- [pkg/virt-controller/watch/vm/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vm/vm.go) — VM controller
+- [pkg/virt-controller/watch/vmi/vmi.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vmi/vmi.go) — VMI controller
+- [pkg/virt-controller/watch/migration/migration.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migration.go) — Migration controller
+- [pkg/virt-controller/services/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-controller/services) — templateService (RenderLaunchManifest)

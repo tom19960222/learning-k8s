@@ -1,0 +1,62 @@
+[
+  {
+    "id": 1,
+    "question": "KubeVirt 的 virt-launcher 是 per-VMI Pod，不是 DaemonSet。為什麼？",
+    "options": [
+      "把 QEMU 圈進 Pod 才能繼承 cgroup limit、CNI、CSI、scheduler 等 k8s 資源管理；1 VMI = 1 Pod 也讓 lifecycle 對齊 k8s mental model",
+      "DaemonSet 不能用 hostPath，virt-launcher 需要 hostPath",
+      "讓 QEMU 跑在 host network 比較快",
+      "virt-launcher 必須以 root 跑，DaemonSet 不允許 root"
+    ],
+    "answer": 0,
+    "explanation": "per-VMI Pod 設計把 QEMU 進 Pod 的 cgroup / network / mount namespace，自動繼承 k8s resource limit、CNI (multus secondary network)、CSI (PVC mount)、scheduler 排程能力。1 VMI = 1 Pod 也讓 VM 重啟 = Pod 重建這個 mental model 直接套用。virt-launcher Pod 由 VMI controller 透過 templateService.RenderLaunchManifest 算出 spec 來建。"
+  },
+  {
+    "id": 2,
+    "question": "VirtualMachine (VM) / VirtualMachineInstance (VMI) / VirtualMachineInstanceMigration (VMIM) 三個 CRD 的關係是？",
+    "options": [
+      "VM = desired state (可 stop/start)，VMI = 一次運行 (VM owns VMI)，VMIM = 一次 migration job (引用 VMI 但無 ownerRef)",
+      "VM、VMI、VMIM 三者都用 ownerReferences 形成 chain：VM owns VMI owns VMIM",
+      "VMI 是 VM 的 Pod 包裝；VMIM 是 VMI 的 Pod 包裝",
+      "都是同一個 CRD 的不同 phase"
+    ],
+    "answer": 0,
+    "explanation": "VM (VirtualMachine) 是 desired state，可以 stop/start，由 spec.runStrategy 決定它何時對應一個 running VMI。VMI 是「一次運行」，跟 Pod 對 Deployment 一樣由 VM owns；VMI 自己再 owns virt-launcher Pod。VMIM (VirtualMachineInstanceMigration) 是獨立的「一次 migration job」CRD，用 spec.vmiName 引用 VMI 但沒有 ownerReference 關係。Migration controller 接 VMIM 起 target Pod、orchestrate 整個 migration。"
+  },
+  {
+    "id": 3,
+    "question": "virt-handler (per-node DaemonSet) 不直接連 libvirt，而是透過 virt-launcher Pod 內的 cmd-server gRPC 對話。這樣設計的核心理由是什麼？",
+    "options": [
+      "libvirt 預設只 listen unix socket，且在 virt-launcher Pod 的 mount/network namespace 內。透過 Pod 內 cmd-server gRPC 是 cross-Pod 最乾淨的介面；KubeVirt 自己定 RPC (SyncVMI/KillVMI/MigrateVMI/...) 比直接暴露 libvirt 更合適",
+      "gRPC 比 libvirt protocol 快很多",
+      "libvirt 不能在 Pod 內跑，所以必須有 wrapper",
+      "為了讓 virt-handler 可以連到不同 node 的 virt-launcher"
+    ],
+    "answer": 0,
+    "explanation": "libvirt 預設只 listen unix socket、在 virt-launcher Pod 的 mount/network namespace 內。要從 virt-handler (跑在 host network 的 DaemonSet Pod) 跨 Pod 連 libvirt 需要 TCP socket + auth + cert，麻煩且不必要。乾淨做法是在 virt-launcher 內起 cmd-server gRPC (pkg/handler-launcher-com)，定 KubeVirt 自己的 RPC 集合 (SyncVMI/KillVMI/MigrateVMI/PrepareMigrationTarget...)，由 virt-launcher 把 RPC 翻成 libvirt API。socket path 透過 hostPath volume 暴露給 virt-handler。"
+  },
+  {
+    "id": 4,
+    "question": "live migration 的 precopy 模式可能「不收斂」。什麼情況下會發生？KubeVirt/libvirt 怎麼處理？",
+    "options": [
+      "guest dirty rate (每秒改寫 memory) 接近或超過 migration bandwidth → 每輪 dirty pages 沒減少。處理：AUTO_CONVERGE 降 vCPU 頻率；仍不收斂 → 切 postcopy；都沒設 → abort",
+      "guest CPU 太低 → memory 抄不過來",
+      "target node disk 不夠 → 直接失敗",
+      "libvirt 預設限制 5 輪 iteration，超過就停"
+    ],
+    "answer": 0,
+    "explanation": "precopy 是 iterative dirty page copy。每輪抄上輪 dirty 的 page；如果 guest 的 dirty rate (每秒 dirtyMB) 接近或超過 migration bandwidth (每秒可送 MB)，每輪 dirty 沒減少，永遠到不了「最後一輪暫停 < downtimeMs」門檻。AUTO_CONVERGE flag 會自動降 vCPU 頻率讓 guest 慢下來；仍不收斂可切 postcopy (先切換 target，缺 page 用 page-fault 拉回)；都沒開 → migration abort。migrationMonitor (live-migration-source.go:407) 是判斷這些 transitions 的人。"
+  },
+  {
+    "id": 5,
+    "question": "migration-proxy 在 KubeVirt live migration 裡扮演什麼角色？為什麼不直接用 libvirt 的 TCP listen？",
+    "options": [
+      "libvirt 預設只 listen unix socket；migration-proxy 把 source virt-launcher 的 unix socket 流量包成 TCP 跨 node 送，target 端再解回 unix socket。避免 libvirt TCP 設定 (cert/auth/port) 的繁複，也不需要在 Pod 內開 listen port",
+      "做加密：libvirt 的跨 node 流量沒加密",
+      "做 bandwidth throttle 不讓 migration 吃光 cluster bandwidth",
+      "讓 source / target 同時連到一個中央 server 做協調"
+    ],
+    "answer": 0,
+    "explanation": "libvirt 預設只 listen unix socket；要跨 node 直連需要 libvirt TCP 設定 (cert/auth/port)，麻煩且 Pod 內開 listen port 會跟 CNI 設定衝突。migration-proxy (pkg/virt-handler/migration-proxy/) 在 virt-handler 起一個 unix socket→TCP→unix socket 的中繼 proxy：source 的 libvirt 連自己 node 的 unix socket，proxy 把流量包成 TCP 送到 target node 的 proxy，後者再寫進 target libvirt 的 unix socket。對 libvirt 來說整段跟 local 一樣；KubeVirt 在 proxy 那層處理跨 node 的 transport。"
+  }
+]

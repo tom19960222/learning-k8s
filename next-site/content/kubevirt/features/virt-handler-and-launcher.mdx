@@ -1,0 +1,183 @@
+---
+layout: doc
+title: KubeVirt — virt-handler 與 virt-launcher
+description: per-node DaemonSet 與 per-VMI Pod 怎麼接力把 VMI spec 變成跑著的 QEMU。VirtualMachineController 主迴圈、cmd-server gRPC 介面、virtwrap DomainManager、libvirt domain XML 翻譯。
+---
+
+## 場景
+
+scheduler 把 virt-launcher Pod 放到 worker-X。從這時起到 QEMU 真的跑起來、guest OS boot，發生了什麼？virt-handler 跟 virt-launcher 怎麼分工？為什麼不直接讓 virt-handler 自己 spawn QEMU process？
+
+## virt-handler：per-node 的 VM 管家
+
+virt-handler 是 DaemonSet，每個 node 一個。它跟 kubelet 平起平坐：kubelet 管 container，virt-handler 管 VM（precisely: 它管 VMI 的 lifecycle、跟 virt-launcher Pod 內的 libvirt 對話）。
+
+```go
+// File: cmd/virt-handler/virt-handler.go (line 202)
+func (app *virtHandlerApp) Run() {
+    // 起 VirtualMachineController (主迴圈)
+    // 起 cmd-server (對 virt-launcher Pod 開 unix socket gRPC)
+    // 起 console/lifecycle HTTP server (給 virt-api 反向代理)
+    // 起 metrics + heartbeat
+}
+```
+
+主迴圈是 `VirtualMachineController`：
+
+```go
+// File: pkg/virt-handler/vm.go (line 120)
+func NewVirtualMachineController( /* informers, clients, cache, ... */ ) *VirtualMachineController {
+    // ...
+}
+
+// File: pkg/virt-handler/vm.go (line 242)
+func (c *VirtualMachineController) Run(threadiness int, stopCh chan struct{}) {
+    // 跑 worker goroutines, 每個 goroutine 從 queue 拿 key 做 Execute()
+}
+
+// File: pkg/virt-handler/vm.go (line 290)
+func (c *VirtualMachineController) Execute() bool {
+    // pop key → call execute(key) → requeue on err
+}
+
+// File: pkg/virt-handler/vm.go (line 306)
+func (c *VirtualMachineController) execute(key string) error {
+    // load VMI from informer
+    // load Domain (libvirt 那邊回傳的真實狀態) from cache
+    // call sync(key, vmi, domain)
+}
+
+// File: pkg/virt-handler/vm.go (line 1354)
+func (c *VirtualMachineController) sync(key string, /* ... */) (err error) {
+    // 對比 desired (vmi spec) vs actual (domain state)
+    // 決定要 processVmUpdate / processVmShutdown / processVmDelete / processVmCleanup
+}
+```
+
+關鍵 sync 動作：
+
+```go
+// File: pkg/virt-handler/vm.go (line 2130)
+func (c *VirtualMachineController) processVmUpdate(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
+    // 拿 VMI 的當前 spec
+    // 跟 virt-launcher 的 cmd-server 對話 (gRPC SyncVMI)
+    // 由 virt-launcher 在 Pod 內把 spec 翻成 libvirt domain XML 並啟動
+}
+```
+
+virt-handler **不接觸 libvirt 也不接觸 QEMU**。它只跟 virt-launcher Pod 內的 cmd-server 對話。
+
+## virt-launcher：per-VMI Pod 內的執行者
+
+每個 VMI 對應一個 virt-launcher Pod。Pod 內 process tree:
+
+```
+PID 1: virt-launcher-monitor       ← watchdog
+       └─ exec → virt-launcher      ← cmd-server, lifecycle wrapper
+                  ├─ libvirtd / virtqemud (子 process)
+                  │   └─ qemu-kvm (孫 process, running guest)
+                  └─ notify-client (連回 virt-handler 報 event)
+```
+
+`virt-launcher-monitor` 是 PID 1，唯一工作是「watch virt-launcher，掛了就讓 Pod 結束」。這樣可以避免 zombie 進程，也讓 Pod 有明確的 termination semantics。
+
+`virt-launcher` 本身做幾件事：
+
+```go
+// File: cmd/virt-launcher/virt-launcher.go (line 343)
+func main() {
+    // 1. 起 cmd-server 監聽 unix socket (給 virt-handler 連)
+    // 2. 連 libvirtd
+    // 3. 啟 startDomainEventMonitoring (line 136) 從 libvirt 收 event
+    // 4. wait for SyncVMI gRPC, 收到後翻 spec、call libvirt
+    // 5. domain 啟動後 markReady (line 77)
+}
+```
+
+## cmd-server gRPC：跨 Pod 的合理介面
+
+為什麼 virt-handler 不直接連 libvirt？因為 libvirt 預設只監聽 unix socket，且在 virt-launcher Pod 的 mount/network namespace 內。要跨 Pod 用 libvirt 需要 TCP socket + auth + cert，相當麻煩。
+
+更乾淨的做法：在 virt-launcher 內起一個 gRPC server (cmd-server)，定義 KubeVirt 自己的 RPC 集合 (SyncVMI / KillVMI / MigrateVMI / FreezeVMI / ...)，由 virt-launcher 把 RPC 翻成 libvirt API call。
+
+```
+virt-handler  ──unix socket gRPC──>  virt-launcher cmd-server
+                                          │
+                                          │ libvirt-go-xml
+                                          ▼
+                                       libvirtd
+                                          │
+                                          ▼
+                                       QEMU
+```
+
+socket path 在 host 的 `/var/run/kubevirt/sockets/<vmi-uid>_sock`，由 virt-launcher Pod 用 hostPath volume 暴露給 virt-handler。
+
+事件方向相反：virt-launcher 透過 notify-client (`pkg/virt-launcher/notify-client/`) 連回 virt-handler 的事件接收 socket，把 libvirt domain event 推回去。virt-handler 看到 event → 更新 in-memory cache → 觸發 reconcile → 把 status PATCH 回 apiserver。
+
+protobuf 在 `pkg/handler-launcher-com/`。
+
+## DomainManager：virt-launcher 內的核心 abstraction
+
+virt-launcher 內把所有 libvirt 操作收斂到 `DomainManager` 介面：
+
+```go
+// File: pkg/virt-launcher/virtwrap/manager.go (line 135)
+type DomainManager interface {
+    SyncVMI(vmi *v1.VirtualMachineInstance, options *cmdv1.VirtualMachineOptions) (*api.DomainSpec, error)
+    PauseVMI(*v1.VirtualMachineInstance) error
+    UnpauseVMI(*v1.VirtualMachineInstance) error
+    KillVMI(*v1.VirtualMachineInstance) error
+    DeleteVMI(*v1.VirtualMachineInstance) error
+    SignalShutdownVMI(*v1.VirtualMachineInstance) error
+    MigrateVMI(*v1.VirtualMachineInstance, *cmdclient.MigrationOptions) error
+    PrepareMigrationTarget(...) error
+    // ... ~30 個 method
+}
+
+// File: pkg/virt-launcher/virtwrap/manager.go (line 239)
+func NewLibvirtDomainManager( /* connection, virtShareDir, ephemeralDiskDir, agentStore, ovmfPath, ... */ ) (DomainManager, error) {
+    // ...
+}
+```
+
+實作 `LibvirtDomainManager` 對應一份 libvirt connection。每個 method 把 VMI 操作翻成 libvirt RPC call。
+
+## VMI spec → libvirt domain XML
+
+最關鍵的翻譯：把 `VirtualMachineInstance.spec.domain` 翻成 libvirt XML。converter 在這：
+
+```go
+// File: pkg/virt-launcher/virtwrap/converter/converter.go
+// (~300 個 Convert_* function)
+// e.g.
+// Convert_v1_Disk_To_api_Disk(...)        // line 87 — disk → libvirt <disk>
+// Convert_v1_Interface_To_api_Interface() // network interface
+// Convert_v1_Memory_To_api_Memory()       // memory + hugepages
+// Convert_v1_CPU_To_api_CPU()             // cpu topology + pinning
+```
+
+這些 Convert 函式拼出一個 `*api.DomainSpec` (KubeVirt 自己的 Go struct)，最終 marshal 成 libvirt 接受的 XML。每個 disk / interface / volume hot-plug 都是一個 Convert 來回。
+
+## CNI 與 storage 的接點
+
+**CNI**：VMI 的 primary network 走 Pod 既有的 CNI（cilium/calico/flannel...）。Pod 起來時 kubelet 已經呼叫 CNI 配好 net namespace；virt-handler 在 sync 時把 Pod 的 network interface 透過 bridge / macvtap / passt 等模式接到 QEMU。secondary network 透過 multus annotation (`k8s.v1.cni.cncf.io/networks`)，多接幾張 interface 進 Pod，virt-launcher 看到都會綁進 QEMU。
+
+**Storage**：DataVolume / PVC mount 進 virt-launcher Pod 的 volume 路徑；converter 把 path 翻成 libvirt `<disk>` 元素，QEMU 直接 open 那個 file (或 block device)。 ephemeral disk、container disk、emptyDir、hostPath 都各自有對應路徑與 converter 邏輯 (`pkg/ephemeral-disk/`、`pkg/container-disk/`、`pkg/empty-disk/`)。
+
+## 收穫檢查
+
+- 為什麼 virt-handler 不自己連 libvirt 而要透過 virt-launcher 內的 cmd-server？
+- virt-launcher-monitor 是 PID 1 的目的是什麼？
+- 一個 VMI hot-plug 一張 disk，整段路徑 (從 VMI spec patch 到 QEMU 看到 disk) 經過哪些 component？
+- secondary network 透過 multus 加進來時，virt-launcher 怎麼知道哪張是 secondary？
+
+## 原始碼參考
+
+- [cmd/virt-handler/virt-handler.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-handler/virt-handler.go) — handler main
+- [pkg/virt-handler/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-handler/vm.go) — VirtualMachineController
+- [cmd/virt-launcher/virt-launcher.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-launcher/virt-launcher.go) — launcher main
+- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/manager.go) — DomainManager
+- [pkg/virt-launcher/virtwrap/converter/converter.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/converter/converter.go) — VMI → libvirt XML
+- [pkg/handler-launcher-com/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/handler-launcher-com) — gRPC protobuf
+- [pkg/virt-launcher/notify-client/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/notify-client) — event push back

@@ -1,0 +1,210 @@
+---
+layout: doc
+title: KubeVirt — 架構與 5 個 virt-* process
+description: virt-operator / virt-api / virt-controller / virt-handler / virt-launcher 各自的職責邊界，VirtualMachine / VirtualMachineInstance / VirtualMachineInstanceMigration 三個 CRD 的接力關係。
+---
+
+## 場景
+
+你裝完 KubeVirt 後 `kubectl get pods -n kubevirt`，看到五種 Pod：virt-operator、virt-api、virt-controller、virt-handler (DaemonSet)、virt-launcher (per-VMI)。前四個你也許可以猜到是 control plane，但為什麼 launcher 是 per-VMI 一個 Pod，而不是 DaemonSet？三個 CRD (VM / VMI / VMIM) 又是什麼關係？
+
+## 整體 process map
+
+```
+┌─────────────── control plane ────────────────┐
+│                                               │
+│  virt-operator (Deployment)                   │
+│   └─ install/upgrade KubeVirt CRDs + Deploys  │
+│                                               │
+│  virt-api (Deployment, HA)                    │
+│   ├─ ValidatingAdmissionWebhook (VM/VMI)      │
+│   ├─ MutatingAdmissionWebhook                 │
+│   └─ subresource API (/console, /vnc, /freeze)│
+│                                               │
+│  virt-controller (Deployment, HA leader)      │
+│   ├─ VM controller       (VM → VMI)           │
+│   ├─ VMI controller      (VMI → virt-launcher)│
+│   ├─ Migration controller (VMIM → target Pod) │
+│   └─ ~10 個其他 controller (pool, replicaset…) │
+└───────────────────────────────────────────────┘
+                       │
+                       │ all talk via apiserver
+                       ▼
+┌─────────────── worker node × N ──────────────┐
+│                                               │
+│  virt-handler (DaemonSet, per node)           │
+│   └─ watch own-node VMIs + Domain events      │
+│                                               │
+│  virt-launcher Pod (per VMI)                  │
+│   ├─ virt-launcher-monitor (PID 1)            │
+│   ├─ virt-launcher (cmd-server)               │
+│   ├─ libvirtd / virtqemud                     │
+│   └─ QEMU process (running guest OS)          │
+└───────────────────────────────────────────────┘
+```
+
+## 五個 process 各做什麼
+
+**virt-operator** — install / upgrade / uninstall KubeVirt 自己。`kubectl create -f kubevirt-cr.yaml` 後，operator 把 CRD、deployment、RBAC 全部 apply 出來。entry：
+
+```go
+// File: cmd/virt-operator/virt-operator.go
+package main
+// Execute() 在 pkg/virt-operator/application.go:155
+```
+
+**virt-api** — KubeVirt 的「extension API server」。負責兩件事：
+
+1. **Admission webhooks**：驗證 VM/VMI spec、mutating defaults
+2. **Subresource API**：apiserver 看到 `/api/.../virtualmachineinstances/<name>/console` 等路徑會 proxy 到 virt-api，virt-api 再 websocket proxy 到對應 node 的 virt-handler 連到 virt-launcher
+
+```go
+// File: cmd/virt-api/virt-api.go
+// 真實邏輯在 pkg/virt-api/api.go (virtAPIApp.Execute, line 161)
+```
+
+**virt-controller** — 跟 kube-controller-manager 同形狀，1 process 跑多個 controller goroutine。每個 controller 用 informer + work queue。詳細留 [controllers](/kubevirt/features/controllers)。
+
+```go
+// File: cmd/virt-controller/virt-controller.go
+// 主框架在 pkg/virt-controller/watch/application.go
+```
+
+**virt-handler** — DaemonSet，每個 node 一個。它跟 kubelet 平起平坐：kubelet 管 container，virt-handler 管 VM。watch 自己 node 上 VMI、跟自己 node 上各 virt-launcher Pod 透過 cmd-server gRPC 對話。
+
+```go
+// File: cmd/virt-handler/virt-handler.go (line 202)
+func (app *virtHandlerApp) Run() {
+    // 起 VirtualMachineController (per-node 的主迴圈)
+    // 起 cmd-server (對 virt-launcher 的 gRPC server)
+    // 起 console/lifecycle HTTP handler (給 virt-api 反向代理)
+}
+```
+
+**virt-launcher** — **per-VMI Pod**。一個 VMI 對應一個 virt-launcher Pod；Pod 內跑 libvirtd + QEMU。為什麼不是 DaemonSet？因為要把 QEMU 圈進 Pod 的 cgroup / network namespace / mount namespace 才能套用 k8s 的 resource limit、CNI、CSI。每個 VMI 自己一個 Pod 也方便 scheduler 排到合適的 node。
+
+```go
+// File: cmd/virt-launcher/virt-launcher.go (line 343)
+func main() {
+    // 起 cmd-server (gRPC listen for virt-handler)
+    // 連 libvirtd
+    // wait for SyncVMI command
+}
+```
+
+## 三個核心 CRD：VM / VMI / VMIM
+
+```
+VirtualMachine (VM)
+   │  desired state — 可以 stop/start
+   │  spec.runStrategy: Always | Manual | Halted | RerunOnFailure
+   │
+   │ owns
+   ▼
+VirtualMachineInstance (VMI)
+   │  一次運行 (像 Pod 對 Deployment)
+   │  spec: domain (CPU/memory/disk/network)
+   │  status.phase: Pending / Scheduling / Scheduled / Running / Succeeded / Failed
+   │
+   │ owns
+   ▼
+virt-launcher Pod
+   │  跑 QEMU 的真實容器
+
+
+獨立但相關：
+VirtualMachineInstanceMigration (VMIM)
+   │  「我要把某個 VMI live migrate」一次性 job
+   │  Migration controller 接 → 起 target virt-launcher Pod
+   │  → libvirt MigrateVMI from source to target
+```
+
+VM 與 VMI 的對應：一個 VM 對應「最多一個」VMI (因為一個 VM 一次只跑一個 VMI)；VM `spec.runStrategy` 決定 VMI 何時被建 / 重建。VMIM 是獨立 CRD，跟 VM/VMI 是 reference 關係 (沒有 ownerRef)。
+
+## kubectl apply VM.yaml 的端到端旅程
+
+```
+你 kubectl apply -f vm.yaml
+        │
+        ▼ HTTPS POST /apis/kubevirt.io/v1/.../virtualmachines
+   apiserver
+        │
+        ▼ admission webhook (extension)
+   virt-api validating/mutating webhook
+        │
+        ▼ etcd write + watch event
+        │
+        ▼  Watch:
+   virt-controller VM controller (sync)
+        │  if runStrategy == Always 且 VMI 不存在
+        ├──> 建 VMI (spec from VM template)
+        │
+        ▼ etcd write + watch event
+        │
+        ▼  Watch:
+   virt-controller VMI controller (sync)
+        │  if VMI.spec.nodeName == ""
+        ├──> 用 templateService.RenderLaunchManifest 算 virt-launcher Pod spec
+        │    (含 podAffinity、resource limits、CNI annotation 等)
+        ├──> 建 virt-launcher Pod
+        │
+        ▼  Watch:
+   k8s scheduler
+        ├──> 挑 node, Bind Pod.spec.nodeName = worker-X
+        │
+        ▼
+   worker-X 的 kubelet 把 virt-launcher Pod 拉起來
+        │
+        ▼ 同時：
+   worker-X 的 virt-handler watch 自己 node 上 VMIs
+        ├──> 看到 VMI 落在自己 node
+        ├──> 等 virt-launcher cmd-server 上線
+        ├──> SyncVMI gRPC 給 virt-launcher
+        │     ├─ virt-launcher 把 VMI spec 透過 converter 翻成 libvirt domain XML
+        │     ├─ libvirtd 啟動 QEMU
+        │     └─ QEMU boot guest OS
+        │
+        ▼
+   guest OS Running，VMI status.phase = Running
+   你 kubectl get vmi 看到 Running
+```
+
+## kubectl virt vnc / console 怎麼通
+
+`virtctl vnc <vm>` 透過 apiserver 的 extension API → virt-api 的 subresource handler → websocket 到 virt-handler 的 lifecycle/console HTTP server → 連 virt-launcher cmd-server 內的 console socket → libvirt → QEMU 的 VNC port。
+
+整段是 **websocket tunneling**：每跳一層都是 websocket proxy，最後接到 QEMU。所以你的 vnc client 看到的 framebuffer 是直接從 QEMU 回來的。
+
+## 為什麼 virt-launcher 是 per-VMI Pod
+
+**回到開頭問題**。原因：
+
+1. **k8s 第一公民**：把 QEMU 放進 Pod 後，自動繼承 cgroup limit (CPU/memory)、network (CNI / multus 加 secondary network)、storage (CSI 掛 PVC)、scheduler (排到合適的 node)。
+2. **lifecycle 對應**：1 VMI = 1 Pod。VM 重啟（不是 migration）= 重建 VMI = 重建 Pod。可以套用 k8s 的「Pod 死了重建」mental model。
+3. **isolation**：QEMU process 在 Pod 內跑，安全邊界跟 container 一樣 (容器 escape 才能跨 VM 干擾)。
+4. **可移植**：virt-launcher Pod 可以被 evict、re-schedule、live migrate（也是「在 target node 起新 Pod」的形式）。
+
+## 收穫檢查
+
+- VM / VMI / VMIM 三個 CRD 的 ownership chain 是什麼？哪兩個有 ownerRef？
+- virt-handler 與 kubelet 的職責邊界？兩者都是 per-node DaemonSet 嗎？
+- 為什麼 subresource API (vnc / console) 要走 virt-api 而不是直接 apiserver？
+- virt-operator 跟 virt-controller 都是 Deployment，差別在哪？
+
+## 原始碼進入點
+
+- [cmd/virt-operator/virt-operator.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-operator/virt-operator.go)
+- [cmd/virt-api/virt-api.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-api/virt-api.go)
+- [cmd/virt-controller/virt-controller.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-controller/virt-controller.go)
+- [cmd/virt-handler/virt-handler.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-handler/virt-handler.go)
+- [cmd/virt-launcher/virt-launcher.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-launcher/virt-launcher.go)
+- [pkg/virt-api/api.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/api.go) — virt-api 主邏輯
+- [pkg/virt-operator/application.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-operator/application.go) — operator 主邏輯
+- [pkg/virt-controller/watch/application.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/application.go) — controller manager
+- [staging/src/kubevirt.io/api/core/v1/types.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/staging/src/kubevirt.io/api/core/v1/types.go) — VM/VMI/VMIM CRD types
+
+## 接下來
+
+- [controllers](/kubevirt/features/controllers)：VM / VMI / Migration 三條 reconcile pipeline
+- [virt-handler-and-launcher](/kubevirt/features/virt-handler-and-launcher)：Pod 內部跟 libvirt/QEMU 的橋
+- [live-migration](/kubevirt/features/live-migration)：memory copy 與 cutover 機制

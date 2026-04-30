@@ -208,6 +208,55 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'kubevirt': {
+    id: 'kubevirt',
+    displayName: 'KubeVirt',
+    shortName: 'KubeVirt',
+    description: '在 k8s 上跑 VM 的 operator：5 個 process + 3 個 CRD 把 libvirt/QEMU 包成 Kubernetes 第一公民',
+    githubUrl: 'https://github.com/kubevirt/kubevirt',
+    submodulePath: path.join(REPO_ROOT, 'kubevirt'),
+    color: 'purple',
+    accentClass: 'border-purple-500 text-purple-400',
+    features: ['architecture', 'controllers', 'virt-handler-and-launcher', 'live-migration'],
+    featureGroups: [
+      { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
+      { label: '控制平面', icon: '🧠', slugs: ['controllers'] },
+      { label: 'Node + Pod 內部', icon: '🖥️', slugs: ['virt-handler-and-launcher'] },
+      { label: 'Live Migration', icon: '✈️', slugs: ['live-migration'] },
+    ],
+    usecases: [],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: 'KubeVirt 把整個 libvirt/QEMU stack 塞進 k8s — VM 變成 CRD，VM Pod 內跑 QEMU，live migration 由 controller 協調。但 5 個 virt-* process 各自做什麼？VM / VMI / VMIM 三個 CRD 怎麼接力？live migration 是真的把 RAM 抄一份過去？這 4 頁從原始碼層拆。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: '老闆要在 k8s 上跑舊系統的 VM。你聽過 KubeVirt 但搞不懂為什麼有 virt-operator / virt-api / virt-controller / virt-handler / virt-launcher 五種 Pod。今天決定從 cmd entry point 一路拆到 libvirt MigrateVMI。',
+      scenes: [
+        { step: 1, icon: '🏗️', actor: '你', action: '讀 architecture：5 個 process + 3 個 CRD', detail: 'VirtualMachine (desired) → VirtualMachineInstance (一次 run) → virt-launcher Pod (跑 QEMU)。virt-handler 是 DaemonSet 跟 kubelet 平起平坐。' },
+        { step: 2, icon: '🔄', actor: '你', action: '讀 controllers：三條 reconcile pipeline', detail: 'VM controller / VMI controller / Migration controller 各自的 sync()，全部用 informer + work queue + Execute 模式。跟 k8s 內建 controller 一樣的骨架。' },
+        { step: 3, icon: '🖥️', actor: '你', action: '讀 virt-handler-and-launcher：Pod 內 process tree', detail: 'virt-launcher-monitor / virt-launcher / libvirtd / QEMU 四層 process。virt-handler 透過 cmd-server gRPC 跟 launcher 對話；launcher 內 DomainManager 把 VMI spec 翻成 libvirt domain XML。' },
+        { step: 4, icon: '✈️', actor: '你', action: '讀 live-migration：memory 真的在搬', detail: 'precopy → iteration → cutover。dirty rate 不收斂時 fallback 到 postcopy。migration-proxy 把 libvirt 的 unix socket 走 TCP 跨 node。' },
+      ],
+      outcome: '從此面對 KubeVirt 任何狀況 (VM 卡 Pending、migration 失敗、QEMU panic)，你能直覺知道「該去哪個 process 看 log」、「該追哪段原始碼」。第 27 天 lab 你看著 live migration downtime 187ms 跳到 target node，懂為什麼這個數字長這樣。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'architecture', note: '先建立全貌：5 process + 3 CRD' },
+        { slug: 'controllers', note: 'VM → VMI → Pod 三條 reconcile 接力' },
+        { slug: 'virt-handler-and-launcher', note: '看 Pod 內真實 process tree' },
+      ],
+      intermediate: [
+        { slug: 'controllers', note: '深入 templateService 與 ownerReferences chain' },
+        { slug: 'virt-handler-and-launcher', note: 'virtwrap DomainManager 跟 libvirt 的接點' },
+        { slug: 'live-migration', note: 'precopy / postcopy 的取捨' },
+      ],
+      advanced: [
+        { slug: 'live-migration', note: 'migrationMonitor 與 auto-converge 邏輯' },
+        { slug: 'virt-handler-and-launcher', note: 'CNI bind 進 Pod net namespace 給 QEMU 的時序' },
+        { slug: 'architecture', note: 'virt-operator 的 install/upgrade strategy job' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)
