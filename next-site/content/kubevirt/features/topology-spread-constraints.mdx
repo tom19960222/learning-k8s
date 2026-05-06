@@ -1,0 +1,371 @@
+---
+layout: doc
+title: KubeVirt — topologySpreadConstraints
+description: 建 VM 時動態加 label 與 topologySpreadConstraints，如何一路變成 virt-launcher Pod 的 Kubernetes scheduling 條件。
+---
+
+## 場景
+
+你自己寫了一個 VM create service：使用者送出「我要一組 redis-primary VM」，service 要幫他建 KubeVirt `VirtualMachine`，而且同一組 VM 不能全部擠在同一台 node。這不是 KubeVirt 自己另外寫 scheduler，而是把 VM template 裡的 scheduling intent 傳到最底下的 `virt-launcher` Pod，最後交給 Kubernetes `PodTopologySpread` plugin 判斷。
+
+本頁使用已驗證的 stable 原始碼版本：Kubernetes `v1.36.0`、KubeVirt `v1.8.2`。upstream tag 檢查時，Kubernetes `v1.37.0` 仍是 alpha，KubeVirt 最新 stable tag 仍是 `v1.8.2`。
+
+## 結論
+
+可以。最乾淨的落點是 `VirtualMachine.spec.template`：
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: redis-01
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        spread-group: tenant-a-redis-primary
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              spread-group: tenant-a-redis-primary
+      domain:
+        resources:
+          requests:
+            memory: 4Gi
+        devices:
+          disks: []
+      volumes: []
+```
+
+`spread-group` 要放在 `spec.template.metadata.labels`，不是只放在 `VirtualMachine.metadata.labels`。原因很直接：Kubernetes scheduler 的 `labelSelector` 是拿來選 Pod labels，而 KubeVirt 會把 VMI labels copy 到 `virt-launcher` Pod labels。
+
+## VM 到 Pod 的資料流
+
+整段 flow 是這樣：
+
+```text
+your service
+  -> VirtualMachine.spec.template.metadata.labels
+  -> VirtualMachine.spec.template.spec.topologySpreadConstraints
+  -> VM controller 建 VirtualMachineInstance
+  -> templateService.RenderLaunchManifest 建 virt-launcher Pod
+  -> kube-scheduler 的 PodTopologySpread plugin 計算 skew
+  -> virt-launcher Pod 被排到某個 node
+  -> virt-launcher 裡啟動 libvirt/QEMU
+```
+
+這個設計的重點是「label 跟 constraint 要在同一個 template 上」。constraint 的 selector 必須選得到未來那個 `virt-launcher` Pod；如果 selector 不 match 自己，scheduler 計算 skew 時就不會把這個 Pod 當成同一組，行為會跟你想像的不一樣。
+
+## KubeVirt API：VM template 直接包 VMI template
+
+`VirtualMachine.spec.template` 的型別就是 `VirtualMachineInstanceTemplateSpec`。這代表你在 VM 上寫的 template metadata 與 VMI spec，會成為建立 VMI 的來源。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go
+type VirtualMachineSpec struct {
+    Template *VirtualMachineInstanceTemplateSpec `json:"template"`
+}
+```
+
+template 裡包含 `ObjectMeta` 與 `VirtualMachineInstanceSpec`：
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go
+type VirtualMachineInstanceTemplateSpec struct {
+    ObjectMeta metav1.ObjectMeta `json:"metadata,omitempty"`
+    Spec VirtualMachineInstanceSpec `json:"spec,omitempty" valid:"required"`
+}
+```
+
+而 VMI spec 本身有 KubeVirt 對外公開的 `TopologySpreadConstraints` 欄位，型別直接重用 Kubernetes `core/v1.TopologySpreadConstraint`：
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go
+TopologySpreadConstraints []k8sv1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+```
+
+所以你的 service 不需要繞過 KubeVirt 去 patch Pod。它只要建立 VM 時把 `spec.template.metadata.labels` 與 `spec.template.spec.topologySpreadConstraints` 寫對。
+
+## VM controller：template 變成 VMI
+
+VM controller 建 VMI 時，核心函式是 `SetupVMIFromVM()`。它先把 VM template metadata copy 到 VMI，再把 VM template spec copy 到 VMI spec。
+
+```go
+// File: kubevirt/pkg/virt-controller/watch/vm/vm.go
+vmi.ObjectMeta = *vm.Spec.Template.ObjectMeta.DeepCopy()
+vmi.Spec = *vm.Spec.Template.Spec.DeepCopy()
+```
+
+同一段程式最後又明確把 template labels 設回 VMI labels：
+
+```go
+// File: kubevirt/pkg/virt-controller/watch/vm/vm.go
+vmi.ObjectMeta.Labels = vm.Spec.Template.ObjectMeta.Labels
+```
+
+這就是為什麼 label 放在 `VirtualMachine.metadata.labels` 不夠。VM metadata 是 VM 物件自己的 label；scheduler 看不到 VM，它只會看到最後被排程的 `virt-launcher` Pod。
+
+## templateService：VMI 變成 virt-launcher Pod
+
+VMI controller 建 Pod 時會走 `TemplateService.RenderLaunchManifest()`，最後組出一個 Kubernetes `Pod`。Pod spec 裡的 `TopologySpreadConstraints` 直接取自 VMI spec：
+
+```go
+// File: kubevirt/pkg/virt-controller/services/template.go
+TopologySpreadConstraints: vmi.Spec.TopologySpreadConstraints,
+```
+
+Pod labels 也不是重新設計一套；`podLabels()` 會先 copy VMI labels，再加上 KubeVirt 自己需要的 labels。
+
+```go
+// File: kubevirt/pkg/virt-controller/services/template.go
+for k, v := range vmi.Labels {
+    labels[k] = v
+}
+labels[v1.AppLabel] = "virt-launcher"
+```
+
+KubeVirt 對這件事有測試：`template_test.go` 建一個帶 `TopologySpreadConstraints` 的 VMI，呼叫 `RenderLaunchManifest()` 後檢查 Pod spec 真的保留同一組 constraints。
+
+```go
+// File: kubevirt/pkg/virt-controller/services/template_test.go
+Expect(pod.Spec.TopologySpreadConstraints).To(Equal(topologySpreadConstraints))
+```
+
+因此，實際鏈路是：
+
+| 你寫的 VM 欄位 | KubeVirt 轉換 | scheduler 實際看到 |
+|---|---|---|
+| `spec.template.metadata.labels` | VMI labels -> Pod labels | `virt-launcher` Pod labels |
+| `spec.template.spec.topologySpreadConstraints` | VMI spec -> Pod spec | `PodSpec.TopologySpreadConstraints` |
+| `metadata.labels` | VM object labels | 不直接參與 Pod spread 計算 |
+
+## Kubernetes API：constraint 是 PodSpec 的一部分
+
+Kubernetes API 把 `topologySpreadConstraints` 放在 `PodSpec` 上，而且所有 constraints 是 AND 關係。
+
+```go
+// File: kubernetes/staging/src/k8s.io/api/core/v1/types.go
+TopologySpreadConstraints []TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+```
+
+`TopologySpreadConstraint` 的幾個核心欄位控制不同層次：
+
+| 欄位 | 在 scheduler 裡的意思 |
+|---|---|
+| `labelSelector` | 找出「要一起計算分散度」的既有 Pods |
+| `topologyKey` | 用哪個 node label 切 topology domain，例如 hostname、zone、rack |
+| `maxSkew` | 候選 domain 的 matching pod 數量，最多能比全域最小值多多少 |
+| `whenUnsatisfiable` | `DoNotSchedule` 是 hard filter；`ScheduleAnyway` 是 soft score |
+| `minDomains` | eligible domains 太少時，把 global minimum 當 0 |
+| `nodeAffinityPolicy` / `nodeTaintsPolicy` | 計算 skew 時要 Honor 或 Ignore incoming Pod 的 nodeAffinity / taints |
+| `matchLabelKeys` | 從 incoming Pod labels 動態補 selector，常用在 rollout revision |
+
+`labelSelector` 有一個很容易踩的細節：`nil` selector 會變成 `labels.Nothing()`，不會 match 任何 Pod；空 selector 才是 match everything。
+
+```go
+// File: kubernetes/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go
+if ps == nil {
+    return labels.Nothing(), nil
+}
+```
+
+所以 production VM policy 不應該省略 `labelSelector`。最穩的是讓 selector 明確 match template label。
+
+## scheduler plugin：hard constraint 怎麼擋 node
+
+Kubernetes scheduler 的實作在 `pkg/scheduler/framework/plugins/podtopologyspread/`。這個 plugin 同時實作 `PreFilter`、`Filter`、`PreScore`、`Score`：
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/plugin.go
+var _ fwk.PreFilterPlugin = &PodTopologySpread{}
+var _ fwk.FilterPlugin = &PodTopologySpread{}
+var _ fwk.PreScorePlugin = &PodTopologySpread{}
+var _ fwk.ScorePlugin = &PodTopologySpread{}
+```
+
+當 `whenUnsatisfiable: DoNotSchedule` 時，scheduler 走 hard path：
+
+1. `getConstraints()` 只挑 `DoNotSchedule` constraints。
+2. `PreFilter` 掃過所有 node，計算每個 topology value 上已經有幾個 matching Pods。
+3. `Filter` 對每個候選 node 算一次 skew。
+4. skew 超過 `maxSkew`，這個 node 就被判定 Unschedulable。
+
+constraint 先會被轉成 scheduler plugin 內部型別。這一步會解析 `labelSelector`，也會套用幾個預設值。
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/common.go
+MinDomains: ptr.Deref(c.MinDomains, 1),
+NodeAffinityPolicy: v1.NodeInclusionPolicyHonor,
+NodeTaintsPolicy: v1.NodeInclusionPolicyIgnore,
+```
+
+`PreFilter` 的核心資料結構是每個 constraint 一份 `TpValueToMatchNum`，key 是 topology value，value 是 matching pod 數量。它還維護 `CriticalPaths`，只保留最低與次低候選值，讓 `Filter` 可以快速拿到 global minimum。
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/filtering.go
+TpValueToMatchNum []map[string]int
+CriticalPaths []*criticalPaths
+```
+
+真正判斷 node 能不能放的是這個公式：
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/filtering.go
+skew := matchNum + selfMatchNum - minMatchNum
+if skew > int(c.MaxSkew) {
+    return fwk.NewStatus(fwk.Unschedulable, ErrReasonConstraintsNotMatch)
+}
+```
+
+換成白話：
+
+```text
+如果把這個 Pod 放到候選 node 所在 domain：
+
+該 domain 現有 matching Pods
++ 這個 Pod 自己是否 match selector
+- 全部 eligible domains 的最低 matching pod 數
+<= maxSkew
+```
+
+如果你的 VM 自己沒有 `spread-group=tenant-a-redis-primary`，`selfMatchNum` 會是 0；這是「selector 不 match 自己」問題的原始碼原因。
+
+## ScheduleAnyway：不擋 node，只影響分數
+
+`ScheduleAnyway` 不會讓 VM 卡 Pending，它會進 scoring path。`PreScore` 先計算各 topology value 的 matching pod 數，`Score` 把「越多 matching pods」轉成越差的原始分數，最後 `NormalizeScore` 反轉成 Kubernetes 的 0-100 node score。
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/scoring.go
+score += scoreForCount(cnt, c.MaxSkew, s.TopologyNormalizingWeight[i])
+```
+
+`NormalizeScore` 會把原始分數越低的 node 轉成越高的 scheduler score：
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/scoring.go
+scores[i].Score = fwk.MaxNodeScore * (maxScore + minScore - s) / maxScore
+```
+
+所以 `ScheduleAnyway` 的意思不是「忽略 constraint」，而是「用它排序候選 node，但不要把所有不完美的 node 都擋掉」。對 VM 平台來說，這通常比一開始就用 `DoNotSchedule` 更安全。
+
+## namespace 邊界
+
+`countPodsMatchSelector()` 只計算同 namespace 的 Pods：
+
+```go
+// File: kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/common.go
+if p.GetPod().DeletionTimestamp != nil || p.GetPod().Namespace != ns {
+    continue
+}
+```
+
+這代表 `spread-group=tenant-a-redis-primary` 即使跨 namespace 相同，也不會互相計算。你的 service 如果用 namespace 做 tenant 隔離，這通常是好事；如果你想跨 namespace 做全域 VM spread，`topologySpreadConstraints` 本身不是那個工具。
+
+## KubeVirt webhook 驗證的邊界
+
+KubeVirt 在 VMI create validating webhook 裡會檢查 `spec.topologySpreadConstraints`，但 v1.8.2 的驗證碼是「copy Kubernetes 部分 validation」，不是把最新 Kubernetes validation 全部直接拿進來。
+
+```go
+// File: kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/vmi-create-admitter.go
+causes = append(causes, validateSpecTopologySpreadConstraints(field, spec)...)
+```
+
+實際 validation 檢查包含 `maxSkew` 必須大於 0、`topologyKey` 必須是合法 label name、`whenUnsatisfiable` 只能是 `DoNotSchedule` 或 `ScheduleAnyway`、`labelSelector` 必須合法、同一組 `{topologyKey, whenUnsatisfiable}` 不可重複。
+
+```go
+// File: kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go
+if err := ValidateWhenUnsatisfiable(...); err != nil {
+    allErrs = append(allErrs, err)
+}
+```
+
+實務上我會先避開進階欄位，使用最穩定的明確 selector：
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        spread-group: tenant-a-redis-primary
+```
+
+等 VM 平台 policy 穩定後，再考慮 `minDomains`、`nodeAffinityPolicy`、`nodeTaintsPolicy`、`matchLabelKeys` 這些進階欄位。
+
+## service 設計建議
+
+你的 VM create service 可以把使用者 API 抽象成比較穩定的 policy：
+
+```json
+{
+  "name": "redis-01",
+  "tenant": "tenant-a",
+  "role": "redis-primary",
+  "spreadPolicy": {
+    "enabled": true,
+    "topology": "hostname",
+    "mode": "soft"
+  }
+}
+```
+
+轉成 VM spec 時，service 只做兩件事：
+
+1. 產生穩定的 group label，例如 `spread-group=tenant-a-redis-primary`。
+2. 讓 `labelSelector.matchLabels` 明確選到同一個 group label。
+
+```yaml
+spec:
+  template:
+    metadata:
+      labels:
+        tenant: tenant-a
+        vm-role: redis-primary
+        spread-group: tenant-a-redis-primary
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              spread-group: tenant-a-redis-primary
+```
+
+如果你要防止使用者繞過 service 建 VM，可以補 Kubernetes `MutatingAdmissionWebhook` 或 `ValidatingAdmissionWebhook`，但優先 mutate `VirtualMachine` / `VirtualMachineInstance` spec，不要優先 mutate KubeVirt 生成的 `virt-launcher` Pod。前者是使用者意圖，後者是 controller 產物，debug 成本差很多。
+
+## 注意事項與邊界情況
+
+| 情況 | 結果 | 建議 |
+|---|---|---|
+| label 只放在 `VirtualMachine.metadata.labels` | Pod labels 不一定有你的 spread label | 放在 `spec.template.metadata.labels` |
+| selector 不 match 自己 | `selfMatchNum=0`，分散計算會失真 | selector 跟 template label 使用同一組 `spread-group` |
+| 每台 VM 都用不同 `spread-group` | 每台只跟自己比，幾乎沒有 spread 效果 | group label 代表一組 workload，而不是單一 VM |
+| `DoNotSchedule` + 資源不足 | VM/VMI 可能卡 Pending | 預設用 `ScheduleAnyway`，critical VM 才改 hard |
+| node 缺少 `topologyKey` label | hard path 直接不符合 constraint | 自訂 rack/zone label 前先整理 node labels |
+| VM 已經 Running 後才改 policy | 不會自動搬家 | 需要重啟 VM、live migration 或外部 descheduler/controller |
+
+## 收穫檢查
+
+- 為什麼 `spec.template.metadata.labels` 比 `metadata.labels` 重要？
+- `DoNotSchedule` 與 `ScheduleAnyway` 分別走 scheduler plugin 的哪兩條 path？
+- `labelSelector: null` 跟 `labelSelector: {}` 差在哪裡？
+- 為什麼跨 namespace 的 VM 不會互相計算 spread？
+- 如果你的 service 同時支援 zone-level hard spread 與 hostname-level soft spread，YAML 應該怎麼組？
+
+## 原始碼參考
+
+- [kubevirt/staging/src/kubevirt.io/api/core/v1/types.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/staging/src/kubevirt.io/api/core/v1/types.go) — VM/VMI API 欄位
+- [kubevirt/pkg/virt-controller/watch/vm/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vm/vm.go) — VM template 轉 VMI
+- [kubevirt/pkg/virt-controller/services/template.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/services/template.go) — VMI 轉 virt-launcher Pod
+- [kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go) — KubeVirt VMI topology spread validation
+- [kubernetes/staging/src/k8s.io/api/core/v1/types.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/api/core/v1/types.go) — PodSpec 與 TopologySpreadConstraint API
+- [kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/scheduler/framework/plugins/podtopologyspread) — scheduler plugin 實作
+- [kubernetes/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go) — LabelSelector 轉 labels.Selector

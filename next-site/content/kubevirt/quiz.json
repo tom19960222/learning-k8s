@@ -58,5 +58,17 @@
     ],
     "answer": 0,
     "explanation": "libvirt 預設只 listen unix socket；要跨 node 直連需要 libvirt TCP 設定 (cert/auth/port)，麻煩且 Pod 內開 listen port 會跟 CNI 設定衝突。migration-proxy (pkg/virt-handler/migration-proxy/) 在 virt-handler 起一個 unix socket→TCP→unix socket 的中繼 proxy：source 的 libvirt 連自己 node 的 unix socket，proxy 把流量包成 TCP 送到 target node 的 proxy，後者再寫進 target libvirt 的 unix socket。對 libvirt 來說整段跟 local 一樣；KubeVirt 在 proxy 那層處理跨 node 的 transport。"
+  },
+  {
+    "id": 6,
+    "question": "你在建立 KubeVirt VirtualMachine 時要讓同一組 VM 分散到不同 node。label 與 topologySpreadConstraints 應該放在哪裡？",
+    "options": [
+      "放在 spec.template.metadata.labels 與 spec.template.spec.topologySpreadConstraints，讓 VM controller 建出的 VMI 和 virt-launcher Pod 都帶到同一組 selector",
+      "只放在 VirtualMachine.metadata.labels，因為 scheduler 會直接看 VM object",
+      "只 mutate virt-launcher Pod，因為 KubeVirt API 不支援 topologySpreadConstraints",
+      "放在 VirtualMachine.status，讓 virt-handler 啟動 QEMU 時讀取"
+    ],
+    "answer": 0,
+    "explanation": "KubeVirt v1.8.2 的 VirtualMachine.spec.template 是 VirtualMachineInstanceTemplateSpec。VM controller 的 SetupVMIFromVM() 會把 template metadata 和 spec copy 到 VMI；templateService.RenderLaunchManifest() 會把 VMI labels copy 成 virt-launcher Pod labels，並把 vmi.Spec.TopologySpreadConstraints 放進 PodSpec。scheduler 實際計算的是 Pod labels 和 PodSpec，不是 VirtualMachine.metadata.labels。"
   }
 ]
