@@ -23,3 +23,6 @@
 	url = https://github.com/k8snetworkplumbingwg/multus-cni.git
 	branch = v4.2.4
 	shallow = true
+[submodule "molearn"]
+	path = molearn
+	url = https://github.com/hwchiu/molearn.git
