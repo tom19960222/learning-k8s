@@ -278,10 +278,54 @@ def check_no_vitepress() -> None:
 
 
 # ─────────────────────────────────────────────
-# CHECK 7: Build
+# CHECK 7: 大陸用語黑名單
+# ─────────────────────────────────────────────
+# 依 CLAUDE.md「大陸 / 港式用語禁止」清單：
+#   軟體（非 软件/软体/軟件）、網路（非 网络）、檔案（非 文件）、
+#   程式（非 程序）、預設（非 默认）、資料（非 数据）、
+#   使用者（非 用户）、影片（非 视频）、滑鼠（非 鼠标）、解析度（非 分辨率）
+#
+# 注意：「文件」在繁中正式語境亦可指 document，誤判率高 → 不納入自動檢查，
+# 由人工 review 處理。
+MAINLAND_TERMS: list[tuple[str, str]] = [
+    ("軟件", "軟體"),
+    ("软件", "軟體"),
+    ("软体", "軟體"),
+    ("网络", "網路"),
+    ("程序", "程式（或保留英文 process）"),
+    ("默认", "預設"),
+    ("数据", "資料"),
+    ("用户", "使用者"),
+    ("视频", "影片"),
+    ("鼠标", "滑鼠"),
+    ("分辨率", "解析度"),
+]
+
+
+def check_mainland_terms() -> None:
+    print(f"\n{BOLD}[7] 大陸用語黑名單{RESET}")
+    mdx_files = list(CONTENT.rglob("*.mdx"))
+    hits: list[tuple[Path, int, str, str]] = []
+
+    for f in mdx_files:
+        text = f.read_text()
+        for i, line in enumerate(text.splitlines(), 1):
+            for bad, suggest in MAINLAND_TERMS:
+                if bad in line:
+                    hits.append((f.relative_to(NEXT_SITE), i, bad, suggest))
+
+    if hits:
+        for f, lineno, bad, suggest in hits:
+            fail(f"{f}:{lineno} — 「{bad}」應改為「{suggest}」")
+    else:
+        ok(f"No 大陸用語 found in {len(mdx_files)} MDX files")
+
+
+# ─────────────────────────────────────────────
+# CHECK 8: Build
 # ─────────────────────────────────────────────
 def check_build() -> None:
-    print(f"\n{BOLD}[7] Next.js Build{RESET}")
+    print(f"\n{BOLD}[8] Next.js Build{RESET}")
     print("  Running npm run build (this may take ~30s)...")
     result = subprocess.run(
         ["npm", "run", "build"],
@@ -316,6 +360,7 @@ def main() -> None:
     check_quiz_json()
     check_feature_files()
     check_no_vitepress()
+    check_mainland_terms()
 
     # Build runs by default. Use --no-build / -n to skip (e.g. in quick iteration loops)
     if "--no-build" in sys.argv or "-n" in sys.argv:
