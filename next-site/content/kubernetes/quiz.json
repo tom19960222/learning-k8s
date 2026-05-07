@@ -226,5 +226,109 @@
     ],
     "answer": 0,
     "explanation": "CSI Node driver 常在 container 內執行 mount，但 target path 位於 host 的 /var/lib/kubelet/pods。Bidirectional mount propagation 對應 Linux rshared，能讓後續 mount event 在 host 與 container 之間傳播。"
+  },
+  {
+    "id": 20,
+    "feature": "runtime-learning-map",
+    "question": "整理 9 篇 runtime 文章後，本專案歸納 Kubernetes 介面化（CRI/CNI/CSI/Device Plugin）的核心理由是什麼？",
+    "options": [
+      "把高變動、強硬體相依的部分外部化，讓核心 control plane 只管 API、reconcile 與調度，第三方 plugin 可獨立 release",
+      "讓 kube-apiserver 能直接管理每張網卡、每顆磁碟、每個 GPU",
+      "強制所有 plugin 都跟 Kubernetes 用同一個 release cycle，避免版本漂移",
+      "讓 kubelet 自己內建所有 runtime / network / storage 實作，減少外部依賴"
+    ],
+    "answer": 0,
+    "explanation": "見 features/runtime-learning-map.mdx 的「9 篇共同主軸」段：第一層強調 Kubernetes core 不直接處理底層差異，CRI/CNI/CSI/Device Plugin 把高變動、硬體相依的部分外部化，讓第三方按介面獨立演進。"
+  },
+  {
+    "id": 21,
+    "feature": "cni-learning-map",
+    "question": "本專案的 CNI 知識地圖把 Kubernetes Pod network 拆成兩條主線。下列哪組描述最符合該地圖的責任邊界？",
+    "options": [
+      "Kubernetes 把「Pod 要有 network namespace 與 IP」抽成 CNI contract；真正 datapath 仍是 Linux network stack（veth、bridge、route、iptables、ARP、FDB、VXLAN、netlink）",
+      "Kubernetes apiserver 直接轉發 Pod-to-Pod 封包；CNI 只負責回報 metric",
+      "CNI plugin 是長駐 daemon，kubelet 透過 gRPC 呼叫；datapath 由 etcd 直接寫入 Linux kernel",
+      "scheduler 決定 route，CNI 負責 NetworkPolicy；kube-proxy 負責 Pod IP 分配"
+    ],
+    "answer": 0,
+    "explanation": "見 features/cni-learning-map.mdx 開頭「場景」段：兩條主線分別是 (1) CNI contract 把 namespace + IP 抽象化，(2) 真正 datapath 仍由 Linux network stack 完成；CNI 是 binary execution protocol，不是 daemon API。"
+  },
+  {
+    "id": 22,
+    "feature": "csi-learning-map",
+    "question": "本專案 CSI 知識地圖把 CSI 拆成三個世界。下列哪一組正確列出這三個世界？",
+    "options": [
+      "Kubernetes API（PV/PVC/StorageClass/CSIDriver/CSINode/VolumeAttachment）、CSI gRPC contract（Identity/Controller/Node）、Linux storage/mount 現實（block/filesystem/NFS/bind mount/mount namespace）",
+      "kube-apiserver、kube-scheduler、kube-controller-manager 三個 control plane process",
+      "CRI、CNI、CSI 三個介面，各自由 kubelet 直接呼叫",
+      "etcd、apiserver、kubelet 三層儲存責任"
+    ],
+    "answer": 0,
+    "explanation": "見 features/csi-learning-map.mdx 開頭「場景」段：CSI 橫跨三個世界 — Kubernetes API object、CSI gRPC service（Identity/Controller/Node）、Linux storage/mount 現實。Kubernetes 只標準化接線方式，耐久性等仍由 storage backend 負責。"
+  },
+  {
+    "id": 23,
+    "feature": "pod-network-lifecycle",
+    "question": "在現代 Kubernetes（1.24+）裡，當 kubelet 為 Pod 建立 network 時，CNI ADD 是被誰直接觸發的？",
+    "options": [
+      "kubelet 透過 CRI 呼叫 RunPodSandbox，由 containerd / CRI-O 在建立 sandbox 過程中執行 /opt/cni/bin/ 下的 plugin",
+      "kubelet 自己直接執行 /opt/cni/bin/ 下的 CNI binary，並把 result 寫回 apiserver",
+      "kube-controller-manager watch Pod 後直接呼叫 CNI plugin",
+      "scheduler 在 bind Pod 時順便呼叫 CNI plugin 配 IP"
+    ],
+    "answer": 0,
+    "explanation": "見 features/pod-network-lifecycle.mdx「從 Kubernetes source 看 kubelet 邊界」段：kubelet 不直接執行 CNI binary，而是呼叫 CRI 的 RunPodSandbox；containerd / CRI-O 在 sandbox 建立過程中才執行 CNI plugin。dockershim 已在 1.24 移除。"
+  },
+  {
+    "id": 24,
+    "feature": "node-ipam-and-flannel",
+    "question": "flannel 部署中，flanneld（DaemonSet 長駐 process）與 flannel CNI binary 的職責邊界是什麼？",
+    "options": [
+      "flanneld 長駐 watch Node、註冊 subnet lease、寫 kernel route/ARP/FDB 並產出 /run/flannel/subnet.env；flannel CNI binary 是 runtime 觸發的短命 binary，讀 subnet.env 後 delegate 到 bridge + host-local",
+      "flanneld 每次 Pod 建立時都被 runtime 直接呼叫；flannel CNI binary 是長駐 daemon",
+      "flanneld 直接呼叫 kube-apiserver 為每個 Pod 分配 IP；flannel CNI binary 只負責 log",
+      "flanneld 與 flannel CNI binary 是同一個 process 的兩個 thread，沒有檔案層的交接"
+    ],
+    "answer": 0,
+    "explanation": "見 features/node-ipam-and-flannel.mdx「flanneld 讀 Node PodCIDR」與「subnet.env 是 flanneld 與 CNI binary 的交接點」段：flanneld 是長駐 daemon、flannel CNI 是短命 binary，兩者透過 host filesystem 上的 subnet.env 交接。"
+  },
+  {
+    "id": 25,
+    "feature": "pod-to-pod-datapath",
+    "question": "Pod A（10.244.0.5 在 node-a）跨 node 送封包給 Pod B（10.244.2.7 在 node-c）。在 flannel VXLAN 中，封包經 VXLAN 封裝後 outer packet 的 source/destination IP 是什麼？",
+    "options": [
+      "outer src = node-a underlay IP，outer dst = node-c underlay IP；underlay 看不到 PodCIDR",
+      "outer src = 10.244.0.5，outer dst = 10.244.2.7；跟 original packet 一樣",
+      "outer src = kube-apiserver ClusterIP，outer dst = Pod B IP",
+      "outer src = node-a underlay IP，outer dst = Service ClusterIP"
+    ],
+    "answer": 0,
+    "explanation": "見 features/pod-to-pod-datapath.mdx「先分清楚 original packet 與 outer packet」段：VXLAN 把 Pod-to-Pod original packet 包進 Node-to-Node outer packet，underlay 只需 node IP 互通，不需要知道 PodCIDR。"
+  },
+  {
+    "id": 26,
+    "feature": "storage-api-and-binding",
+    "question": "使用 CSI driver 的 dynamic provisioning 中，PVC Pending 時 Kubernetes PV controller 會怎麼處理？",
+    "options": [
+      "走 provisionClaimOperationExternal()：根據 StorageClass.provisioner 在 PVC 加 annotation、發 event，等 external-provisioner sidecar watch 到後才呼叫 CSI CreateVolume",
+      "PV controller 直接用 in-tree code 呼叫 CSI CreateVolume，並建立 PV",
+      "kube-apiserver 在儲存 PVC 時直接呼叫 driver 的 CreateVolume RPC",
+      "scheduler 在 bind Pod 時順便建立 volume"
+    ],
+    "answer": 0,
+    "explanation": "見 features/storage-api-and-binding.mdx「Dynamic provisioning 的分工」段：modern CSI 路徑下 PV controller 不直接呼叫 CreateVolume，而是走 provisionClaimOperationExternal()，由 external-provisioner sidecar 接手。"
+  },
+  {
+    "id": 27,
+    "feature": "kubelet-csi-mount-path",
+    "question": "kubelet volume manager 處理 Pod CSI volume 時，下列哪個流程順序符合 GenerateMountVolumeFunc() 的 source 行為？",
+    "options": [
+      "WaitForAttach -> MountDevice (對應 NodeStageVolume，若 driver 支援) -> SetUp (對應 NodePublishVolume)",
+      "NodePublishVolume -> NodeStageVolume -> ControllerPublishVolume",
+      "ControllerPublishVolume -> NodePublishVolume -> NodeStageVolume",
+      "kubelet 直接把 PV YAML 透過 gRPC 傳給 driver，driver 自行決定 mount 順序"
+    ],
+    "answer": 0,
+    "explanation": "見 features/kubelet-csi-mount-path.mdx「MountVolume 會先等 attach」段：operation_generator.go 的 GenerateMountVolumeFunc() 先 WaitForAttach、再 MountDevice（CSI 對應 NodeStageVolume）、最後 SetUp（CSI 對應 NodePublishVolume）。"
   }
 ]
