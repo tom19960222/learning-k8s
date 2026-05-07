@@ -4,6 +4,19 @@ title: Kubernetes — CNI 文章知識地圖
 description: 從 8 篇 CNI 文章抽取知識點，整理成從 CNI contract、kubelet/CRI 邊界、bridge/veth/IPAM、NodeIPAM、flannel VXLAN 到 CNI 選型的學習路徑。
 ---
 
+> 📍 **本頁性質：導航頁**
+>
+> 這頁不是技術深度教材，而是 CNI 主題的知識地圖。它把 8 篇外部 CNI 文章整理成清單，並把每個重點對應到本 repo 已有的 source-first 深度頁。如果你要的是原始碼層級的拆解，請直接跳到下方「對應的深度頁」清單。
+
+## 對應的深度頁
+
+如果你已熟悉外部文章脈絡，直接跳這幾頁讀本 repo 的原始碼分析：
+
+- [pod-network-lifecycle](/kubernetes/features/pod-network-lifecycle) — kubelet、CRI runtime、CNI plugin 在 Pod 生命週期中誰呼叫誰，CNI ADD / DEL 觸發點。
+- [cni-plugin-primitives](/kubernetes/features/cni-plugin-primitives) — CNI spec、`skel.CmdArgs`、bridge plugin、netlink、veth pair 是怎麼真的落到 Linux kernel。
+- [node-ipam-and-flannel](/kubernetes/features/node-ipam-and-flannel) — controller-manager 的 NodeIPAM 怎麼把 cluster CIDR 切給每個 Node，flannel daemon 又怎麼把它寫成 `subnet.env`。
+- [pod-to-pod-datapath](/kubernetes/features/pod-to-pod-datapath) — 跨 node Pod-to-Pod 封包用 route、ARP、FDB、VXLAN 拆掉「魔法感」。
+
 ## 場景
 
 你有網路背景，所以 Kubernetes network 最容易讓人覺得「魔法」的地方不是 IP、route、ARP、VXLAN 本身，而是這些熟悉的東西突然被 kubelet、container runtime、CNI plugin、controller-manager、DaemonSet、Node annotation 串在一起。

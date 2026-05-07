@@ -4,6 +4,19 @@ title: Kubernetes — runtime 文章知識地圖
 description: 從 9 篇 Kubernetes 原理分析文章提取知識點，整理成本專案可延伸的學習地圖：介面化、OCI、namespace、CRI、containerd、CRI-O、安全 runtime 與 VM runtime。
 ---
 
+> 📍 **本頁性質：導航頁**
+>
+> 這頁不是技術深度教材，而是 runtime 主題的知識地圖。它把 9 篇外部文章整理成清單，並把每個重點對應到本 repo 已有的 source-first 深度頁。如果你要的是原始碼層級的拆解，請直接跳到下方「對應的深度頁」清單。
+
+## 對應的深度頁
+
+如果你已熟悉外部文章脈絡，直接跳這幾頁讀本 repo 的原始碼分析：
+
+- [extension-interfaces](/kubernetes/features/extension-interfaces) — Kubernetes 為什麼把 CRI / CNI / CSI / Device Plugin 抽成介面，介面化的設計理由。
+- [oci-container-primitives](/kubernetes/features/oci-container-primitives) — OCI image / runtime spec、runc、libcontainer、containerd-shim、Linux namespace 與 cgroup 的基礎層。
+- [cri-runtime-stack](/kubernetes/features/cri-runtime-stack) — kubelet 透過 CRI gRPC `RuntimeService` / `ImageService` 呼叫 containerd / CRI-O 的完整 API 邊界。
+- [runtime-alternatives](/kubernetes/features/runtime-alternatives) — RuntimeClass、gVisor、Kata Containers、KubeVirt 在隔離與 VM workload 取捨上的決策圖。
+
 ## 場景
 
 這組文章不是單純教你「怎麼裝 Kubernetes」，而是在回答一個更底層的問題：Kubernetes 為什麼能同時接上不同 container runtime、CNI、CSI、Device Plugin，甚至把 VM workload 納入同一套調度模型？

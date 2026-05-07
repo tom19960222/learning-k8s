@@ -4,6 +4,18 @@ title: Kubernetes — CSI 文章知識地圖
 description: 從 5 篇 CSI 文章抽取知識點，整理成從 PV/PVC/StorageClass、CSI protobuf、sidecar controller、VolumeAttachment、kubelet Node RPC 到 mount propagation 的學習路徑。
 ---
 
+> 📍 **本頁性質：導航頁**
+>
+> 這頁不是技術深度教材，而是 CSI 主題的知識地圖。它把 5 篇外部 CSI 文章整理成清單，並把每個重點對應到本 repo 已有的 source-first 深度頁。如果你要的是原始碼層級的拆解，請直接跳到下方「對應的深度頁」清單。
+
+## 對應的深度頁
+
+如果你已熟悉外部文章脈絡，直接跳這幾頁讀本 repo 的原始碼分析：
+
+- [storage-api-and-binding](/kubernetes/features/storage-api-and-binding) — `PersistentVolume`、`PersistentVolumeClaim`、`StorageClass` 的 API type，以及 PV controller 的 binding / external provisioning 流程。
+- [csi-rpc-and-sidecars](/kubernetes/features/csi-rpc-and-sidecars) — CSI Identity / Controller / Node RPC 與 external-provisioner / external-attacher / node-driver-registrar 三個 sidecar 的接線。
+- [kubelet-csi-mount-path](/kubernetes/features/kubelet-csi-mount-path) — kubelet volume manager 從 `NodeStageVolume` / `NodePublishVolume` 一路追到 `/var/lib/kubelet/pods/...` 的 mount path 與 mount propagation。
+
 ## 場景
 
 CSI 比 CRI/CNI 更容易被誤解，因為它橫跨三個世界：
