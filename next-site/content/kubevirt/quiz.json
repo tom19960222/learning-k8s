@@ -82,5 +82,31 @@
     ],
     "answer": 0,
     "explanation": "KubeVirt 的 clock converter 把 `timer.hyperv` 轉成 libvirt `hypervclock`，libvirt 在 QEMU CPU argument 加 `hv-time=on`。`features.hyperv.*` 由 hypervisor_features converter 轉成 `<features><hyperv>`，再由 libvirt 輸出 `hv-relaxed`、`hv-vapic`、`hv-vpindex` 等 CPU flags。`devices.tpm.persistent` 則走 TPM converter：non-persistent 是 emulator TPM 2.0 + `tpm-tis`；persistent 會加 `persistent_state=yes` 並切到 `tpm-crb`。"
+  },
+  {
+    "id": 8,
+    "feature": "controllers",
+    "question": "在 virt-controller 三條 reconcile pipeline 裡，「呼叫 templateService.RenderLaunchManifest 把 VMI 翻成 *k8sv1.Pod、再 create 出 virt-launcher Pod」這件事是哪一條 controller 的 sync() 在做？為什麼？",
+    "options": [
+      "VMI controller。它看 VMI status.phase=Pending 時呼 templateService 算出 Pod spec、create Pod，並把 Pod 的 ownerReferences 指回 VMI；VM controller 只管 VMI 物件存在與否，不直接接觸 Pod",
+      "VM controller。VirtualMachine 是 desired state，所以 VM controller 一手包辦：建 VMI、建 Pod、設 ownerReferences chain",
+      "Migration controller。所有 virt-launcher Pod (含初次啟動) 都被視為 migration 的一個特例，由 Migration controller 統一建立",
+      "三條 controller 都不建 Pod；virt-handler 在 node 上直接透過 cmd-server gRPC 把 Pod spec 推給 kubelet"
+    ],
+    "answer": 0,
+    "explanation": "見 features/controllers.mdx：VM controller 的 sync() 只負責「VMI 該不該存在 / 要不要重建」，不直接接觸 Pod；真正把 VMI 翻成 virt-launcher Pod 的是 VMI controller。VMI controller 在 status.phase=Pending 時呼 pkg/virt-controller/services/ 的 templateService.RenderLaunchManifest()，這個 function 把 VMI 翻成 *k8sv1.Pod (含 virt-launcher image、command/args 帶 VMI uid、sidecar volume mount、nodeSelector/tolerations/affinity、CNI annotation)，create 出 Pod 並把 Pod.metadata.ownerReferences[0] 指回 VMI。三條 controller 都共用 informer + work queue + Execute() + idempotent sync() 這個骨架，跟 client-go/tools/cache/ 一樣。"
+  },
+  {
+    "id": 9,
+    "feature": "virt-handler-and-launcher",
+    "question": "virt-launcher Pod 的 PID 1 是 virt-launcher-monitor 而不是 virt-launcher 本身；DomainManager 介面也是「per-Pod 一份 libvirt connection」而不是 per-node 共用。這兩個設計加起來反映什麼樣的 per-VMI Pod 邊界？",
+    "options": [
+      "virt-launcher-monitor 是 watchdog：它 fork/exec 出 virt-launcher 後守著它，任何子 process (libvirtd / QEMU) 異常退出都讓 Pod 結束，給 Kubernetes 明確 termination semantics、避免 zombie。DomainManager (LibvirtDomainManager) 對應一份 libvirt connection、一個 VMI、一個 Pod，所以 Pod 重建 = libvirt connection 重建 = QEMU 重起；virt-handler 不在 Pod 內、也不持有 libvirt connection",
+      "virt-launcher-monitor 是給 virt-handler 用 ssh 進 Pod 的跳板；DomainManager 則是 virt-handler 的 in-memory cache",
+      "virt-launcher-monitor 把多個 VMI 共用同一個 libvirtd 來省記憶體；DomainManager 則是這個共用 libvirtd 的封裝",
+      "virt-launcher-monitor 等於 systemd PID 1；DomainManager 是 host 上 per-node 的 libvirt daemon，所有 Pod 共用"
+    ],
+    "answer": 0,
+    "explanation": "見 features/virt-handler-and-launcher.mdx：Pod process tree 是 PID 1 = virt-launcher-monitor → virt-launcher → libvirtd → qemu-kvm。monitor 唯一工作是 watch virt-launcher，掛了就讓 Pod 結束 — 避免 zombie 並讓 Pod 有明確的 termination semantics。pkg/virt-launcher/virtwrap/manager.go 的 LibvirtDomainManager 是 per-Pod instance：建出 NewLibvirtDomainManager 時拿到一份 libvirt connection、對應一個 VMI、一個 Pod，所以「VMI 重啟 = Pod 重建 = libvirt connection 重建 = QEMU 重起」這條 mental model 直接成立。virt-handler 是 per-node DaemonSet、跟 kubelet 平起平坐，不在 Pod 內、不持有 libvirt connection；它只透過 cmd-server gRPC 對 Pod 內的 virt-launcher 對話。"
   }
 ]
