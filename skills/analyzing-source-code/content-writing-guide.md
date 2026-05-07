@@ -1,485 +1,433 @@
+---
+name: content-writing-guide
+description: learning-k8s 寫 MDX 的具體規範。SKILL.md 講「怎麼分析」，本檔講「怎麼寫得讓初學者讀得進去」。每篇 next-site/content/{project}/features/*.mdx 應通過本檔的檢查表。
+---
+
 # Content Writing Guide
 
-This guide defines quality standards for all documentation pages in this site. Technical accuracy is necessary but not sufficient — pages must also be readable, progressive, and scenario-driven.
-
-**Every page author (human or AI) must follow the 5 UX rules below.**
-
----
-
-## The 5 UX Rules
-
-These rules exist because documentation written without them tends to feel like a specification sheet: accurate but hard to learn from. Engineers read docs to solve problems, not to memorize facts.
+> SKILL.md 是分析方法（讀 source、跑 5 個 exploration、產出 facts）；
+> 這份是寫作品質規範（讓 facts 變成讀者可吸收的內容）。
+>
+> 每篇 `next-site/content/{project}/features/*.mdx` 在送 PR 前都應對照本檔最後的「檢查清單」過一遍。
 
 ---
 
-### Rule 1: Scene Before Mechanism
+## 為什麼需要這份規範
 
-**Every feature page must open with a scenario (1-2 sentences) before any code or technical definition.**
+技術正確 ≠ 讀得懂。常見的失敗模式：
 
-The scenario answers: "What problem does a real engineer face that makes this feature relevant?"
+- 第一段直接丟出 `apiserver 透過 watch 通道 broadcast event 到 controller-manager 的 informer cache`——讀者連 informer 是什麼都還不知道。
+- 連續 7 個 bullet 列 7 個 component，每個 1 行，沒有任何串接散文——讀者讀完只記得最後一個。
+- 貼一坨 60 行 Go code，前後沒有任何說明——讀者不知道該看哪一行。
 
-❌ Bad opening:
-```
-## MachineController
-
-MachineController is a Kubernetes controller that reconciles Machine objects.
-It implements the controller-runtime Reconciler interface and watches
-for Machine CR creation, update, and deletion events.
-```
-
-✅ Good opening:
-```
-## MachineController
-
-When you apply a Machine YAML, something needs to translate that declaration into
-a real provisioned server. MachineController is what bridges that gap — it watches
-for new Machine CRs and drives them through the provisioning lifecycle until the
-physical machine joins the cluster as a Node.
-```
-
-The bad opening tells you *what* it is. The good opening tells you *why it exists*.
+learning-k8s 是個人深度學習網站，不是公開教學站，但**讀者就是未來的你自己**。半年後回來看這頁，能不能 30 秒內想起「這頁在講什麼」、能不能 5 分鐘內定位到關鍵那段 code？這份規範就是為了確保「能」。
 
 ---
 
-### Rule 2: No Waterfall Listing
+## 5 條 UX 原則（先有原則再有模板）
 
-**Never write "Function A does X, Function B does Y, Function C does Z" as a prose inventory.**
+### 1. Scene Before Mechanism（場景先於機制）
 
-This pattern forces readers to hold multiple disconnected facts in memory before any meaning emerges. Instead, explain the flow: what triggers what, what depends on what, what happens when something goes wrong.
+**每頁都應以「使用者會遇到的具體場景」開場，再帶入機制。**
 
-❌ Bad (waterfall listing):
+場景回答：「真正的工程師在什麼情境下會關心這頁？沒有這頁的知識會怎樣？」
+
+反例：
+
+```mdx
+## 控制平面架構
+
+Kubernetes control plane 由 kube-apiserver、etcd、kube-scheduler、
+kube-controller-manager、cloud-controller-manager 等元件組成。
+本文介紹這些元件的功能。
 ```
-## MachineReconciler 的實作
 
-MachineReconciler 呼叫 reconcileMachine() 函數。
-reconcileMachine() 呼叫 getMAASmachine() 從 MAAS API 取得機器狀態。
-getMAASmachine() 使用 HTTP client 發送 GET 請求到 MAAS endpoint。
-回傳的機器物件包含 SystemID、Hostname、PowerState 等欄位。
-MachineReconciler 接著呼叫 patchMachine() 更新 status。
+正例（取自 `next-site/content/kubernetes/features/architecture.mdx:7-11`）：
+
+```mdx
+## 場景
+
+你第一次 ssh 進 control plane node，跑 `ps -ef | grep kube`，
+期待看到一堆熟悉的 process。結果只有一個 kubelet 在跑。
+kube-apiserver、etcd、kube-scheduler、kube-controller-manager
+都不見了——它們竟然是 container。整個 control plane 是 Pod。
 ```
 
-✅ Good (scene → flow → code):
+差別：反例告訴你「是什麼」；正例告訴你「為什麼你會在意」，且埋下後續 static Pod 那段的伏筆。
+
+> 場景不一定是「使用者操作」。也可以是「除錯時你看到的怪現象」、「你以為 X 但其實 Y」、「跨 project 的設計選擇對比」。重點是**讀者能立刻代入**。
+
+---
+
+### 2. No Waterfall Listing（不要瀑布式列舉）
+
+**不要連續用「A 呼叫 B、B 呼叫 C、C 呼叫 D」這種一行一句的條列堆滿一段。**
+
+這種寫法強迫讀者把零散事實塞進工作記憶，讀完一段腦袋是空的。**改用「流程化敘述」**：什麼觸發什麼、什麼 block 什麼、失敗會怎樣。
+
+反例：
+
+```mdx
+Migration controller 呼叫 reconcile()。
+reconcile() 呼叫 validateVMI() 檢查 VMI 狀態。
+validateVMI() 檢查 VMI.status.conditions 是否有 LiveMigratable。
+然後呼叫 createTargetPod() 建立 target Pod。
+createTargetPod() 呼叫 podClient.Create()。
+patchVMIStatus() 更新 migrationState。
 ```
-## 機器從申請到就緒
 
-當你建立一個 MAAsMachine CR，三件事會依序發生：
+正例（取自 `next-site/content/kubevirt/features/live-migration.mdx:13-53`）：先用 ASCII flow 圖把「VMIM CRD → controller → target Pod → virt-handler → libvirt」整段串起來，再針對其中 **一個** 步驟貼 code。讀者先有 mental model，code 才有意義。
 
-1. **偵測** — Reconciler 發現新 CR，查詢 MAAS 找到對應的實體機
-2. **啟動** — 透過 MAAS API 觸發 PXE boot，等待 OS 安裝完成
-3. **交接** — 機器就緒後設定 `providerID`，通知 CAPI 開始 bootstrap
+> 一個簡易判準：如果你的段落第一句是「然後」「接著」「接下來」「最後」這四個之一連續超過 3 個 bullet，就應該改寫成編號流程或圖。
 
-以下是步驟 1 的核心邏輯，位於 `controllers/maasmachine_controller.go`：
-```go
-// File: controllers/maasmachine_controller.go
-machine, err := r.MaasClient.GetMachineByHostname(ctx, maasRef.Hostname)
-if err != nil {
-    return ctrl.Result{}, fmt.Errorf("querying MAAS: %w", err)
+---
+
+### 3. Diagram Before Code（圖在 code 之前）
+
+**有跨元件互動、有時序的概念，先畫圖再貼 code。**
+
+Code 講「實作怎麼寫」，圖講「系統長怎樣」。讀者要先有 mental model 才看得懂 implementation。
+
+順序定錨（每個小節內）：
+
+1. 場景 / 問題（Rule 1）
+2. 圖（架構 / 流程 / 時序）
+3. 對圖的 1-2 段散文解釋
+4. Code（每塊都要有 Rule 5 的鋪陳）
+5. 邊界條件 / 注意事項
+
+learning-k8s 的圖檔規範：
+
+- **靜態 PNG**，存 `next-site/public/diagrams/{project}/{name}.png`
+- 引用：`![alt text 描述圖在說什麼](/diagrams/{project}/{name}.png)`
+- **禁止 Mermaid**（CLAUDE.md 規定）
+- ASCII art flow 圖也算「圖」，可接受。實際上現存大多數頁面 (`architecture.mdx:13-37`、`agent-and-datapath.mdx:14-24`、`live-migration.mdx:13-53`) 都用 ASCII art——夠表達就不用畫 PNG。
+- **嚴禁 1×1 placeholder PNG**（`make validate` 會擋）
+
+---
+
+### 4. Progressive Disclosure（漸進式揭露）
+
+**按「為什麼存在 → 怎麼用 → 原始碼怎麼實作 → 進階邊界」分四層。每層內部不要跳級。**
+
+讀者分兩種：junior 從上往下讀到夠用就停；senior 直接跳到 code 區塊。**任何一種都不該被迫讀完另一種人需要的內容**才能拿到自己要的。
+
+四層的內容約束：
+
+| 層 | 該寫 | **不該** 寫 |
+|---|---|---|
+| 1. 為什麼存在 | 場景、痛點、跟相鄰元件的對比 | cgroup namespace 細節、syscall 名 |
+| 2. 怎麼用 | YAML 範例、kubectl 指令、概念上的流程 | 內部 struct 名稱、goroutine 模型 |
+| 3. 原始碼怎麼實作 | file:line 引用、函式簽章、關鍵 code 片段 | 太細節的 helper（除非是核心邏輯）|
+| 4. 進階 / 邊界 | corner case、效能調優、版本差異、跟其他 project 的整合陷阱 | 會 distract 主線的 trivia |
+
+跳級的反例：「為什麼存在」段就出現 `mount propagation = rslave`——讀者第一次看會直接放棄。
+
+---
+
+### 5. Explain Before Quote（先說明再貼）
+
+**任何 code block / YAML / table / 圖之前，至少 1 段話描述「等下要看什麼、為什麼貼這段」。**
+
+不是「以下是 code：」這種空洞句。要具體到讓讀者知道**該注意哪一行**。
+
+反例：
+
+```mdx
+reconcile 函式如下：
+
+\`\`\`go
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // ... 60 行 ...
 }
-```
-```
-
-The bad version lists functions. The good version tells a story with numbered steps, then shows the code for one specific step.
-
----
-
-### Rule 3: Architecture Diagram Before Code
-
-**If a page has both a concept diagram and code snippets, the diagram comes first.**
-
-Code shows *how* something is implemented. A diagram shows *what* the system looks like. Readers need the mental model before they can make sense of implementation details.
-
-Order within a section:
-1. Scenario / problem statement (Rule 1)
-2. Architecture diagram or flow diagram
-3. High-level explanation of the diagram
-4. Code blocks (Rule 5 applies to each)
-5. Edge cases and gotchas
-
----
-
-### Rule 4: Progressive Disclosure
-
-**Structure each page: Overview → Why it matters → How it works → Code detail → Edge cases.**
-
-Junior engineers read top-down and stop when they have enough context. Senior engineers skip to the code. Neither should be forced to wade through the other's content to get what they need.
-
-**Page structure template:**
-```
-## Overview
-  1-2 paragraph scenario + what this page covers
-
-## 為什麼需要它
-  The problem this solves. What breaks without it.
-
-## 工作原理
-  High-level flow, diagram, key concepts.
-  No implementation code yet.
-
-## 實作細節
-  Code blocks with file paths.
-  Data structures, function signatures.
-
-## 注意事項與邊界情況
-  What can go wrong. Non-obvious behavior.
-  <Callout type="warning"> blocks go here.
+\`\`\`
 ```
 
----
+正例（取自 `next-site/content/cilium/features/agent-and-datapath.mdx:30-39`）：
 
-### Rule 5: Explain Before Quote
+```mdx
+`Regenerate()` 是入口。當 endpoint 的 desired state 變動
+（label 改、policy 變、新建立）時呼叫：
 
-**Every code block must be preceded by one sentence explaining what the reader is about to see.**
-
-❌ Bad (code dropped without context):
-```
-The reconciler processes machines in a loop.
-
-```go
-// File: controllers/machine_controller.go
-for _, m := range machines {
-    if err := r.reconcileOne(ctx, m); err != nil {
-        ...
-    }
+\`\`\`go
+// File: cilium/pkg/endpoint/policy.go (line 759)
+func (e *Endpoint) Regenerate(...) <-chan bool {
+    // 排隊到 endpoint 自己的 regen queue
+    // worker goroutine 真正執行 regenerateBPF
 }
-```
+\`\`\`
 ```
 
-✅ Good (one sentence before the block):
-```
-The reconciler iterates over all machines in the queue, stopping on the first error
-to avoid cascading failures:
-
-```go
-// File: controllers/machine_controller.go
-for _, m := range machines {
-    if err := r.reconcileOne(ctx, m); err != nil {
-        return ctrl.Result{}, fmt.Errorf("reconciling machine %s: %w", m.Name, err)
-    }
-}
-```
-```
+讀者看到 code block 時已經知道：(a) 入口函式叫什麼、(b) 什麼時機觸發、(c) 該注意它是 async 排隊。
 
 ---
 
-## MDX Page Templates
+## 三段式模板（每篇 features/*.mdx 的骨架）
 
-### Template: Architecture Page (`architecture.mdx`)
+learning-k8s 的 feature 頁強制以這個結構開場、收尾。中段隨內容彈性調整。
 
 ```mdx
 ---
-title: "{Project} — 系統架構"
-description: "系統元件、資料流與核心設計決策"
+layout: doc
+title: {Project} — {Feature 名稱}
+description: {1-2 句說這頁在講什麼。要具體，避免「介紹 X 元件」這種空話。}
 ---
 
-# {Project} — 系統架構
+## 場景
+（Rule 1）
+{2-4 句描述：使用者會遇到的具體情境 / 怪現象 / 設計問題。}
 
-## 概述
+{1 段話列出本頁要解開哪些問題（可選；若場景已經帶出問題就省）。}
 
-{1-2 sentence scenario: what problem does this system solve for an operator or developer?}
+## {主要機制名稱}
+（中段；隨內容寫。可拆 2-5 個小節。每節遵守 Rule 2-5。）
 
-{Project} 由以下幾個核心元件組成：
+### 第 1 個概念（圖 → 解說 → code）
 
-| 元件 | 職責 |
-|------|------|
-| {Component A} | {one line} |
-| {Component B} | {one line} |
-| {Component C} | {one line} |
+{1 段散文鋪陳場景中的某個面向。}
 
-## 架構圖
+```
+{ASCII flow 圖 或 PNG ![alt](/diagrams/{project}/x.png)}
+```
 
-下圖顯示各元件之間的控制流與資料流：
+{1-2 段對圖的解釋——arrow 方向是什麼、numbered step 對應什麼。}
 
-![{Project} 系統架構](/diagrams/{project}/architecture.png)
-
-{2-3 sentences explaining the diagram — what the arrows mean, what the numbered steps represent.}
-
-## 核心元件說明
-
-### {Component A}
-
-{Scenario: when would an engineer care about this component?}
-
-{Component A} 負責...（解釋職責，不要只列函數名稱）
-
-以下是它的主要入口點，位於 `{path/to/file.go}`：
+{1 段話交代「以下這塊 code 為什麼貼」。}
 
 ```go
-// File: {path/to/file.go}
-{actual code from the file}
+// File: {real/path/from/repo}.go (line N)
+{actual code, 不超過 20 行}
 ```
 
-<Callout type="tip" title="設計決策">
-  {Why was it designed this way? What alternative was rejected and why?}
-</Callout>
+{1-2 句解讀這塊 code 的「非顯然之處」。}
 
-### {Component B}
+### 第 2 個概念……
 
-{same pattern}
+（同上）
 
-## 資料流
+## 接下來 / 相關頁面
 
-{Explain the flow of data through the system. Use numbered steps. Reference the diagram.}
-
-1. 當使用者建立 `{Resource}` 時，{what happens first}
-2. {Component A} 收到事件後，{what it does}
-3. ...
-
-## 狀態機（如適用）
-
-{If the resource has a Phase/State field, explain the transitions here.}
-
-![{Project} 狀態轉換圖](/diagrams/{project}/state-machine.png)
-
-| 狀態 | 觸發條件 | 下一狀態 |
-|------|---------|---------|
-| {State A} | {condition} | {State B} |
-| {State B} | {condition} | {State C} |
-
-<Callout type="warning" title="注意">
-  {Important non-obvious behavior, e.g., what happens if the system crashes mid-transition}
-</Callout>
-
-## 相關頁面
-
-<Callout type="info" title="延伸閱讀">
-  - [{Feature page title}](../{slug}) — {one line about what's there}
-  - [{Another page}](../{slug}) — {one line}
-</Callout>
+- [{相關 feature 1}](/{project}/features/{slug}) — {1 行說那邊講什麼}
+- [{相鄰 project 的相關概念}](/{other-project}/features/{slug}) — {1 行}
 ```
+
+> 不要 import 任何 component（`<Callout>`、`<QuizQuestion>` 等）。它們是全域註冊，加 import 反而會壞掉。
 
 ---
 
-### Template: Feature Detail Page (`{feature}.mdx`)
+## Glossary 規範（解 pain-points 跨 project 共通主題：「術語首次出現未鋪陳」）
+
+每個 project **第一頁** features（通常是 `architecture.mdx`）的 frontmatter 之後、`## 場景` 之前，應放一個 blockquote 列出**會用到的外部術語**。一句話交代是什麼，不展開。
+
+格式：
 
 ```mdx
 ---
-title: "{Project} — {Feature Name}"
-description: "{One-line description}"
+layout: doc
+title: ...
+description: ...
 ---
 
-# {Project} — {Feature Name}
+> **會用到的外部術語**
+> - **Paxos quorum**：分散式系統「過半節點同意才算數」的共識協定
+> - **netlink**：Linux kernel 給 user-space 設定 network 的 syscall family
+> - **mount propagation**：bind mount 在 namespace 之間是否傳遞掛載事件
+> - **Hive cell DI**：cilium 用的 dependency injection 容器，每個 cell 是一個可注入單元
+> - **Paxos / Raft**：兩種主流的分散式共識演算法，etcd 用 Raft
+> - **PodResources gRPC**：kubelet 暴露給 device-plugin 查詢 Pod 與 device 對應關係的 gRPC service
 
-## 使用情境
-
-{Concrete scenario: who needs this, what are they trying to accomplish, what breaks without this feature?}
-
-## 工作原理
-
-{High-level explanation without code. Answer: what are the key steps? who is involved? what are the inputs and outputs?}
-
-{diagram if applicable}
-
-![{Feature} 流程圖](/diagrams/{project}/{feature}-flow.png)
-
-## 核心邏輯
-
-### {Sub-feature or Step 1}
-
-{One sentence explaining what the code below does.}
-
-```go
-// File: {real/path/to/file.go}
-{actual code from grep/view}
+## 場景
+...
 ```
 
-{1-2 sentences interpreting the code — what to notice, what's non-obvious.}
+判準：**這個術語在本 project source code 之外（kernel、外部 library、學術名詞）也存在，且讀者不一定學過**——就列進來。
 
-### {Step 2 / Sub-feature 2}
-
-{One sentence explaining what the code below does.}
-
-```go
-// File: {real/path/to/file.go}
-{actual code}
-```
-
-## 設定選項
-
-| 參數 | 類型 | 預設值 | 說明 |
-|------|------|--------|------|
-| `{field}` | `{type}` | `{default}` | {what it controls} |
-
-## 注意事項
-
-<Callout type="warning" title="常見陷阱">
-  {What breaks in production. What limits exist. What's not obvious from the docs.}
-</Callout>
-
-<Callout type="tip" title="最佳實踐">
-  {Recommendation based on the code analysis.}
-</Callout>
-
-## 相關頁面
-
-<Callout type="info" title="延伸閱讀">
-  - [{Related page}](../{slug}) — {one line}
-</Callout>
-```
+learning-k8s 自己的概念（k8s 的 Pod、cilium 的 endpoint、ceph 的 OSD）**不**列進 glossary，那些在內文第一次出現時用半句話帶過即可。
 
 ---
 
-### Template: Quiz Page (`app/[project]/quiz/page.tsx`)
+## 連結規範
 
-The quiz page is a React route that reads from `content/{project}/quiz.json`. It does not use MDX. See [quiz-generation/SKILL.md](../quiz-generation/SKILL.md) for how to generate quiz questions.
+learning-k8s 是純靜態網站（`output: 'export'`），所有連結都應該離線可用。
 
-The quiz.json format:
+| 場景 | 寫法 |
+|---|---|
+| 同 project 內的 forward link | `[kubelet](/kubernetes/features/kubelet)`（絕對路徑） |
+| 跨 project 引用概念 | `[cilium 的 endpoint regeneration](/cilium/features/agent-and-datapath)` |
+| 引原始碼某個檔案 | 用 `File: project-name/pkg/foo/bar.go (line N)` 註解，**不**外連 GitHub |
+| 引外部規範 / RFC | 可外連，但僅在 Glossary 或「接下來」段 |
+
+**禁止**外連 GitHub blob URL 當作主要 reference。原因：(a) 學習者可能離線、(b) submodule 已經 pin 在特定版本，外連到 master 會錯版。改用相對路徑 + line number。
+
+範例（取自 `next-site/content/kubernetes/features/architecture.mdx:100-106`）有外連 GitHub 是因為它在「進入點對照表」末段，當作 v1.36.0 specific 的版本參考——這種**輔助性**外連可以接受，但**不是**正文的主要 reference。
+
+---
+
+## QuizQuestion 規範
+
+- 每個 features/*.mdx **至少 1 道 quiz**，放在 `next-site/content/{project}/quiz.json`，**不要** inline 進 MDX
+- distractor（錯誤選項）要是「真的可能誤解」的內容，不是隨手寫的廢話
+  - 反例：`A. 對 / B. 錯 / C. 我不知道 / D. 以上皆非`
+  - 正例：4 個選項都是「乍看合理但其中只有 1 個 source code 真的這樣寫」
+- `id` 是整數、`answer` 是 0-indexed
+- 每題附 `explanation` 解釋「為什麼這個對、其他為什麼錯」
+
+格式（與 `make validate` 對齊）：
+
 ```json
 [
   {
-    "section": "🏗️ 核心架構",
-    "question": "1. {question text}",
+    "id": 1,
+    "question": "kube-apiserver 啟動時，誰是第一個 client？",
     "options": [
-      "{option A}",
-      "{option B}",
-      "{option C}",
-      "{option D}"
+      "kube-controller-manager",
+      "kubelet（以 static Pod 模式啟動 apiserver 自己）",
+      "etcd（apiserver 主動連 etcd）",
+      "kubectl"
     ],
-    "answer": 0,
-    "explanation": "{why the answer is correct, and why others are wrong}"
+    "answer": 2,
+    "explanation": "apiserver 啟動時做的第一件事是連 etcd 拉狀態。它自己是被 kubelet 以 static Pod 啟動，但那是『誰起 apiserver』，不是 apiserver 的『第一個 client』。"
   }
 ]
 ```
 
 ---
 
-## Component Usage in MDX
+## 圖表規範
 
-### `<Callout>`
+| 規則 | 細節 |
+|---|---|
+| 格式 | **PNG**（禁 Mermaid、禁 SVG、禁 GIF） |
+| 路徑 | `next-site/public/diagrams/{project}/{name}.png` |
+| 引用前 | 1 段話描述「等下要看什麼」（Rule 5） |
+| alt text | 必須有，且能描述圖的內容（不是「圖一」這種廢話） |
+| 1×1 placeholder | **嚴禁**（`make validate` 會擋下） |
+| ASCII art | 接受。簡單的 flow / box diagram 用 ASCII 即可。複雜時序圖才畫 PNG |
 
-Use for important asides, warnings, tips, and contextual notes.
+命名慣例：
+
+- `architecture.png`：整體系統架構
+- `state-machine.png`：CRD 的 phase / state 轉換
+- `{feature}-flow.png`：某個 feature 的流程
+- `{feature}-sequence.png`：multi-actor 時序
+
+---
+
+## 常見反模式
+
+### Anti-pattern 1：Definition Dump
 
 ```mdx
-<Callout type="info" title="背景知識">
-  This is informational context.
-</Callout>
-
-<Callout type="warning" title="注意">
-  This warns about non-obvious behavior or common mistakes.
-</Callout>
-
-<Callout type="tip" title="提示">
-  This offers a practical recommendation.
-</Callout>
-
-<Callout type="danger" title="警告">
-  This warns about something that can cause data loss or security issues.
-</Callout>
-```
-
-**When to use each type:**
-
-| Type | Use for |
-|------|---------|
-| `info` | Background context, related concepts, cross-references |
-| `warning` | Common mistakes, non-obvious limitations, version differences |
-| `tip` | Best practices, performance hints, workflow recommendations |
-| `danger` | Data loss risks, security issues, breaking change warnings |
-
-**Callout placement rules:**
-- `warning` and `danger`: place AFTER the explanation, not before. The reader needs context before the caution is meaningful.
-- `tip`: place AFTER the main explanation, as a "now that you understand, here's how to use it well" addition.
-- `info`: can appear anywhere, often best at the start of a section to provide context.
-
----
-
-### `<QuizQuestion>`
-
-Use in quiz pages (via quiz.json) — **not in regular feature MDX pages**.
-
-The component is used by the quiz route at `app/[project]/quiz/page.tsx` and reads from `content/{project}/quiz.json`. Individual feature pages should not embed quiz questions.
-
----
-
-## Diagram Usage
-
-All diagrams are static PNG files (generated with `skills/fireworks-tech-graph/`).
-
-**Where to store them:** `next-site/public/diagrams/{project}/{diagram-name}.png`
-
-**How to reference in MDX:**
-```mdx
-![Architecture overview](/diagrams/{project}/architecture.png)
-```
-
-**Naming conventions:**
-- `architecture.png` — overall system architecture
-- `state-machine.png` — resource phase/state transitions
-- `{feature}-flow.png` — flow diagram for a specific feature
-- `{feature}-sequence.png` — sequence diagram for multi-actor flows
-
-**When a diagram is needed:**
-- Any page that describes a multi-step flow with 3+ actors → sequence or flow diagram
-- Any page that describes resource lifecycle states → state machine diagram
-- The architecture page → always needs an architecture diagram
-
-If a diagram generator script is needed, save it in `scripts/diagram-generators/{project}-{diagram}.py`.
-
----
-
-## Common Writing Anti-Patterns
-
-### Anti-pattern: The Definition Dump
-
-Writing a page that starts with a list of definitions:
-
-```
 ## 基本概念
 
-**Machine**: A Machine is a Kubernetes custom resource that...
-**MachineSet**: A MachineSet is a Kubernetes custom resource that...
-**MachineDeployment**: A MachineDeployment is a Kubernetes custom resource that...
+**Endpoint**: cilium 的 endpoint 是...
+**Identity**: cilium 的 identity 是...
+**Policy**: cilium 的 policy 是...
 ```
 
-**Fix:** Start with a scenario where an engineer needs to understand these things. Introduce each concept *when the scenario calls for it*, not in a batch at the beginning.
+修正：開頭用一個場景（「Pod 落地半秒就能通訊，中間發生了什麼？」），讓 endpoint / identity / policy 在故事流程裡**該出現的時候才出現**，不要批次 dump。
 
----
+### Anti-pattern 2：Wall of Code
 
-### Anti-pattern: The Wall of Code
+一個小節 80% 是 code block，每塊 30+ 行，前後幾乎沒有解釋。
 
-A section that is 80% code blocks with minimal explanation between them.
+修正：套 Rule 5，每塊 code 之前 1 段、之後 1-2 句解讀。code 不要超過 20 行（超過就應該分塊或省略）。
 
-**Fix:** Apply Rule 5 (explain before quote) to every block. After each block, add 1-2 sentences interpreting what the code shows. Then move to the next block.
+### Anti-pattern 3：Missing Cross-References
 
----
+頁面寫完沒有「接下來」段，讀者不知道下一步該看哪頁。
 
-### Anti-pattern: The Shallow Architecture Section
+修正：每篇 MDX 最後都應該有 2-4 個相關連結。同 project 為主，跨 project 為輔。
 
+### Anti-pattern 4：Translating the Untranslatable
+
+把 `Pod`、`namespace`、`reconcile` 等名詞翻成中文。
+
+修正：對照 CLAUDE.md 的 never-translate 清單。技術名詞保留英文原文。
+
+### Anti-pattern 5：Code Without `File:` Comment
+
+```go
+func reconcile() { ... }
 ```
-## 架構
 
-這個專案包含 Controller、API Server 和 Webhook 三個元件。
-Controller 負責協調資源。API Server 提供 API。Webhook 驗證資源。
-```
+讀者不知道這 code 是哪裡來的，無法去 source 對照。
 
-**Fix:** Each component deserves a dedicated subsection explaining *what problem it solves* (not just what it does), *how it interacts with the others*, and *what would break if it were removed*.
+修正：每塊 code block 第一行加 `// File: project/pkg/foo/bar.go (line N)`。沒有 `File:` 註解的 code block 在 review 時應退稿。
 
----
+### Anti-pattern 6：Untyped Quotes
 
-### Anti-pattern: Missing Cross-References
+引用上游文件 / spec / RFC 的內容，但沒標出處。
 
-Pages written in isolation with no links to related pages.
-
-**Fix:** Every page must end with a `<Callout type="info">` block listing 2-4 related pages with one-line descriptions of what's there.
+修正：引用 spec / kep / blog 等外部來源時，至少加一行「`-- source: KEP-1234`」。
 
 ---
 
-## Language Reference
+## 語言規範速查（補 CLAUDE.md）
 
-**Approved zh-TW phrasing for common documentation patterns:**
+| 場景 | 用法 |
+|---|---|
+| 動詞連接 K8s 名詞 | 「watch Service」「list Pod」「reconcile VirtualMachine」——**動詞用英文也可以** |
+| 「使用者透過 X 來 Y」 | 「使用者用 `kubectl apply` 建 Deployment」——比「使用者通過 kubectl apply 來建立 Deployment」自然 |
+| 否定式 | 「不會」「不能」「不該」——避免「不可以」「不可能」這類書面腔 |
+| 比較句 | 「A 比 B 快」「A 跟 B 不同」——避免「相比於」「與……相比」 |
+| 條件式 | 「如果 X，那 Y」 / 「X 的時候 Y」——避免「在 X 的情況下」 |
 
-| English | zh-TW |
-|---------|-------|
-| "reconcile loop" | 協調迴圈 |
-| "watches for changes" | 監聽變化 / 監控事件 |
-| "owner reference" | 擁有者參考 |
-| "control plane" | 控制平面 |
-| "data plane" | 資料平面 |
-| "bootstrap" | 引導啟動（keep "bootstrap" in code) |
-| "provision" | 佈建 |
-| "drain a node" | 排空節點 |
-| "cordon a node" | 隔離節點 |
-| "garbage collect" | 垃圾回收 |
-| "leader election" | Leader 選舉 |
-| "lease" | 租約 (keep "Lease" for the Kubernetes resource) |
+never-translate 清單（從 CLAUDE.md 摘）：`node`, `cluster`, `controller`, `namespace`, `container`, `image`, `workload`, `bare-metal`, `gateway`, `scheduling`, `rolling update`, `label`, `Pod`, `Deployment`, `Service`, `ConfigMap`, `Secret`, `PV`, `PVC`, `StorageClass`, `CRD`, `webhook`, `reconcile`, `operator`, `daemon`, `sidecar`, `taint`, `toleration`, `affinity`。
 
-**Always keep in English (never translate):** Controller, Reconciler, CRD, CR, Webhook, Operator, Pod, Node, Namespace, ConfigMap, Secret, Deployment, StatefulSet, DaemonSet, ReplicaSet, Service, Ingress, PersistentVolume, PersistentVolumeClaim, StorageClass, RBAC, ClusterRole, ServiceAccount, Finalizer, OwnerReference, Phase, Status, Spec, Annotation, Label, Selector.
+學習過程也禁用大陸 / 港式用語：軟體（非软件 / 软体）、網路（非网络）、檔案（非文件）、程式（非程序）、預設（非默认）、資料（非数据）、使用者（非用户）、影片（非视频）、解析度（非分辨率）、滑鼠（非鼠标）。
+
+---
+
+## 送 PR 前的檢查清單
+
+打勾後再 commit：
+
+### 結構
+- [ ] 三段式齊全（`## 場景` → 中段機制 → `## 接下來`）？
+- [ ] 第一頁 features（架構頁）有 Glossary blockquote？
+- [ ] frontmatter 有 `layout: doc` + `title:` + `description:`？
+
+### 內容
+- [ ] 每個 code block 前都有 1 段話鋪陳（Rule 5）？
+- [ ] 每個 code block 第一行有 `// File: ...` 註解？
+- [ ] 沒有連續超過 5 個 bullet 的瀑布式列舉？
+- [ ] 沒有跳級（「為什麼存在」段沒出現過深的細節）？
+- [ ] 圖在 code 之前？
+
+### 視覺
+- [ ] 圖是 PNG（或 ASCII art），**不是** Mermaid？
+- [ ] PNG 不是 1×1 placeholder？
+- [ ] PNG 引用前有 1 段話描述「等下要看什麼」？
+- [ ] PNG 有 alt text？
+
+### 測驗
+- [ ] `quiz.json` 有對應這頁的題目（至少 1 題）？
+- [ ] `id` 是整數、`answer` 是 0-indexed？
+- [ ] 每題有 `explanation`？
+- [ ] distractor 是「真的可能誤解」的選項？
+
+### 連結
+- [ ] 「接下來」段有 2-4 個相關連結？
+- [ ] 沒有把主要 reference 設成外連 GitHub？
+- [ ] 跨 project 引用用 `/{project}/features/{slug}` 絕對路徑？
+
+### 語言
+- [ ] 全篇台灣繁中？
+- [ ] never-translate 詞保留英文原文？
+- [ ] 沒有大陸 / 港式用語？
+
+### 自動驗證
+- [ ] `make validate` exit 0？
+
+---
+
+## 回頭讀自己的文章
+
+寫完隔 1 天回來讀一次。問自己 3 個問題：
+
+1. **半年後的我** ssh 進 cluster 除錯時，能不能用這頁的內容快速定位問題？
+2. **沒讀過 source** 的工程師，看完這頁能不能講出大致流程？
+3. **讀過 source** 的工程師，看完這頁有沒有「喔，這個設計原來是為了 X」這種收穫？
+
+3 題只要有 1 題答不出來，這頁就還沒寫完。
