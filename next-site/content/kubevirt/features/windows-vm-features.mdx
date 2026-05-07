@@ -1,0 +1,434 @@
+---
+layout: doc
+title: KubeVirt — Windows VM features
+description: Hyper-V enlightenments、hypervclock、SMM、persistent vTPM 如何從 VM spec 轉成 libvirt/QEMU 設定。
+---
+
+## 場景
+
+你在 KubeVirt `VirtualMachine` template 裡看到一串 Windows VM 相關參數：
+
+```yaml
+spec:
+  template:
+    spec:
+      domain:
+        clock:
+          timer:
+            hyperv: {}
+        features:
+          hyperv:
+            relaxed: {}
+            vapic: {}
+            spinlocks:
+              spinlocks: 8191
+            vpindex: {}
+            runtime: {}
+            synic: {}
+            synictimer:
+              direct: {}
+            frequencies: {}
+            reenlightenment: {}
+            tlbflush:
+              direct: {}
+              extended: {}
+            ipi: {}
+          smm:
+            enabled: true
+        devices:
+          tpm:
+            persistent: true
+```
+
+這些欄位看起來都跟 Windows、Hyper-V、TPM、Secure Boot 有關，但它們不是同一類東西。本頁使用已驗證的 stable 原始碼版本：KubeVirt `v1.8.2`、QEMU `v11.0.0`、libvirt `v12.3.0`。因為最後真正產生 QEMU command line 的邏輯不在 KubeVirt repo，所以本頁也追到 QEMU 與 libvirt 原始碼。
+
+先修正一個常見 typo：欄位路徑是 `spec.template.spec.domain.features.hyperv`，不是 `features.typerv`。寫成 `typerv` 只會變成 unknown field；實際結果取決於 CRD schema 與 admission，但一定不會啟用 Hyper-V enlightenment。
+
+## 三種不同層次
+
+這組設定可以先拆成三層：
+
+| KubeVirt 欄位 | 本質 | 最後大致落點 |
+|---|---|---|
+| `clock.timer.hyperv` | Windows 用的 paravirtualized clock timer | libvirt `<timer name='hypervclock'>`，QEMU `hv-time=on` |
+| `features.hyperv.*` | Hyper-V enlightenments | libvirt `<features><hyperv>...`，QEMU `hv-*` CPU flags |
+| `features.smm`、`devices.tpm.persistent` | firmware/security/stateful device | libvirt `<smm/>`、`<tpm model='tpm-crb'>`、swtpm state PVC mount |
+
+也就是說，`clock.timer.hyperv` 雖然最後也會打開 QEMU 的 `hv-time`，但它在 KubeVirt API 裡不屬於 `features.hyperv` 那包。這個差異對除錯很重要，因為你查 libvirt XML 時會分別出現在 `<clock>` 與 `<features>`。
+
+## clock.timer.hyperv
+
+KubeVirt API 對 `Timer.Hyperv` 的註解很明確：這是 Hyper-V clock，讓 Windows guest 用 paravirtualized 方式讀 host wall clock。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+// Hyperv (Hypervclock) - lets guests read the host’s wall clock time (paravirtualized). For windows guests.
+Hyperv *HypervTimer `json:"hyperv,omitempty"`
+```
+
+converter 會把這個欄位轉成 libvirt timer：
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/compute/clock.go
+if source.Timer.Hyperv != nil {
+    newTimer := api.Timer{Name: "hypervclock"}
+    newTimer.Present = boolToYesNo(source.Timer.Hyperv.Enabled, true)
+    clock.Timer = append(clock.Timer, newTimer)
+}
+```
+
+libvirt 在建 QEMU CPU 參數時，看到 `hypervclock` timer 且 `present=yes`，才會加上 `hv-time=on`：
+
+```c
+// File: libvirt/src/qemu/qemu_command.c
+case VIR_DOMAIN_TIMER_NAME_HYPERVCLOCK:
+    if (timer->present == VIR_TRISTATE_BOOL_YES)
+        virBufferAddLit(&buf, ",hv-time=on");
+    break;
+```
+
+QEMU docs 把 `hv-time` 定義成 Hyper-V-specific clocksource，包含 MSR-based clocksource 與 Reference TSC page。對 Windows VM 來說，這是時間讀取路徑，不是一般 I/O 加速。
+
+## features.hyperv 的轉換規則
+
+KubeVirt 的 `FeatureState` 有一個很重要的慣例：
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+// Enabled determines if the feature should be enabled or disabled on the guest.
+// Defaults to true.
+Enabled *bool `json:"enabled,omitempty"`
+```
+
+所以這兩種寫法在語意上都是打開：
+
+```yaml
+relaxed: {}
+```
+
+```yaml
+relaxed:
+  enabled: true
+```
+
+converter 也是用 `boolToOnOff(source.Enabled, true)`，所以空物件會變成 libvirt `state='on'`。
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/compute/hypervisor_features.go
+func convertFeatureState(source *v1.FeatureState) *api.FeatureState {
+    if source != nil {
+        return &api.FeatureState{
+            State: boolToOnOff(source.Enabled, true),
+        }
+    }
+    return nil
+}
+```
+
+KubeVirt 會把 `FeatureHyperv` 裡的欄位一一搬到自己的 libvirt XML struct：
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/compute/hypervisor_features.go
+hyperv.Relaxed = convertFeatureState(source.Relaxed)
+hyperv.Runtime = convertFeatureState(source.Runtime)
+hyperv.SyNIC = convertFeatureState(source.SyNIC)
+hyperv.SyNICTimer = convertV1ToAPISyNICTimer(source.SyNICTimer)
+hyperv.VAPIC = convertFeatureState(source.VAPIC)
+hyperv.VPIndex = convertFeatureState(source.VPIndex)
+hyperv.Frequencies = convertFeatureState(source.Frequencies)
+hyperv.Reenlightenment = convertFeatureState(source.Reenlightenment)
+hyperv.TLBFlush = convertTLBFlushFeature(source.TLBFlush)
+hyperv.IPI = convertFeatureState(source.IPI)
+```
+
+libvirt 讀到 `<features><hyperv>...</hyperv></features>` 之後，最後會在 QEMU CPU argument 上輸出 `hv-*`：
+
+```c
+// File: libvirt/src/qemu/qemu_command.c
+if (def->hyperv.features[i] == VIR_TRISTATE_SWITCH_ON) {
+    const char *name = virDomainHypervTypeToString(i);
+    g_autofree char *full_name = g_strdup_printf("hv-%s", name);
+    const char *qemu_name = virQEMUCapsCPUFeatureToQEMU(def->os.arch, full_name);
+    virBufferAsprintf(buf, ",%s=on", qemu_name);
+}
+```
+
+特殊子欄位則另外展開：
+
+| KubeVirt 欄位 | libvirt XML | QEMU CPU flag |
+|---|---|---|
+| `spinlocks.spinlocks` | `<spinlocks state='on' retries='8191'/>` | `hv-spinlocks=0x1fff` |
+| `synictimer.direct` | `<stimer state='on'><direct state='on'/></stimer>` | `hv-stimer=on,hv-stimer-direct=on` |
+| `tlbflush.direct` | `<tlbflush state='on'><direct state='on'/></tlbflush>` | `hv-tlbflush=on,hv-tlbflush-direct=on` |
+| `tlbflush.extended` | `<tlbflush state='on'><extended state='on'/></tlbflush>` | `hv-tlbflush=on,hv-tlbflush-ext=on` |
+
+QEMU 自己也把這些名字註冊成 x86 CPU properties：
+
+```c
+// File: qemu/target/i386/cpu.c
+DEFINE_PROP_BIT64("hv-relaxed", X86CPU, hyperv_features, HYPERV_FEAT_RELAXED, 0),
+DEFINE_PROP_BIT64("hv-vapic", X86CPU, hyperv_features, HYPERV_FEAT_VAPIC, 0),
+DEFINE_PROP_BIT64("hv-time", X86CPU, hyperv_features, HYPERV_FEAT_TIME, 0),
+DEFINE_PROP_BIT64("hv-vpindex", X86CPU, hyperv_features, HYPERV_FEAT_VPINDEX, 0),
+DEFINE_PROP_BIT64("hv-runtime", X86CPU, hyperv_features, HYPERV_FEAT_RUNTIME, 0),
+DEFINE_PROP_BIT64("hv-synic", X86CPU, hyperv_features, HYPERV_FEAT_SYNIC, 0),
+DEFINE_PROP_BIT64("hv-stimer", X86CPU, hyperv_features, HYPERV_FEAT_STIMER, 0),
+DEFINE_PROP_BIT64("hv-frequencies", X86CPU, hyperv_features, HYPERV_FEAT_FREQUENCIES, 0),
+DEFINE_PROP_BIT64("hv-reenlightenment", X86CPU, hyperv_features, HYPERV_FEAT_REENLIGHTENMENT, 0),
+DEFINE_PROP_BIT64("hv-tlbflush", X86CPU, hyperv_features, HYPERV_FEAT_TLBFLUSH, 0),
+DEFINE_PROP_BIT64("hv-ipi", X86CPU, hyperv_features, HYPERV_FEAT_IPI, 0),
+```
+
+## 每個 Hyper-V enlightenment 在做什麼
+
+`relaxed`：告訴 guest OS 它跑在 hypervisor 上，讓 Windows 停用或放寬 watchdog timeout。這比較像相容性/穩定性旗標，不是 throughput 加速。
+
+`vapic`：提供 VP Assist page，讓 Windows 以更有效率的方式處理 APIC，尤其是 exit-less EOI processing。這是 Windows VM 常見基本項目。
+
+`spinlocks`：設定 paravirtualized spinlock retry count。KubeVirt API 欄位叫 `spinlocks.spinlocks`，第二層其實是 retry count。KubeVirt 要求至少 `4096`；libvirt XML 層要求至少 `4095`。overcommit 時，QEMU docs 建議可以用類似 `0xfff` 的值，避免 vCPU 在 lock contention 下白白 busy loop。
+
+`vpindex`：提供 Virtual Processor Index。QEMU docs 明確說 `hv-synic`、`hv-stimer` 與其他需要 guest 知道 VP index 的 enlightenment 都會依賴它。實務上它是很多 Windows enlightenment 的基礎。
+
+`runtime`：提供 `HV_X64_MSR_VP_RUNTIME`，讓 guest 知道 virtual processor 實際 runtime，也就是大致知道有多少時間被 host preempt。CPU overcommit 時，這能改善 Windows guest 的 time accounting 與 scheduling。
+
+`synic`：Synthetic Interrupt Controller，是 local APIC 的延伸，提供 SynIC messages/events，也是 synthetic timer 的前置條件。QEMU docs 標明它需要 `hv-vpindex`。
+
+`synictimer`：Hyper-V synthetic timer。某些 Windows 版本沒有這個 enlightenment 時，idle 狀態也可能大量退回 HPET 或 RTC，造成 CPU 消耗偏高。QEMU docs 標明它需要 `hv-vpindex`、`hv-synic`、`hv-time`。
+
+`synictimer.direct`：synthetic timer direct mode。nested Hyper-V 只能用 direct mode，所以 Windows VBS、Credential Guard、WSL2 這類情境要特別注意。
+
+`frequencies`：提供 TSC/APIC frequency MSRs，讓 guest 不用自己量測 frequency。它也常跟 `reenlightenment` 一起看，因為 migration 後 TSC frequency 可能變動。
+
+`reenlightenment`：偏 nested Hyper-V / migration / TSC frequency change notification。QEMU docs 寫得很直接：它讓 guest 在 TSC frequency 變化時收到通知，並建議搭配 `hv-frequencies`。但它也有硬體邊界；如果需要 migration，目的端 host 要有相同 TSC frequency 或支援 TSC scaling。
+
+`tlbflush`：paravirtualized TLB shootdown。多 vCPU guest 修改 page table 後要通知其他 vCPU flush TLB；虛擬化環境下有些 vCPU 可能根本沒被排程，讓 hypervisor 介入可以少走一段不必要的 IPI 等待。QEMU docs 標明它需要 `hv-vpindex`。
+
+`tlbflush.extended`：允許 extended GVA range 傳給 Hyper-V TLB flush hypercall，對一般 workload 可能有幫助。
+
+`tlbflush.direct`：偏 nested Hyper-V；讓 L0 KVM 直接處理 L2 guest 的 TLB flush hypercall，避免退出到 L1 Hyper-V。
+
+`ipi`：paravirtualized IPI send。多 vCPU VM 發 IPI 時，Hyper-V hypercall 可以一次 target 更多 vCPU，減少 APIC 存取造成的 VM exit。QEMU docs 標明它需要 `hv-vpindex`。
+
+## SMM：Secure Boot 的前置條件
+
+`features.smm.enabled` 不是 Hyper-V enlightenment。SMM 是 System Management Mode，KubeVirt API 把它放在 `domain.features.smm`。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+// SMM enables/disables System Management Mode.
+SMM *FeatureState `json:"smm,omitempty"`
+```
+
+KubeVirt converter 只有在你明確寫了 `smm` 且不是 `enabled: false` 時，才會在 libvirt XML 裡加 `<smm/>`：
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/compute/hypervisor_features.go
+if source.SMM != nil {
+    if source.SMM.Enabled == nil || *source.SMM.Enabled {
+        features.SMM = &api.FeatureEnabled{}
+    }
+}
+```
+
+它最常見的用途是 UEFI Secure Boot。KubeVirt API 對 EFI 的註解寫明：`secureBoot` 會換成 SecureBoot-enabled OVMF ROM，而且 requires SMM to be enabled。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+// If set, SecureBoot will be enabled and the OVMF roms will be swapped for
+// SecureBoot-enabled ones.
+// Requires SMM to be enabled.
+SecureBoot *bool `json:"secureBoot,omitempty"`
+```
+
+所以 Windows 11 / Secure Boot 類 VM，不要只開 TPM；也要明確處理 UEFI 與 SMM：
+
+```yaml
+domain:
+  firmware:
+    bootloader:
+      efi:
+        secureBoot: true
+        persistent: true
+  features:
+    smm:
+      enabled: true
+```
+
+`efi.persistent` 是另一件事：它保留 UEFI NVRAM 狀態，跟 TPM state 不同。BitLocker、Secure Boot database、boot order 這類狀態如果要跨 reboot 穩定，TPM persistence 與 EFI NVRAM persistence 要一起檢查。
+
+## devices.tpm.persistent
+
+KubeVirt `devices.tpm` 表示要模擬 TPM device；`persistent` 表示 TPM state 要跨 reboot 保留。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+type TPMDevice struct {
+    // Enabled allows a user to explicitly disable the vTPM even when one is enabled by a preference referenced by the VirtualMachine
+    // Defaults to True
+    Enabled *bool `json:"enabled,omitempty"`
+    // Persistent indicates the state of the TPM device should be kept accross reboots
+    // Defaults to false
+    Persistent *bool `json:"persistent,omitempty"`
+}
+```
+
+KubeVirt 的 TPM converter 寫得非常直白：
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/compute/tpm.go
+newTPMDevice := api.TPM{
+    Model: "tpm-tis",
+    Backend: api.TPMBackend{
+        Type:    "emulator",
+        Version: "2.0",
+    },
+}
+
+if tpm.HasPersistentDevice(&vmi.Spec) {
+    newTPMDevice.Backend.PersistentState = "yes"
+    newTPMDevice.Model = "tpm-crb"
+}
+```
+
+也就是：
+
+| VM spec | libvirt/QEMU 結果 |
+|---|---|
+| `tpm: {}` | emulator TPM 2.0，model `tpm-tis`，state 不持久 |
+| `tpm.persistent: true` | emulator TPM 2.0，model `tpm-crb`，`persistent_state='yes'` |
+
+KubeVirt 註解也說 `tpm-crb` 不是 persistence 的技術必要條件，但 KubeVirt 選擇把 persistent TPM 與 `tpm-crb` 一起導入，且長期偏好 `tpm-crb`。
+
+TPM state 的保存不是靠 node 上有實體 TPM。KubeVirt 會用 emulated TPM backend，並把 swtpm 相關路徑 mount 到 backend storage：
+
+```go
+// File: kubevirt/pkg/virt-controller/services/rendervolumes.go
+if tpm.HasPersistentDevice(&vmi.Spec) {
+    renderer.podVolumeMounts = append(renderer.podVolumeMounts, k8sv1.VolumeMount{
+        Name: volumeName,
+        MountPath: util.PathForSwtpm(vmi),
+        SubPath: "swtpm",
+    }, k8sv1.VolumeMount{
+        Name: volumeName,
+        MountPath: util.PathForSwtpmLocalca(vmi),
+        SubPath: "swtpm-localca",
+    })
+}
+```
+
+在 KubeVirt `v1.8.2`，`VMPersistentState` feature gate 已經註冊為 GA：
+
+```go
+// File: kubevirt/pkg/virt-config/featuregate/inactive.go
+// VMPersistentState enables persisting backend state files of VMs, such as the contents of the vTPM
+VMPersistentState = "VMPersistentState"
+```
+
+實務重點是：persistent vTPM 需要可用的 backend storage / PVC。它能讓 BitLocker、Windows TPM keys、measured boot 相關狀態跨 reboot 保留，但它不是 physical TPM 的安全邊界。
+
+## TIS 與 CRB 的差異
+
+QEMU 同時有 `tpm-tis` 與 `tpm-crb` device type：
+
+```c
+// File: qemu/include/system/tpm.h
+#define TYPE_TPM_TIS_ISA "tpm-tis"
+#define TYPE_TPM_CRB     "tpm-crb"
+```
+
+TIS 走 TPM Interface Specification / FIFO style registers；QEMU 的 ACPI TPM header 裡可以看到 `TPM_TIS_REG_DATA_FIFO`。CRB 則走 command response buffer，ACPI TPM2 table 會把 start method 設成 CRB：
+
+```c
+// File: qemu/hw/acpi/aml-build.c
+if (TPM_IS_TIS_ISA(tpmif) || TPM_IS_TIS_SYSBUS(tpmif)) {
+    start_method = TPM2_START_METHOD_MMIO;
+} else if (TPM_IS_CRB(tpmif)) {
+    start_method = TPM2_START_METHOD_CRB;
+}
+```
+
+功能模型的主體仍然是 TPM command set 與 backend 狀態，不是 TIS/CRB 本身。對 KubeVirt 使用者來說，真正要抓的是：
+
+| 問題 | 應該看哪裡 |
+|---|---|
+| guest 看不看得到 TPM | `devices.tpm.enabled` / `devices.tpm` 是否存在 |
+| TPM state 是否跨 reboot | `devices.tpm.persistent` |
+| Windows 11 / BitLocker 是否穩定 | TPM 2.0 + persistent TPM + UEFI NVRAM persistence + Secure Boot/SMM |
+| TIS 還是 CRB | KubeVirt non-persistent 用 `tpm-tis`，persistent 用 `tpm-crb` |
+
+## 一個務實的 Windows VM 組合
+
+對現代 Windows VM，尤其是 Windows 11、BitLocker、Secure Boot、VBS 這類情境，可以從這個組合開始：
+
+```yaml
+spec:
+  template:
+    spec:
+      domain:
+        clock:
+          timer:
+            hyperv: {}
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: true
+              persistent: true
+        features:
+          smm:
+            enabled: true
+          hyperv:
+            relaxed: {}
+            vapic: {}
+            spinlocks:
+              spinlocks: 8191
+            vpindex: {}
+            runtime: {}
+            synic: {}
+            synictimer:
+              direct: {}
+            frequencies: {}
+            tlbflush:
+              extended: {}
+            ipi: {}
+        devices:
+          tpm:
+            persistent: true
+```
+
+`reenlightenment` 我不會無腦放進每台 VM。它牽涉 TSC frequency change、nested Hyper-V 與 migration 條件；如果你要用它，必須一起確認 host TSC scaling、KubeVirt topology hints、live migration 策略。
+
+也不要為了省事開 `features.hypervPassthrough`。KubeVirt API 註解明確提醒：啟用它會自動打開所有支援的 Hyper-V flags，但 VM 會變成 non-migratable。對需要 live migration 的平台 VM，這通常不是你要的 tradeoff。
+
+## 注意事項與邊界情況
+
+| 情況 | 結果 | 建議 |
+|---|---|---|
+| 把 `hyperv` 寫成 `typerv` | 不會啟用任何 Hyper-V enlightenment | 用 CRD schema / dry-run 檢查 VM manifest |
+| 以為 `clock.timer.hyperv` 等於 `features.hyperv` | 除錯時會找錯 libvirt XML 區塊 | clock timer 看 `<clock>`，enlightenment 看 `<features>` |
+| `relaxed: {}` 以為沒有作用 | KubeVirt 會當成 enabled true | 要關閉就寫 `enabled: false` |
+| `spinlocks.spinlocks` 看起來像重複欄位 | 第二層是 retry count | 常見值用 `8191` 或依平台 policy 設定 |
+| 只開 TPM，不開 persistence | guest 看到 TPM，但 state 可能不保留 | BitLocker / TPM keys 要用 `persistent: true` |
+| 只開 Secure Boot，不開 SMM | Secure Boot-enabled OVMF 需要 SMM | 明確設 `features.smm.enabled: true` |
+| Linux guest 套整包 Hyper-V flags | 多數情境沒有必要 | Linux 通常走 KVM paravirt clock 與 virtio 路線 |
+
+## 收穫檢查
+
+- `clock.timer.hyperv` 為什麼最後會變成 QEMU `hv-time=on`，但不在 `features.hyperv` 底下？
+- `relaxed: {}` 跟 `relaxed.enabled: true` 在 KubeVirt converter 裡為什麼等價？
+- `vpindex` 為什麼常常要跟 `synic`、`synictimer`、`tlbflush`、`ipi` 一起看？
+- `features.smm.enabled` 跟 UEFI Secure Boot 的關係是什麼？
+- `devices.tpm.persistent: true` 在 KubeVirt v1.8.2 會把 TPM model 從什麼改成什麼？
+
+## 原始碼參考
+
+- [kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/staging/src/kubevirt.io/api/core/v1/schema.go) — clock、features、SMM、TPM API 欄位
+- [kubevirt/pkg/virt-launcher/virtwrap/converter/compute/clock.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/converter/compute/clock.go) — KubeVirt clock timer 轉 libvirt timer
+- [kubevirt/pkg/virt-launcher/virtwrap/converter/compute/hypervisor_features.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/converter/compute/hypervisor_features.go) — KubeVirt features 轉 libvirt features
+- [kubevirt/pkg/virt-launcher/virtwrap/converter/compute/tpm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/converter/compute/tpm.go) — KubeVirt vTPM model 與 persistent_state 轉換
+- [kubevirt/pkg/virt-controller/services/rendervolumes.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/services/rendervolumes.go) — persistent TPM backend storage mount
+- [libvirt/src/conf/domain_conf.c](https://gitlab.com/libvirt/libvirt/-/blob/v12.3.0/src/conf/domain_conf.c) — Hyper-V feature XML parse/format、TPM XML parse/format
+- [libvirt/src/qemu/qemu_command.c](https://gitlab.com/libvirt/libvirt/-/blob/v12.3.0/src/qemu/qemu_command.c) — libvirt 轉 QEMU CPU flags 與 `hv-time=on`
+- [qemu/docs/system/i386/hyperv.rst](https://github.com/qemu/qemu/blob/v11.0.0/docs/system/i386/hyperv.rst) — Hyper-V enlightenments 定義與依賴
+- [qemu/target/i386/cpu.c](https://github.com/qemu/qemu/blob/v11.0.0/target/i386/cpu.c) — QEMU x86 `hv-*` CPU properties
+- [qemu/include/system/tpm.h](https://github.com/qemu/qemu/blob/v11.0.0/include/system/tpm.h) — QEMU TPM device type
+- [qemu/hw/acpi/aml-build.c](https://github.com/qemu/qemu/blob/v11.0.0/hw/acpi/aml-build.c) — TPM2 ACPI start method：TIS MMIO vs CRB

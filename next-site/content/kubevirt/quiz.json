@@ -70,5 +70,17 @@
     ],
     "answer": 0,
     "explanation": "KubeVirt v1.8.2 的 VirtualMachine.spec.template 是 VirtualMachineInstanceTemplateSpec。VM controller 的 SetupVMIFromVM() 會把 template metadata 和 spec copy 到 VMI；templateService.RenderLaunchManifest() 會把 VMI labels copy 成 virt-launcher Pod labels，並把 vmi.Spec.TopologySpreadConstraints 放進 PodSpec。scheduler 實際計算的是 Pod labels 和 PodSpec，不是 VirtualMachine.metadata.labels。"
+  },
+  {
+    "id": 7,
+    "question": "KubeVirt Windows VM 裡 `clock.timer.hyperv`、`features.hyperv.*`、`devices.tpm.persistent` 三者的差異是什麼？",
+    "options": [
+      "`clock.timer.hyperv` 先變成 libvirt hypervclock timer 再讓 QEMU 打開 `hv-time=on`；`features.hyperv.*` 變成 libvirt `<hyperv>` 與 QEMU `hv-*` CPU flags；`tpm.persistent` 讓 emulated TPM 2.0 使用 `persistent_state=yes`，並在 KubeVirt v1.8.2 切到 `tpm-crb`",
+      "三者都只是 Kubernetes scheduler policy，會影響 virt-launcher Pod 排到哪個 node",
+      "`clock.timer.hyperv` 只給 Linux guest 使用；`features.hyperv.*` 只會影響實體 TPM；`tpm.persistent` 會打開 Secure Boot",
+      "只要設定 `features.hypervPassthrough`，三者會自動完整啟用且仍可 live migration"
+    ],
+    "answer": 0,
+    "explanation": "KubeVirt 的 clock converter 把 `timer.hyperv` 轉成 libvirt `hypervclock`，libvirt 在 QEMU CPU argument 加 `hv-time=on`。`features.hyperv.*` 由 hypervisor_features converter 轉成 `<features><hyperv>`，再由 libvirt 輸出 `hv-relaxed`、`hv-vapic`、`hv-vpindex` 等 CPU flags。`devices.tpm.persistent` 則走 TPM converter：non-persistent 是 emulator TPM 2.0 + `tpm-tis`；persistent 會加 `persistent_state=yes` 並切到 `tpm-crb`。"
   }
 ]
