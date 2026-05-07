@@ -229,6 +229,55 @@ DataVolume 是 KubeVirt 給 PVC 加 lifecycle 的 wrapper：自動建 PVC + 跑 
 - [CDI](https://github.com/kubevirt/containerized-data-importer)
 - [DataVolume API](https://kubevirt.io/user-guide/storage/datavolumes/)
 
+## 🧹 Cleanup / 回退
+
+🔴 **警告**：刪除 VM、PVC、CDI 後，今天匯入的 fedora cloud image 會永久消失，下次重新匯入要再下載一次幾百 MiB。Day 26 / 28 / 30 都會用到 `fedora-vm` / `fedora-rootdisk`，所以**通常不需要 cleanup**。下面是「整個 reset 回 Day 23 結束狀態」用：
+
+順序：VM → DataVolume / PVC → CDI（如果連 CDI 也想拆）。
+
+```bash
+# 1. stop VM 後再 delete（避免 launcher Pod 卡住）
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-vm 2>/dev/null
+kubectl delete vm fedora-vm --ignore-not-found
+```
+
+等到 `kubectl get vmi` 沒有 `fedora-vm`。
+
+```bash
+# 2. 刪 DataVolume（連同 PVC）
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete dv fedora-rootdisk --ignore-not-found
+```
+
+刪 DataVolume 會自動連帶刪 PVC；ceph-csi 收到 PVC delete 後會把對應 RBD image 砍掉。
+
+```bash
+# 3. 確認 ceph 端 RBD image 也消失了
+# 🔴 需在你環境跑後對照
+rbd ls k8s-rbd
+```
+
+預期不再列 `csi-vol-<uuid>`（fedora-rootdisk 對應的那一行）。
+
+```bash
+# 4.（可選）卸 CDI — Day 28 還會用，建議留著
+# 🟡 已對照官方文件 / 原始碼
+kubectl delete cdi cdi --timeout=5m
+kubectl delete -f https://github.com/kubevirt/containerized-data-importer/releases/download/v1.62.0/cdi-cr.yaml --ignore-not-found
+kubectl delete -f https://github.com/kubevirt/containerized-data-importer/releases/download/v1.62.0/cdi-operator.yaml --ignore-not-found
+kubectl delete namespace cdi --ignore-not-found
+```
+
+```bash
+# 5. 驗證乾淨
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vm,vmi,pvc,dv -A | grep fedora-rootdisk
+kubectl get crd | grep cdi.kubevirt.io   # 若你也卸了 CDI 應該空
+```
+
+預期沒輸出，所有 fedora-rootdisk 相關資源都已銷毀。
+
 ## 明日預告
 
 明天 [day-25](/learning-plan/features/day-25) 進 node 看 virt-launcher Pod 內部 — qemu process、libvirt domain XML、namespace 拓樸。

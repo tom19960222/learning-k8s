@@ -224,6 +224,40 @@ vmbr0 物理 bridge → 物理網路
 - [Multus Quickstart](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/docs/quickstart.md)
 - [pkg/network/setup/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/network/setup) — 網卡配置原始碼
 
+## 🧹 Cleanup / 回退
+
+今天的「破壞性」操作只有改 `fedora-vm` 加上第二張 NIC。回退 = 把 VM YAML 還原成 Day 24 結束時的版本（單張 default NIC、無 multus annotation），不需要動 multus DaemonSet 或 NAD（Day 13 建立、後續還會用）。
+
+🔴 **警告**：下面 `virtctl stop` 會中斷 VM；如果 VM 內有未存檔的工作先存。
+
+```bash
+# 1. stop VM
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-vm
+```
+
+```bash
+# 2. 重 apply Day 24 版本的 vm.yaml（單張 default NIC、無 bridge-net）
+# 🟡 已對照官方文件 / 原始碼
+kubectl apply -f vm.yaml   # ← 用 Day 24 那份，不要用今天加 bridge-net 的版本
+```
+
+```bash
+# 3. start 後驗證 VM 內只剩 eth0
+# 🟡 已對照官方文件 / 原始碼
+virtctl start fedora-vm
+# 等 Running 後 virtctl console fedora-vm
+# 在 VM 內：ip addr   # 預期不再有 eth1
+```
+
+```bash
+# 4.（可選）若也要拆 multus 整套，看 Day 13 的反向步驟
+# kubectl delete net-attach-def bridge-nad
+# kubectl delete -f multus DaemonSet manifest
+```
+
+🟡 通常 Day 27 還會用同一張 VM（live migration），所以保留現狀更省事；只有要徹底回到 Day 24 結束狀態時才需要做。
+
 ## 明日預告
 
 明天 [day-27](/learning-plan/features/day-27) 是 weekend lab：觸發 live migration，看 VM 在不停機狀態下被搬到另一個 node。

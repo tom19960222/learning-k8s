@@ -137,7 +137,62 @@ object name → hash → PG id → CRUSH(PG) → [OSD list]
 - [Pools — Ceph docs](https://docs.ceph.com/en/squid/rados/operations/pools/) — pool create / 設定 / 刪除
 - [Placement Groups](https://docs.ceph.com/en/squid/rados/operations/placement-groups/) — PG 數選擇
 - [RBD Block Devices](https://docs.ceph.com/en/squid/rbd/) — RBD 概念
-- [src/osd/](https://github.com/ceph/ceph/tree/v19.2.3/src/osd) — OSD 原始碼
+- [src/osd/OSD.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/OSD.cc) — OSD 主迴圈
+- [src/osd/PG.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PG.cc) — PG state machine 主類別
+
+## 🧹 Cleanup / 回退
+
+🔴 **警告**：刪除 RBD pool 會永久銷毀其中所有 image 與資料。請確認 pool 是今天 lab 才建的、沒有被任何 PVC / VM / 其他 workload 在用。生產環境的 ceph 預設禁止刪 pool（`mon_allow_pool_delete = false`），下面的步驟需要先暫時打開。
+
+如果今天 lab 之後想保留環境給 Day 18 接 ceph-csi 用，**就跳過這節**（pool 留著很正常）；下面是「整個 reset 回 Day 14 結束狀態」的順序：
+
+```bash
+# 1. 確認沒有 RBD image 還在被 mount / map（看 watcher 列表）
+# 🔴 需在你環境跑後對照
+rbd status k8s-rbd/test-vol
+```
+
+```
+Watchers: none
+```
+
+```bash
+# 2. 刪掉今天建的 image
+# 🔴 需在你環境跑後對照
+rbd rm k8s-rbd/test-vol
+```
+
+```bash
+# 3. 暫時允許 pool 刪除
+# 🔴 需在你環境跑後對照
+ceph config set mon mon_allow_pool_delete true
+```
+
+```bash
+# 4. 刪 pool（pool 名稱要打兩次，--yes-i-really-really-mean-it 是必須的安全閘）
+# 🔴 需在你環境跑後對照
+ceph osd pool delete k8s-rbd k8s-rbd --yes-i-really-really-mean-it
+```
+
+```
+pool 'k8s-rbd' removed
+```
+
+```bash
+# 5. 把 pool 刪除權限關回去
+# 🔴 需在你環境跑後對照
+ceph config set mon mon_allow_pool_delete false
+```
+
+```bash
+# 6. 驗證乾淨：clean 後 ceph df 不該再有 k8s-rbd
+# 🔴 需在你環境跑後對照
+ceph osd pool ls | grep k8s-rbd
+```
+
+預期沒輸出。`ceph -s` 應該回到 `HEALTH_OK`。
+
+如果中途 `ceph osd pool delete` 報 `EPERM` 就是 step 3 沒做或設定還沒 propagate，等 10 秒再試。
 
 ## 明日預告
 

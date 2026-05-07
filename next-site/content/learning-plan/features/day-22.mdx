@@ -176,6 +176,62 @@ KubeVirt 把 VM 當 first-class k8s 資源：
 - [v1.8.2 release notes](https://github.com/kubevirt/kubevirt/releases/tag/v1.8.2)
 - [pkg/virt-operator/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-operator) — operator 原始碼
 
+## 🧹 Cleanup / 回退
+
+🔴 **警告**：卸載 KubeVirt 會把所有 VirtualMachine / VirtualMachineInstance / DataVolume 等資源連同 CRD 一併消失。Day 23 之後的所有 VM lab 都建立在這套 KubeVirt 上；只有當你**確定要打掉重練**才執行下面步驟。日常情況不需要 cleanup，留著繼續用就好。
+
+順序：先刪 workload（VM），再刪 KubeVirt CR 等 operator 走 finalizer，最後刪 operator manifest 與 namespace。
+
+```bash
+# 1. 列出並刪除所有 VM（如果 Day 23+ 已經有 VM，先 stop 再 delete）
+# 🟡 已對照官方文件 / 原始碼
+kubectl get vm,vmi -A
+# 對每個 VM：
+# virtctl stop <vm-name> -n <ns>
+# kubectl delete vm <vm-name> -n <ns>
+```
+
+```bash
+# 2. 刪 KubeVirt CR，operator 會 reconcile 把 virt-api / virt-controller / virt-handler 拆光
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt delete kv kubevirt --timeout=5m
+```
+
+預期 5 分鐘內完成。如果 finalizer 卡住（少數情況），可手動移除：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n kubevirt patch kv kubevirt --type=merge -p '{"metadata":{"finalizers":[]}}'
+```
+
+```bash
+# 3. 刪除 operator deployment 與 CRD（用裝的時候那份 manifest 反向 apply）
+# 🟡 已對照官方文件 / 原始碼
+kubectl delete -f https://github.com/kubevirt/kubevirt/releases/download/v1.8.2/kubevirt-cr.yaml --ignore-not-found
+kubectl delete -f https://github.com/kubevirt/kubevirt/releases/download/v1.8.2/kubevirt-operator.yaml --ignore-not-found
+```
+
+```bash
+# 4. 確保 kubevirt namespace 也走光
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete namespace kubevirt --ignore-not-found
+```
+
+```bash
+# 5. （可選）移除本機 virtctl
+# 🟡 已對照官方文件 / 原始碼
+sudo rm -f /usr/local/bin/virtctl
+```
+
+```bash
+# 6. 驗證乾淨
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get crd | grep kubevirt.io
+kubectl get ns kubevirt
+```
+
+預期 `kubectl get crd | grep kubevirt.io` 沒輸出（沒有殘留 CRD），`kubectl get ns kubevirt` 回 `Error from server (NotFound)`。
+
 ## 明日預告
 
 明天 [day-23](/learning-plan/features/day-23) 跑第一台 VM：寫 VirtualMachine YAML、啟動、用 `virtctl console` 進系統。

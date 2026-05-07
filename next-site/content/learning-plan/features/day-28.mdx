@@ -241,6 +241,45 @@ PVC clone 走 CSI 的 [`spec.dataSource`](https://kubernetes.io/docs/concepts/st
 - [CDI 設計](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/basic_flow.md)
 - [Container Disks](https://kubevirt.io/user-guide/virtual_machines/disks_and_volumes/#containerdisk) — 跟 registry source 對比
 
+## 🧹 Cleanup / 回退
+
+🔴 **警告**：今天建了 4 個 DataVolume（`ubuntu-cloud` / `fedora-clone` / `centos-from-registry` / `data-disk`）+ 1 個 VM（`fedora-clone-vm`）。若不清理，每個都佔 5–10 GiB ceph-rbd 空間，多累積幾天 lab 會把小 cluster 撐爆。Day 29 不依賴這些資源，**建議跑完 cleanup**。
+
+順序：VM → DataVolume（會連同 PVC、importer Pod 一起收）。
+
+```bash
+# 1. stop 並 delete fedora-clone-vm
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop fedora-clone-vm 2>/dev/null
+kubectl delete vm fedora-clone-vm --ignore-not-found
+```
+
+```bash
+# 2. 刪 4 個 DataVolume（連同 PVC + ceph 端 RBD image）
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete dv ubuntu-cloud fedora-clone centos-from-registry data-disk --ignore-not-found
+```
+
+刪 DataVolume → CDI controller 會把對應 PVC delete → ceph-csi 把 RBD image 砍掉。整個過程通常 < 30 秒。
+
+```bash
+# 3. 看 ceph 端確認 image 真的消失
+# 🔴 需在你環境跑後對照
+rbd ls k8s-rbd | wc -l
+```
+
+預期數字回到 lab 開始前的水準（通常只剩 Day 24 的 `fedora-rootdisk` 對應 image）。
+
+```bash
+# 4. 驗證 PVC 也清乾淨
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get pvc | grep -E "(ubuntu-cloud|fedora-clone|centos-from-registry|data-disk)"
+```
+
+預期沒輸出。
+
+如果某個 DataVolume 卡在 `Terminating` 狀態（例如 importer Pod 還在跑沒被中止），先 `kubectl delete pod importer-<dv-name> --force --grace-period=0`，再 retry step 2。
+
 ## 明日預告
 
 明天 [day-29](/learning-plan/features/day-29) 看 KubeVirt 監控：vmi metrics、prometheus 指標、debug 工具。

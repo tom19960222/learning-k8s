@@ -177,7 +177,7 @@ Proxmox 8 使用 `cephadm` 管理這些 daemon 的生命週期，`ceph orch ps` 
 
 參考：
 - [Ceph Architecture](https://docs.ceph.com/en/squid/architecture/)
-- [Ceph 原始碼 v19.2.3](https://github.com/ceph/ceph/tree/v19.2.3/src)
+- [Ceph 原始碼 src/mon/Monitor.h](https://github.com/ceph/ceph/blob/v19.2.3/src/mon/Monitor.h) — MON daemon 主類別宣告
 
 ## 收穫檢查
 
@@ -191,8 +191,8 @@ Proxmox 8 使用 `cephadm` 管理這些 daemon 的生命週期，`ceph orch ps` 
 
 - [Ceph Architecture](https://docs.ceph.com/en/squid/architecture/) — 官方架構總覽，含各 daemon 角色
 - [Ceph Monitoring and Alerting](https://docs.ceph.com/en/squid/operations/monitoring/) — `ceph -s` 各欄位說明
-- [Ceph 原始碼 src/mon](https://github.com/ceph/ceph/blob/v19.2.3/src/mon) — MON 實作
-- [Ceph 原始碼 src/osd](https://github.com/ceph/ceph/blob/v19.2.3/src/osd) — OSD 實作
+- [Ceph 原始碼 src/mon/Monitor.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/mon/Monitor.cc) — MON 主迴圈與 Paxos 整合
+- [Ceph 原始碼 src/osd/OSD.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/OSD.cc) — OSD daemon 主邏輯（init / heartbeat / op dispatch）
 
 ## 明日預告
 

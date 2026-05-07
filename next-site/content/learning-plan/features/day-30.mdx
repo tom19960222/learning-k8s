@@ -198,16 +198,6 @@ kubectl get vmi web-vm -o wide
 
 `NODENAME` 應該變了。再試 curl 還是通。
 
-### 7. 收尾 — 不刪 VM，保留作為日後玩具
-
-```bash
-# 🟢 已驗證 (kind / 顯然正確)
-virtctl stop web-vm
-kubectl get vm
-```
-
-VM 進 Stopped 狀態但 PVC / VirtualMachine 還在。需要時 `virtctl start` 即可。
-
 ## 觀念深化
 
 這個 VM 用上你 30 天累積的所有元件：
@@ -257,6 +247,61 @@ VM 進 Stopped 狀態但 PVC / VirtualMachine 還在。需要時 `virtctl start`
 - [Cluster API Provider KubeVirt](https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt) — KubeVirt VM 當 k8s node
 - [KubeVirt SIG Storage](https://github.com/kubevirt/community/tree/main/sig-storage) — VM 儲存整合最新討論
 - 本站待寫：SP-3..SP-7 的 5 個原始碼分析頁
+
+## 🧹 Cleanup / 回退
+
+整個 30 天 lab 的最後總清理。分兩個情境：
+
+**情境 A — 保留 web-vm 當日後玩具**（推薦）：
+
+```bash
+# 🟢 已驗證 (kind / 顯然正確)
+virtctl stop web-vm
+kubectl get vm
+```
+
+VM 進 Stopped 狀態但 PVC / VirtualMachine 都還在，需要時 `virtctl start web-vm` 即可。
+
+**情境 B — 整個拆掉、把 cluster 還給其他用途**：
+
+🔴 **警告**：下面步驟會把今天 demo 的 VM、PVC、Service、上週累積的 fedora-rootdisk 全部刪除，以及 web-vm 用的 192.168.1.100 IP 釋放。順序為從外到內：Service → VM → DataVolume / PVC。
+
+```bash
+# 1. 刪今天的 demo Service（外部 LB / ClusterIP）
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete svc web-vm-svc --ignore-not-found
+```
+
+```bash
+# 2. stop 後 delete VM
+# 🟡 已對照官方文件 / 原始碼
+virtctl stop web-vm 2>/dev/null
+kubectl delete vm web-vm --ignore-not-found
+```
+
+```bash
+# 3. 刪 DataVolume（連 PVC + RBD image 一起收）
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl delete dv web-vm-root --ignore-not-found
+```
+
+```bash
+# 4. 確認 ceph 端 image 真的消失
+# 🔴 需在你環境跑後對照
+rbd ls k8s-rbd
+```
+
+預期不再列 `csi-vol-*` 中對應 web-vm-root 的那一行。
+
+```bash
+# 5. 驗證乾淨
+# 🟢 已驗證 (kind / 顯然正確)
+kubectl get vm,vmi,svc,pvc,dv -A | grep web-vm
+```
+
+預期沒輸出。
+
+如果你打算徹底重置 cluster 回到 Day 1 之前的狀態，也可以參考 Day 22 / Day 17 / Day 19 的 cleanup 章節分層拆 KubeVirt、CephFS、RBD pool；不過大部分情況保留環境會更實用。
 
 ## 結語
 

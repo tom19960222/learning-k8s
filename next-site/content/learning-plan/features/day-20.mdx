@@ -168,13 +168,6 @@ git clone --depth=1 -b release-1.16 https://github.com/rook/rook.git /tmp/rook
 5. 呼叫 osd controller → 對每個 storage 配置建 OSD prepare Job → OSD Deployment
 6. 更新 `.status` 反映目前 phase
 
-### 7. 收尾
-
-```bash
-# 🟢 已驗證 (kind / 顯然正確)
-kind delete cluster --name rook-study
-```
-
 ## 觀念深化
 
 Rook 沒有重寫 ceph —— 它跑的是 **upstream ceph binary 包成 container**。Operator 只負責 lifecycle 編排：
@@ -206,6 +199,53 @@ Rook 沒有重寫 ceph —— 它跑的是 **upstream ceph binary 包成 contain
 - [Rook Getting Started](https://rook.io/docs/rook/v1.16/Getting-Started/intro/)
 - [Rook CRDs reference](https://rook.io/docs/rook/v1.16/CRDs/Cluster/ceph-cluster-crd/)
 - [pkg/operator/ceph/](https://github.com/rook/rook/tree/release-1.16/pkg/operator/ceph) — 全部 ceph operator 邏輯
+
+## 🧹 Cleanup / 回退
+
+今天的 lab 全部跑在拋棄式 kind cluster，所以 cleanup 最簡單：直接砍掉整個 cluster，所有 Rook + ceph 資源、PV、namespace 一次清空，不影響本機其他環境。
+
+🔴 **警告**：`kind delete cluster` 會永久銷毀 cluster 與 hostPath（`/var/lib/rook` 在 kind node container 內）。如果你想留著明天接著看 operator 行為，先別跑這步。
+
+順序：先把 CephCluster 刪掉讓 operator 跑 finalizer 收尾，再砍 cluster。
+
+```bash
+# 1. 刪 CephCluster CR，讓 Rook operator 走完 finalizer（清 mon / osd Pod、清 secret）
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n rook-ceph delete cephcluster my-cluster --timeout=5m
+```
+
+如果卡 finalizer 超過 5 分鐘（通常因為 mon Pod 沒掃乾淨），參考 [Rook cleanup 文件](https://rook.io/docs/rook/v1.16/Storage-Configuration/ceph-teardown/) 移除 finalizer：
+
+```bash
+# 🟡 已對照官方文件 / 原始碼
+kubectl -n rook-ceph patch cephcluster my-cluster --type merge -p '{"metadata":{"finalizers":null}}'
+```
+
+```bash
+# 2. 卸 Rook Helm chart
+# 🟡 已對照官方文件 / 原始碼
+helm uninstall rook-ceph -n rook-ceph
+kubectl delete namespace rook-ceph --ignore-not-found
+```
+
+```bash
+# 3. 砍整個 kind cluster（一勞永逸）
+# 🟢 已驗證 (kind / 顯然正確)
+kind delete cluster --name rook-study
+```
+
+```
+Deleting cluster "rook-study" ...
+```
+
+```bash
+# 4. 驗證乾淨：不該再有 rook-study context
+# 🟢 已驗證 (kind / 顯然正確)
+kind get clusters
+kubectl config get-contexts | grep rook-study
+```
+
+`kind get clusters` 不應列 `rook-study`，`kubectl config get-contexts` 也不該還有 `kind-rook-study` row。
 
 ## 明日預告
 
