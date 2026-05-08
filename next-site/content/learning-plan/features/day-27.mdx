@@ -156,6 +156,10 @@ Live migration 的核心是 **memory dirty page tracking**：
 
 Downtime 主要發生在 cutover 那段。一台輕度負載 VM 通常 < 200ms；高 dirty rate VM 可能要等很久才收斂（極端情況下 KubeVirt 會 abort migration）。
 
+![Live migration memory dirty page tracking 時間軸：precopy iter 1..N（每次拷貝上一輪以來 dirty 的 page，dirty 比例逐輪縮小）→ 收斂判斷 → cutover (atomic, source qemu PAUSE → 最後一批 dirty + CPU state → target qemu RESUME)；底部顯示 service availability 與 downtime ≈ cutover 寬度；側邊列 AUTO_CONVERGE / POSTCOPY / pause-fallback 三個非收斂路徑](/diagrams/learning-plan/live-migration-cutover.png)
+
+*圖：上半段以 page grid 視覺化每輪 precopy dirty 比例的縮減；中段是 dirty rate 與 copy bandwidth 兩條曲線的收斂；下段對齊到 service availability，明確標示「downtime」就是 cutover band 的寬度（10s ms 到數百 ms）。*
+
 KubeVirt 不發明這個 — 用的是 qemu/libvirt 內建的 migration 功能。它做的是：
 
 - 排程 target Pod

@@ -1,0 +1,456 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1100" width="1700" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 26px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 15px; fill: #94a3b8; }
+    .section-label { font-size: 14px; font-weight: 700; letter-spacing: 0.04em; }
+    .iter-label { font-size: 13px; font-weight: 700; }
+    .iter-sub { font-size: 11px; fill: #cbd5e1; }
+    .iter-num { font-size: 10px; fill: #94a3b8; }
+    .axis-label { font-size: 11px; fill: #64748b; }
+    .axis-tick { font-size: 10px; fill: #64748b; }
+    .curve-label { font-size: 12px; font-weight: 700; }
+    .timeline-label { font-size: 12px; font-weight: 700; fill: #f1f5f9; }
+    .timeline-sub { font-size: 11px; fill: #cbd5e1; }
+    .annotation { font-size: 11px; fill: #94a3b8; font-style: italic; }
+    .fallback-title { font-size: 13px; font-weight: 700; }
+    .fallback-sub { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .downtime-label { font-size: 13px; font-weight: 700; fill: #eab308; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+  </defs>
+
+  <rect width="1700" height="1100" fill="url(#bg-grad)"/>
+
+  <!-- Header -->
+  <text x="850" y="44" text-anchor="middle" class="title">Live migration &#8729; memory dirty page tracking 時間軸</text>
+  <text x="850" y="70" text-anchor="middle" class="subtitle">precopy iter 1..N &#8594; 收斂 &#8594; cutover (atomic) &#8594; resume on target &#8729; downtime &#8776; cutover 寬度</text>
+
+  <!-- ===== Time axis (top) ===== -->
+  <text x="60" y="108" class="section-label" fill="#94a3b8">TIME &#8594;</text>
+  <line x1="120" y1="118" x2="1320" y2="118" stroke="#334155" stroke-width="1.2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Iteration phase markers on time axis -->
+  <text x="200" y="108" class="axis-tick" text-anchor="middle">iter 1</text>
+  <text x="350" y="108" class="axis-tick" text-anchor="middle">iter 2</text>
+  <text x="490" y="108" class="axis-tick" text-anchor="middle">iter 3</text>
+  <text x="620" y="108" class="axis-tick" text-anchor="middle">iter 4</text>
+  <text x="740" y="108" class="axis-tick" text-anchor="middle">iter 5</text>
+  <text x="860" y="108" class="axis-tick" text-anchor="middle">converged</text>
+  <text x="980" y="108" class="axis-tick" text-anchor="middle">cutover</text>
+  <text x="1140" y="108" class="axis-tick" text-anchor="middle">resume on target</text>
+
+  <!-- ===== Top half: page grid visualization (RAM dirty page tracking) ===== -->
+  <text x="60" y="148" class="section-label" fill="#3b82f6">RAM PAGE GRID &#8729; dirty (orange) vs copied (gray)</text>
+
+  <!-- Each "iter" is a 10x10 page grid (100 squares = 100% of RAM, simplified) -->
+  <!-- ITER 1: all dirty -->
+  <g transform="translate(140, 160)">
+    <rect x="-10" y="-10" width="140" height="160" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.2"/>
+    <text x="60" y="6" text-anchor="middle" class="iter-label" fill="#3b82f6">iter 1</text>
+    <text x="60" y="22" text-anchor="middle" class="iter-sub">全部 RAM</text>
+    <text x="60" y="36" text-anchor="middle" class="iter-sub">2 GiB / 100%</text>
+    <!-- 10x10 grid of pages, all dirty (orange) -->
+    <g transform="translate(10, 46)">
+      <!-- Row 1-10, all dirty -->
+      <rect x="0"   y="0" width="9" height="9" fill="#f97316"/><rect x="10"  y="0" width="9" height="9" fill="#f97316"/><rect x="20"  y="0" width="9" height="9" fill="#f97316"/><rect x="30"  y="0" width="9" height="9" fill="#f97316"/><rect x="40"  y="0" width="9" height="9" fill="#f97316"/><rect x="50"  y="0" width="9" height="9" fill="#f97316"/><rect x="60"  y="0" width="9" height="9" fill="#f97316"/><rect x="70"  y="0" width="9" height="9" fill="#f97316"/><rect x="80"  y="0" width="9" height="9" fill="#f97316"/><rect x="90"  y="0" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="10" width="9" height="9" fill="#f97316"/><rect x="10" y="10" width="9" height="9" fill="#f97316"/><rect x="20" y="10" width="9" height="9" fill="#f97316"/><rect x="30" y="10" width="9" height="9" fill="#f97316"/><rect x="40" y="10" width="9" height="9" fill="#f97316"/><rect x="50" y="10" width="9" height="9" fill="#f97316"/><rect x="60" y="10" width="9" height="9" fill="#f97316"/><rect x="70" y="10" width="9" height="9" fill="#f97316"/><rect x="80" y="10" width="9" height="9" fill="#f97316"/><rect x="90" y="10" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="20" width="9" height="9" fill="#f97316"/><rect x="10" y="20" width="9" height="9" fill="#f97316"/><rect x="20" y="20" width="9" height="9" fill="#f97316"/><rect x="30" y="20" width="9" height="9" fill="#f97316"/><rect x="40" y="20" width="9" height="9" fill="#f97316"/><rect x="50" y="20" width="9" height="9" fill="#f97316"/><rect x="60" y="20" width="9" height="9" fill="#f97316"/><rect x="70" y="20" width="9" height="9" fill="#f97316"/><rect x="80" y="20" width="9" height="9" fill="#f97316"/><rect x="90" y="20" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="30" width="9" height="9" fill="#f97316"/><rect x="10" y="30" width="9" height="9" fill="#f97316"/><rect x="20" y="30" width="9" height="9" fill="#f97316"/><rect x="30" y="30" width="9" height="9" fill="#f97316"/><rect x="40" y="30" width="9" height="9" fill="#f97316"/><rect x="50" y="30" width="9" height="9" fill="#f97316"/><rect x="60" y="30" width="9" height="9" fill="#f97316"/><rect x="70" y="30" width="9" height="9" fill="#f97316"/><rect x="80" y="30" width="9" height="9" fill="#f97316"/><rect x="90" y="30" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="40" width="9" height="9" fill="#f97316"/><rect x="10" y="40" width="9" height="9" fill="#f97316"/><rect x="20" y="40" width="9" height="9" fill="#f97316"/><rect x="30" y="40" width="9" height="9" fill="#f97316"/><rect x="40" y="40" width="9" height="9" fill="#f97316"/><rect x="50" y="40" width="9" height="9" fill="#f97316"/><rect x="60" y="40" width="9" height="9" fill="#f97316"/><rect x="70" y="40" width="9" height="9" fill="#f97316"/><rect x="80" y="40" width="9" height="9" fill="#f97316"/><rect x="90" y="40" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="50" width="9" height="9" fill="#f97316"/><rect x="10" y="50" width="9" height="9" fill="#f97316"/><rect x="20" y="50" width="9" height="9" fill="#f97316"/><rect x="30" y="50" width="9" height="9" fill="#f97316"/><rect x="40" y="50" width="9" height="9" fill="#f97316"/><rect x="50" y="50" width="9" height="9" fill="#f97316"/><rect x="60" y="50" width="9" height="9" fill="#f97316"/><rect x="70" y="50" width="9" height="9" fill="#f97316"/><rect x="80" y="50" width="9" height="9" fill="#f97316"/><rect x="90" y="50" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="60" width="9" height="9" fill="#f97316"/><rect x="10" y="60" width="9" height="9" fill="#f97316"/><rect x="20" y="60" width="9" height="9" fill="#f97316"/><rect x="30" y="60" width="9" height="9" fill="#f97316"/><rect x="40" y="60" width="9" height="9" fill="#f97316"/><rect x="50" y="60" width="9" height="9" fill="#f97316"/><rect x="60" y="60" width="9" height="9" fill="#f97316"/><rect x="70" y="60" width="9" height="9" fill="#f97316"/><rect x="80" y="60" width="9" height="9" fill="#f97316"/><rect x="90" y="60" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="70" width="9" height="9" fill="#f97316"/><rect x="10" y="70" width="9" height="9" fill="#f97316"/><rect x="20" y="70" width="9" height="9" fill="#f97316"/><rect x="30" y="70" width="9" height="9" fill="#f97316"/><rect x="40" y="70" width="9" height="9" fill="#f97316"/><rect x="50" y="70" width="9" height="9" fill="#f97316"/><rect x="60" y="70" width="9" height="9" fill="#f97316"/><rect x="70" y="70" width="9" height="9" fill="#f97316"/><rect x="80" y="70" width="9" height="9" fill="#f97316"/><rect x="90" y="70" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="80" width="9" height="9" fill="#f97316"/><rect x="10" y="80" width="9" height="9" fill="#f97316"/><rect x="20" y="80" width="9" height="9" fill="#f97316"/><rect x="30" y="80" width="9" height="9" fill="#f97316"/><rect x="40" y="80" width="9" height="9" fill="#f97316"/><rect x="50" y="80" width="9" height="9" fill="#f97316"/><rect x="60" y="80" width="9" height="9" fill="#f97316"/><rect x="70" y="80" width="9" height="9" fill="#f97316"/><rect x="80" y="80" width="9" height="9" fill="#f97316"/><rect x="90" y="80" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="90" width="9" height="9" fill="#f97316"/><rect x="10" y="90" width="9" height="9" fill="#f97316"/><rect x="20" y="90" width="9" height="9" fill="#f97316"/><rect x="30" y="90" width="9" height="9" fill="#f97316"/><rect x="40" y="90" width="9" height="9" fill="#f97316"/><rect x="50" y="90" width="9" height="9" fill="#f97316"/><rect x="60" y="90" width="9" height="9" fill="#f97316"/><rect x="70" y="90" width="9" height="9" fill="#f97316"/><rect x="80" y="90" width="9" height="9" fill="#f97316"/><rect x="90" y="90" width="9" height="9" fill="#f97316"/>
+    </g>
+    <text x="60" y="156" text-anchor="middle" class="iter-num">100 / 100 dirty</text>
+  </g>
+
+  <!-- ITER 2: 25% dirty (since iter 1) -->
+  <g transform="translate(290, 160)">
+    <rect x="-10" y="-10" width="140" height="160" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.2"/>
+    <text x="60" y="6" text-anchor="middle" class="iter-label" fill="#3b82f6">iter 2</text>
+    <text x="60" y="22" text-anchor="middle" class="iter-sub">iter 1 後變動的</text>
+    <text x="60" y="36" text-anchor="middle" class="iter-sub">~500 MB / 25%</text>
+    <g transform="translate(10, 46)">
+      <!-- 25 dirty out of 100, scattered, rest gray -->
+      <rect x="0"   y="0" width="9" height="9" fill="#f97316"/><rect x="10"  y="0" width="9" height="9" fill="#374151"/><rect x="20"  y="0" width="9" height="9" fill="#374151"/><rect x="30"  y="0" width="9" height="9" fill="#f97316"/><rect x="40"  y="0" width="9" height="9" fill="#374151"/><rect x="50"  y="0" width="9" height="9" fill="#374151"/><rect x="60"  y="0" width="9" height="9" fill="#f97316"/><rect x="70"  y="0" width="9" height="9" fill="#374151"/><rect x="80"  y="0" width="9" height="9" fill="#374151"/><rect x="90"  y="0" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="10" width="9" height="9" fill="#374151"/><rect x="10" y="10" width="9" height="9" fill="#f97316"/><rect x="20" y="10" width="9" height="9" fill="#374151"/><rect x="30" y="10" width="9" height="9" fill="#374151"/><rect x="40" y="10" width="9" height="9" fill="#f97316"/><rect x="50" y="10" width="9" height="9" fill="#374151"/><rect x="60" y="10" width="9" height="9" fill="#374151"/><rect x="70" y="10" width="9" height="9" fill="#f97316"/><rect x="80" y="10" width="9" height="9" fill="#374151"/><rect x="90" y="10" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="20" width="9" height="9" fill="#f97316"/><rect x="10" y="20" width="9" height="9" fill="#374151"/><rect x="20" y="20" width="9" height="9" fill="#374151"/><rect x="30" y="20" width="9" height="9" fill="#374151"/><rect x="40" y="20" width="9" height="9" fill="#374151"/><rect x="50" y="20" width="9" height="9" fill="#f97316"/><rect x="60" y="20" width="9" height="9" fill="#374151"/><rect x="70" y="20" width="9" height="9" fill="#374151"/><rect x="80" y="20" width="9" height="9" fill="#f97316"/><rect x="90" y="20" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="30" width="9" height="9" fill="#374151"/><rect x="10" y="30" width="9" height="9" fill="#374151"/><rect x="20" y="30" width="9" height="9" fill="#f97316"/><rect x="30" y="30" width="9" height="9" fill="#374151"/><rect x="40" y="30" width="9" height="9" fill="#374151"/><rect x="50" y="30" width="9" height="9" fill="#374151"/><rect x="60" y="30" width="9" height="9" fill="#f97316"/><rect x="70" y="30" width="9" height="9" fill="#374151"/><rect x="80" y="30" width="9" height="9" fill="#374151"/><rect x="90" y="30" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="40" width="9" height="9" fill="#f97316"/><rect x="10" y="40" width="9" height="9" fill="#374151"/><rect x="20" y="40" width="9" height="9" fill="#374151"/><rect x="30" y="40" width="9" height="9" fill="#f97316"/><rect x="40" y="40" width="9" height="9" fill="#374151"/><rect x="50" y="40" width="9" height="9" fill="#374151"/><rect x="60" y="40" width="9" height="9" fill="#374151"/><rect x="70" y="40" width="9" height="9" fill="#374151"/><rect x="80" y="40" width="9" height="9" fill="#f97316"/><rect x="90" y="40" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="50" width="9" height="9" fill="#374151"/><rect x="10" y="50" width="9" height="9" fill="#f97316"/><rect x="20" y="50" width="9" height="9" fill="#374151"/><rect x="30" y="50" width="9" height="9" fill="#374151"/><rect x="40" y="50" width="9" height="9" fill="#f97316"/><rect x="50" y="50" width="9" height="9" fill="#374151"/><rect x="60" y="50" width="9" height="9" fill="#374151"/><rect x="70" y="50" width="9" height="9" fill="#374151"/><rect x="80" y="50" width="9" height="9" fill="#374151"/><rect x="90" y="50" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="60" width="9" height="9" fill="#374151"/><rect x="10" y="60" width="9" height="9" fill="#374151"/><rect x="20" y="60" width="9" height="9" fill="#f97316"/><rect x="30" y="60" width="9" height="9" fill="#374151"/><rect x="40" y="60" width="9" height="9" fill="#374151"/><rect x="50" y="60" width="9" height="9" fill="#374151"/><rect x="60" y="60" width="9" height="9" fill="#374151"/><rect x="70" y="60" width="9" height="9" fill="#f97316"/><rect x="80" y="60" width="9" height="9" fill="#374151"/><rect x="90" y="60" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="70" width="9" height="9" fill="#f97316"/><rect x="10" y="70" width="9" height="9" fill="#374151"/><rect x="20" y="70" width="9" height="9" fill="#374151"/><rect x="30" y="70" width="9" height="9" fill="#374151"/><rect x="40" y="70" width="9" height="9" fill="#374151"/><rect x="50" y="70" width="9" height="9" fill="#f97316"/><rect x="60" y="70" width="9" height="9" fill="#374151"/><rect x="70" y="70" width="9" height="9" fill="#374151"/><rect x="80" y="70" width="9" height="9" fill="#374151"/><rect x="90" y="70" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="80" width="9" height="9" fill="#374151"/><rect x="10" y="80" width="9" height="9" fill="#374151"/><rect x="20" y="80" width="9" height="9" fill="#374151"/><rect x="30" y="80" width="9" height="9" fill="#f97316"/><rect x="40" y="80" width="9" height="9" fill="#374151"/><rect x="50" y="80" width="9" height="9" fill="#374151"/><rect x="60" y="80" width="9" height="9" fill="#f97316"/><rect x="70" y="80" width="9" height="9" fill="#374151"/><rect x="80" y="80" width="9" height="9" fill="#374151"/><rect x="90" y="80" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="90" width="9" height="9" fill="#374151"/><rect x="10" y="90" width="9" height="9" fill="#374151"/><rect x="20" y="90" width="9" height="9" fill="#f97316"/><rect x="30" y="90" width="9" height="9" fill="#374151"/><rect x="40" y="90" width="9" height="9" fill="#374151"/><rect x="50" y="90" width="9" height="9" fill="#374151"/><rect x="60" y="90" width="9" height="9" fill="#374151"/><rect x="70" y="90" width="9" height="9" fill="#f97316"/><rect x="80" y="90" width="9" height="9" fill="#374151"/><rect x="90" y="90" width="9" height="9" fill="#374151"/>
+    </g>
+    <text x="60" y="156" text-anchor="middle" class="iter-num">25 / 100 dirty</text>
+  </g>
+
+  <!-- ITER 3: 10% dirty -->
+  <g transform="translate(440, 160)">
+    <rect x="-10" y="-10" width="140" height="160" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.2"/>
+    <text x="60" y="6" text-anchor="middle" class="iter-label" fill="#3b82f6">iter 3</text>
+    <text x="60" y="22" text-anchor="middle" class="iter-sub">iter 2 後變動的</text>
+    <text x="60" y="36" text-anchor="middle" class="iter-sub">~100 MB / 10%</text>
+    <g transform="translate(10, 46)">
+      <!-- 10 dirty -->
+      <rect x="0"   y="0" width="9" height="9" fill="#f97316"/><rect x="10"  y="0" width="9" height="9" fill="#374151"/><rect x="20"  y="0" width="9" height="9" fill="#374151"/><rect x="30"  y="0" width="9" height="9" fill="#374151"/><rect x="40"  y="0" width="9" height="9" fill="#374151"/><rect x="50"  y="0" width="9" height="9" fill="#374151"/><rect x="60"  y="0" width="9" height="9" fill="#f97316"/><rect x="70"  y="0" width="9" height="9" fill="#374151"/><rect x="80"  y="0" width="9" height="9" fill="#374151"/><rect x="90"  y="0" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="10" width="9" height="9" fill="#374151"/><rect x="10" y="10" width="9" height="9" fill="#374151"/><rect x="20" y="10" width="9" height="9" fill="#374151"/><rect x="30" y="10" width="9" height="9" fill="#374151"/><rect x="40" y="10" width="9" height="9" fill="#374151"/><rect x="50" y="10" width="9" height="9" fill="#374151"/><rect x="60" y="10" width="9" height="9" fill="#374151"/><rect x="70" y="10" width="9" height="9" fill="#374151"/><rect x="80" y="10" width="9" height="9" fill="#f97316"/><rect x="90" y="10" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="20" width="9" height="9" fill="#374151"/><rect x="10" y="20" width="9" height="9" fill="#374151"/><rect x="20" y="20" width="9" height="9" fill="#374151"/><rect x="30" y="20" width="9" height="9" fill="#f97316"/><rect x="40" y="20" width="9" height="9" fill="#374151"/><rect x="50" y="20" width="9" height="9" fill="#374151"/><rect x="60" y="20" width="9" height="9" fill="#374151"/><rect x="70" y="20" width="9" height="9" fill="#374151"/><rect x="80" y="20" width="9" height="9" fill="#374151"/><rect x="90" y="20" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="30" width="9" height="9" fill="#374151"/><rect x="10" y="30" width="9" height="9" fill="#374151"/><rect x="20" y="30" width="9" height="9" fill="#374151"/><rect x="30" y="30" width="9" height="9" fill="#374151"/><rect x="40" y="30" width="9" height="9" fill="#374151"/><rect x="50" y="30" width="9" height="9" fill="#f97316"/><rect x="60" y="30" width="9" height="9" fill="#374151"/><rect x="70" y="30" width="9" height="9" fill="#374151"/><rect x="80" y="30" width="9" height="9" fill="#374151"/><rect x="90" y="30" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="40" width="9" height="9" fill="#f97316"/><rect x="10" y="40" width="9" height="9" fill="#374151"/><rect x="20" y="40" width="9" height="9" fill="#374151"/><rect x="30" y="40" width="9" height="9" fill="#374151"/><rect x="40" y="40" width="9" height="9" fill="#374151"/><rect x="50" y="40" width="9" height="9" fill="#374151"/><rect x="60" y="40" width="9" height="9" fill="#374151"/><rect x="70" y="40" width="9" height="9" fill="#374151"/><rect x="80" y="40" width="9" height="9" fill="#374151"/><rect x="90" y="40" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="50" width="9" height="9" fill="#374151"/><rect x="10" y="50" width="9" height="9" fill="#374151"/><rect x="20" y="50" width="9" height="9" fill="#374151"/><rect x="30" y="50" width="9" height="9" fill="#374151"/><rect x="40" y="50" width="9" height="9" fill="#f97316"/><rect x="50" y="50" width="9" height="9" fill="#374151"/><rect x="60" y="50" width="9" height="9" fill="#374151"/><rect x="70" y="50" width="9" height="9" fill="#374151"/><rect x="80" y="50" width="9" height="9" fill="#374151"/><rect x="90" y="50" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="60" width="9" height="9" fill="#374151"/><rect x="10" y="60" width="9" height="9" fill="#374151"/><rect x="20" y="60" width="9" height="9" fill="#f97316"/><rect x="30" y="60" width="9" height="9" fill="#374151"/><rect x="40" y="60" width="9" height="9" fill="#374151"/><rect x="50" y="60" width="9" height="9" fill="#374151"/><rect x="60" y="60" width="9" height="9" fill="#374151"/><rect x="70" y="60" width="9" height="9" fill="#374151"/><rect x="80" y="60" width="9" height="9" fill="#374151"/><rect x="90" y="60" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="70" width="9" height="9" fill="#374151"/><rect x="10" y="70" width="9" height="9" fill="#374151"/><rect x="20" y="70" width="9" height="9" fill="#374151"/><rect x="30" y="70" width="9" height="9" fill="#374151"/><rect x="40" y="70" width="9" height="9" fill="#374151"/><rect x="50" y="70" width="9" height="9" fill="#374151"/><rect x="60" y="70" width="9" height="9" fill="#374151"/><rect x="70" y="70" width="9" height="9" fill="#f97316"/><rect x="80" y="70" width="9" height="9" fill="#374151"/><rect x="90" y="70" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="80" width="9" height="9" fill="#374151"/><rect x="10" y="80" width="9" height="9" fill="#374151"/><rect x="20" y="80" width="9" height="9" fill="#374151"/><rect x="30" y="80" width="9" height="9" fill="#374151"/><rect x="40" y="80" width="9" height="9" fill="#374151"/><rect x="50" y="80" width="9" height="9" fill="#374151"/><rect x="60" y="80" width="9" height="9" fill="#374151"/><rect x="70" y="80" width="9" height="9" fill="#374151"/><rect x="80" y="80" width="9" height="9" fill="#374151"/><rect x="90" y="80" width="9" height="9" fill="#f97316"/>
+      <rect x="0"  y="90" width="9" height="9" fill="#374151"/><rect x="10" y="90" width="9" height="9" fill="#374151"/><rect x="20" y="90" width="9" height="9" fill="#f97316"/><rect x="30" y="90" width="9" height="9" fill="#374151"/><rect x="40" y="90" width="9" height="9" fill="#374151"/><rect x="50" y="90" width="9" height="9" fill="#374151"/><rect x="60" y="90" width="9" height="9" fill="#374151"/><rect x="70" y="90" width="9" height="9" fill="#374151"/><rect x="80" y="90" width="9" height="9" fill="#374151"/><rect x="90" y="90" width="9" height="9" fill="#374151"/>
+    </g>
+    <text x="60" y="156" text-anchor="middle" class="iter-num">10 / 100 dirty</text>
+  </g>
+
+  <!-- ITER 4: 4% dirty -->
+  <g transform="translate(580, 160)">
+    <rect x="-10" y="-10" width="120" height="160" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.2"/>
+    <text x="50" y="6" text-anchor="middle" class="iter-label" fill="#3b82f6">iter 4</text>
+    <text x="50" y="22" text-anchor="middle" class="iter-sub">~25 MB</text>
+    <text x="50" y="36" text-anchor="middle" class="iter-sub">4%</text>
+    <g transform="translate(0, 46)">
+      <!-- 10x10 mini grid: 4 dirty -->
+      <rect x="0"   y="0" width="9" height="9" fill="#374151"/><rect x="10"  y="0" width="9" height="9" fill="#374151"/><rect x="20"  y="0" width="9" height="9" fill="#374151"/><rect x="30"  y="0" width="9" height="9" fill="#374151"/><rect x="40"  y="0" width="9" height="9" fill="#374151"/><rect x="50"  y="0" width="9" height="9" fill="#374151"/><rect x="60"  y="0" width="9" height="9" fill="#374151"/><rect x="70"  y="0" width="9" height="9" fill="#f97316"/><rect x="80"  y="0" width="9" height="9" fill="#374151"/><rect x="90"  y="0" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="10" width="9" height="9" fill="#374151"/><rect x="10" y="10" width="9" height="9" fill="#374151"/><rect x="20" y="10" width="9" height="9" fill="#374151"/><rect x="30" y="10" width="9" height="9" fill="#374151"/><rect x="40" y="10" width="9" height="9" fill="#374151"/><rect x="50" y="10" width="9" height="9" fill="#374151"/><rect x="60" y="10" width="9" height="9" fill="#374151"/><rect x="70" y="10" width="9" height="9" fill="#374151"/><rect x="80" y="10" width="9" height="9" fill="#374151"/><rect x="90" y="10" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="20" width="9" height="9" fill="#374151"/><rect x="10" y="20" width="9" height="9" fill="#374151"/><rect x="20" y="20" width="9" height="9" fill="#374151"/><rect x="30" y="20" width="9" height="9" fill="#f97316"/><rect x="40" y="20" width="9" height="9" fill="#374151"/><rect x="50" y="20" width="9" height="9" fill="#374151"/><rect x="60" y="20" width="9" height="9" fill="#374151"/><rect x="70" y="20" width="9" height="9" fill="#374151"/><rect x="80" y="20" width="9" height="9" fill="#374151"/><rect x="90" y="20" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="30" width="9" height="9" fill="#374151"/><rect x="10" y="30" width="9" height="9" fill="#374151"/><rect x="20" y="30" width="9" height="9" fill="#374151"/><rect x="30" y="30" width="9" height="9" fill="#374151"/><rect x="40" y="30" width="9" height="9" fill="#374151"/><rect x="50" y="30" width="9" height="9" fill="#374151"/><rect x="60" y="30" width="9" height="9" fill="#374151"/><rect x="70" y="30" width="9" height="9" fill="#374151"/><rect x="80" y="30" width="9" height="9" fill="#374151"/><rect x="90" y="30" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="40" width="9" height="9" fill="#374151"/><rect x="10" y="40" width="9" height="9" fill="#f97316"/><rect x="20" y="40" width="9" height="9" fill="#374151"/><rect x="30" y="40" width="9" height="9" fill="#374151"/><rect x="40" y="40" width="9" height="9" fill="#374151"/><rect x="50" y="40" width="9" height="9" fill="#374151"/><rect x="60" y="40" width="9" height="9" fill="#374151"/><rect x="70" y="40" width="9" height="9" fill="#374151"/><rect x="80" y="40" width="9" height="9" fill="#374151"/><rect x="90" y="40" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="50" width="9" height="9" fill="#374151"/><rect x="10" y="50" width="9" height="9" fill="#374151"/><rect x="20" y="50" width="9" height="9" fill="#374151"/><rect x="30" y="50" width="9" height="9" fill="#374151"/><rect x="40" y="50" width="9" height="9" fill="#374151"/><rect x="50" y="50" width="9" height="9" fill="#374151"/><rect x="60" y="50" width="9" height="9" fill="#374151"/><rect x="70" y="50" width="9" height="9" fill="#374151"/><rect x="80" y="50" width="9" height="9" fill="#374151"/><rect x="90" y="50" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="60" width="9" height="9" fill="#374151"/><rect x="10" y="60" width="9" height="9" fill="#374151"/><rect x="20" y="60" width="9" height="9" fill="#374151"/><rect x="30" y="60" width="9" height="9" fill="#374151"/><rect x="40" y="60" width="9" height="9" fill="#374151"/><rect x="50" y="60" width="9" height="9" fill="#374151"/><rect x="60" y="60" width="9" height="9" fill="#f97316"/><rect x="70" y="60" width="9" height="9" fill="#374151"/><rect x="80" y="60" width="9" height="9" fill="#374151"/><rect x="90" y="60" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="70" width="9" height="9" fill="#374151"/><rect x="10" y="70" width="9" height="9" fill="#374151"/><rect x="20" y="70" width="9" height="9" fill="#374151"/><rect x="30" y="70" width="9" height="9" fill="#374151"/><rect x="40" y="70" width="9" height="9" fill="#374151"/><rect x="50" y="70" width="9" height="9" fill="#374151"/><rect x="60" y="70" width="9" height="9" fill="#374151"/><rect x="70" y="70" width="9" height="9" fill="#374151"/><rect x="80" y="70" width="9" height="9" fill="#374151"/><rect x="90" y="70" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="80" width="9" height="9" fill="#374151"/><rect x="10" y="80" width="9" height="9" fill="#374151"/><rect x="20" y="80" width="9" height="9" fill="#374151"/><rect x="30" y="80" width="9" height="9" fill="#374151"/><rect x="40" y="80" width="9" height="9" fill="#374151"/><rect x="50" y="80" width="9" height="9" fill="#374151"/><rect x="60" y="80" width="9" height="9" fill="#374151"/><rect x="70" y="80" width="9" height="9" fill="#374151"/><rect x="80" y="80" width="9" height="9" fill="#374151"/><rect x="90" y="80" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="90" width="9" height="9" fill="#374151"/><rect x="10" y="90" width="9" height="9" fill="#374151"/><rect x="20" y="90" width="9" height="9" fill="#374151"/><rect x="30" y="90" width="9" height="9" fill="#374151"/><rect x="40" y="90" width="9" height="9" fill="#f97316"/><rect x="50" y="90" width="9" height="9" fill="#374151"/><rect x="60" y="90" width="9" height="9" fill="#374151"/><rect x="70" y="90" width="9" height="9" fill="#374151"/><rect x="80" y="90" width="9" height="9" fill="#374151"/><rect x="90" y="90" width="9" height="9" fill="#374151"/>
+    </g>
+    <text x="50" y="156" text-anchor="middle" class="iter-num">4 / 100 dirty</text>
+  </g>
+
+  <!-- ITER 5: ~2% dirty (near convergence) -->
+  <g transform="translate(700, 160)">
+    <rect x="-10" y="-10" width="120" height="160" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.2"/>
+    <text x="50" y="6" text-anchor="middle" class="iter-label" fill="#3b82f6">iter 5</text>
+    <text x="50" y="22" text-anchor="middle" class="iter-sub">~10 MB</text>
+    <text x="50" y="36" text-anchor="middle" class="iter-sub">2%</text>
+    <g transform="translate(0, 46)">
+      <rect x="0"   y="0" width="9" height="9" fill="#374151"/><rect x="10"  y="0" width="9" height="9" fill="#374151"/><rect x="20"  y="0" width="9" height="9" fill="#374151"/><rect x="30"  y="0" width="9" height="9" fill="#374151"/><rect x="40"  y="0" width="9" height="9" fill="#374151"/><rect x="50"  y="0" width="9" height="9" fill="#374151"/><rect x="60"  y="0" width="9" height="9" fill="#374151"/><rect x="70"  y="0" width="9" height="9" fill="#374151"/><rect x="80"  y="0" width="9" height="9" fill="#374151"/><rect x="90"  y="0" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="10" width="9" height="9" fill="#374151"/><rect x="10" y="10" width="9" height="9" fill="#374151"/><rect x="20" y="10" width="9" height="9" fill="#374151"/><rect x="30" y="10" width="9" height="9" fill="#374151"/><rect x="40" y="10" width="9" height="9" fill="#374151"/><rect x="50" y="10" width="9" height="9" fill="#f97316"/><rect x="60" y="10" width="9" height="9" fill="#374151"/><rect x="70" y="10" width="9" height="9" fill="#374151"/><rect x="80" y="10" width="9" height="9" fill="#374151"/><rect x="90" y="10" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="20" width="9" height="9" fill="#374151"/><rect x="10" y="20" width="9" height="9" fill="#374151"/><rect x="20" y="20" width="9" height="9" fill="#374151"/><rect x="30" y="20" width="9" height="9" fill="#374151"/><rect x="40" y="20" width="9" height="9" fill="#374151"/><rect x="50" y="20" width="9" height="9" fill="#374151"/><rect x="60" y="20" width="9" height="9" fill="#374151"/><rect x="70" y="20" width="9" height="9" fill="#374151"/><rect x="80" y="20" width="9" height="9" fill="#374151"/><rect x="90" y="20" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="30" width="9" height="9" fill="#374151"/><rect x="10" y="30" width="9" height="9" fill="#374151"/><rect x="20" y="30" width="9" height="9" fill="#374151"/><rect x="30" y="30" width="9" height="9" fill="#374151"/><rect x="40" y="30" width="9" height="9" fill="#374151"/><rect x="50" y="30" width="9" height="9" fill="#374151"/><rect x="60" y="30" width="9" height="9" fill="#374151"/><rect x="70" y="30" width="9" height="9" fill="#374151"/><rect x="80" y="30" width="9" height="9" fill="#374151"/><rect x="90" y="30" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="40" width="9" height="9" fill="#374151"/><rect x="10" y="40" width="9" height="9" fill="#374151"/><rect x="20" y="40" width="9" height="9" fill="#374151"/><rect x="30" y="40" width="9" height="9" fill="#374151"/><rect x="40" y="40" width="9" height="9" fill="#374151"/><rect x="50" y="40" width="9" height="9" fill="#374151"/><rect x="60" y="40" width="9" height="9" fill="#374151"/><rect x="70" y="40" width="9" height="9" fill="#374151"/><rect x="80" y="40" width="9" height="9" fill="#374151"/><rect x="90" y="40" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="50" width="9" height="9" fill="#374151"/><rect x="10" y="50" width="9" height="9" fill="#374151"/><rect x="20" y="50" width="9" height="9" fill="#374151"/><rect x="30" y="50" width="9" height="9" fill="#374151"/><rect x="40" y="50" width="9" height="9" fill="#374151"/><rect x="50" y="50" width="9" height="9" fill="#374151"/><rect x="60" y="50" width="9" height="9" fill="#374151"/><rect x="70" y="50" width="9" height="9" fill="#374151"/><rect x="80" y="50" width="9" height="9" fill="#374151"/><rect x="90" y="50" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="60" width="9" height="9" fill="#374151"/><rect x="10" y="60" width="9" height="9" fill="#374151"/><rect x="20" y="60" width="9" height="9" fill="#374151"/><rect x="30" y="60" width="9" height="9" fill="#f97316"/><rect x="40" y="60" width="9" height="9" fill="#374151"/><rect x="50" y="60" width="9" height="9" fill="#374151"/><rect x="60" y="60" width="9" height="9" fill="#374151"/><rect x="70" y="60" width="9" height="9" fill="#374151"/><rect x="80" y="60" width="9" height="9" fill="#374151"/><rect x="90" y="60" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="70" width="9" height="9" fill="#374151"/><rect x="10" y="70" width="9" height="9" fill="#374151"/><rect x="20" y="70" width="9" height="9" fill="#374151"/><rect x="30" y="70" width="9" height="9" fill="#374151"/><rect x="40" y="70" width="9" height="9" fill="#374151"/><rect x="50" y="70" width="9" height="9" fill="#374151"/><rect x="60" y="70" width="9" height="9" fill="#374151"/><rect x="70" y="70" width="9" height="9" fill="#374151"/><rect x="80" y="70" width="9" height="9" fill="#374151"/><rect x="90" y="70" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="80" width="9" height="9" fill="#374151"/><rect x="10" y="80" width="9" height="9" fill="#374151"/><rect x="20" y="80" width="9" height="9" fill="#374151"/><rect x="30" y="80" width="9" height="9" fill="#374151"/><rect x="40" y="80" width="9" height="9" fill="#374151"/><rect x="50" y="80" width="9" height="9" fill="#374151"/><rect x="60" y="80" width="9" height="9" fill="#374151"/><rect x="70" y="80" width="9" height="9" fill="#374151"/><rect x="80" y="80" width="9" height="9" fill="#374151"/><rect x="90" y="80" width="9" height="9" fill="#374151"/>
+      <rect x="0"  y="90" width="9" height="9" fill="#374151"/><rect x="10" y="90" width="9" height="9" fill="#374151"/><rect x="20" y="90" width="9" height="9" fill="#374151"/><rect x="30" y="90" width="9" height="9" fill="#374151"/><rect x="40" y="90" width="9" height="9" fill="#374151"/><rect x="50" y="90" width="9" height="9" fill="#374151"/><rect x="60" y="90" width="9" height="9" fill="#374151"/><rect x="70" y="90" width="9" height="9" fill="#f97316"/><rect x="80" y="90" width="9" height="9" fill="#374151"/><rect x="90" y="90" width="9" height="9" fill="#374151"/>
+    </g>
+    <text x="50" y="156" text-anchor="middle" class="iter-num">2 / 100 dirty</text>
+  </g>
+
+  <!-- CONVERGENCE check -->
+  <g transform="translate(820, 160)">
+    <rect x="-10" y="-10" width="120" height="160" rx="6" ry="6" fill="#0a2018" stroke="#10b981" stroke-width="1.6"/>
+    <text x="50" y="6" text-anchor="middle" class="iter-label" fill="#10b981">收斂判斷</text>
+    <text x="50" y="24" text-anchor="middle" class="iter-sub">dirty rate</text>
+    <text x="50" y="38" text-anchor="middle" class="iter-sub">&lt; bandwidth</text>
+    <text x="50" y="56" text-anchor="middle" class="iter-sub" fill="#10b981" font-weight="700">YES &#8594;</text>
+    <text x="50" y="72" text-anchor="middle" class="iter-sub" fill="#10b981" font-weight="700">cutover</text>
+    <line x1="0" y1="84" x2="100" y2="84" stroke="#334155" stroke-width="0.8"/>
+    <text x="50" y="100" text-anchor="middle" class="iter-sub">NO &#8594; 再 iter</text>
+    <text x="50" y="116" text-anchor="middle" class="iter-sub">或 fallback</text>
+    <text x="50" y="138" text-anchor="middle" class="iter-num" fill="#94a3b8">(100 Mbps</text>
+    <text x="50" y="152" text-anchor="middle" class="iter-num" fill="#94a3b8">KubeVirt 預設)</text>
+  </g>
+
+  <!-- CUTOVER atomic block -->
+  <g transform="translate(940, 160)">
+    <rect x="-10" y="-10" width="120" height="160" rx="6" ry="6" fill="#2a2410" stroke="#eab308" stroke-width="2"/>
+    <text x="50" y="6" text-anchor="middle" class="iter-label" fill="#eab308">CUTOVER</text>
+    <text x="50" y="22" text-anchor="middle" class="iter-sub" fill="#fde047">(atomic)</text>
+    <line x1="0" y1="32" x2="100" y2="32" stroke="#854d0e" stroke-width="0.8"/>
+    <text x="50" y="50" text-anchor="middle" class="iter-sub">1. source</text>
+    <text x="50" y="64" text-anchor="middle" class="iter-sub" fill="#f43f5e" font-weight="700">qemu PAUSE</text>
+    <text x="50" y="82" text-anchor="middle" class="iter-sub">2. 傳最後</text>
+    <text x="50" y="96" text-anchor="middle" class="iter-sub">dirty + CPU</text>
+    <text x="50" y="110" text-anchor="middle" class="iter-sub">state &#8594; target</text>
+    <text x="50" y="128" text-anchor="middle" class="iter-sub">3. target</text>
+    <text x="50" y="142" text-anchor="middle" class="iter-sub" fill="#10b981" font-weight="700">qemu RESUME</text>
+  </g>
+
+  <!-- TARGET RESUME block -->
+  <g transform="translate(1060, 160)">
+    <rect x="-10" y="-10" width="220" height="160" rx="6" ry="6" fill="#1a1430" stroke="#a855f7" stroke-width="1.4"/>
+    <text x="100" y="6" text-anchor="middle" class="iter-label" fill="#a855f7">target node 接手</text>
+    <text x="100" y="24" text-anchor="middle" class="iter-sub">VM 在 target 上跑</text>
+    <line x1="0" y1="36" x2="200" y2="36" stroke="#581c87" stroke-width="0.8"/>
+    <text x="14" y="54" class="iter-sub">&#8226; source virt-launcher Pod 被刪除</text>
+    <text x="14" y="70" class="iter-sub">&#8226; RBD image unmap source</text>
+    <text x="14" y="86" class="iter-sub">&#8226; eth0 重新分 cilium IP</text>
+    <text x="14" y="102" class="iter-sub">&#8226; eth1 (multus bridge) 維持</text>
+    <text x="14" y="118" class="iter-sub">&#8226; Service endpoint 重指 target</text>
+    <text x="14" y="134" class="iter-sub">&#8226; nginx process 不重啟</text>
+    <text x="14" y="150" class="iter-sub" fill="#a855f7" font-style="italic">VMIM phase: Running &#8594; Succeeded</text>
+  </g>
+
+  <!-- Arrows between iter cells (precopy flow) -->
+  <line x1="270" y1="240" x2="290" y2="240" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="420" y1="240" x2="440" y2="240" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="570" y1="240" x2="580" y2="240" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="690" y1="240" x2="700" y2="240" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="810" y1="240" x2="820" y2="240" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="930" y1="240" x2="940" y2="240" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)"/>
+  <line x1="1050" y1="240" x2="1060" y2="240" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+
+  <!-- ===== Side panel: fallback paths (right side) ===== -->
+  <rect x="1340" y="148" width="340" height="510" rx="8" ry="8" fill="#0b1220" stroke="#f43f5e" stroke-width="1.4" stroke-dasharray="6,4"/>
+  <text x="1360" y="172" class="section-label" fill="#f43f5e">FALLBACK 不收斂時三條路</text>
+  <text x="1360" y="190" class="annotation">precopy 永遠不收斂 (dirty rate &gt; bandwidth)</text>
+
+  <!-- AUTO_CONVERGE -->
+  <rect x="1360" y="206" width="300" height="124" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="1378" y="226" class="fallback-title" fill="#3b82f6">[1] AUTO_CONVERGE</text>
+  <text x="1378" y="244" class="fallback-sub">qemu 偵測 dirty rate 過高 &#8594; 主動</text>
+  <text x="1378" y="260" class="fallback-sub">throttle vCPU 執行速度 (sleep loop)</text>
+  <text x="1378" y="276" class="fallback-sub">VM 變慢 &#8594; 寫 page 速率下降</text>
+  <text x="1378" y="292" class="fallback-sub">&#8594; dirty rate 跟著降 &#8594; 收斂</text>
+  <text x="1378" y="308" class="fallback-sub" fill="#94a3b8">代價：VM 在遷移期間反應變慢</text>
+  <text x="1378" y="322" class="fallback-sub" fill="#94a3b8">KubeVirt 預設 ON (allowAutoConverge)</text>
+
+  <!-- POSTCOPY -->
+  <rect x="1360" y="346" width="300" height="148" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1378" y="366" class="fallback-title" fill="#a855f7">[2] POSTCOPY</text>
+  <text x="1378" y="384" class="fallback-sub">切換策略：先 RESUME target</text>
+  <text x="1378" y="400" class="fallback-sub">target 還沒收到的 page &#8594; 觸發</text>
+  <text x="1378" y="416" class="fallback-sub">page fault &#8594; 從 source 拉回</text>
+  <text x="1378" y="432" class="fallback-sub">downtime 短 (cutover ms)</text>
+  <text x="1378" y="448" class="fallback-sub" fill="#94a3b8">風險：source 掛掉 = VM 整個壞</text>
+  <text x="1378" y="464" class="fallback-sub" fill="#94a3b8">(沒有 target 完整副本)</text>
+  <text x="1378" y="482" class="fallback-sub" fill="#94a3b8">需 allowPostCopy: true</text>
+
+  <!-- pause-fallback -->
+  <rect x="1360" y="510" width="300" height="138" rx="6" ry="6" fill="#0f172a" stroke="#f43f5e" stroke-width="1.2"/>
+  <text x="1378" y="530" class="fallback-title" fill="#f43f5e">[3] pause-fallback / abort</text>
+  <text x="1378" y="548" class="fallback-sub">timeout (預設 800s) &#8594; 認定失敗</text>
+  <text x="1378" y="564" class="fallback-sub">完全暫停 source VM &#8594; 整份</text>
+  <text x="1378" y="580" class="fallback-sub">RAM 一次傳完 &#8594; resume target</text>
+  <text x="1378" y="596" class="fallback-sub">downtime 變很長 (秒級)</text>
+  <text x="1378" y="612" class="fallback-sub" fill="#94a3b8">或直接 abort：VM 留在 source</text>
+  <text x="1378" y="628" class="fallback-sub" fill="#94a3b8">VirtualMachineInstanceMigration</text>
+  <text x="1378" y="642" class="fallback-sub" fill="#94a3b8">phase = Failed</text>
+
+  <!-- ===== Middle: bandwidth vs dirty-rate curve ===== -->
+  <text x="60" y="370" class="section-label" fill="#10b981">RATE CURVES &#8729; copy bandwidth (固定) vs dirty rate (遞減)</text>
+
+  <!-- chart frame -->
+  <rect x="120" y="384" width="1160" height="186" rx="6" ry="6" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+
+  <!-- y-axis -->
+  <line x1="160" y1="394" x2="160" y2="558" stroke="#475569" stroke-width="1"/>
+  <text x="138" y="402" text-anchor="end" class="axis-tick">Mbps</text>
+  <text x="154" y="406" text-anchor="end" class="axis-tick">高</text>
+  <text x="154" y="558" text-anchor="end" class="axis-tick">0</text>
+
+  <!-- x-axis -->
+  <line x1="160" y1="558" x2="1260" y2="558" stroke="#475569" stroke-width="1"/>
+  <text x="1268" y="562" class="axis-tick">time</text>
+
+  <!-- gridlines -->
+  <line x1="160" y1="430" x2="1260" y2="430" stroke="#1e293b" stroke-width="0.6" stroke-dasharray="2,3"/>
+  <line x1="160" y1="490" x2="1260" y2="490" stroke="#1e293b" stroke-width="0.6" stroke-dasharray="2,3"/>
+
+  <!-- vertical iter dividers -->
+  <line x1="280" y1="394" x2="280" y2="558" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="3,3"/>
+  <line x1="430" y1="394" x2="430" y2="558" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="3,3"/>
+  <line x1="570" y1="394" x2="570" y2="558" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="3,3"/>
+  <line x1="690" y1="394" x2="690" y2="558" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="3,3"/>
+  <line x1="810" y1="394" x2="810" y2="558" stroke="#1e293b" stroke-width="0.5" stroke-dasharray="3,3"/>
+
+  <!-- Convergence threshold line (horizontal) -->
+  <line x1="160" y1="500" x2="1260" y2="500" stroke="#10b981" stroke-width="1.4" stroke-dasharray="6,3"/>
+  <text x="1268" y="504" class="curve-label" fill="#10b981">convergence threshold</text>
+  <text x="1268" y="518" class="annotation">(KubeVirt 預設 100 Mbps)</text>
+
+  <!-- Copy bandwidth (constant, blue) -->
+  <line x1="160" y1="430" x2="1010" y2="430" stroke="#3b82f6" stroke-width="2.2"/>
+  <text x="180" y="422" class="curve-label" fill="#3b82f6">copy bandwidth (固定)</text>
+
+  <!-- Dirty rate curve (declining, orange) -->
+  <path d="M 160 408 Q 220 410 280 420 Q 340 432 430 470 Q 510 488 570 498 Q 630 502 690 504 Q 750 506 810 506" stroke="#f97316" stroke-width="2.4" fill="none"/>
+  <text x="180" y="464" class="curve-label" fill="#f97316">dirty rate (遞減)</text>
+
+  <!-- Convergence point (where dirty rate < threshold) -->
+  <circle cx="810" cy="506" r="6" fill="#10b981" stroke="#0f172a" stroke-width="1.5"/>
+  <text x="820" y="490" class="curve-label" fill="#10b981">收斂點</text>
+  <text x="820" y="478" class="annotation">dirty rate &lt; copy bw</text>
+
+  <!-- cutover band on chart -->
+  <rect x="940" y="394" width="50" height="164" fill="#eab308" fill-opacity="0.18" stroke="#eab308" stroke-width="0.8"/>
+  <text x="965" y="408" text-anchor="middle" class="curve-label" fill="#eab308">cutover</text>
+
+  <!-- target running region on chart -->
+  <line x1="990" y1="558" x2="1260" y2="558" stroke="#a855f7" stroke-width="3"/>
+  <text x="1100" y="548" class="curve-label" fill="#a855f7" text-anchor="middle">target run</text>
+
+  <!-- iter labels under chart -->
+  <text x="220" y="572" class="axis-tick" text-anchor="middle">iter 1</text>
+  <text x="355" y="572" class="axis-tick" text-anchor="middle">iter 2</text>
+  <text x="500" y="572" class="axis-tick" text-anchor="middle">iter 3</text>
+  <text x="630" y="572" class="axis-tick" text-anchor="middle">iter 4</text>
+  <text x="750" y="572" class="axis-tick" text-anchor="middle">iter 5</text>
+
+  <!-- ===== Bottom: service availability timeline ===== -->
+  <text x="60" y="618" class="section-label" fill="#a855f7">SERVICE AVAILABILITY &#8729; ping miss / connection drops &#8776; cutover 寬度</text>
+
+  <!-- timeline frame -->
+  <rect x="120" y="632" width="1160" height="220" rx="6" ry="6" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+
+  <!-- VM running on source band (green) -->
+  <rect x="160" y="656" width="780" height="44" rx="4" ry="4" fill="#0a3322" stroke="#10b981" stroke-width="1.4"/>
+  <text x="180" y="676" class="timeline-label" fill="#10b981">VM running on source (pve-2)</text>
+  <text x="180" y="690" class="timeline-sub">qemu 持續執行 instruction &#8729; nginx 提供服務</text>
+  <text x="930" y="676" text-anchor="end" class="timeline-sub" fill="#10b981">user 看不出在遷移</text>
+
+  <!-- cutover narrow band (yellow) -->
+  <rect x="940" y="656" width="50" height="44" rx="2" ry="2" fill="#3a2f12" stroke="#eab308" stroke-width="1.6"/>
+  <text x="965" y="678" text-anchor="middle" class="downtime-label">cutover</text>
+  <text x="965" y="692" text-anchor="middle" class="iter-num" fill="#fde047">PAUSE/RESUME</text>
+
+  <!-- VM running on target band (purple) -->
+  <rect x="990" y="656" width="270" height="44" rx="4" ry="4" fill="#1a1430" stroke="#a855f7" stroke-width="1.4"/>
+  <text x="1010" y="676" class="timeline-label" fill="#a855f7">VM running on target (pve-3)</text>
+  <text x="1010" y="690" class="timeline-sub">qemu RESUME &#8729; nginx 不重啟 &#8729; Service 自動 reroute</text>
+
+  <!-- ping ticks row -->
+  <text x="140" y="730" class="timeline-sub">ping</text>
+  <!-- successful pings (green dots) before cutover -->
+  <circle cx="200" cy="726" r="4" fill="#10b981"/>
+  <circle cx="260" cy="726" r="4" fill="#10b981"/>
+  <circle cx="320" cy="726" r="4" fill="#10b981"/>
+  <circle cx="380" cy="726" r="4" fill="#10b981"/>
+  <circle cx="440" cy="726" r="4" fill="#10b981"/>
+  <circle cx="500" cy="726" r="4" fill="#10b981"/>
+  <circle cx="560" cy="726" r="4" fill="#10b981"/>
+  <circle cx="620" cy="726" r="4" fill="#10b981"/>
+  <circle cx="680" cy="726" r="4" fill="#10b981"/>
+  <circle cx="740" cy="726" r="4" fill="#10b981"/>
+  <circle cx="800" cy="726" r="4" fill="#10b981"/>
+  <circle cx="860" cy="726" r="4" fill="#10b981"/>
+  <circle cx="920" cy="726" r="4" fill="#10b981"/>
+  <!-- TIMEOUT during cutover (orange/red Xs) -->
+  <text x="950" y="730" class="iter-label" fill="#f43f5e" text-anchor="middle">&#10005;</text>
+  <text x="970" y="730" class="iter-label" fill="#f43f5e" text-anchor="middle">&#10005;</text>
+  <text x="985" y="730" class="iter-label" fill="#f43f5e" text-anchor="middle">&#10005;</text>
+  <!-- successful pings after -->
+  <circle cx="1010" cy="726" r="4" fill="#10b981"/>
+  <circle cx="1070" cy="726" r="4" fill="#10b981"/>
+  <circle cx="1130" cy="726" r="4" fill="#10b981"/>
+  <circle cx="1190" cy="726" r="4" fill="#10b981"/>
+  <circle cx="1250" cy="726" r="4" fill="#10b981"/>
+
+  <!-- downtime bracket -->
+  <line x1="940" y1="752" x2="940" y2="772" stroke="#eab308" stroke-width="1.6"/>
+  <line x1="990" y1="752" x2="990" y2="772" stroke="#eab308" stroke-width="1.6"/>
+  <line x1="940" y1="772" x2="990" y2="772" stroke="#eab308" stroke-width="1.6"/>
+  <text x="965" y="788" text-anchor="middle" class="downtime-label">downtime &#8776; 50-200 ms</text>
+  <text x="965" y="802" text-anchor="middle" class="annotation" fill="#fde047">(輕度負載 VM 通常 &lt; 200ms)</text>
+
+  <!-- TCP connection drop annotations -->
+  <text x="140" y="830" class="timeline-sub">TCP</text>
+  <text x="180" y="830" class="timeline-sub">已建立 connection 多半不會 reset (qemu 凍結而非 kill)，</text>
+  <text x="180" y="844" class="timeline-sub">但 cutover 期間到達的 SYN/ACK 會 retransmit；高頻寫應用可能掉幾個 packet。</text>
+
+  <!-- VMIM phase markers below timeline -->
+  <line x1="200" y1="816" x2="940" y2="816" stroke="#3b82f6" stroke-width="0.6" stroke-dasharray="2,3" opacity="0.5"/>
+  <text x="200" y="708" class="iter-num" fill="#3b82f6">VMIM: Running (precopy)</text>
+  <text x="945" y="708" class="iter-num" fill="#eab308">cutover</text>
+  <text x="1000" y="708" class="iter-num" fill="#a855f7">VMIM: Succeeded</text>
+
+  <!-- ===== Legend (bottom strip) ===== -->
+  <g transform="translate(80, 880)">
+    <rect x="0" y="0" width="1540" height="78" rx="8" ry="8" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+
+    <!-- Page grid legend -->
+    <rect x="16" y="14" width="14" height="14" fill="#f97316"/>
+    <text x="38" y="26" class="legend-text">dirty page (本輪需要再 copy)</text>
+
+    <rect x="240" y="14" width="14" height="14" fill="#374151"/>
+    <text x="262" y="26" class="legend-text">clean page (上輪 copy 後沒被改)</text>
+
+    <!-- Curve legend -->
+    <line x1="490" y1="22" x2="514" y2="22" stroke="#3b82f6" stroke-width="2.2"/>
+    <text x="522" y="26" class="legend-text">copy bandwidth</text>
+
+    <line x1="660" y1="22" x2="684" y2="22" stroke="#f97316" stroke-width="2.2"/>
+    <text x="692" y="26" class="legend-text">dirty rate</text>
+
+    <line x1="810" y1="22" x2="834" y2="22" stroke="#10b981" stroke-width="1.4" stroke-dasharray="6,3"/>
+    <text x="842" y="26" class="legend-text">convergence threshold</text>
+
+    <!-- Service availability legend -->
+    <rect x="1030" y="14" width="14" height="14" fill="#0a3322" stroke="#10b981" stroke-width="1.4"/>
+    <text x="1052" y="26" class="legend-text">VM on source</text>
+
+    <rect x="1180" y="14" width="14" height="14" fill="#3a2f12" stroke="#eab308" stroke-width="1.4"/>
+    <text x="1202" y="26" class="legend-text">cutover (downtime)</text>
+
+    <rect x="1350" y="14" width="14" height="14" fill="#1a1430" stroke="#a855f7" stroke-width="1.4"/>
+    <text x="1372" y="26" class="legend-text">VM on target</text>
+
+    <!-- Row 2: ping legend + observability -->
+    <circle cx="23" cy="54" r="4" fill="#10b981"/>
+    <text x="38" y="58" class="legend-text">ping success (1 包/s)</text>
+
+    <text x="200" y="58" class="iter-label" fill="#f43f5e">&#10005;</text>
+    <text x="216" y="58" class="legend-text">ping TIMEOUT (cutover 期間)</text>
+
+    <line x1="430" y1="54" x2="454" y2="54" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+    <text x="462" y="58" class="legend-text">precopy iter 推進</text>
+
+    <line x1="610" y1="54" x2="634" y2="54" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+    <text x="642" y="58" class="legend-text">cutover &#8594; resume</text>
+
+    <text x="810" y="58" class="legend-text">觀察：</text>
+    <text x="858" y="58" class="legend-text" fill="#94a3b8">kubectl get vmim -w &#8729; kubectl logs -l kubevirt.io=virt-handler &#8729; kubevirt.io/migration_progress 系列 metrics</text>
+  </g>
+
+  <!-- ===== Source -> Target cross-link arrow (purple, large, behind everything else) ===== -->
+  <path d="M 160 980 Q 850 1010 1540 980" stroke="#a855f7" stroke-width="0" fill="none" opacity="0"/>
+
+  <!-- Side panel arrow connector to convergence-check block -->
+  <path d="M 880 250 Q 1100 240 1340 280" stroke="#f43f5e" stroke-width="1.4" stroke-dasharray="6,3" fill="none" marker-end="url(#arrow-rose)" opacity="0.7"/>
+  <text x="1130" y="244" class="annotation" fill="#f43f5e">收斂失敗 &#8594; fallback</text>
+
+</svg>
