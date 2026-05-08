@@ -15,6 +15,10 @@ description: 把 30 天累積的所有元件整合成一個 production-style web
 
 最後一天，總結。Day 1 你 ssh 進 control plane node 第一次看到 kube-apiserver；Day 30 你親手部署一個跨儲存、網路、虛擬化整層的 production-style VM 平台。
 
+![Day 30 整合 demo 拓樸：3 baremetal Proxmox node 各跑一個 k8s VM；node 1 跑 control plane (cilium / kubevirt / rook operator) + ceph mon-a/osd.0；node 2 跑 demo VM（web-vm 含 eth0 cilium primary + eth1 multus bridge）+ ceph mon-b/osd.1；node 3 跑 k8s Service expose + live migration target slot + ceph mon-c/osd.2](/diagrams/learning-plan/day-30-topology.png)
+
+*圖：30 天 lab 終局的整合拓樸——cilium 提供 Pod 與 Service 網路、multus 給 VM 加第二張 NIC、ceph 透過 rook+ceph-csi 給 VM PVC、kubevirt 把 VM 跑成 Pod；外部 client 走 multus bridge 直接打 192.168.1.100，cluster 內 client 走 Service 經 cilium VXLAN 進 web-vm；最後 live migration 把 VM 從 node 2 搬到 node 3，nginx 不中斷。*
+
 ## 前置條件
 
 - 昨日 [day-29](/learning-plan/features/day-29) 已完成；Day 1-29 累積的所有元件正常運作
