@@ -16,11 +16,12 @@ opened_at: 2026-05-08 (loop-1)
 
 生成方式有以下選項，每個都需要使用者拍板：
 
-### 選項 A：用 `skills/fireworks-tech-graph/`（如果是 Fireworks AI 圖像生成）
-- 需要 Fireworks API key（環境變數？.env？）
-- 每張圖 token / 費用未知
-- 風格可控但需要 prompt engineering
-- molearn 的 PNG 看起來是用此方法生（`molearn/next-site/public/diagrams/` 有實際 PNG）
+### 選項 A：用 `skills/fireworks-tech-graph/`（**已安裝，純本機工具**）
+- **跟 Fireworks AI API 無關**。是 yizhiyanhua-ai 寫的 Claude Code skill，用 SVG template + JSON 輸入產生 diagram，再用 `rsvg-convert` 轉 PNG。
+- 7 種內建樣式：architecture / flowchart / UML / ER / sequence / agent-memory / concept map
+- **無 API key、無外部費用**，只要本機裝了 `rsvg-convert`（macOS: `brew install librsvg`）
+- 用法：呼叫 skill → 給 JSON 描述 → SVG 出來 → 自動轉 PNG
+- molearn 的 PNG 應該是用此方式生的（`molearn/next-site/public/diagrams/` 有實際 PNG，跟此 skill 樣式一致）
 
 ### 選項 B：mermaid-cli + 手寫 mermaid
 - 免費、本機可跑
@@ -51,11 +52,15 @@ opened_at: 2026-05-08 (loop-1)
 
 ## 需要使用者決定的事
 
-1. 採選項 A、B、C、D 哪一個？
-2. 若 A：是否要授權 Fireworks API 使用？key 放哪？
-3. 若 B：build pipeline 怎麼接？是 commit time 跑還是 CI 跑？
+1. 採選項 A、B、C、D 哪一個？（**修正後：選項 A 已是無 API key 的本機工具，門檻最低**）
+2. 若 A：本機有沒有 `rsvg-convert`（macOS `brew install librsvg`）？沒有的話授權安裝？
+3. 若 B：build pipeline 怎麼接？是 commit time 跑還是 CI 跑？（且要重新詮釋 CLAUDE.md「不加 Mermaid」是否包含 build-time render）
 4. 若 C：使用者想自己畫還是要 AI 用文字描述後丟給其他工具？
 5. 若 D：是否要修 spec §3 r4 評分標準的 weight？
+
+## 訂正紀錄
+
+2026-05-08：原本以為「選項 A 需要 Fireworks API key」是錯的——`fireworks-tech-graph` 是純本機 SVG skill 跟 Fireworks AI 無關。修正後門檻大幅降低。
 
 ## 暫定處理（不等使用者）
 
