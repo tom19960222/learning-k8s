@@ -1,0 +1,304 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1100" width="1700" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 12px; fill: #94a3b8; }
+    .section-label { font-size: 14px; font-weight: 700; letter-spacing: 0.04em; }
+    .node-title { font-size: 14px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .mount-label { font-size: 10px; fill: #cbd5e1; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .arrow-label-strong { font-size: 11px; font-weight: 700; fill: #f1f5f9; }
+    .code { font-size: 11px; fill: #cbd5e1; }
+    .code-key { font-size: 11px; fill: #fbbf24; }
+    .note { font-size: 10px; fill: #94a3b8; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .step-num { font-size: 11px; font-weight: 700; fill: #f1f5f9; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+  </defs>
+  <rect width="1700" height="1100" fill="url(#bg-grad)"/>
+  <text x="850" y="34" text-anchor="middle" class="title">Multus Thick mode Internals: shim &#8594; multus.sock UDS RPC &#8594; daemon &#8594; chroot+exec delegate (host fs view)</text>
+  <text x="850" y="54" text-anchor="middle" class="subtitle">Why containerized daemon needs chroot to reach host /opt/cni/bin and host /etc/cni/net.d so each delegate sees the same fs as if invoked from host</text>
+
+  <!-- ==================== Section 1: Process Layout ==================== -->
+  <rect x="20" y="74" width="1660" height="280" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="36" y="96" class="section-label" fill="#3b82f6">Section 1 &#8212; Process layout (multus-shim in kubelet&apos;s CNI runtime context vs multus-daemon DaemonSet Pod with hostPath mounts)</text>
+
+  <!-- kubelet CNI runtime box (left) -->
+  <rect x="60" y="118" width="380" height="220" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="250" y="142" text-anchor="middle" class="node-title" fill="#3b82f6">kubelet&apos;s CNI runtime context</text>
+  <text x="250" y="160" text-anchor="middle" class="node-sub">node-local; runs as root</text>
+
+  <!-- multus-shim binary inside -->
+  <rect x="92" y="180" width="316" height="138" rx="5" ry="5" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="250" y="202" text-anchor="middle" class="node-title" fill="#f97316">multus-shim binary</text>
+  <text x="250" y="218" text-anchor="middle" class="node-sub">/opt/cni/bin/multus (host)</text>
+  <text x="106" y="240" class="code">size: ~few MB (Go static binary)</text>
+  <text x="106" y="256" class="code">no clientset, no informer, no</text>
+  <text x="106" y="270" class="code">apiserver TLS handshake</text>
+  <text x="106" y="288" class="code-key">func main() {</text>
+  <text x="106" y="302" class="code">  skel.PluginMainFuncs(api.CmdAdd, ...)</text>
+  <text x="106" y="316" class="code-key">}</text>
+
+  <!-- UDS in middle -->
+  <rect x="700" y="170" width="300" height="170" rx="6" ry="6" fill="#0a0a0a" stroke="#eab308" stroke-width="1.8"/>
+  <text x="850" y="194" text-anchor="middle" class="node-title" fill="#eab308">multus.sock</text>
+  <text x="850" y="212" text-anchor="middle" class="node-sub">unix domain socket (UDS)</text>
+  <text x="716" y="236" class="code-key">path:</text>
+  <text x="760" y="236" class="code">/run/multus/multus.sock</text>
+  <text x="716" y="254" class="code-key">type:</text>
+  <text x="760" y="254" class="code">SOCK_STREAM</text>
+  <text x="716" y="272" class="code-key">protocol:</text>
+  <text x="780" y="272" class="code">HTTP-over-UDS</text>
+  <text x="716" y="290" class="code-key">perms:</text>
+  <text x="760" y="290" class="code">0600, owner root</text>
+  <text x="716" y="312" class="code">net.Dial(&quot;unix&quot;, path) on shim;</text>
+  <text x="716" y="326" class="code">net.Listen(&quot;unix&quot;, path) on daemon</text>
+
+  <!-- multus-daemon Pod (right, large) -->
+  <rect x="1060" y="118" width="600" height="220" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="2"/>
+  <text x="1360" y="142" text-anchor="middle" class="node-title" fill="#f97316">multus-daemon Pod (DaemonSet, per node)</text>
+  <text x="1360" y="160" text-anchor="middle" class="node-sub">securityContext.privileged: true; CAP_SYS_CHROOT, CAP_NET_ADMIN</text>
+
+  <!-- hostPath mounts inside daemon Pod -->
+  <rect x="1080" y="178" width="280" height="36" rx="4" ry="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1090" y="194" class="mount-label" fill="#34d399">hostPath: /opt/cni/bin</text>
+  <text x="1090" y="208" class="mount-label">&#8594; mount: /host/opt/cni/bin (delegate binaries)</text>
+
+  <rect x="1080" y="222" width="280" height="36" rx="4" ry="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1090" y="238" class="mount-label" fill="#34d399">hostPath: /etc/cni/net.d</text>
+  <text x="1090" y="252" class="mount-label">&#8594; mount: /host/etc/cni/net.d (CNI conf)</text>
+
+  <rect x="1080" y="266" width="280" height="36" rx="4" ry="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1090" y="282" class="mount-label" fill="#34d399">hostPath: /run</text>
+  <text x="1090" y="296" class="mount-label">&#8594; mount: /host/run (UDS dir + runtime)</text>
+
+  <rect x="1080" y="310" width="280" height="22" rx="4" ry="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1090" y="324" class="mount-label" fill="#34d399">hostPath: /var/lib/kubelet/pod-resources (PodResources gRPC)</text>
+
+  <!-- daemon process box (right side of daemon Pod) -->
+  <rect x="1380" y="178" width="260" height="154" rx="5" ry="5" fill="#0b1220" stroke="#f97316" stroke-width="1.2"/>
+  <text x="1510" y="200" text-anchor="middle" class="node-title" fill="#fb923c">daemon process</text>
+  <text x="1510" y="216" text-anchor="middle" class="node-sub">cmd/multus-daemon/main.go</text>
+  <text x="1394" y="238" class="code">http.Server on UDS (/cni, /delegate)</text>
+  <text x="1394" y="254" class="code">Pod informer (own node)</text>
+  <text x="1394" y="270" class="code">NAD informer (cluster-wide)</text>
+  <text x="1394" y="286" class="code">ChrootExec invoker</text>
+  <text x="1394" y="304" class="code">log writer for network-status</text>
+  <text x="1394" y="322" class="code">retry on ETXTBSY</text>
+
+  <!-- shim -> UDS arrow -->
+  <line x1="408" y1="248" x2="700" y2="248" stroke="#f97316" stroke-width="2.2" marker-end="url(#arrow-orange)"/>
+  <rect x="500" y="226" width="120" height="18" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="560" y="240" text-anchor="middle" class="arrow-label-strong" fill="#fb923c">net.Dial(unix)</text>
+
+  <!-- UDS -> daemon arrow -->
+  <line x1="1000" y1="248" x2="1380" y2="248" stroke="#f97316" stroke-width="2.2" marker-end="url(#arrow-orange)"/>
+  <rect x="1130" y="226" width="120" height="18" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1190" y="240" text-anchor="middle" class="arrow-label-strong" fill="#fb923c">net.Listen(unix)</text>
+
+  <!-- ==================== Section 2: UDS RPC ==================== -->
+  <rect x="20" y="372" width="1660" height="240" rx="8" ry="8" fill="#0f172a" stroke="#eab308" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="36" y="394" class="section-label" fill="#eab308">Section 2 &#8212; UDS RPC (HTTP-over-UDS protocol; JSON body carries CNI args; daemon dispatches to handler)</text>
+
+  <!-- shim side request -->
+  <rect x="60" y="416" width="500" height="180" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="310" y="438" text-anchor="middle" class="node-title" fill="#f97316">shim builds HTTP request</text>
+  <text x="76" y="460" class="code-key">POST</text>
+  <text x="116" y="460" class="code">http://dummy/cni  HTTP/1.1</text>
+  <text x="76" y="476" class="code-key">Host:</text>
+  <text x="120" y="476" class="code">dummy   (URL host is fake; UDS overrides)</text>
+  <text x="76" y="492" class="code-key">Content-Type:</text>
+  <text x="190" y="492" class="code">application/json</text>
+  <text x="76" y="510" class="code">{</text>
+  <text x="86" y="524" class="code-key">&quot;env&quot;:</text>
+  <text x="140" y="524" class="code">[&quot;CNI_COMMAND=ADD&quot;, &quot;CNI_CONTAINERID=...&quot;,</text>
+  <text x="146" y="538" class="code">&quot;CNI_NETNS=/proc/&lt;pid&gt;/ns/net&quot;, ...],</text>
+  <text x="86" y="552" class="code-key">&quot;config&quot;:</text>
+  <text x="158" y="552" class="code">&quot;&lt;multus netconf JSON&gt;&quot;,</text>
+  <text x="86" y="566" class="code-key">&quot;cniArgs&quot;:</text>
+  <text x="166" y="566" class="code">&quot;K8S_POD_NAME=...;K8S_POD_NAMESPACE=...&quot;</text>
+  <text x="76" y="580" class="code">}</text>
+
+  <!-- arrow -->
+  <line x1="568" y1="500" x2="710" y2="500" stroke="#f97316" stroke-width="2.5" marker-end="url(#arrow-orange)"/>
+  <rect x="588" y="478" width="100" height="18" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="638" y="492" text-anchor="middle" class="arrow-label-strong" fill="#fb923c">over multus.sock</text>
+
+  <!-- daemon side dispatch -->
+  <rect x="720" y="416" width="500" height="180" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="970" y="438" text-anchor="middle" class="node-title" fill="#f97316">daemon dispatch</text>
+  <text x="736" y="460" class="code-key">router.HandleFunc(</text>
+  <text x="900" y="460" class="code">&quot;/cni&quot;, handleCNIRequest)</text>
+  <text x="736" y="476" class="code-key">router.HandleFunc(</text>
+  <text x="900" y="476" class="code">&quot;/delegate&quot;, handleDelegate)</text>
+  <text x="736" y="492" class="code-key">router.HandleFunc(</text>
+  <text x="900" y="492" class="code">&quot;/healthz&quot;, ...)</text>
+  <text x="736" y="514" class="code-key">switch cmd {</text>
+  <text x="736" y="528" class="code-key">case &quot;ADD&quot;:</text>
+  <text x="836" y="528" class="code">return s.cmdAdd(args, k8sArgs)</text>
+  <text x="736" y="542" class="code-key">case &quot;DEL&quot;:</text>
+  <text x="836" y="542" class="code">return nil, s.cmdDel(...)</text>
+  <text x="736" y="556" class="code-key">case &quot;CHECK&quot;</text>
+  <text x="816" y="556" class="code">/ &quot;GC&quot; / &quot;STATUS&quot;: ...</text>
+  <text x="736" y="570" class="code-key">}</text>
+  <text x="736" y="586" class="code">cache hit on Pod + NAD informer &#8594; no apiserver call</text>
+
+  <!-- daemon -> response (back to shim) -->
+  <line x1="1228" y1="500" x2="1370" y2="500" stroke="#f97316" stroke-width="2.5" marker-end="url(#arrow-orange)" stroke-dasharray="6,3"/>
+  <rect x="1250" y="478" width="100" height="18" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1300" y="492" text-anchor="middle" class="arrow-label-strong" fill="#fb923c">CNI Result JSON</text>
+
+  <!-- response box -->
+  <rect x="1380" y="416" width="280" height="180" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1520" y="438" text-anchor="middle" class="node-title" fill="#06b6d4">HTTP response body</text>
+  <text x="1394" y="460" class="code">{</text>
+  <text x="1404" y="474" class="code-key">&quot;Result&quot;:</text>
+  <text x="1474" y="474" class="code">{</text>
+  <text x="1414" y="488" class="code-key">&quot;cniVersion&quot;:</text>
+  <text x="1514" y="488" class="code">&quot;1.0.0&quot;,</text>
+  <text x="1414" y="502" class="code-key">&quot;interfaces&quot;:</text>
+  <text x="1514" y="502" class="code">[...],</text>
+  <text x="1414" y="516" class="code-key">&quot;ips&quot;:</text>
+  <text x="1464" y="516" class="code">[...]</text>
+  <text x="1404" y="530" class="code">},</text>
+  <text x="1404" y="544" class="code-key">&quot;CNIVersion&quot;:</text>
+  <text x="1504" y="544" class="code">&quot;1.0.0&quot;</text>
+  <text x="1394" y="558" class="code">}</text>
+  <text x="1394" y="578" class="code">shim prints to stdout &#8594; kubelet</text>
+
+  <!-- ==================== Section 3: chroot+exec mechanism ==================== -->
+  <rect x="20" y="630" width="1660" height="380" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="36" y="652" class="section-label" fill="#10b981">Section 3 &#8212; chroot+exec mechanism (Go SysProcAttr.Chroot at fork; daemon stays containerized; child sees host fs view)</text>
+
+  <!-- Code box (left) -->
+  <rect x="44" y="672" width="500" height="316" rx="6" ry="6" fill="#0a0a0a" stroke="#10b981" stroke-width="1.5"/>
+  <text x="294" y="694" text-anchor="middle" class="node-title" fill="#10b981">pkg/server/exec_chroot.go</text>
+  <text x="60" y="716" class="code-key">type ChrootExec struct {</text>
+  <text x="60" y="730" class="code">  Stderr        io.Writer</text>
+  <text x="60" y="744" class="code">  chrootDir     string  // e.g. &quot;/host&quot;</text>
+  <text x="60" y="758" class="code">  PluginDecoder</text>
+  <text x="60" y="772" class="code-key">}</text>
+  <text x="60" y="794" class="code-key">func (e *ChrootExec) ExecPlugin(</text>
+  <text x="60" y="808" class="code">    ctx context.Context, pluginPath string,</text>
+  <text x="60" y="822" class="code">    stdinData []byte, environ []string,</text>
+  <text x="60" y="836" class="code-key">) ([]byte, error) {</text>
+  <text x="60" y="852" class="code">  c := exec.CommandContext(ctx, pluginPath)</text>
+  <text x="60" y="866" class="code-key">  c.SysProcAttr = &amp;syscall.SysProcAttr{</text>
+  <text x="60" y="880" class="code-key">      Chroot:</text>
+  <text x="140" y="880" class="code">e.chrootDir,    // &lt;-- key</text>
+  <text x="60" y="894" class="code-key">  }</text>
+  <text x="60" y="908" class="code">  c.Env   &#9472; environ</text>
+  <text x="60" y="922" class="code">  c.Stdin &#9472; bytes.NewBuffer(stdinData)</text>
+  <text x="60" y="936" class="code">  return c.Output()</text>
+  <text x="60" y="950" class="code">  // retry on ETXTBSY (text file busy)</text>
+  <text x="60" y="964" class="code-key">}</text>
+  <text x="294" y="982" text-anchor="middle" class="note">Chroot is a SysProcAttr field; child does chroot before exec</text>
+
+  <!-- syscall trace (middle) -->
+  <rect x="568" y="672" width="380" height="316" rx="6" ry="6" fill="#0a0a0a" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="758" y="694" text-anchor="middle" class="node-title" fill="#a855f7">kernel syscall trace (per delegate)</text>
+
+  <text x="582" y="722" class="step-num" fill="#60a5fa">1.</text>
+  <text x="600" y="722" class="arrow-label-strong">clone() / fork()</text>
+  <text x="582" y="738" class="code">  daemon process forks new child</text>
+
+  <text x="582" y="762" class="step-num" fill="#60a5fa">2.</text>
+  <text x="600" y="762" class="arrow-label-strong">in child only:</text>
+  <text x="582" y="778" class="code-key">  chroot(&quot;/host&quot;)</text>
+  <text x="582" y="792" class="code">  &#8594; child&apos;s fs root pivots to /host</text>
+  <text x="582" y="806" class="code">     (CAP_SYS_CHROOT required)</text>
+
+  <text x="582" y="830" class="step-num" fill="#60a5fa">3.</text>
+  <text x="600" y="830" class="arrow-label-strong">in child:</text>
+  <text x="582" y="846" class="code-key">  chdir(&quot;/&quot;)</text>
+  <text x="582" y="860" class="code">  &#8594; cwd at new root</text>
+
+  <text x="582" y="884" class="step-num" fill="#60a5fa">4.</text>
+  <text x="600" y="884" class="arrow-label-strong">in child:</text>
+  <text x="582" y="900" class="code-key">  execve(&quot;/opt/cni/bin/macvlan&quot;,</text>
+  <text x="582" y="914" class="code">         argv, envp)</text>
+  <text x="582" y="928" class="code">  &#8594; resolves on the new fs root</text>
+  <text x="582" y="942" class="code">     (i.e. host&apos;s /opt/cni/bin/macvlan)</text>
+
+  <text x="582" y="966" class="step-num" fill="#34d399">5.</text>
+  <text x="600" y="966" class="arrow-label-strong" fill="#34d399">delegate runs as host process</text>
+  <text x="582" y="982" class="note">parent (daemon) keeps original rootfs</text>
+
+  <!-- fs view comparison (right) -->
+  <rect x="972" y="672" width="688" height="316" rx="6" ry="6" fill="#0a0a0a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1316" y="694" text-anchor="middle" class="node-title" fill="#06b6d4">filesystem view: before chroot vs after chroot</text>
+
+  <!-- daemon view (left half) -->
+  <rect x="988" y="710" width="328" height="260" rx="5" ry="5" fill="#0b1220" stroke="#f97316" stroke-width="1.2"/>
+  <text x="1152" y="730" text-anchor="middle" class="node-title" fill="#fb923c">daemon&apos;s view (container fs)</text>
+  <text x="1152" y="746" text-anchor="middle" class="note">parent process; rootfs = container image</text>
+  <text x="1004" y="770" class="code-key">/</text>
+  <text x="1004" y="786" class="code">  bin/, etc/, usr/  (container image)</text>
+  <text x="1004" y="802" class="code">  run/multus/multus.sock</text>
+  <text x="1004" y="818" class="code-key">  /host/</text>
+  <text x="1004" y="834" class="code">    opt/cni/bin/macvlan,</text>
+  <text x="1004" y="848" class="code">                bridge, ipvlan, ...</text>
+  <text x="1004" y="862" class="code">    etc/cni/net.d/00-multus.conf, ...</text>
+  <text x="1004" y="876" class="code">    run/multus/, run/...</text>
+  <text x="1004" y="890" class="code">    var/lib/kubelet/pod-resources/</text>
+  <text x="1004" y="912" class="note">daemon refers to host bin as</text>
+  <text x="1004" y="926" class="code-key">  /host/opt/cni/bin/macvlan</text>
+  <text x="1004" y="946" class="note">but the binary expects to see</text>
+  <text x="1004" y="960" class="note">its peers at /opt/cni/bin/...,</text>
+
+  <!-- delegate view (right half) -->
+  <rect x="1332" y="710" width="316" height="260" rx="5" ry="5" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1490" y="730" text-anchor="middle" class="node-title" fill="#34d399">delegate&apos;s view (after chroot)</text>
+  <text x="1490" y="746" text-anchor="middle" class="note">child process; rootfs = host /</text>
+  <text x="1346" y="770" class="code-key">/</text>
+  <text x="1346" y="786" class="code">  bin/, etc/, usr/  (host)</text>
+  <text x="1346" y="802" class="code-key">  /opt/cni/bin/</text>
+  <text x="1346" y="818" class="code">    macvlan, bridge, ipvlan,</text>
+  <text x="1346" y="832" class="code">    sriov, host-device, ...</text>
+  <text x="1346" y="846" class="code-key">  /etc/cni/net.d/</text>
+  <text x="1346" y="862" class="code">    00-multus.conf, ...</text>
+  <text x="1346" y="876" class="code-key">  /run/</text>
+  <text x="1346" y="890" class="code">    multus/, cni/, ...</text>
+  <text x="1346" y="912" class="note">SAME paths a CNI plugin invoked</text>
+  <text x="1346" y="926" class="note">from the host kubelet would see;</text>
+  <text x="1346" y="940" class="note">delegates were authored assuming</text>
+  <text x="1346" y="954" class="note">a host fs &#8212; they keep working.</text>
+
+  <!-- arrow between views -->
+  <line x1="1316" y1="840" x2="1332" y2="840" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow-cyan)"/>
+
+  <!-- ==================== Why-this-dance footer ==================== -->
+  <rect x="20" y="1024" width="1660" height="62" rx="6" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="36" y="1044" class="section-label" fill="#f1f5f9">Why the dance</text>
+  <text x="36" y="1062" class="legend-text">Daemon stays containerized so k8s manages its lifecycle (DaemonSet, restartPolicy, image upgrade, log collection)</text>
+  <text x="36" y="1078" class="legend-text">but each delegate must see the host fs &#8212; that&apos;s where /opt/cni/bin/* and /etc/cni/net.d/ live, and IPAM state files like /var/lib/cni/networks/. Chroot bridges the two worlds without unmounting the daemon&apos;s own rootfs.</text>
+
+  <text x="1672" y="1098" text-anchor="end" class="note">Source: multus-cni v4.2.4 pkg/server/exec_chroot.go (ChrootExec.ExecPlugin), deployments/multus-daemonset-thick.yml, pkg/server/api/{api.go, shim.go, socket.go}</text>
+</svg>

@@ -223,6 +223,10 @@ func (e *ChrootExec) ExecPlugin(ctx context.Context, pluginPath string,
 
 DaemonSet yaml 把 host `/` mount 進 daemon Pod 的某個路徑（例如 `/host`），daemon 啟動時把那個路徑當 `chrootDir`，每次 exec delegate 用 `Chroot` syscall 進那個 namespace。delegate 看到的 filesystem 就是真正的 host。
 
+![Multus thick mode 內部：multus-shim → multus.sock UDS RPC → multus-daemon (DaemonSet Pod with hostPath mounts /host/opt/cni/bin、/host/etc/cni/net.d、/run/multus、/var/lib/kubelet/pod-resources)；daemon 用 Go SysProcAttr.Chroot fork+exec 每個 delegate，讓 delegate 看到的根目錄是 host fs，能讀 host 的 CNI binaries 與 configs](/diagrams/multus/thick-shim-internals.png)
+
+*圖：上半段是 shim ↔ daemon 兩個 process 的位置，中段顯示 UDS RPC 的 payload 與 dispatch；下半段拆開 chroot+exec 機制——daemon 自己仍在 container 裡，但 fork 出去的 delegate 進到 host fs view（從 daemon 的 /host/opt/cni/bin 變成 delegate 的 /opt/cni/bin）。*
+
 ## /delegate endpoint：dynamic networks API
 
 ```go
