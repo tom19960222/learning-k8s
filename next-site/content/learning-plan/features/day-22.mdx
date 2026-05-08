@@ -162,6 +162,28 @@ KubeVirt 把 VM 當 first-class k8s 資源：
 - 原始碼進入點：[cmd/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/cmd) 下各元件的 main.go
 - virt-controller 主邏輯：[pkg/virt-controller/watch/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-controller/watch)
 
+### 為什麼這樣設計
+
+KubeVirt 把整套虛擬化平台拆成 operator + apiserver-extension + controller + per-node agent 四層，並用 operator pattern 管理自身 lifecycle，而不做成單一 DaemonSet。直觀答案是「KubeVirt 自己也要升級／降級／reconfigure，而 DaemonSet 沒辦法自我管理 CRD、webhook、ServiceAccount、SCC 這些 cluster-scoped 資源」。`KubeVirt` CR 是「我想要某個 version 的 KubeVirt 在 cluster 裡跑」的宣告，virt-operator 看到這個 CR 就把對應 version 的 manifest bundle 攤開、做版本差比、滾動更新。整個流程跟 cluster-api 或 prometheus-operator 同套思路。
+
+設計選擇背後的取捨主要在「資料平面 vs 控制平面」的隔離。virt-controller 是無狀態的 reconciler（任何 replica 接手都行，靠 leader election 決定主節點），所以做成 Deployment；virt-handler 必須 1:1 對應 node 上的 libvirt socket（VM 進程的本地 supervisor），所以做成 DaemonSet。把這兩種職責壓在同一個 binary 會讓 cluster-wide 的決策跟 per-node 的執行混在一起，後續要做 RBAC 收斂、要上 SELinux/seccomp profile、要分開 release cadence 都會卡住。virt-launcher 又再往下分一層 — 每個 VM 起一個 launcher Pod，把 libvirt + qemu 包進 Pod 裡跑，讓 k8s scheduler 直接做 VM placement。
+
+常見誤解是「virt-handler 跟 kubelet 重疊」。實際上 kubelet 還是負責 Pod lifecycle，virt-handler 只在 launcher Pod 內透過 unix socket 跟 libvirt 講話、把 domain state 對齊到 VMI status。沒有 virt-handler，VM 還是會跑（launcher Pod 裡的 libvirt 自己就能起 qemu），但 VMI 的 phase 不會收斂、live migration 也無法被觸發。
+
+### 對應原始碼
+
+- [`kubevirt/cmd/virt-operator/virt-operator.go:26`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-operator/virt-operator.go#L26) — virt-operator 的 main，啟動 leader election + KubeVirt CR 控制器
+- [`kubevirt/pkg/virt-operator/kubevirt.go:758`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-operator/kubevirt.go#L758) — `KubeVirtController.Run`，operator reconcile loop 的入口
+- [`kubevirt/pkg/virt-operator/kubevirt.go:1016`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-operator/kubevirt.go#L1016) — `syncInstallation`，operator 把 install bundle apply 到 cluster 的核心邏輯
+- [`kubevirt/pkg/virt-operator/resource/apply/`](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-operator/resource/apply) — 個別 resource 的 reconciler（Deployment、DaemonSet、CRD、webhook）
+- [`kubevirt/cmd/virt-handler/virt-handler.go`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-handler/virt-handler.go) — virt-handler main，啟動時連 libvirt socket、註冊 device plugin
+- [`kubevirt/pkg/virt-handler/vm.go:96`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-handler/vm.go#L96) — `VirtualMachineController` 的型別定義，看 handler 端 watch 哪些 informer
+
+### 延伸思考（可跳過）
+
+- 如果要設計「KubeVirt-lite」（只支援單 namespace、不支援 live migration），三層元件可以合併嗎？哪些 RBAC 必須拆開？
+- virt-operator 自己 crash 時，已存在的 VM 受不受影響？對照 prometheus-operator crash 時 prometheus 還跑得起來這件事。
+
 ## 收穫檢查
 
 - 為什麼 virt-handler 是 DaemonSet 而 virt-controller 是 Deployment？

@@ -162,6 +162,27 @@ KubeVirt metrics 是 Prometheus 標準格式，可以接進 thanos / grafana / V
 - [Metric reference](https://kubevirt.io/user-guide/operations/component_monitoring/)
 - [Prometheus operator + KubeVirt](https://kubevirt.io/labs/kubernetes/lab8.html)
 
+### 為什麼這樣設計
+
+console / vnc / migrate 這些 API 不是普通的 sub-resource，而是放在 virt-api 的 aggregation layer 上。直觀答案是這幾個 API 都需要「長連線、雙向資料流、binary 傳輸」這三個特性，跟標準 k8s sub-resource 的「單次 HTTP 請求／回應」模型不相容。`virtctl console` 開的是一條 WebSocket，把 user terminal 的 stdin 跟 VM 的 serial console 雙向接起來；`virtctl vnc` 也類似，但走 RFB protocol（VNC 二進位流）。標準 sub-resource（例如 `pods/exec`）也用 WebSocket，但是 kube-apiserver 有寫死的處理路徑；KubeVirt 不能改 kube-apiserver，只能用 aggregation layer 把自己的 sub-resource 接進去。
+
+設計選擇背後的取捨是「整合度 vs 自由度」。aggregation layer（透過 `APIService`）讓 virt-api 看起來像 kube-apiserver 的一部分：使用者用 `kubectl get vmi` / `kubectl proxy` / `RBAC` 都能直接套用，不必另外開 endpoint。但代價是 virt-api 必須完整實作一套 OpenAPI、handle authn/authz delegation、發 TLS cert（通常由 virt-operator 簽發給 aggregator 用）。這些 boilerplate 換來的是「Kubernetes-native UX」 — `virtctl console fedora-vm` 底層其實是 `kubectl proxy` + WebSocket upgrade，使用者不需要知道 virt-api 的存在。
+
+常見誤解是「sub-resource 都長得一樣、API 慣例都一致」。其實 console / vnc 的 WebSocket 又轉了一層：virt-api 收到 WebSocket 後，會去 cluster 內找對應 VM 的 virt-handler、再用 mTLS 跟 virt-handler 開另一條 WebSocket、最後 proxy 進 launcher Pod 的 unix socket。中間每跳一段 latency 都會疊加，所以 console 開起來會有 hop 感。`migrate` 又是另一回事 — virt-api 接受 PUT 請求後立刻回，實際的 RAM copy 是兩端 virt-handler 之間用 libvirt migration protocol 直接通，不經過 virt-api。
+
+### 對應原始碼
+
+- [`kubevirt/cmd/virt-api/virt-api.go`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-api/virt-api.go) — virt-api binary 入口
+- [`kubevirt/pkg/virt-api/api.go:206`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/api.go#L206) — `subresourceAPIGroup`，定義 `subresource.kubevirt.io` 這個 aggregation API group
+- [`kubevirt/pkg/virt-api/api.go:358`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/api.go#L358) — `console` / `vnc` sub-resource route 註冊
+- [`kubevirt/pkg/virt-api/rest/console.go:35`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/rest/console.go#L35) — `ConsoleRequestHandler`，處理 WebSocket upgrade + proxy 到 virt-handler 的核心 handler
+- [`kubevirt/pkg/virt-handler/vm.go:96`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-handler/vm.go#L96) — virt-handler 端的 `VirtualMachineController`，提供 console / vnc 的 socket endpoint
+
+### 延伸思考（可跳過）
+
+- 如果你想新增一個 `gpustats` sub-resource（streaming GPU 使用率），會放在 virt-api 還是另寫一個 aggregator？兩種選法在 RBAC 上有什麼差別？
+- console 的 WebSocket 經過 virt-api → virt-handler → launcher 三跳，理論延遲多少？實際打字感覺得到嗎？哪一段最容易變成瓶頸？
+
 ## 收穫檢查
 
 - VMI Phase 與 Pod Phase 不對等 — VMI Running 但 launcher Pod 卡住會是什麼狀況？

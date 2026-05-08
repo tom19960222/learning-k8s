@@ -216,6 +216,26 @@ DataVolume 是 KubeVirt 給 PVC 加 lifecycle 的 wrapper：自動建 PVC + 跑 
 - [Disks and Volumes](https://kubevirt.io/user-guide/storage/disks_and_volumes/) — VM disk 配置
 - [pkg/virt-launcher/virtwrap/converter/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/virtwrap/converter) — VMI spec 轉 libvirt domain XML 的程式碼
 
+### 為什麼這樣設計
+
+CDI 把「下載／轉換 image」的工作做成 importer Pod，而不是塞進 launcher Pod 的 init container。直觀答案是 importer Pod 必須在「PVC 還沒被任何 VM 用」時就跑完，否則會跟 VM 啟動的 mount 行為打架。把這層做成獨立的 controller-driven Pod，CDI 可以自由排程 importer 到任意有 ceph-csi node 的位置、用獨立 ServiceAccount 拿 image registry credential、importer 失敗時 controller 重新拉一個新 Pod 都不影響 PVC 本身。
+
+設計選擇背後的取捨是「lifecycle 解耦」。如果 image import 跟 VM 啟動綁在 launcher 的 init container 裡，會出三個問題：(1) VM 每次重啟都要驗證 image 完整性，浪費時間；(2) init container 跑失敗會讓整個 launcher Pod CrashLoopBackOff，VMI 的 condition 看起來會像「VM 起不來」而不是「image 還沒準備好」；(3) 多個 VM 共用同一份 base image 時沒辦法重用。DataVolume 走 controller pattern 後，import 是一次性事件、PVC 是長期資源，VM controller 看到 DataVolume `Succeeded` 才開始排 launcher Pod。這也是為什麼 KubeVirt 鼓勵「先建 base image PVC、再用 PVC clone 出每個 VM 的 root disk」。
+
+常見誤解是「DataVolume 等於 PVC + 一段下載指令」。實際上 DataVolume 帶 lifecycle 語意：source 換成 `pvc:` 時 CDI 會走 CSI clone（不起 importer Pod、由 ceph 端做 RBD snapshot）；source 是 `blank:` 時連 importer Pod 都不需要、controller 直接建 sparse PVC。這層抽象讓上層 CR（VirtualMachine）不必區分「我這個 root disk 是怎麼來的」，只要 reference DataVolume 就好。
+
+### 對應原始碼
+
+- [`kubevirt/containerized-data-importer/pkg/controller/datavolume/`](https://github.com/kubevirt/containerized-data-importer/tree/v1.62.0/pkg/controller/datavolume) — DataVolume controller，依 source 類型分派（http、registry、PVC clone、blank）
+- [`kubevirt/containerized-data-importer/pkg/importer/`](https://github.com/kubevirt/containerized-data-importer/tree/v1.62.0/pkg/importer) — importer Pod 內的 binary，負責下載 + qemu-img convert
+- [`kubevirt/pkg/virt-controller/watch/vmi/datavolumes.go`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vmi/datavolumes.go) — virt-controller 端等 DataVolume 進入 `Succeeded` 才放行 launcher Pod 的邏輯
+- [`kubevirt/pkg/virt-launcher/virtwrap/converter/`](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/virtwrap/converter) — VMI volume spec 轉 libvirt domain XML 時，PVC 跟 DataVolume 的差別
+
+### 延伸思考（可跳過）
+
+- 如果你要設計一個「給 GPU 訓練 image 用的 DataVolume 變體」，會把 importer Pod 換成什麼？要保留哪些 lifecycle 語意？
+- DataVolume `Succeeded` 之後 importer Pod 就可以刪了；但如果 PVC 後來壞掉，DataVolume status 還能告訴你「之前是從 https://x 下載的」嗎？
+
 ## 收穫檢查
 
 - DataVolume 是必要的嗎？能直接寫 PVC 然後手動填內容嗎？

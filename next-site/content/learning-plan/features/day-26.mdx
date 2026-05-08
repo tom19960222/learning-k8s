@@ -211,6 +211,26 @@ vmbr0 物理 bridge → 物理網路
 - VM NIC 程式碼：[pkg/network/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/network)
 - [SR-IOV with KubeVirt](https://kubevirt.io/user-guide/network/sriov/) — 高效能版本
 
+### 為什麼這樣設計
+
+KubeVirt 沒有自己重做 secondary network，而是 wrap 一層 multus 並加上 binding mode（`bridge` / `masquerade` / `passt` / `slirp`）。直觀答案是 multus 已經解決了「一個 Pod 多張 NIC」這個問題，KubeVirt 只負責「拿到 launcher Pod 的 N 張介面之後，怎麼接到 qemu」。multus annotation 只能配到 launcher Pod 的 namespace（產生一張 veth/macvlan/bridge port），但 VM 內看到的 NIC 必須走 qemu virtio-net、tap interface 才有 MAC、才能被 guest OS enumerate。中間這段（launcher Pod 的 NIC ↔ VM 內 NIC）就是 KubeVirt binding mode 在做的事。
+
+設計選擇背後的取捨是「pod-network 整合 vs 效能」。bridge binding 在 launcher Pod 內加一個 Linux bridge，把 multus 給的介面跟 qemu 的 tap 接起來 — 設定簡單、相容性最高，但每個 packet 多走一次 kernel bridge 跟 tap，throughput 只有 SR-IOV 的 1/3 到 1/2、latency 也較高。SR-IOV 走 device plugin 把 PF/VF 當 device 直接 passthrough 給 launcher Pod、再 PCI passthrough 給 qemu，不經過 kernel bridge — throughput 接近 line-rate，但要求 NIC 支援 SR-IOV、driver 要對、cluster 要部署 SR-IOV operator。對 5G UPF / NFV 這類 use case，多走一次 kernel 就足以讓 packet rate 從 10 Mpps 掉到 1 Mpps，所以正式環境會選 SR-IOV；對辦公室 VM 跑 legacy 軟體 bridge mode 已經夠用。
+
+常見誤解是「multus secondary network 也走 cilium NetworkPolicy」。實際上 NetworkPolicy 只 enforce 在 cilium 自己負責的介面（pod default network），第二介面走 multus → bridge → 物理網段，這條路徑 cilium 看不到、policy 不適用。要對 secondary network 做 ACL 必須靠物理 bridge 上層的 firewall，或改用 cilium 的 multi-network 支援（experimental）。
+
+### 對應原始碼
+
+- [`kubevirt/pkg/network/multus/annotation.go:45`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/network/multus/annotation.go#L45) — `GenerateCNIAnnotation`，把 VMI spec 的 networks 轉成 multus 認得的 `k8s.v1.cni.cncf.io/networks` annotation
+- [`kubevirt/pkg/network/setup/network.go:32`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/network/setup/network.go#L32) — `VMNetworkConfigurator`，launcher Pod 內負責把 multus 給的介面接到 qemu tap 的核心型別
+- [`kubevirt/pkg/network/setup/podnic.go:77`](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/network/setup/podnic.go#L77) — `podNIC.PlugPhase2`，per-NIC 在 VM 啟動 phase 2 時做 bridge / masquerade 設定的 entry point
+- [`multus-cni/pkg/multus/multus.go:742`](https://github.com/k8snetworkplumbingwg/multus-cni/blob/v4.2.4/pkg/multus/multus.go#L742) — `CmdAdd`，multus CNI 接到 ADD 後依 annotation 逐一 delegate 給後端 CNI（bridge / sr-iov / macvlan）的主函式
+
+### 延伸思考（可跳過）
+
+- 如果你要做一個「VM 第二介面也受 cilium NetworkPolicy 管」的 PoC，最少要動哪幾層？是 multus 端、KubeVirt binding 端、還是 cilium 端？
+- bridge binding 跟 macvlan binding 在「VM 與 host 互通」這件事上有什麼差別？哪個更適合做 management network？
+
 ## 收穫檢查
 
 - 為什麼預設介面用 `masquerade` 而第二介面用 `bridge`？兩種 binding mode 差在哪？

@@ -228,6 +228,26 @@ PVC clone 走 CSI 的 [`spec.dataSource`](https://kubernetes.io/docs/concepts/st
 - [CDI repository](https://github.com/kubevirt/containerized-data-importer) — 原始碼
 - [Volume PVC dataSource](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/) — k8s clone 規格
 
+### 為什麼這樣設計
+
+CDI 的 clone 流程其實有三條路：smart clone（CSI VolumeSnapshot）、host-assisted clone（importer Pod + qemu-img）、network clone（rsync over Pod-to-Pod tunnel）。直觀答案是「能用 storage backend 的 native 能力就用」。ceph-rbd 支援 CSI VolumeSnapshot 跟 RBD layered clone，建立 snapshot 是 O(1)、clone 出新 image 也是 O(1)（copy-on-write），所以 CDI controller 偵測到 source PVC 跟 target PVC 在同一個 storage class、同一個 node selector 時，會直接走 smart clone — 不需要起 importer Pod，秒回。
+
+設計選擇背後的取捨是「正確性 vs 效能」。CSI smart clone 雖然快，但限制條件多：source / target 必須在同一個 CSI driver、同一個 storage pool、同一個 namespace 範圍（依 driver 而定）；跨 storage class（例如從 ceph-rbd clone 到 longhorn）就絕對不行。host-assisted clone 是 fallback：CDI 在 source PVC 那邊起一個 source Pod（read-only mount）、target PVC 那邊起一個 target Pod（read-write mount），中間用 unix pipe 把 qcow2 stream 過去；速度大約 = 網路頻寬，但 source / target 可以在不同 node、不同 storage class。network clone 是更老的 fallback，跨 cluster 用，現在很少用到。CDI controller 會自動依當前 storage 能力選 mode，使用者只寫一份 DataVolume YAML。
+
+常見誤解是「smart clone 的 PVC 跟 source PVC 互相影響」。實際上 RBD layered clone 是 copy-on-write：兩個 image 共享 base block，任一邊寫入時才 copy 到自己的 layer。但這代表 source 不能被刪掉（會把 child 的 base 抽掉）；CDI 處理這個用 PVC finalizer + CDI volume cloning 的 ownership chain。如果你看到 PVC 卡在 `Terminating`，多半就是被另一個 cloned PVC 鎖住。
+
+### 對應原始碼
+
+- [`kubevirt/containerized-data-importer/pkg/controller/clone/`](https://github.com/kubevirt/containerized-data-importer/tree/v1.62.0/pkg/controller/clone) — clone strategy 選擇邏輯（smart vs host-assisted vs network）
+- [`kubevirt/containerized-data-importer/pkg/controller/datavolume/clone-controller.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/datavolume/clone-controller.go) — DataVolume controller 的 clone 分支
+- [`kubevirt/containerized-data-importer/pkg/controller/clone/csi-clone.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/clone/csi-clone.go) — smart clone 走 CSI `dataSource` 的實作
+- [`kubevirt/containerized-data-importer/pkg/controller/clone/host-clone.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/clone/host-clone.go) — fallback 的 importer-based host-assisted clone
+
+### 延伸思考（可跳過）
+
+- 如果你要把一個 base image 從「ceph-rbd」storage class 搬到「local-path」storage class，CDI 會走哪條 clone path？需要多少網路傳輸？
+- smart clone 的 source PVC 被鎖住沒辦法刪，這設計有沒有可能引發 cluster 級別的清理難題？對照 docker layered image 的 GC 模型。
+
 ## 收穫檢查
 
 - 4 種 source 的 import 時間排序？哪個最快、哪個最慢？
