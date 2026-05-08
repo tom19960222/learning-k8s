@@ -108,6 +108,10 @@ func compileWithOptions(ctx context.Context, logger *slog.Logger, src string, ou
 | `bpf/bpf_overlay.c` | overlay device (vxlan / geneve) | tunnel encap/decap |
 | `bpf/bpf_sock.c` | cgroup connect4/connect6 | socket-based LB (KPR 的 service DNAT 取代 iptables) |
 
+![Cilium eBPF datapath：bpf_xdp.c (XDP)、bpf_host.c (tc clsact)、bpf_lxc.c (tc clsact per-endpoint)、bpf_overlay.c (VXLAN tunnel)、bpf_sock.c (cgroup connect4 / sock_ops) 各自掛在 Linux kernel 的 hook 點，箭頭追蹤一個 Pod-to-Pod 封包路徑](/diagrams/cilium/ebpf-datapath.png)
+
+*圖：5 個 bpf_*.c 程式對應到 kernel 的 hook 點 (XDP / tc clsact / cgroup connect / sock_ops)，packet 路徑顯示同節點 Pod-to-Pod 走的捷徑與跨節點走 VXLAN tunnel 的差別。*
+
 每份 .c 在 build 時還會 patch 上 endpoint header (`ep_config.h` 之類) 與 node 的 config，所以「同一份 .c」對不同 endpoint 出來的 .o 內容不同。
 
 bpf_lxc.c 的 entry section 看起來像：

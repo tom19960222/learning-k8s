@@ -1,0 +1,358 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .step-num { font-size: 13px; font-weight: 700; fill: #f1f5f9; }
+    .scenario-label { font-size: 14px; font-weight: 700; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#ef4444"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg-grad)"/>
+  <text x="800" y="36" text-anchor="middle" class="title">Cilium eBPF Datapath: bpf_*.c &#8594; kernel hook &#8594; Pod packet path</text>
+  <text x="800" y="58" text-anchor="middle" class="node-sub">5 個 bpf_*.c 各掛在不同 hook，sample packet 路徑顯示同節點 sock_ops 捷徑與跨節點 VXLAN tunnel</text>
+
+  <!-- ================== LEFT: eBPF programs ================== -->
+  <rect x="30" y="80" width="320" height="780" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="102" class="layer-label" fill="#10b981">eBPF programs (cilium/bpf/*.c)</text>
+
+  <!-- bpf_xdp.c -->
+  <rect x="50" y="120" width="280" height="120" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="190" y="146" text-anchor="middle" class="node-title" fill="#10b981">bpf_xdp.c</text>
+  <text x="190" y="166" text-anchor="middle" class="node-sub">earliest hook (pre-skb)</text>
+  <text x="190" y="180" text-anchor="middle" class="node-sub">DDoS drop / L4 LB DSR</text>
+  <text x="190" y="194" text-anchor="middle" class="node-sub">section: __section(&quot;xdp&quot;)</text>
+  <text x="190" y="208" text-anchor="middle" class="node-sub">runs on NIC driver</text>
+  <text x="190" y="222" text-anchor="middle" class="node-sub">XDP_DRV / XDP_GENERIC</text>
+
+  <!-- bpf_host.c -->
+  <rect x="50" y="260" width="280" height="120" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="190" y="286" text-anchor="middle" class="node-title" fill="#10b981">bpf_host.c</text>
+  <text x="190" y="306" text-anchor="middle" class="node-sub">host eth0 + cilium_host</text>
+  <text x="190" y="320" text-anchor="middle" class="node-sub">node-level policy</text>
+  <text x="190" y="334" text-anchor="middle" class="node-sub">KPR service handling</text>
+  <text x="190" y="348" text-anchor="middle" class="node-sub">VXLAN/Geneve decap</text>
+  <text x="190" y="362" text-anchor="middle" class="node-sub">handoff to bpf_lxc</text>
+
+  <!-- bpf_lxc.c -->
+  <rect x="50" y="400" width="280" height="135" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="2"/>
+  <text x="190" y="426" text-anchor="middle" class="node-title" fill="#10b981">bpf_lxc.c</text>
+  <text x="190" y="446" text-anchor="middle" class="node-sub">per-Pod, attached to veth</text>
+  <text x="190" y="460" text-anchor="middle" class="node-sub">cil_from_container (egress)</text>
+  <text x="190" y="474" text-anchor="middle" class="node-sub">cil_to_container (ingress)</text>
+  <text x="190" y="488" text-anchor="middle" class="node-sub">PolicyMap lookup</text>
+  <text x="190" y="502" text-anchor="middle" class="node-sub">identity / conntrack / NAT</text>
+  <text x="190" y="516" text-anchor="middle" class="node-sub">tail-call &#8594; redirect</text>
+
+  <!-- bpf_overlay.c -->
+  <rect x="50" y="555" width="280" height="120" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="190" y="581" text-anchor="middle" class="node-title" fill="#10b981">bpf_overlay.c</text>
+  <text x="190" y="601" text-anchor="middle" class="node-sub">cilium_vxlan / geneve_sys</text>
+  <text x="190" y="615" text-anchor="middle" class="node-sub">tunnel encap / decap</text>
+  <text x="190" y="629" text-anchor="middle" class="node-sub">cross-node Pod traffic</text>
+  <text x="190" y="643" text-anchor="middle" class="node-sub">when not native routing</text>
+  <text x="190" y="657" text-anchor="middle" class="node-sub">VNI = ClusterID</text>
+
+  <!-- bpf_sock.c -->
+  <rect x="50" y="695" width="280" height="145" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="190" y="721" text-anchor="middle" class="node-title" fill="#10b981">bpf_sock.c</text>
+  <text x="190" y="741" text-anchor="middle" class="node-sub">attached to cgroup v2 root</text>
+  <text x="190" y="755" text-anchor="middle" class="node-sub">cgroup/connect4 (IPv4)</text>
+  <text x="190" y="769" text-anchor="middle" class="node-sub">cgroup/connect6 (IPv6)</text>
+  <text x="190" y="783" text-anchor="middle" class="node-sub">sockops / sk_msg redirect</text>
+  <text x="190" y="797" text-anchor="middle" class="node-sub">ClusterIP DNAT in syscall</text>
+  <text x="190" y="811" text-anchor="middle" class="node-sub">(no iptables / no skb)</text>
+  <text x="190" y="826" text-anchor="middle" class="node-sub" fill="#eab308">replaces kube-proxy</text>
+
+  <!-- ================== MIDDLE: Linux kernel network stack ================== -->
+  <rect x="380" y="80" width="640" height="780" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="396" y="102" class="layer-label" fill="#3b82f6">Linux kernel network stack (hook points highlighted)</text>
+
+  <!-- syscall layer -->
+  <rect x="400" y="120" width="600" height="70" rx="6" ry="6" fill="#1c1917" stroke="#eab308" stroke-width="1.5"/>
+  <text x="700" y="144" text-anchor="middle" class="node-title" fill="#eab308">syscall: connect() / sendmsg()</text>
+  <text x="700" y="164" text-anchor="middle" class="node-sub">cgroup/connect4 hook fires here &#8212; before any skb is built</text>
+  <text x="700" y="180" text-anchor="middle" class="node-sub">bpf_sock 改寫 sockaddr：ClusterIP &#8594; backend Pod IP</text>
+
+  <!-- socket / TCP stack -->
+  <rect x="400" y="210" width="600" height="60" rx="6" ry="6" fill="#0b1220" stroke="#475569" stroke-width="1.2"/>
+  <text x="700" y="234" text-anchor="middle" class="node-title" fill="#94a3b8">socket layer / TCP / IP / routing</text>
+  <text x="700" y="252" text-anchor="middle" class="node-sub">同節點時可被 sockops / sk_msg 改寫成 in-kernel splice</text>
+
+  <!-- veth Pod-side egress -->
+  <rect x="400" y="290" width="290" height="80" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="545" y="313" text-anchor="middle" class="node-title" fill="#a855f7">veth (Pod side)</text>
+  <text x="545" y="332" text-anchor="middle" class="node-sub">封包離開 Pod netns</text>
+  <text x="545" y="348" text-anchor="middle" class="node-sub">穿過 veth pair 到 host netns</text>
+  <text x="545" y="362" text-anchor="middle" class="node-sub">lxcXXXX@ifN</text>
+
+  <!-- veth host-side -->
+  <rect x="710" y="290" width="290" height="80" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="2"/>
+  <text x="855" y="313" text-anchor="middle" class="node-title" fill="#10b981">veth (host side) &#8212; tc clsact</text>
+  <text x="855" y="332" text-anchor="middle" class="node-sub" fill="#10b981">ingress: cil_to_container</text>
+  <text x="855" y="346" text-anchor="middle" class="node-sub" fill="#10b981">egress:  cil_from_container</text>
+  <text x="855" y="362" text-anchor="middle" class="node-sub">bpf_lxc.c attaches here</text>
+
+  <!-- cilium_host -->
+  <rect x="400" y="395" width="290" height="80" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="1.8"/>
+  <text x="545" y="418" text-anchor="middle" class="node-title" fill="#10b981">cilium_host / cilium_net</text>
+  <text x="545" y="437" text-anchor="middle" class="node-sub">tc clsact ingress/egress</text>
+  <text x="545" y="451" text-anchor="middle" class="node-sub">bpf_host.c attaches here</text>
+  <text x="545" y="465" text-anchor="middle" class="node-sub">node-level policy + KPR</text>
+
+  <!-- cilium_vxlan -->
+  <rect x="710" y="395" width="290" height="80" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="1.8"/>
+  <text x="855" y="418" text-anchor="middle" class="node-title" fill="#10b981">cilium_vxlan (overlay dev)</text>
+  <text x="855" y="437" text-anchor="middle" class="node-sub">tc clsact ingress/egress</text>
+  <text x="855" y="451" text-anchor="middle" class="node-sub">bpf_overlay.c attaches here</text>
+  <text x="855" y="465" text-anchor="middle" class="node-sub">UDP/8472 encap to remote</text>
+
+  <!-- routing / FIB -->
+  <rect x="400" y="500" width="600" height="50" rx="6" ry="6" fill="#0b1220" stroke="#475569" stroke-width="1.2"/>
+  <text x="700" y="522" text-anchor="middle" class="node-title" fill="#94a3b8">FIB lookup / routing decision</text>
+  <text x="700" y="538" text-anchor="middle" class="node-sub">同節點：直接送對端 veth；跨節點：送 cilium_vxlan</text>
+
+  <!-- physical NIC tc -->
+  <rect x="400" y="575" width="290" height="80" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="1.8"/>
+  <text x="545" y="598" text-anchor="middle" class="node-title" fill="#10b981">eth0 &#8212; tc clsact</text>
+  <text x="545" y="617" text-anchor="middle" class="node-sub">ingress/egress (post-XDP)</text>
+  <text x="545" y="631" text-anchor="middle" class="node-sub">bpf_host.c second instance</text>
+  <text x="545" y="645" text-anchor="middle" class="node-sub">final policy / masquerade</text>
+
+  <!-- physical NIC XDP -->
+  <rect x="710" y="575" width="290" height="80" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="1.8"/>
+  <text x="855" y="598" text-anchor="middle" class="node-title" fill="#10b981">eth0 &#8212; XDP hook</text>
+  <text x="855" y="617" text-anchor="middle" class="node-sub">earliest, on NIC driver</text>
+  <text x="855" y="631" text-anchor="middle" class="node-sub">bpf_xdp.c attaches here</text>
+  <text x="855" y="645" text-anchor="middle" class="node-sub">DDoS drop / DSR LB</text>
+
+  <!-- driver / wire -->
+  <rect x="400" y="680" width="600" height="55" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.2"/>
+  <text x="700" y="704" text-anchor="middle" class="node-title" fill="#94a3b8">NIC driver / wire (DMA out)</text>
+  <text x="700" y="722" text-anchor="middle" class="node-sub">封包離開本節點 &#8212; 跨節點時送對端 host eth0</text>
+
+  <!-- BPF maps callout -->
+  <rect x="400" y="755" width="600" height="80" rx="6" ry="6" fill="#0a0a0a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="700" y="778" text-anchor="middle" class="node-title" fill="#06b6d4">BPF maps (shared by all programs)</text>
+  <text x="700" y="797" text-anchor="middle" class="node-sub">PolicyMap &#183; IPCache &#183; ConntrackMap &#183; ServiceMap &#183; BackendMap &#183; events ring (perf)</text>
+  <text x="700" y="813" text-anchor="middle" class="node-sub">cilium-agent userspace 寫入；所有 bpf_*.c 共用查詢</text>
+
+  <!-- ================== RIGHT: Pods / NICs ================== -->
+  <rect x="1050" y="80" width="530" height="780" rx="8" ry="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="1066" y="102" class="layer-label" fill="#a855f7">Pod netns / NIC (workload &amp; remote)</text>
+
+  <!-- Pod A (source) -->
+  <rect x="1075" y="125" width="240" height="115" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1195" y="151" text-anchor="middle" class="node-title" fill="#a855f7">Pod A (source)</text>
+  <text x="1195" y="171" text-anchor="middle" class="node-sub">netns: container</text>
+  <text x="1195" y="185" text-anchor="middle" class="node-sub">eth0 (veth peer)</text>
+  <text x="1195" y="199" text-anchor="middle" class="node-sub">10.244.1.10</text>
+  <text x="1195" y="215" text-anchor="middle" class="node-sub">connect(svc 10.96.0.50)</text>
+  <text x="1195" y="229" text-anchor="middle" class="node-sub">curl http://nginx-svc</text>
+
+  <!-- Pod B same node -->
+  <rect x="1335" y="125" width="240" height="115" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1455" y="151" text-anchor="middle" class="node-title" fill="#a855f7">Pod B (same node)</text>
+  <text x="1455" y="171" text-anchor="middle" class="node-sub">netns: container</text>
+  <text x="1455" y="185" text-anchor="middle" class="node-sub">eth0 (veth peer)</text>
+  <text x="1455" y="199" text-anchor="middle" class="node-sub">10.244.1.20</text>
+  <text x="1455" y="215" text-anchor="middle" class="node-sub">backend of nginx-svc</text>
+  <text x="1455" y="229" text-anchor="middle" class="node-sub">picked by bpf_sock DNAT</text>
+
+  <!-- Scenario 1 box -->
+  <rect x="1075" y="260" width="500" height="245" rx="6" ry="6" fill="#0a0a0a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1325" y="285" text-anchor="middle" class="scenario-label" fill="#06b6d4">情境 1：Pod A &#8594; Pod B (同節點)</text>
+  <text x="1325" y="306" text-anchor="middle" class="node-sub" fill="#06b6d4">socket-level shortcut，不走 skb / 不走 veth</text>
+
+  <text x="1095" y="332" class="step-num">[1]</text>
+  <text x="1130" y="332" class="node-sub" fill="#cbd5e1">App connect(10.96.0.50:80) &#8212; syscall</text>
+  <text x="1095" y="354" class="step-num">[2]</text>
+  <text x="1130" y="354" class="node-sub" fill="#cbd5e1">cgroup/connect4 (bpf_sock.c)</text>
+  <text x="1130" y="368" class="node-sub">查 ServiceMap &#8594; BackendMap</text>
+  <text x="1130" y="382" class="node-sub">改寫 sockaddr 為 10.244.1.20:80</text>
+  <text x="1095" y="404" class="step-num">[3]</text>
+  <text x="1130" y="404" class="node-sub" fill="#cbd5e1">sockops 偵測同節點 endpoint</text>
+  <text x="1130" y="418" class="node-sub">attach sk_msg 程式到 socket</text>
+  <text x="1095" y="440" class="step-num">[4]</text>
+  <text x="1130" y="440" class="node-sub" fill="#cbd5e1">後續 send() 直接 in-kernel splice</text>
+  <text x="1130" y="454" class="node-sub">繞過 TCP/IP / veth / tc</text>
+  <text x="1095" y="476" class="step-num">[5]</text>
+  <text x="1130" y="476" class="node-sub" fill="#10b981">payload 直送 Pod B socket buffer</text>
+  <text x="1130" y="490" class="node-sub">latency &amp; CPU 大幅下降</text>
+
+  <!-- Pod C remote node -->
+  <rect x="1335" y="525" width="240" height="115" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1455" y="551" text-anchor="middle" class="node-title" fill="#a855f7">Pod C (remote node)</text>
+  <text x="1455" y="571" text-anchor="middle" class="node-sub">node2，10.244.2.30</text>
+  <text x="1455" y="585" text-anchor="middle" class="node-sub">需要走 VXLAN tunnel</text>
+  <text x="1455" y="599" text-anchor="middle" class="node-sub">UDP/8472 over node IP</text>
+  <text x="1455" y="615" text-anchor="middle" class="node-sub">remote bpf_overlay.c decap</text>
+  <text x="1455" y="629" text-anchor="middle" class="node-sub">remote bpf_lxc cil_to_container</text>
+
+  <!-- Scenario 2 box -->
+  <rect x="1075" y="525" width="240" height="115" rx="6" ry="6" fill="#0a0a0a" stroke="#f97316" stroke-width="1.5"/>
+  <text x="1195" y="551" text-anchor="middle" class="scenario-label" fill="#f97316">情境 2：跨節點</text>
+  <text x="1195" y="571" text-anchor="middle" class="node-sub" fill="#f97316">VXLAN tunnel mode</text>
+  <text x="1195" y="589" text-anchor="middle" class="node-sub">走完整 skb 路徑</text>
+  <text x="1195" y="603" text-anchor="middle" class="node-sub">tc &#8594; overlay encap &#8594; eth0</text>
+  <text x="1195" y="619" text-anchor="middle" class="node-sub">遠端鏡像路徑收回</text>
+
+  <!-- Scenario 2 detailed steps -->
+  <rect x="1075" y="660" width="500" height="195" rx="6" ry="6" fill="#0a0a0a" stroke="#f97316" stroke-width="1.5"/>
+  <text x="1325" y="684" text-anchor="middle" class="scenario-label" fill="#f97316">跨節點 packet 路徑（A &#8594; C）</text>
+
+  <text x="1095" y="708" class="step-num">[a]</text>
+  <text x="1130" y="708" class="node-sub" fill="#cbd5e1">bpf_sock connect4：DNAT 到 10.244.2.30</text>
+  <text x="1095" y="728" class="step-num">[b]</text>
+  <text x="1130" y="728" class="node-sub" fill="#cbd5e1">veth host side tc egress：bpf_lxc</text>
+  <text x="1130" y="742" class="node-sub">cil_from_container：policy + identity</text>
+  <text x="1095" y="764" class="step-num">[c]</text>
+  <text x="1130" y="764" class="node-sub" fill="#cbd5e1">cilium_vxlan tc egress：bpf_overlay encap</text>
+  <text x="1130" y="778" class="node-sub">VXLAN header + outer UDP/8472</text>
+  <text x="1095" y="800" class="step-num">[d]</text>
+  <text x="1130" y="800" class="node-sub" fill="#cbd5e1">eth0 tc egress：bpf_host masquerade</text>
+  <text x="1095" y="822" class="step-num">[e]</text>
+  <text x="1130" y="822" class="node-sub" fill="#cbd5e1">DMA 出網卡 &#8594; remote node 鏡像路徑回收</text>
+  <text x="1130" y="836" class="node-sub">XDP &#8594; tc &#8594; overlay decap &#8594; lxc &#8594; Pod C</text>
+
+  <!-- ================== Arrows: bpf_*.c → kernel hooks ================== -->
+  <!-- bpf_xdp.c → eth0 XDP -->
+  <path d="M 330,180 L 360,180 L 360,615 L 710,615" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="430" y="600" width="115" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="487" y="611" text-anchor="middle" class="arrow-label">attach XDP hook</text>
+
+  <!-- bpf_host.c → cilium_host -->
+  <path d="M 330,320 L 365,320 L 365,435 L 400,435" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="372" y="421" width="105" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="424" y="432" text-anchor="middle" class="arrow-label">attach tc clsact</text>
+
+  <!-- bpf_host.c → eth0 tc clsact (second instance) -->
+  <path d="M 330,340 L 372,340 L 372,615 L 400,615" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- bpf_lxc.c → veth host side tc clsact -->
+  <path d="M 330,460 L 700,330" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="475" y="380" width="125" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="538" y="391" text-anchor="middle" class="arrow-label">tc clsact per-endpoint</text>
+
+  <!-- bpf_overlay.c → cilium_vxlan -->
+  <path d="M 330,615 L 700,440" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="430" y="528" width="125" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="492" y="539" text-anchor="middle" class="arrow-label">attach to vxlan dev</text>
+
+  <!-- bpf_sock.c → syscall (cgroup/connect4) -->
+  <path d="M 330,760 L 376,760 L 376,155 L 400,155" fill="none" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <rect x="376" y="86" width="155" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="453" y="97" text-anchor="middle" class="arrow-label" fill="#eab308">attach cgroup/connect4</text>
+
+  <!-- ================== Arrows: kernel → Pods ================== -->
+  <!-- syscall ↔ Pod A -->
+  <path d="M 1000,155 L 1075,155" fill="none" stroke="#eab308" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+  <rect x="1003" y="138" width="68" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1037" y="149" text-anchor="middle" class="arrow-label">syscall</text>
+
+  <!-- veth Pod side ↔ Pod A (egress source) -->
+  <path d="M 1075,200 L 690,330" fill="none" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+
+  <!-- veth host side ↔ Pod B (same node ingress) -->
+  <path d="M 1000,330 L 1335,165" fill="none" stroke="#10b981" stroke-width="1.4" marker-end="url(#arrow-green)" stroke-dasharray="4,3"/>
+
+  <!-- physical eth0 → Pod C (cross node) -->
+  <path d="M 1000,705 L 1335,580" fill="none" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <rect x="1080" y="630" width="160" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1160" y="641" text-anchor="middle" class="arrow-label" fill="#f97316">VXLAN-encapped wire</text>
+
+  <!-- ================== Sample packet path: same-node sock_ops shortcut ================== -->
+  <!-- Step labels along Pod A connect path: cyan dashed = sock_ops shortcut -->
+  <!-- 1: Pod A → syscall -->
+  <circle cx="1062" cy="155" r="11" fill="#06b6d4" opacity="0.85"/>
+  <text x="1062" y="160" text-anchor="middle" class="step-num" fill="#0f172a">1</text>
+
+  <!-- 2: syscall (cgroup/connect4 fires) -->
+  <circle cx="710" cy="155" r="11" fill="#06b6d4" opacity="0.85"/>
+  <text x="710" y="160" text-anchor="middle" class="step-num" fill="#0f172a">2</text>
+
+  <!-- 3: socket layer + sockops -->
+  <circle cx="710" cy="240" r="11" fill="#06b6d4" opacity="0.85"/>
+  <text x="710" y="245" text-anchor="middle" class="step-num" fill="#0f172a">3</text>
+
+  <!-- 4: sk_msg splice direct to Pod B sock -->
+  <path d="M 710,250 C 1100,250 1300,180 1335,170" fill="none" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow-cyan)" stroke-dasharray="8,4"/>
+  <circle cx="1335" cy="170" r="11" fill="#06b6d4" opacity="0.85"/>
+  <text x="1335" y="175" text-anchor="middle" class="step-num" fill="#0f172a">5</text>
+  <rect x="975" y="218" width="155" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1052" y="229" text-anchor="middle" class="arrow-label" fill="#06b6d4">sk_msg splice (shortcut)</text>
+
+  <!-- ================== Sample packet path: cross-node (orange solid) ================== -->
+  <!-- a: Pod A egress to syscall (shared with same-node 1) labeled separately -->
+  <!-- packet path: Pod A → veth → bpf_lxc → cilium_vxlan → eth0 → wire → Pod C -->
+  <!-- circle markers along the cross-node trace -->
+  <circle cx="690" cy="330" r="11" fill="#f97316" opacity="0.9"/>
+  <text x="690" y="335" text-anchor="middle" class="step-num" fill="#0f172a">b</text>
+
+  <circle cx="855" cy="330" r="11" fill="#f97316" opacity="0.9"/>
+  <text x="855" y="335" text-anchor="middle" class="step-num" fill="#0f172a">b</text>
+
+  <!-- bpf_lxc tc → cilium_vxlan -->
+  <path d="M 855,370 L 855,395" fill="none" stroke="#f97316" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+
+  <circle cx="855" cy="435" r="11" fill="#f97316" opacity="0.9"/>
+  <text x="855" y="440" text-anchor="middle" class="step-num" fill="#0f172a">c</text>
+
+  <!-- vxlan → routing → eth0 -->
+  <path d="M 855,475 L 855,500" fill="none" stroke="#f97316" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+  <path d="M 855,550 L 855,575" fill="none" stroke="#f97316" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+
+  <circle cx="545" cy="615" r="11" fill="#f97316" opacity="0.9"/>
+  <text x="545" y="620" text-anchor="middle" class="step-num" fill="#0f172a">d</text>
+
+  <!-- eth0 tc → driver -->
+  <path d="M 545,655 L 545,680" fill="none" stroke="#f97316" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
+
+  <circle cx="545" cy="705" r="11" fill="#f97316" opacity="0.9"/>
+  <text x="545" y="710" text-anchor="middle" class="step-num" fill="#0f172a">e</text>
+
+  <!-- driver → wire → remote -->
+  <path d="M 545,735 L 545,760 L 1095,760 L 1095,580 L 1335,580" fill="none" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)" stroke-dasharray="6,4"/>
+
+  <!-- Legend bottom -->
+  <rect x="30" y="868" width="1540" height="24" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="46" y1="880" x2="78" y2="880" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <text x="84" y="884" class="legend-text">bpf_*.c attach &#8594; kernel hook</text>
+  <line x1="346" y1="880" x2="378" y2="880" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow-cyan)" stroke-dasharray="8,4"/>
+  <text x="384" y="884" class="legend-text">同節點 sock_ops shortcut (情境 1)</text>
+  <line x1="676" y1="880" x2="708" y2="880" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="714" y="884" class="legend-text">跨節點 VXLAN packet path (情境 2)</text>
+  <line x1="1006" y1="880" x2="1038" y2="880" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="1044" y="884" class="legend-text">syscall / cgroup hook</text>
+  <line x1="1226" y1="880" x2="1258" y2="880" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+  <text x="1264" y="884" class="legend-text">Pod netns &#8596; veth pair</text>
+</svg>
