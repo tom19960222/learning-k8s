@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 13px; fill: #94a3b8; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .node-mono { font-size: 11px; fill: #cbd5e1; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .step-num { font-size: 12px; font-weight: 700; fill: #fbbf24; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg-grad)"/>
+
+  <text x="800" y="42" text-anchor="middle" class="title">Kubernetes Controller: informer + workqueue reconcile loop</text>
+  <text x="800" y="64" text-anchor="middle" class="subtitle">apiserver watch &#8594; Reflector &#8594; DeltaFIFO &#8594; Indexer + EventHandler &#8594; Workqueue &#8594; Worker &#8594; Reconcile() &#8594; apiserver</text>
+
+  <rect x="40" y="100" width="220" height="700" rx="8" ry="8" fill="#1c1917" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="124" class="layer-label" fill="#f97316">apiserver (source of truth)</text>
+
+  <rect x="300" y="100" width="1260" height="700" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="316" y="124" class="layer-label" fill="#3b82f6">Controller binary (e.g. kube-controller-manager goroutine, or out-of-tree operator)</text>
+
+  <rect x="80" y="280" width="140" height="200" rx="6" ry="6" fill="#0a0a0a" stroke="#f97316" stroke-width="1.5"/>
+  <text x="150" y="308" text-anchor="middle" class="node-title" fill="#f97316">kube-apiserver</text>
+  <text x="150" y="332" text-anchor="middle" class="node-sub">REST + watch</text>
+  <text x="150" y="350" text-anchor="middle" class="node-sub">/api/v1/pods</text>
+  <text x="150" y="368" text-anchor="middle" class="node-sub">/apis/apps/v1/</text>
+  <text x="150" y="386" text-anchor="middle" class="node-sub">replicasets</text>
+  <text x="150" y="416" text-anchor="middle" class="node-sub">backed by</text>
+  <text x="150" y="434" text-anchor="middle" class="node-sub">cacher + etcd</text>
+  <text x="150" y="458" text-anchor="middle" class="node-sub" fill="#fbbf24">resourceVersion</text>
+
+  <rect x="320" y="160" width="1220" height="540" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.2" stroke-dasharray="3,3" opacity="0.6"/>
+  <text x="336" y="184" class="layer-label" fill="#06b6d4">SharedInformer (client-go: tools/cache)</text>
+
+  <rect x="350" y="280" width="220" height="200" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="460" y="308" text-anchor="middle" class="node-title" fill="#3b82f6">Reflector</text>
+  <text x="460" y="332" text-anchor="middle" class="node-mono">reflector.go</text>
+  <text x="460" y="354" text-anchor="middle" class="node-sub">1. List initial state</text>
+  <text x="460" y="372" text-anchor="middle" class="node-sub">2. Watch from RV</text>
+  <text x="460" y="390" text-anchor="middle" class="node-sub">3. Re-list on 410</text>
+  <text x="460" y="408" text-anchor="middle" class="node-sub">    Gone (relist)</text>
+  <text x="460" y="438" text-anchor="middle" class="node-sub" fill="#fbbf24">push deltas</text>
+  <text x="460" y="456" text-anchor="middle" class="node-sub">into FIFO</text>
+  <text x="370" y="270" class="step-num">[1]</text>
+
+  <rect x="610" y="280" width="220" height="200" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="720" y="308" text-anchor="middle" class="node-title" fill="#06b6d4">DeltaFIFO</text>
+  <text x="720" y="332" text-anchor="middle" class="node-mono">delta_fifo.go</text>
+  <text x="720" y="354" text-anchor="middle" class="node-sub">FIFO of deltas:</text>
+  <text x="720" y="372" text-anchor="middle" class="node-sub">Added / Updated /</text>
+  <text x="720" y="390" text-anchor="middle" class="node-sub">Deleted / Sync</text>
+  <text x="720" y="408" text-anchor="middle" class="node-sub">keyed by ns/name</text>
+  <text x="720" y="438" text-anchor="middle" class="node-sub" fill="#fbbf24">collapses</text>
+  <text x="720" y="456" text-anchor="middle" class="node-sub">repeated keys</text>
+  <text x="630" y="270" class="step-num">[2]</text>
+
+  <rect x="870" y="220" width="220" height="120" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="980" y="248" text-anchor="middle" class="node-title" fill="#10b981">Indexer (cache)</text>
+  <text x="980" y="270" text-anchor="middle" class="node-mono">thread_safe_store.go</text>
+  <text x="980" y="290" text-anchor="middle" class="node-sub">in-memory map</text>
+  <text x="980" y="306" text-anchor="middle" class="node-sub">key &#8594; runtime.Object</text>
+  <text x="980" y="322" text-anchor="middle" class="node-sub" fill="#fbbf24">Lister reads here</text>
+  <text x="890" y="210" class="step-num">[3a]</text>
+
+  <rect x="870" y="380" width="220" height="100" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="980" y="408" text-anchor="middle" class="node-title" fill="#3b82f6">EventHandler</text>
+  <text x="980" y="430" text-anchor="middle" class="node-sub">OnAdd / OnUpdate /</text>
+  <text x="980" y="446" text-anchor="middle" class="node-sub">OnDelete callbacks</text>
+  <text x="980" y="464" text-anchor="middle" class="node-sub" fill="#fbbf24">enqueue(key)</text>
+  <text x="890" y="370" class="step-num">[3b]</text>
+
+  <rect x="1140" y="280" width="220" height="200" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="1250" y="308" text-anchor="middle" class="node-title" fill="#eab308">Workqueue</text>
+  <text x="1250" y="332" text-anchor="middle" class="node-mono">rate_limiting_queue.go</text>
+  <text x="1250" y="354" text-anchor="middle" class="node-sub">dedup: same key</text>
+  <text x="1250" y="372" text-anchor="middle" class="node-sub">enqueued once</text>
+  <text x="1250" y="390" text-anchor="middle" class="node-sub">rate-limit: exp</text>
+  <text x="1250" y="408" text-anchor="middle" class="node-sub">backoff on retry</text>
+  <text x="1250" y="438" text-anchor="middle" class="node-sub" fill="#fbbf24">Get() blocks</text>
+  <text x="1250" y="456" text-anchor="middle" class="node-sub">until item ready</text>
+  <text x="1160" y="270" class="step-num">[4]</text>
+
+  <rect x="1380" y="280" width="160" height="200" rx="6" ry="6" fill="#0b1220" stroke="#f43f5e" stroke-width="1.5"/>
+  <text x="1460" y="308" text-anchor="middle" class="node-title" fill="#f43f5e">Worker</text>
+  <text x="1460" y="328" text-anchor="middle" class="node-sub">N goroutines</text>
+  <text x="1460" y="346" text-anchor="middle" class="node-sub">key := q.Get()</text>
+  <text x="1460" y="364" text-anchor="middle" class="node-sub">syncFn(key)</text>
+  <text x="1460" y="382" text-anchor="middle" class="node-sub">if err: AddRate</text>
+  <text x="1460" y="400" text-anchor="middle" class="node-sub">  Limited(key)</text>
+  <text x="1460" y="418" text-anchor="middle" class="node-sub">else: Forget(key)</text>
+  <text x="1460" y="446" text-anchor="middle" class="node-sub" fill="#fbbf24">q.Done(key)</text>
+  <text x="1390" y="270" class="step-num">[5]</text>
+
+  <rect x="700" y="560" width="500" height="160" rx="6" ry="6" fill="#1c1917" stroke="#f43f5e" stroke-width="1.8"/>
+  <text x="950" y="588" text-anchor="middle" class="node-title" fill="#f43f5e">Reconcile() / syncReplicaSet()</text>
+  <text x="950" y="610" text-anchor="middle" class="node-mono">pkg/controller/replicaset/replica_set.go:755</text>
+  <text x="950" y="634" text-anchor="middle" class="node-sub">a) read CURRENT  state from Indexer (Lister, no apiserver call)</text>
+  <text x="950" y="652" text-anchor="middle" class="node-sub">b) read DESIRED state from the resource&apos;s spec</text>
+  <text x="950" y="670" text-anchor="middle" class="node-sub">c) diff &#8594; Create / Update / Delete sub-objects via apiserver</text>
+  <text x="950" y="688" text-anchor="middle" class="node-sub">d) UpdateStatus on root object  &#8594; idempotent, safe to retry</text>
+  <text x="710" y="552" class="step-num">[6]</text>
+
+  <line x1="220" y1="360" x2="350" y2="360" stroke="#3b82f6" stroke-width="2.0" marker-end="url(#arrow-blue)"/>
+  <rect x="240" y="338" width="90" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="285" y="350" text-anchor="middle" class="arrow-label" fill="#cbd5e1">list / watch</text>
+
+  <line x1="570" y1="380" x2="610" y2="380" stroke="#06b6d4" stroke-width="2.0" marker-end="url(#arrow-cyan)"/>
+  <rect x="540" y="354" width="100" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="590" y="366" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Add(delta)</text>
+
+  <path d="M 830,330 L 850,330 L 850,280 L 870,280" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="800" y="252" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="860" y="264" text-anchor="middle" class="arrow-label" fill="#cbd5e1">update cache</text>
+
+  <path d="M 830,420 L 850,420 L 850,420 L 870,420" fill="none" stroke="#3b82f6" stroke-width="2.0" marker-end="url(#arrow-blue)"/>
+  <rect x="800" y="396" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="860" y="408" text-anchor="middle" class="arrow-label" fill="#cbd5e1">notify handler</text>
+
+  <line x1="1090" y1="420" x2="1140" y2="380" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="1085" y="386" width="80" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1125" y="398" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Add(key)</text>
+
+  <line x1="1360" y1="380" x2="1380" y2="380" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="1340" y="356" width="60" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1370" y="368" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Get()</text>
+
+  <path d="M 1460,480 L 1460,640 L 1200,640" fill="none" stroke="#f43f5e" stroke-width="2.2" marker-end="url(#arrow-rose)"/>
+  <rect x="1230" y="616" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1290" y="628" text-anchor="middle" class="arrow-label" fill="#cbd5e1">syncFn(key)</text>
+
+  <path d="M 950,560 L 950,510 L 980,510 L 980,480" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="868" y="498" width="160" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="948" y="510" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Lister.List() (cache read)</text>
+
+  <path d="M 700,640 L 250,640 L 150,640 L 150,480" fill="none" stroke="#f97316" stroke-width="2.2" marker-end="url(#arrow-orange)"/>
+  <rect x="380" y="616" width="240" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="500" y="628" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Create / Update / UpdateStatus</text>
+
+  <path d="M 80,500 L 60,500 L 60,180 L 460,180 L 460,280" fill="none" stroke="#eab308" stroke-width="1.6" marker-end="url(#arrow-yellow)" stroke-dasharray="4,3"/>
+  <rect x="240" y="160" width="200" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="340" y="172" text-anchor="middle" class="arrow-label" fill="#cbd5e1">watch event &#8594; new RV (loop closes)</text>
+
+  <rect x="320" y="730" width="1220" height="56" rx="6" ry="6" fill="#0b1220" stroke="#334155" stroke-width="1.2" opacity="0.95"/>
+  <text x="336" y="752" class="layer-label" fill="#94a3b8">key invariants</text>
+  <text x="336" y="772" class="node-sub">- apiserver is the only writer of cluster state; the controller proposes mutations and waits for the watch echo to confirm.</text>
+  <text x="336" y="786" class="node-sub">- Reconcile() is idempotent: the same key may be processed many times; output should converge regardless of how many times you arrive.</text>
+
+  <rect x="40" y="820" width="1520" height="60" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="60" y1="840" x2="92" y2="840" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="98" y="844" class="legend-text">apiserver REST / watch</text>
+  <line x1="320" y1="840" x2="352" y2="840" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="358" y="844" class="legend-text">DeltaFIFO inflow</text>
+  <line x1="540" y1="840" x2="572" y2="840" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="578" y="844" class="legend-text">cache update / read (dashed = read)</text>
+  <line x1="900" y1="840" x2="932" y2="840" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="938" y="844" class="legend-text">workqueue enqueue / dequeue</text>
+  <line x1="1200" y1="840" x2="1232" y2="840" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="1238" y="844" class="legend-text">worker &#8594; Reconcile()</text>
+  <line x1="60" y1="868" x2="92" y2="868" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="98" y="872" class="legend-text">Reconcile() write-back to apiserver (Create / Update / UpdateStatus)</text>
+  <text x="1560" y="872" text-anchor="end" class="node-sub">Source: kubernetes v1.36.0 staging/src/k8s.io/client-go/tools/cache + pkg/controller/replicaset</text>
+</svg>

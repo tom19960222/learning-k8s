@@ -10,6 +10,10 @@ description: ReplicaSet 怎麼 self-heal、scheduler 怎麼 bind Pod 到 node、
 
 ## informer + work queue：所有 controller 的共同骨架
 
+![Kubernetes controller 內部資料流：apiserver watch → Reflector → DeltaFIFO → Indexer (cache) + EventHandler → Workqueue (rate-limited + dedup) → Worker goroutines → Reconcile() → 寫回 apiserver](/diagrams/kubernetes/controller-flow.png)
+
+*圖：controller binary 內部的標準 informer/workqueue 結構，箭頭顯示事件如何從 apiserver watch 進到 Reconcile()，以及 Reconcile() 怎麼讀 cache 寫 apiserver。*
+
 任何 controller 都是這個樣子：
 
 ```
