@@ -12,6 +12,12 @@ description: 從 kubectl apply 到 Pod 跑起來的完整路徑，4 個 control 
 
 ## 架構全貌
 
+![Kubernetes 架構鳥瞰圖：control plane (kube-apiserver / etcd / kube-scheduler / kube-controller-manager) 與 worker node (kubelet / kube-proxy / container runtime / CNI plugin) 兩層，以及外部 client (kubectl / Operator / Cloud Provider API) 與 workload Pod data plane](/diagrams/kubernetes/architecture.png)
+
+*圖：以 4 層呈現 Kubernetes 架構——外部 client 透過 HTTPS REST 進入 kube-apiserver；control plane 內部 (scheduler、controller-manager) 都只跟 apiserver 對話；只有 apiserver 能讀寫 etcd (黃色 raft 雙向箭頭)；worker node 的 kubelet 透過 CRI gRPC 與 container runtime 對接、再透過 CNI 配 Pod 網路；kube-proxy 把 Service ClusterIP 規則寫到 iptables / IPVS。虛線代表 bootstrap / async 路徑 (static Pod、CSI mount、status report)。*
+
+下面是同一張架構的 ASCII 版本，文字檔可搜尋、可複製：
+
 ```
 ┌─────────────────── control plane node ──────────────────┐
 │                                                          │
