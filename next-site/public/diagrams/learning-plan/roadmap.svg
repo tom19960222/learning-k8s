@@ -1,0 +1,228 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 26px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 15px; fill: #94a3b8; }
+    .week-label { font-size: 18px; font-weight: 700; letter-spacing: 0.02em; }
+    .week-sub { font-size: 12px; fill: #cbd5e1; }
+    .day-id { font-size: 14px; font-weight: 700; }
+    .day-cap { font-size: 11px; fill: #cbd5e1; }
+    .milestone-title { font-size: 13px; font-weight: 700; fill: #f1f5f9; }
+    .milestone-sub { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .axis-label { font-size: 11px; fill: #64748b; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg-grad)"/>
+
+  <!-- Header -->
+  <text x="800" y="46" text-anchor="middle" class="title">30 天 hands-on 路徑圖</text>
+  <text x="800" y="72" text-anchor="middle" class="subtitle">從 k8s 內部 &#8594; CNI &#8594; 儲存 &#8594; VM</text>
+
+  <!-- Timeline axis -->
+  <line x1="80" y1="110" x2="1520" y2="110" stroke="#334155" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="80" y="102" class="axis-label">START</text>
+  <text x="1520" y="102" text-anchor="end" class="axis-label">DAY 30 &#8594; 整合 demo</text>
+
+  <!-- ===== Week 1 column (blue) ===== -->
+  <rect x="80" y="130" width="340" height="640" rx="10" ry="10" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="100" y="160" class="week-label" fill="#3b82f6">Week 1 &#8729; ⚙️ Kubernetes 內部</text>
+  <text x="100" y="180" class="week-sub">control plane / kubelet / kube-proxy</text>
+  <text x="100" y="196" class="week-sub">D1 &#8594; D7 (operator 收關)</text>
+
+  <!-- Week 1 day cells -->
+  <rect x="100" y="218" width="300" height="58" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="240" class="day-id" fill="#3b82f6">D01</text>
+  <text x="120" y="260" class="day-cap">巡禮 control plane 4 元件</text>
+
+  <rect x="100" y="282" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="302" class="day-id" fill="#3b82f6">D02</text>
+  <text x="120" y="320" class="day-cap">etcd raw key 與 watch</text>
+
+  <rect x="100" y="338" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="358" class="day-id" fill="#3b82f6">D03</text>
+  <text x="120" y="376" class="day-cap">apiserver handler chain</text>
+
+  <rect x="100" y="394" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="414" class="day-id" fill="#3b82f6">D04</text>
+  <text x="120" y="432" class="day-cap">controller-manager reconcile</text>
+
+  <rect x="100" y="450" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="470" class="day-id" fill="#3b82f6">D05</text>
+  <text x="120" y="488" class="day-cap">kubelet &#8594; CRI &#8594; container</text>
+
+  <rect x="100" y="506" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1.2"/>
+  <text x="120" y="526" class="day-id" fill="#3b82f6">D06</text>
+  <text x="120" y="544" class="day-cap">kube-proxy iptables/IPVS</text>
+
+  <rect x="100" y="562" width="300" height="62" rx="6" ry="6" fill="#0f172a" stroke="#eab308" stroke-width="2"/>
+  <text x="120" y="586" class="day-id" fill="#eab308">D07 ★</text>
+  <text x="120" y="606" class="day-cap" fill="#fde047">自寫 ConfigMap watcher operator</text>
+  <text x="120" y="620" class="day-cap" fill="#fde047">milestone: k8s 內部走完</text>
+
+  <!-- ===== Week 2 column (green) ===== -->
+  <rect x="440" y="130" width="340" height="640" rx="10" ry="10" fill="#0b1220" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="460" y="160" class="week-label" fill="#10b981">Week 2 &#8729; 🌐 cilium + multus</text>
+  <text x="460" y="180" class="week-sub">eBPF datapath / 多平面網路</text>
+  <text x="460" y="196" class="week-sub">D8 &#8594; D14 (delegate flow)</text>
+
+  <rect x="460" y="218" width="300" height="58" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="240" class="day-id" fill="#10b981">D08</text>
+  <text x="480" y="260" class="day-cap">換掉 kube-proxy，cilium 接手</text>
+
+  <rect x="460" y="282" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="302" class="day-id" fill="#10b981">D09</text>
+  <text x="480" y="320" class="day-cap">cilium monitor 看 eBPF trace</text>
+
+  <rect x="460" y="338" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="358" class="day-id" fill="#10b981">D10</text>
+  <text x="480" y="376" class="day-cap">CiliumNetworkPolicy L3/L4/L7</text>
+
+  <rect x="460" y="394" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="414" class="day-id" fill="#10b981">D11</text>
+  <text x="480" y="432" class="day-cap">Hubble 觀測 flow</text>
+
+  <rect x="460" y="450" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="470" class="day-id" fill="#10b981">D12</text>
+  <text x="480" y="488" class="day-cap">multus 安裝 + CRD</text>
+
+  <rect x="460" y="506" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1.2"/>
+  <text x="480" y="526" class="day-id" fill="#10b981">D13</text>
+  <text x="480" y="544" class="day-cap">多網路 Pod (eth0 + net1)</text>
+
+  <rect x="460" y="562" width="300" height="62" rx="6" ry="6" fill="#0f172a" stroke="#eab308" stroke-width="2"/>
+  <text x="480" y="586" class="day-id" fill="#eab308">D14 ★</text>
+  <text x="480" y="606" class="day-cap" fill="#fde047">multus delegate flow 原始碼</text>
+  <text x="480" y="620" class="day-cap" fill="#fde047">milestone: 多平面網路打通</text>
+
+  <!-- ===== Week 3 column (orange) ===== -->
+  <rect x="800" y="130" width="340" height="640" rx="10" ry="10" fill="#0b1220" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="820" y="160" class="week-label" fill="#f97316">Week 3 &#8729; 💾 ceph + rook</text>
+  <text x="820" y="180" class="week-sub">RBD / CephFS / RGW + CSI</text>
+  <text x="820" y="196" class="week-sub">D15 &#8594; D21 (儲存堆疊)</text>
+
+  <rect x="820" y="218" width="300" height="58" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="240" class="day-id" fill="#f97316">D15</text>
+  <text x="840" y="260" class="day-cap">Proxmox ceph cluster 起步</text>
+
+  <rect x="820" y="282" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="302" class="day-id" fill="#f97316">D16</text>
+  <text x="840" y="320" class="day-cap">CRUSH map / pool / PG</text>
+
+  <rect x="820" y="338" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="358" class="day-id" fill="#f97316">D17</text>
+  <text x="840" y="376" class="day-cap">ceph-csi-rbd 安裝</text>
+
+  <rect x="820" y="394" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="414" class="day-id" fill="#f97316">D18</text>
+  <text x="840" y="432" class="day-cap">第一個 RBD PVC bind</text>
+
+  <rect x="820" y="450" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="470" class="day-id" fill="#f97316">D19</text>
+  <text x="840" y="488" class="day-cap">CephFS RWX 共享 volume</text>
+
+  <rect x="820" y="506" width="300" height="50" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.2"/>
+  <text x="840" y="526" class="day-id" fill="#f97316">D20</text>
+  <text x="840" y="544" class="day-cap">Rook operator reconcile loop</text>
+
+  <rect x="820" y="562" width="300" height="62" rx="6" ry="6" fill="#0f172a" stroke="#eab308" stroke-width="2"/>
+  <text x="840" y="586" class="day-id" fill="#eab308">D21 ★</text>
+  <text x="840" y="606" class="day-cap" fill="#fde047">RGW + boto3 (S3)</text>
+  <text x="840" y="620" class="day-cap" fill="#fde047">milestone: 儲存堆疊就位</text>
+
+  <!-- ===== Week 4+ column (purple) ===== -->
+  <rect x="1160" y="130" width="360" height="640" rx="10" ry="10" fill="#0b1220" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="1180" y="160" class="week-label" fill="#a855f7">Week 4+ &#8729; 🖥️ kubevirt 整合</text>
+  <text x="1180" y="180" class="week-sub">VirtualMachine / virt-handler / live migration</text>
+  <text x="1180" y="196" class="week-sub">D22 &#8594; D30 (整合 demo)</text>
+
+  <rect x="1180" y="218" width="320" height="50" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="238" class="day-id" fill="#a855f7">D22</text>
+  <text x="1200" y="256" class="day-cap">KubeVirt 安裝 + 第一台 VM</text>
+
+  <rect x="1180" y="274" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="294" class="day-id" fill="#a855f7">D23</text>
+  <text x="1200" y="310" class="day-cap">VM spec / DataVolume / cloud-init</text>
+
+  <rect x="1180" y="326" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="346" class="day-id" fill="#a855f7">D24</text>
+  <text x="1200" y="362" class="day-cap">virt-handler 與 libvirt 對話</text>
+
+  <rect x="1180" y="378" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="398" class="day-id" fill="#a855f7">D25</text>
+  <text x="1200" y="414" class="day-cap">VM + multus secondary NIC</text>
+
+  <rect x="1180" y="430" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="450" class="day-id" fill="#a855f7">D26</text>
+  <text x="1200" y="466" class="day-cap">VM 用 ceph-csi RBD root disk</text>
+
+  <rect x="1180" y="482" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="502" class="day-id" fill="#a855f7">D27</text>
+  <text x="1200" y="518" class="day-cap">live migration (memory dirty page)</text>
+
+  <rect x="1180" y="534" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="554" class="day-id" fill="#a855f7">D28</text>
+  <text x="1200" y="570" class="day-cap">VM Service + 連線測試</text>
+
+  <rect x="1180" y="586" width="320" height="46" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1.2"/>
+  <text x="1200" y="606" class="day-id" fill="#a855f7">D29</text>
+  <text x="1200" y="622" class="day-cap">監控 / metrics / 故障演練</text>
+
+  <rect x="1180" y="638" width="320" height="62" rx="6" ry="6" fill="#0f172a" stroke="#eab308" stroke-width="2"/>
+  <text x="1200" y="662" class="day-id" fill="#eab308">D30 ★</text>
+  <text x="1200" y="682" class="day-cap" fill="#fde047">平台整合 demo + 30 天回顧</text>
+  <text x="1200" y="696" class="day-cap" fill="#fde047">milestone: 跑出可用平台</text>
+
+  <!-- Week-to-week flow arrows (timeline) -->
+  <line x1="400" y1="400" x2="442" y2="400" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <line x1="760" y1="400" x2="802" y2="400" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <line x1="1120" y1="400" x2="1162" y2="400" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+
+  <!-- Milestone callouts (bottom strip) -->
+  <rect x="80" y="790" width="1440" height="90" rx="8" ry="8" fill="#0b1220" stroke="#eab308" stroke-width="1.2" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="100" y="814" class="milestone-title" fill="#eab308">★ 4 個 milestone</text>
+
+  <text x="100" y="838" class="milestone-sub"><tspan fill="#3b82f6" font-weight="700">D7</tspan> &#8729; k8s 內部走完：自寫 operator 才算閉環</text>
+  <text x="100" y="858" class="milestone-sub"><tspan fill="#10b981" font-weight="700">D14</tspan> &#8729; 多平面網路打通：cilium eBPF + multus 第二張 NIC</text>
+  <text x="800" y="838" class="milestone-sub"><tspan fill="#f97316" font-weight="700">D21</tspan> &#8729; 儲存堆疊就位：RBD / CephFS / RGW 三種模式都跑過</text>
+  <text x="800" y="858" class="milestone-sub"><tspan fill="#a855f7" font-weight="700">D30</tspan> &#8729; 整合 demo：VM + Service + secondary NIC + ceph PV + live migration</text>
+
+  <!-- Legend (bottom-left, inside header band area) -->
+  <g transform="translate(80, 736)">
+    <rect x="0" y="0" width="1440" height="40" rx="6" ry="6" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+    <rect x="16" y="12" width="14" height="14" fill="#3b82f6" rx="2"/>
+    <text x="38" y="24" class="legend-text">Week 1 — k8s 內部 (D1-7)</text>
+    <rect x="280" y="12" width="14" height="14" fill="#10b981" rx="2"/>
+    <text x="302" y="24" class="legend-text">Week 2 — cilium + multus (D8-14)</text>
+    <rect x="600" y="12" width="14" height="14" fill="#f97316" rx="2"/>
+    <text x="622" y="24" class="legend-text">Week 3 — ceph + rook (D15-21)</text>
+    <rect x="900" y="12" width="14" height="14" fill="#a855f7" rx="2"/>
+    <text x="922" y="24" class="legend-text">Week 4+ — kubevirt 整合 (D22-30)</text>
+    <rect x="1220" y="12" width="14" height="14" fill="#eab308" rx="2"/>
+    <text x="1242" y="24" class="legend-text">★ milestone day</text>
+  </g>
+</svg>
