@@ -98,6 +98,10 @@ flag 的關鍵：
 | `POSTCOPY` | 允許 post-copy fallback |
 | `NON_SHARED_DISK` | 連 disk 一起 copy（block migration）|
 
+![KubeVirt live-migration swimlane：virt-controller、source/target virt-handler、source/target virt-launcher (libvirt+qemu)、shared storage 各自一條 lane；時間軸從 schedule target → precopy → cutover (atomic) → resume target；cutover band 標明 downtime 視窗](/diagrams/kubevirt/live-migration.png)
+
+*圖：以 swimlane 表達 5 個 process 在 migration 各階段的角色，cutover 那條垂直黃帶是唯一 VM 真正暫停的時刻；shared storage (RBD) 不需要複製，由 source / target 同時掛載。*
+
 ## precopy：iterative dirty page copy
 
 預設模式。流程：
