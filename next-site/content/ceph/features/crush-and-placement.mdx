@@ -23,6 +23,10 @@ pg_id = pool_id + (hash(object_name) % pg_num)
 osd_set = CRUSH(CRUSHMap, pg_id, rule, num_replicas)
 ```
 
+![Ceph CRUSH placement：object name → hash → PG ID → CRUSHMap rule traversal (root → datacenter → rack → host → osd) → Acting Set；底部以 straw2 bucket draw 解釋為什麼加減 osd 只影響部分 PG (stable property)](/diagrams/ceph/crush-placement.png)
+
+*圖：上半段是 object 到 OSD 的決定路徑，中段是 CRUSHMap 階層樹，被選中的分支以實線高亮；下半段以 straw2 視覺化「為何 stable」——每個 bucket 抽 weighted random 取最大，新增 osd 只動到原本沒贏過的位置。*
+
 - 第一步是 cheap hash（client 自己算）
 - 第二步才是 CRUSH 演算法
 - CRUSH 的 input 是 PG ID，不是 object name → 計算量取決於 PG 數，不取決於 object 數
