@@ -1,0 +1,410 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1100" width="1700" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 13px; fill: #94a3b8; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .step-num { font-size: 13px; font-weight: 700; fill: #f1f5f9; }
+    .verdict { font-size: 14px; font-weight: 700; }
+    .map-cell { font-size: 11px; fill: #cbd5e1; }
+    .map-head { font-size: 11px; font-weight: 700; fill: #f1f5f9; }
+    .code { font-size: 11px; fill: #cbd5e1; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#ef4444"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+  </defs>
+  <rect width="1700" height="1100" fill="url(#bg-grad)"/>
+
+  <text x="850" y="36" text-anchor="middle" class="title">Cilium Policy + L7 Redirect: Identity &#8594; PolicyMap &#8594; ALLOW / DENY / REDIRECT &#8594; envoy</text>
+  <text x="850" y="58" text-anchor="middle" class="subtitle">label set 算成 numeric ID；per-endpoint BPF map 查 (src_id, dport, proto, dir)；REDIRECT 走 tproxy 進 envoy 做 L7 規則</text>
+
+  <!-- ================== TOP: Identity store + PolicyMap ================== -->
+  <rect x="30" y="80" width="1340" height="270" rx="8" ry="8" fill="#0f172a" stroke="#06b6d4" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="102" class="layer-label" fill="#06b6d4">索引層: CiliumIdentity store + per-endpoint PolicyMap (BPF hash map)</text>
+
+  <!-- Identity store -->
+  <rect x="50" y="120" width="540" height="220" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="320" y="143" text-anchor="middle" class="node-title" fill="#06b6d4">CiliumIdentity store (cluster-wide, kvstore / CRD)</text>
+  <text x="320" y="160" text-anchor="middle" class="node-sub">label set &#8594; 16-bit numeric ID, 跨 cluster 唯一</text>
+
+  <!-- Identity table -->
+  <rect x="70" y="175" width="500" height="150" rx="4" fill="#0a0a0a" stroke="#334155" stroke-width="1"/>
+  <line x1="70" y1="200" x2="570" y2="200" stroke="#334155" stroke-width="1"/>
+  <line x1="380" y1="175" x2="380" y2="325" stroke="#334155" stroke-width="1"/>
+  <text x="220" y="193" text-anchor="middle" class="map-head">label set</text>
+  <text x="475" y="193" text-anchor="middle" class="map-head">numeric ID</text>
+
+  <text x="80" y="219" class="map-cell">app:foo, env:prod, ns:default</text>
+  <text x="475" y="219" text-anchor="middle" class="map-cell" fill="#10b981">1234</text>
+  <line x1="70" y1="227" x2="570" y2="227" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="80" y="245" class="map-cell">app:bar, env:prod, ns:default</text>
+  <text x="475" y="245" text-anchor="middle" class="map-cell" fill="#3b82f6">5678</text>
+  <line x1="70" y1="253" x2="570" y2="253" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="80" y="271" class="map-cell">app:bad-actor, ns:hostile</text>
+  <text x="475" y="271" text-anchor="middle" class="map-cell" fill="#ef4444">9999</text>
+  <line x1="70" y1="279" x2="570" y2="279" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="80" y="297" class="map-cell">reserved:world (cluster 外)</text>
+  <text x="475" y="297" text-anchor="middle" class="map-cell" fill="#a855f7">2</text>
+  <line x1="70" y1="305" x2="570" y2="305" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="80" y="321" class="map-cell">reserved:host (node host stack)</text>
+  <text x="475" y="321" text-anchor="middle" class="map-cell" fill="#a855f7">1</text>
+
+  <!-- PolicyMap -->
+  <rect x="610" y="120" width="740" height="220" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="980" y="143" text-anchor="middle" class="node-title" fill="#eab308">PolicyMap of endpoint Pod B (id:1234)  - per-endpoint BPF hash map</text>
+  <text x="980" y="160" text-anchor="middle" class="node-sub">key: (src_identity, dport, proto, dir)    value: PolicyEntry {flags, proxy_port, ...}</text>
+
+  <!-- Policy table -->
+  <rect x="630" y="175" width="700" height="150" rx="4" fill="#0a0a0a" stroke="#334155" stroke-width="1"/>
+  <line x1="630" y1="200" x2="1330" y2="200" stroke="#334155" stroke-width="1"/>
+  <line x1="780" y1="175" x2="780" y2="325" stroke="#334155" stroke-width="1"/>
+  <line x1="880" y1="175" x2="880" y2="325" stroke="#334155" stroke-width="1"/>
+  <line x1="960" y1="175" x2="960" y2="325" stroke="#334155" stroke-width="1"/>
+  <line x1="1040" y1="175" x2="1040" y2="325" stroke="#334155" stroke-width="1"/>
+  <line x1="1180" y1="175" x2="1180" y2="325" stroke="#334155" stroke-width="1"/>
+
+  <text x="705" y="193" text-anchor="middle" class="map-head">src_id</text>
+  <text x="830" y="193" text-anchor="middle" class="map-head">dport</text>
+  <text x="920" y="193" text-anchor="middle" class="map-head">proto</text>
+  <text x="1000" y="193" text-anchor="middle" class="map-head">dir</text>
+  <text x="1110" y="193" text-anchor="middle" class="map-head">proxy_port</text>
+  <text x="1255" y="193" text-anchor="middle" class="map-head">verdict</text>
+
+  <text x="705" y="219" text-anchor="middle" class="map-cell" fill="#3b82f6">5678</text>
+  <text x="830" y="219" text-anchor="middle" class="map-cell">8080</text>
+  <text x="920" y="219" text-anchor="middle" class="map-cell">TCP</text>
+  <text x="1000" y="219" text-anchor="middle" class="map-cell">ingress</text>
+  <text x="1110" y="219" text-anchor="middle" class="map-cell">0</text>
+  <text x="1255" y="219" text-anchor="middle" class="map-cell" fill="#10b981">ALLOW (L4)</text>
+  <line x1="630" y1="227" x2="1330" y2="227" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="705" y="245" text-anchor="middle" class="map-cell" fill="#3b82f6">5678</text>
+  <text x="830" y="245" text-anchor="middle" class="map-cell">9090</text>
+  <text x="920" y="245" text-anchor="middle" class="map-cell">TCP</text>
+  <text x="1000" y="245" text-anchor="middle" class="map-cell">ingress</text>
+  <text x="1110" y="245" text-anchor="middle" class="map-cell" fill="#eab308">10500</text>
+  <text x="1255" y="245" text-anchor="middle" class="map-cell" fill="#eab308">REDIRECT (L7)</text>
+  <line x1="630" y1="253" x2="1330" y2="253" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="705" y="271" text-anchor="middle" class="map-cell" fill="#ef4444">9999</text>
+  <text x="830" y="271" text-anchor="middle" class="map-cell">*</text>
+  <text x="920" y="271" text-anchor="middle" class="map-cell">*</text>
+  <text x="1000" y="271" text-anchor="middle" class="map-cell">ingress</text>
+  <text x="1110" y="271" text-anchor="middle" class="map-cell">-</text>
+  <text x="1255" y="271" text-anchor="middle" class="map-cell" fill="#ef4444">DENY (flag)</text>
+  <line x1="630" y1="279" x2="1330" y2="279" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="705" y="297" text-anchor="middle" class="map-cell" fill="#a855f7">1</text>
+  <text x="830" y="297" text-anchor="middle" class="map-cell">53</text>
+  <text x="920" y="297" text-anchor="middle" class="map-cell">UDP</text>
+  <text x="1000" y="297" text-anchor="middle" class="map-cell">egress</text>
+  <text x="1110" y="297" text-anchor="middle" class="map-cell" fill="#eab308">10054</text>
+  <text x="1255" y="297" text-anchor="middle" class="map-cell" fill="#eab308">REDIRECT (DNS)</text>
+  <line x1="630" y1="305" x2="1330" y2="305" stroke="#1e293b" stroke-width="0.6"/>
+
+  <text x="705" y="321" text-anchor="middle" class="map-cell">- (miss)</text>
+  <text x="830" y="321" text-anchor="middle" class="map-cell">-</text>
+  <text x="920" y="321" text-anchor="middle" class="map-cell">-</text>
+  <text x="1000" y="321" text-anchor="middle" class="map-cell">-</text>
+  <text x="1110" y="321" text-anchor="middle" class="map-cell">-</text>
+  <text x="1255" y="321" text-anchor="middle" class="map-cell" fill="#94a3b8">default mode</text>
+
+  <!-- arrow from identity store to PolicyMap (key源) -->
+  <line x1="590" y1="225" x2="610" y2="225" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <rect x="555" y="207" width="90" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="600" y="218" text-anchor="middle" class="arrow-label">src_id 來自此</text>
+
+  <!-- ================== MIDDLE: packet path with 3-way branch ================== -->
+  <rect x="30" y="370" width="1340" height="380" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="392" class="layer-label" fill="#10b981">封包路徑: source Pod &#8594; veth &#8594; tc clsact &#8594; bpf_lxc PolicyMap lookup &#8594; 3 branches</text>
+
+  <!-- Pod A (source) -->
+  <rect x="50" y="420" width="200" height="110" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="150" y="446" text-anchor="middle" class="node-title" fill="#3b82f6">Pod A (source)</text>
+  <text x="150" y="466" text-anchor="middle" class="node-sub">label app:bar, env:prod</text>
+  <text x="150" y="480" text-anchor="middle" class="node-sub">identity 5678</text>
+  <text x="150" y="498" text-anchor="middle" class="node-sub">套接層發 TCP packet</text>
+  <text x="150" y="512" text-anchor="middle" class="node-sub">dst :9090 (Pod B)</text>
+
+  <!-- veth pair -->
+  <rect x="280" y="430" width="160" height="90" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="360" y="456" text-anchor="middle" class="node-title" fill="#cbd5e1">veth pair</text>
+  <text x="360" y="476" text-anchor="middle" class="node-sub">Pod netns &#8594; host netns</text>
+  <text x="360" y="490" text-anchor="middle" class="node-sub">lxcXXXX@if interface</text>
+  <text x="360" y="506" text-anchor="middle" class="node-sub">tc clsact attach point</text>
+
+  <!-- bpf_lxc lookup -->
+  <rect x="470" y="410" width="280" height="130" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="2"/>
+  <text x="610" y="436" text-anchor="middle" class="node-title" fill="#10b981">bpf_lxc.c (cil_to_container)</text>
+  <text x="610" y="456" text-anchor="middle" class="node-sub">tc clsact ingress on dest veth</text>
+  <text x="610" y="470" text-anchor="middle" class="node-sub">取 src_ip &#8594; ipcache &#8594; src_id</text>
+  <text x="610" y="484" text-anchor="middle" class="node-sub">key: (5678, 9090, TCP, ingress)</text>
+  <text x="610" y="500" text-anchor="middle" class="node-sub">map_lookup_elem(PolicyMap)</text>
+  <text x="610" y="514" text-anchor="middle" class="node-sub">取 PolicyEntry {flags, proxy_port}</text>
+  <text x="610" y="530" text-anchor="middle" class="node-sub">conntrack 同時更新</text>
+
+  <!-- Decision diamond hint -->
+  <rect x="780" y="430" width="190" height="90" rx="6" ry="6" fill="#1c1917" stroke="#eab308" stroke-width="1.8"/>
+  <text x="875" y="456" text-anchor="middle" class="node-title" fill="#eab308">verdict 判斷</text>
+  <text x="875" y="476" text-anchor="middle" class="node-sub">flags &amp; DENY?</text>
+  <text x="875" y="490" text-anchor="middle" class="node-sub">proxy_port == 0?</text>
+  <text x="875" y="504" text-anchor="middle" class="node-sub">proxy_port != 0?</text>
+
+  <!-- arrow A to veth -->
+  <line x1="250" y1="475" x2="280" y2="475" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <!-- veth to bpf_lxc -->
+  <line x1="440" y1="475" x2="470" y2="475" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <text x="455" y="468" text-anchor="middle" class="arrow-label">tc</text>
+  <!-- bpf_lxc to verdict -->
+  <line x1="750" y1="475" x2="780" y2="475" stroke="#eab308" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+
+  <!-- 3 branches -->
+  <!-- ALLOW -->
+  <rect x="1010" y="395" width="320" height="90" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.8"/>
+  <text x="1170" y="420" text-anchor="middle" class="verdict" fill="#10b981">branch 1: ALLOW (L4)</text>
+  <text x="1170" y="440" text-anchor="middle" class="node-sub">flags 不含 deny &amp; proxy_port == 0</text>
+  <text x="1170" y="454" text-anchor="middle" class="node-sub">tail-call &#8594; redirect_peer()</text>
+  <text x="1170" y="468" text-anchor="middle" class="node-sub">封包直接送進 Pod B veth</text>
+  <text x="1170" y="482" text-anchor="middle" class="node-sub">verdict event &#8594; perf ring</text>
+
+  <!-- DENY -->
+  <rect x="1010" y="500" width="320" height="90" rx="6" ry="6" fill="#1c1917" stroke="#ef4444" stroke-width="1.8"/>
+  <text x="1170" y="525" text-anchor="middle" class="verdict" fill="#ef4444">branch 2: DENY</text>
+  <text x="1170" y="545" text-anchor="middle" class="node-sub">flags &amp; DENY 或 default-deny &amp; miss</text>
+  <text x="1170" y="559" text-anchor="middle" class="node-sub">return TC_ACT_SHOT (kernel drop)</text>
+  <text x="1170" y="573" text-anchor="middle" class="node-sub">可選 send_drop_notify (icmp)</text>
+  <text x="1170" y="587" text-anchor="middle" class="node-sub">drop event &#8594; perf ring</text>
+
+  <!-- REDIRECT -->
+  <rect x="1010" y="605" width="320" height="120" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="2"/>
+  <text x="1170" y="630" text-anchor="middle" class="verdict" fill="#eab308">branch 3: REDIRECT (L7)</text>
+  <text x="1170" y="650" text-anchor="middle" class="node-sub">proxy_port != 0 (e.g. 10500)</text>
+  <text x="1170" y="664" text-anchor="middle" class="node-sub">ctx-&gt;mark = MARK_MAGIC_TO_PROXY</text>
+  <text x="1170" y="678" text-anchor="middle" class="node-sub">redirect to local cilium_host</text>
+  <text x="1170" y="692" text-anchor="middle" class="node-sub">host stack: tproxy / sk_lookup</text>
+  <text x="1170" y="706" text-anchor="middle" class="node-sub">捕獲到 envoy listener :proxy_port</text>
+  <text x="1170" y="720" text-anchor="middle" class="node-sub">L7 verdict 後再決定 forward</text>
+
+  <!-- arrows from verdict diamond -->
+  <line x1="970" y1="450" x2="1010" y2="430" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <line x1="970" y1="475" x2="1010" y2="540" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-rose)"/>
+  <line x1="970" y1="500" x2="1010" y2="650" stroke="#eab308" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+
+  <!-- destination Pod B (for ALLOW arrow) -->
+  <rect x="50" y="600" width="220" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="160" y="626" text-anchor="middle" class="node-title" fill="#10b981">Pod B (dest, id 1234)</text>
+  <text x="160" y="646" text-anchor="middle" class="node-sub">label app:foo, env:prod</text>
+  <text x="160" y="660" text-anchor="middle" class="node-sub">listen :8080 (L4 only)</text>
+  <text x="160" y="674" text-anchor="middle" class="node-sub">listen :9090 (L7-protected)</text>
+  <text x="160" y="688" text-anchor="middle" class="node-sub">PolicyMap owner</text>
+
+  <!-- ALLOW arrow loops back to Pod B from branch 1 (long arc) -->
+  <path d="M 1010,440 L 290,440 L 290,600" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="600" y="426" width="120" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="660" y="437" text-anchor="middle" class="arrow-label" fill="#cbd5e1">redirect_peer to veth</text>
+
+  <!-- DENY: drop sink box -->
+  <rect x="320" y="615" width="220" height="80" rx="6" ry="6" fill="#1c1917" stroke="#ef4444" stroke-width="1.5"/>
+  <text x="430" y="641" text-anchor="middle" class="node-title" fill="#ef4444">drop sink</text>
+  <text x="430" y="660" text-anchor="middle" class="node-sub">TC_ACT_SHOT</text>
+  <text x="430" y="674" text-anchor="middle" class="node-sub">封包直接消失</text>
+  <text x="430" y="688" text-anchor="middle" class="node-sub">conntrack 不建立</text>
+
+  <path d="M 1010,545 L 700,580 L 540,650" fill="none" stroke="#ef4444" stroke-width="1.6" marker-end="url(#arrow-rose)" stroke-dasharray="6,4"/>
+
+  <!-- ================== BOTTOM: envoy L7 enforcement ================== -->
+  <rect x="30" y="770" width="1340" height="290" rx="8" ry="8" fill="#0f172a" stroke="#eab308" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="792" class="layer-label" fill="#eab308">L7 enforcement: local envoy proxy 解析 HTTP / Kafka / DNS frame，比對 CiliumNetworkPolicy L7 規則</text>
+
+  <!-- envoy listener box -->
+  <rect x="50" y="810" width="320" height="220" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="2"/>
+  <text x="210" y="836" text-anchor="middle" class="node-title" fill="#eab308">envoy proxy (cilium-agent embedded)</text>
+  <text x="210" y="855" text-anchor="middle" class="node-sub">listener :10500 (TPROXY mode)</text>
+  <text x="210" y="869" text-anchor="middle" class="node-sub">accept transparent socket</text>
+  <text x="210" y="883" text-anchor="middle" class="node-sub">原 dst :9090 保留</text>
+  <text x="210" y="901" text-anchor="middle" class="node-sub">--</text>
+  <text x="210" y="917" text-anchor="middle" class="node-sub">parse application frame:</text>
+  <text x="210" y="931" text-anchor="middle" class="node-sub">- HTTP: method / path / header</text>
+  <text x="210" y="945" text-anchor="middle" class="node-sub">- Kafka: api_key / topic</text>
+  <text x="210" y="959" text-anchor="middle" class="node-sub">- DNS: qname / qtype</text>
+  <text x="210" y="977" text-anchor="middle" class="node-sub">--</text>
+  <text x="210" y="993" text-anchor="middle" class="node-sub">xDS 從 cilium-agent push</text>
+  <text x="210" y="1007" text-anchor="middle" class="node-sub">L7Policy NetworkPolicyHosts CRD</text>
+
+  <!-- L7 rule eval -->
+  <rect x="400" y="810" width="380" height="220" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="590" y="836" text-anchor="middle" class="node-title" fill="#eab308">L7 rule evaluation</text>
+  <text x="590" y="853" text-anchor="middle" class="node-sub">CiliumNetworkPolicy 範例 (對 id 1234)</text>
+
+  <rect x="420" y="867" width="340" height="100" rx="4" fill="#0a0a0a" stroke="#334155" stroke-width="1"/>
+  <text x="430" y="884" class="code">toEndpoints:</text>
+  <text x="430" y="900" class="code">  - matchLabels: {app: foo}</text>
+  <text x="430" y="916" class="code">toPorts:</text>
+  <text x="430" y="932" class="code">  - ports: [{port: &quot;9090&quot;, proto: TCP}]</text>
+  <text x="430" y="948" class="code">    rules:</text>
+  <text x="430" y="964" class="code">      http: [{method: &quot;GET&quot;, path: &quot;/api/.*&quot;}]</text>
+
+  <text x="590" y="987" text-anchor="middle" class="node-sub">match path/method/header...</text>
+  <text x="590" y="1001" text-anchor="middle" class="node-sub">verdict: ALLOWED / DENIED</text>
+  <text x="590" y="1015" text-anchor="middle" class="node-sub">verdict event &#8594; cilium monitor</text>
+
+  <!-- forward to upstream -->
+  <rect x="810" y="810" width="280" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.8"/>
+  <text x="950" y="836" text-anchor="middle" class="node-title" fill="#10b981">L7 ALLOW: forward upstream</text>
+  <text x="950" y="855" text-anchor="middle" class="node-sub">envoy 開新 socket dial Pod B :9090</text>
+  <text x="950" y="869" text-anchor="middle" class="node-sub">仍走 cilium 自己的 datapath</text>
+  <text x="950" y="883" text-anchor="middle" class="node-sub">這次 src 是 envoy (id reserved:host)</text>
+  <text x="950" y="897" text-anchor="middle" class="node-sub">PolicyMap 對 host id 通常 ALLOW</text>
+
+  <!-- deny response -->
+  <rect x="810" y="930" width="280" height="100" rx="6" ry="6" fill="#1c1917" stroke="#ef4444" stroke-width="1.8"/>
+  <text x="950" y="956" text-anchor="middle" class="node-title" fill="#ef4444">L7 DENY: 回應 / close</text>
+  <text x="950" y="975" text-anchor="middle" class="node-sub">HTTP: 403 Forbidden</text>
+  <text x="950" y="989" text-anchor="middle" class="node-sub">Kafka: 直接 close TCP</text>
+  <text x="950" y="1003" text-anchor="middle" class="node-sub">DNS: SERVFAIL / 不轉發</text>
+  <text x="950" y="1017" text-anchor="middle" class="node-sub">原 source 看到應用層錯誤</text>
+
+  <!-- Pod B (final dest) -->
+  <rect x="1130" y="810" width="220" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1240" y="836" text-anchor="middle" class="node-title" fill="#10b981">Pod B :9090</text>
+  <text x="1240" y="856" text-anchor="middle" class="node-sub">真正收到的是 envoy 開的</text>
+  <text x="1240" y="870" text-anchor="middle" class="node-sub">代理連線</text>
+  <text x="1240" y="884" text-anchor="middle" class="node-sub">看到的 src IP 是 envoy</text>
+  <text x="1240" y="898" text-anchor="middle" class="node-sub">tproxy 保留原 dst port</text>
+
+  <!-- arrows in L7 zone -->
+  <!-- branch3 to envoy -->
+  <path d="M 1170,725 L 1170,755 L 210,755 L 210,810" fill="none" stroke="#eab308" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+  <rect x="640" y="747" width="160" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="720" y="759" text-anchor="middle" class="arrow-label">tproxy / sk_lookup hook</text>
+
+  <!-- envoy to L7 rule eval -->
+  <line x1="370" y1="920" x2="400" y2="920" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <!-- L7 eval to ALLOW box -->
+  <line x1="780" y1="860" x2="810" y2="860" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <!-- L7 eval to DENY box -->
+  <line x1="780" y1="980" x2="810" y2="980" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <!-- ALLOW box to Pod B -->
+  <line x1="1090" y1="860" x2="1130" y2="860" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- ================== RIGHT panel: Hubble / verdict observability ================== -->
+  <rect x="1390" y="80" width="280" height="980" rx="8" ry="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="1406" y="102" class="layer-label" fill="#a855f7">Observability: Hubble verdict pipe</text>
+
+  <rect x="1410" y="120" width="240" height="120" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1530" y="146" text-anchor="middle" class="node-title" fill="#06b6d4">BPF perf event ring</text>
+  <text x="1530" y="166" text-anchor="middle" class="node-sub">events ring map</text>
+  <text x="1530" y="180" text-anchor="middle" class="node-sub">BPF_MAP_TYPE_PERF_EVENT_ARRAY</text>
+  <text x="1530" y="194" text-anchor="middle" class="node-sub">每個 verdict 都 push 一筆</text>
+  <text x="1530" y="208" text-anchor="middle" class="node-sub">policy_verdict_notify()</text>
+  <text x="1530" y="222" text-anchor="middle" class="node-sub">trace_notify() drop_notify()</text>
+
+  <rect x="1410" y="270" width="240" height="120" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1530" y="296" text-anchor="middle" class="node-title" fill="#a855f7">hubble agent</text>
+  <text x="1530" y="316" text-anchor="middle" class="node-sub">in-process inside cilium-agent</text>
+  <text x="1530" y="330" text-anchor="middle" class="node-sub">read perf ring (mmap)</text>
+  <text x="1530" y="344" text-anchor="middle" class="node-sub">解析成 flow records</text>
+  <text x="1530" y="358" text-anchor="middle" class="node-sub">verdict: FORWARDED / DROPPED</text>
+  <text x="1530" y="372" text-anchor="middle" class="node-sub">type: POLICY / L7</text>
+
+  <rect x="1410" y="420" width="240" height="120" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="1530" y="446" text-anchor="middle" class="node-title" fill="#eab308">envoy access log</text>
+  <text x="1530" y="466" text-anchor="middle" class="node-sub">L7 verdict 走另一條 path</text>
+  <text x="1530" y="480" text-anchor="middle" class="node-sub">envoy &#8594; UDS &#8594; cilium-agent</text>
+  <text x="1530" y="494" text-anchor="middle" class="node-sub">經 monitor agent 合流</text>
+  <text x="1530" y="508" text-anchor="middle" class="node-sub">最後也進 hubble flow</text>
+  <text x="1530" y="522" text-anchor="middle" class="node-sub">含 method / path / status</text>
+
+  <rect x="1410" y="570" width="240" height="120" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1530" y="596" text-anchor="middle" class="node-title" fill="#a855f7">hubble-relay</text>
+  <text x="1530" y="616" text-anchor="middle" class="node-sub">cluster-wide aggregator</text>
+  <text x="1530" y="630" text-anchor="middle" class="node-sub">fan-in N node 的 flow</text>
+  <text x="1530" y="644" text-anchor="middle" class="node-sub">給 hubble CLI / UI 用</text>
+
+  <rect x="1410" y="720" width="240" height="170" rx="6" ry="6" fill="#0a0a0a" stroke="#334155" stroke-width="1.5"/>
+  <text x="1530" y="746" text-anchor="middle" class="node-title" fill="#cbd5e1">範例 verdict event</text>
+  <rect x="1422" y="757" width="216" height="120" rx="3" fill="#000" stroke="#334155" stroke-width="0.6"/>
+  <text x="1430" y="773" class="code">type: policy-verdict</text>
+  <text x="1430" y="789" class="code">verdict: FORWARDED</text>
+  <text x="1430" y="805" class="code">match_type: L3_L4</text>
+  <text x="1430" y="821" class="code">src_id: 5678</text>
+  <text x="1430" y="837" class="code">dst_id: 1234</text>
+  <text x="1430" y="853" class="code">dport: 8080 proto: TCP</text>
+  <text x="1430" y="869" class="code">policy_match: rule#3</text>
+
+  <rect x="1410" y="920" width="240" height="130" rx="6" ry="6" fill="#0b1220" stroke="#ef4444" stroke-width="1.5"/>
+  <text x="1530" y="946" text-anchor="middle" class="node-title" fill="#ef4444">drop verdict 範例</text>
+  <rect x="1422" y="957" width="216" height="80" rx="3" fill="#000" stroke="#334155" stroke-width="0.6"/>
+  <text x="1430" y="973" class="code">type: drop</text>
+  <text x="1430" y="989" class="code">verdict: DROPPED</text>
+  <text x="1430" y="1005" class="code">drop_reason: Policy denied</text>
+  <text x="1430" y="1021" class="code">src_id: 9999 dst_id: 1234</text>
+
+  <!-- arrows inside right panel -->
+  <line x1="1530" y1="240" x2="1530" y2="270" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)"/>
+  <line x1="1530" y1="390" x2="1530" y2="420" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+  <line x1="1530" y1="540" x2="1530" y2="570" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)"/>
+  <line x1="1530" y1="690" x2="1530" y2="720" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+
+  <!-- arrows: bpf_lxc -> perf ring -->
+  <path d="M 750,500 L 1380,180 L 1410,180" fill="none" stroke="#a855f7" stroke-width="1.5" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+  <rect x="1100" y="282" width="170" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1185" y="293" text-anchor="middle" class="arrow-label">policy_verdict_notify</text>
+
+  <!-- arrow: envoy -> envoy access log -->
+  <path d="M 370,920 L 1380,460 L 1410,460" fill="none" stroke="#eab308" stroke-width="1.5" marker-end="url(#arrow-yellow)" stroke-dasharray="4,3"/>
+  <rect x="1095" y="556" width="160" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1175" y="567" text-anchor="middle" class="arrow-label">L7 access log via UDS</text>
+
+  <!-- ================== Legend ================== -->
+  <rect x="30" y="1070" width="1340" height="22" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="46" y1="1082" x2="78" y2="1082" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="84" y="1086" class="legend-text">ALLOW path / forward</text>
+
+  <line x1="270" y1="1082" x2="302" y2="1082" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="308" y="1086" class="legend-text">DENY / drop</text>
+
+  <line x1="430" y1="1082" x2="462" y2="1082" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="468" y="1086" class="legend-text">L7 redirect / xDS</text>
+
+  <line x1="620" y1="1082" x2="652" y2="1082" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="658" y="1086" class="legend-text">user packet path</text>
+
+  <line x1="810" y1="1082" x2="842" y2="1082" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="848" y="1086" class="legend-text">map data / lookup key</text>
+
+  <line x1="1020" y1="1082" x2="1052" y2="1082" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="1058" y="1086" class="legend-text">observability (perf ring / hubble)</text>
+</svg>
