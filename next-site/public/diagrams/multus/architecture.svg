@@ -1,0 +1,305 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 940" width="1320" height="940">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+  </defs>
+  <rect width="1320" height="940" fill="url(#bg-grad)"/>
+  <text x="660" y="38" text-anchor="middle" class="title">Multus Architecture: kubelet &#8594; multus meta-CNI &#8594; delegate plugins &#8594; Pod netns</text>
+
+  <!-- Layer 1: Kubernetes side -->
+  <rect x="40" y="64" width="1240" height="130" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="86" class="layer-label" fill="#3b82f6">Layer 1 &#8212; Kubernetes side (apiserver state + node-local CNI invoker)</text>
+
+  <!-- Layer 2: Multus components on node -->
+  <rect x="40" y="218" width="1240" height="180" rx="8" ry="8" fill="#0f172a" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="240" class="layer-label" fill="#f97316">Layer 2 &#8212; Multus components on node (shim binary in /opt/cni/bin + daemon DaemonSet, talk via multus.sock)</text>
+
+  <!-- Layer 3: Delegate CNI plugins -->
+  <rect x="40" y="424" width="1240" height="180" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="446" class="layer-label" fill="#10b981">Layer 3 &#8212; Delegate CNI plugins (real CNI binaries in /opt/cni/bin, exec&apos;d by multus-daemon via chroot)</text>
+
+  <!-- Layer 4: Pod network namespace -->
+  <rect x="40" y="630" width="1240" height="200" rx="8" ry="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="652" class="layer-label" fill="#a855f7">Layer 4 &#8212; Pod network namespace (one per Pod; NICs created by delegates, status written back via annotation)</text>
+
+  <!-- ==================== Layer 1 nodes ==================== -->
+  <rect x="80" y="106" width="240" height="78" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="200" y="132" text-anchor="middle" class="node-title" fill="#3b82f6">kubelet</text>
+  <text x="200" y="150" text-anchor="middle" class="node-sub">reads /etc/cni/net.d/00-multus.conf</text>
+  <text x="200" y="164" text-anchor="middle" class="node-sub">CNI ADD: stdin netconf +</text>
+  <text x="200" y="178" text-anchor="middle" class="node-sub">CNI_COMMAND=ADD env vars</text>
+
+  <rect x="360" y="106" width="280" height="78" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="500" y="132" text-anchor="middle" class="node-title" fill="#a855f7">Pod (with annotations)</text>
+  <text x="500" y="150" text-anchor="middle" class="node-sub">k8s.v1.cni.cncf.io/networks:</text>
+  <text x="500" y="164" text-anchor="middle" class="node-sub">[{name: macvlan-conf, interface: net1},</text>
+  <text x="500" y="178" text-anchor="middle" class="node-sub">{name: sriov-net, interface: net2}]</text>
+
+  <rect x="680" y="106" width="280" height="78" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="820" y="132" text-anchor="middle" class="node-title" fill="#06b6d4">NetworkAttachmentDefinition</text>
+  <text x="820" y="150" text-anchor="middle" class="node-sub">CRD k8s.cni.cncf.io/v1 (NAD)</text>
+  <text x="820" y="164" text-anchor="middle" class="node-sub">spec.config = stringified JSON</text>
+  <text x="820" y="178" text-anchor="middle" class="node-sub">(opaque, parsed by delegate)</text>
+
+  <rect x="1000" y="106" width="240" height="78" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="1120" y="132" text-anchor="middle" class="node-title" fill="#f97316">kube-apiserver</text>
+  <text x="1120" y="150" text-anchor="middle" class="node-sub">stores Pod spec / annotation</text>
+  <text x="1120" y="164" text-anchor="middle" class="node-sub">stores NAD CRD</text>
+  <text x="1120" y="178" text-anchor="middle" class="node-sub">writes network-status back</text>
+
+  <!-- ==================== Layer 2 nodes ==================== -->
+  <rect x="80" y="262" width="260" height="120" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="210" y="288" text-anchor="middle" class="node-title" fill="#f97316">multus-shim binary</text>
+  <text x="210" y="306" text-anchor="middle" class="node-sub">/opt/cni/bin/multus</text>
+  <text x="210" y="320" text-anchor="middle" class="node-sub">~200 LOC, no clientset</text>
+  <text x="210" y="334" text-anchor="middle" class="node-sub">cmd/multus-shim/main.go</text>
+  <text x="210" y="348" text-anchor="middle" class="node-sub">api.CmdAdd / CmdDel / CmdCheck</text>
+  <text x="210" y="362" text-anchor="middle" class="node-sub">serializes args into HTTP body</text>
+  <text x="210" y="376" text-anchor="middle" class="node-sub">POST to multus.sock; exits</text>
+
+  <rect x="380" y="262" width="180" height="120" rx="6" ry="6" fill="#0a0a0a" stroke="#eab308" stroke-width="1.5"/>
+  <text x="470" y="288" text-anchor="middle" class="node-title" fill="#eab308">multus.sock</text>
+  <text x="470" y="306" text-anchor="middle" class="node-sub">unix domain socket</text>
+  <text x="470" y="320" text-anchor="middle" class="node-sub">/run/multus/multus.sock</text>
+  <text x="470" y="334" text-anchor="middle" class="node-sub">HTTP-over-UDS</text>
+  <text x="470" y="348" text-anchor="middle" class="node-sub">POST /cni</text>
+  <text x="470" y="362" text-anchor="middle" class="node-sub">POST /delegate</text>
+  <text x="470" y="376" text-anchor="middle" class="node-sub">GET /healthz, /readyz</text>
+
+  <rect x="600" y="262" width="320" height="120" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="760" y="288" text-anchor="middle" class="node-title" fill="#f97316">multus-daemon (DaemonSet)</text>
+  <text x="760" y="306" text-anchor="middle" class="node-sub">long-lived Pod, one per node</text>
+  <text x="760" y="320" text-anchor="middle" class="node-sub">cmd/multus-daemon/main.go</text>
+  <text x="760" y="334" text-anchor="middle" class="node-sub">Pod informer (own node only)</text>
+  <text x="760" y="348" text-anchor="middle" class="node-sub">NAD informer (cluster-wide)</text>
+  <text x="760" y="362" text-anchor="middle" class="node-sub">informerObjectTrim cuts unused fields</text>
+  <text x="760" y="376" text-anchor="middle" class="node-sub">ChrootExec into host filesystem</text>
+
+  <rect x="960" y="262" width="280" height="120" rx="6" ry="6" fill="#0b1220" stroke="#475569" stroke-width="1.5"/>
+  <text x="1100" y="288" text-anchor="middle" class="node-title" fill="#94a3b8">kubelet PodResources gRPC</text>
+  <text x="1100" y="306" text-anchor="middle" class="node-sub">/var/lib/kubelet/pod-resources/</text>
+  <text x="1100" y="320" text-anchor="middle" class="node-sub">kubelet.sock</text>
+  <text x="1100" y="334" text-anchor="middle" class="node-sub">List() returns Pod &#8594; (resource,</text>
+  <text x="1100" y="348" text-anchor="middle" class="node-sub">deviceID) bindings</text>
+  <text x="1100" y="362" text-anchor="middle" class="node-sub">multus-daemon queries this</text>
+  <text x="1100" y="376" text-anchor="middle" class="node-sub">on SR-IOV / device-backed NAD</text>
+
+  <!-- ==================== Layer 3 nodes ==================== -->
+  <rect x="80" y="476" width="200" height="116" rx="6" ry="6" fill="#1c1917" stroke="#10b981" stroke-width="1.5"/>
+  <text x="180" y="502" text-anchor="middle" class="node-title" fill="#10b981">default delegate</text>
+  <text x="180" y="520" text-anchor="middle" class="node-sub">e.g. cilium-cni</text>
+  <text x="180" y="534" text-anchor="middle" class="node-sub">creates Pod eth0</text>
+  <text x="180" y="548" text-anchor="middle" class="node-sub">picked from clusterNetwork</text>
+  <text x="180" y="562" text-anchor="middle" class="node-sub">or first delegates entry</text>
+  <text x="180" y="576" text-anchor="middle" class="node-sub">result &#8594; Pod.status</text>
+
+  <rect x="296" y="476" width="180" height="116" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="386" y="502" text-anchor="middle" class="node-title" fill="#10b981">macvlan</text>
+  <text x="386" y="520" text-anchor="middle" class="node-sub">/opt/cni/bin/macvlan</text>
+  <text x="386" y="534" text-anchor="middle" class="node-sub">L2 sub-interface</text>
+  <text x="386" y="548" text-anchor="middle" class="node-sub">on master eth1</text>
+  <text x="386" y="562" text-anchor="middle" class="node-sub">unique MAC per child</text>
+  <text x="386" y="576" text-anchor="middle" class="node-sub">no host bridge needed</text>
+
+  <rect x="492" y="476" width="180" height="116" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="582" y="502" text-anchor="middle" class="node-title" fill="#10b981">ipvlan</text>
+  <text x="582" y="520" text-anchor="middle" class="node-sub">/opt/cni/bin/ipvlan</text>
+  <text x="582" y="534" text-anchor="middle" class="node-sub">L3 mode (default)</text>
+  <text x="582" y="548" text-anchor="middle" class="node-sub">share parent MAC</text>
+  <text x="582" y="562" text-anchor="middle" class="node-sub">unique IP per child</text>
+  <text x="582" y="576" text-anchor="middle" class="node-sub">survives MAC filtering</text>
+
+  <rect x="688" y="476" width="200" height="116" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="788" y="502" text-anchor="middle" class="node-title" fill="#10b981">sriov</text>
+  <text x="788" y="520" text-anchor="middle" class="node-sub">/opt/cni/bin/sriov</text>
+  <text x="788" y="534" text-anchor="middle" class="node-sub">moves a VF (PCI dev) into</text>
+  <text x="788" y="548" text-anchor="middle" class="node-sub">Pod netns</text>
+  <text x="788" y="562" text-anchor="middle" class="node-sub">DEVICE_ID from</text>
+  <text x="788" y="576" text-anchor="middle" class="node-sub">PodResources gRPC</text>
+
+  <rect x="904" y="476" width="180" height="116" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="994" y="502" text-anchor="middle" class="node-title" fill="#10b981">bridge</text>
+  <text x="994" y="520" text-anchor="middle" class="node-sub">/opt/cni/bin/bridge</text>
+  <text x="994" y="534" text-anchor="middle" class="node-sub">veth + Linux bridge</text>
+  <text x="994" y="548" text-anchor="middle" class="node-sub">cni0 default</text>
+  <text x="994" y="562" text-anchor="middle" class="node-sub">host-local IPAM</text>
+  <text x="994" y="576" text-anchor="middle" class="node-sub">L2 segment per node</text>
+
+  <rect x="1100" y="476" width="160" height="116" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1180" y="502" text-anchor="middle" class="node-title" fill="#10b981">host-device</text>
+  <text x="1180" y="520" text-anchor="middle" class="node-sub">/opt/cni/bin/host-device</text>
+  <text x="1180" y="534" text-anchor="middle" class="node-sub">moves an existing</text>
+  <text x="1180" y="548" text-anchor="middle" class="node-sub">host NIC into</text>
+  <text x="1180" y="562" text-anchor="middle" class="node-sub">Pod netns</text>
+  <text x="1180" y="576" text-anchor="middle" class="node-sub">no virtualization</text>
+
+  <!-- ==================== Layer 4 nodes (Pod netns interfaces) ==================== -->
+  <rect x="120" y="676" width="280" height="140" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="260" y="702" text-anchor="middle" class="node-title" fill="#a855f7">eth0 (default network)</text>
+  <text x="260" y="722" text-anchor="middle" class="node-sub">created by default delegate</text>
+  <text x="260" y="736" text-anchor="middle" class="node-sub">veth pair to host netns</text>
+  <text x="260" y="750" text-anchor="middle" class="node-sub">IP / route / IPAM via cilium</text>
+  <text x="260" y="764" text-anchor="middle" class="node-sub">CNI Result &#8594; Pod.status.podIP</text>
+  <text x="260" y="778" text-anchor="middle" class="node-sub">used by kube-proxy / Service</text>
+  <text x="260" y="796" text-anchor="middle" class="node-sub">visible to k8s networking</text>
+
+  <rect x="440" y="676" width="280" height="140" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="580" y="702" text-anchor="middle" class="node-title" fill="#a855f7">net1 (additional NAD)</text>
+  <text x="580" y="722" text-anchor="middle" class="node-sub">created by macvlan delegate</text>
+  <text x="580" y="736" text-anchor="middle" class="node-sub">selected via Pod annotation</text>
+  <text x="580" y="750" text-anchor="middle" class="node-sub">name: macvlan-conf</text>
+  <text x="580" y="764" text-anchor="middle" class="node-sub">interface: net1</text>
+  <text x="580" y="778" text-anchor="middle" class="node-sub">IPAM: host-local 10.20.0.0/24</text>
+  <text x="580" y="796" text-anchor="middle" class="node-sub">L2 to physical eth1 VLAN</text>
+
+  <rect x="760" y="676" width="280" height="140" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="900" y="702" text-anchor="middle" class="node-title" fill="#a855f7">net2 (SR-IOV VF)</text>
+  <text x="900" y="722" text-anchor="middle" class="node-sub">created by sriov delegate</text>
+  <text x="900" y="736" text-anchor="middle" class="node-sub">VF moved from host into netns</text>
+  <text x="900" y="750" text-anchor="middle" class="node-sub">DEVICE_ID looked up via</text>
+  <text x="900" y="764" text-anchor="middle" class="node-sub">PodResources gRPC</text>
+  <text x="900" y="778" text-anchor="middle" class="node-sub">PCI passthrough &#8212; bypasses</text>
+  <text x="900" y="796" text-anchor="middle" class="node-sub">host kernel for line-rate IO</text>
+
+  <rect x="1080" y="676" width="180" height="140" rx="6" ry="6" fill="#0a0a0a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1170" y="702" text-anchor="middle" class="node-title" fill="#06b6d4">network-status</text>
+  <text x="1170" y="722" text-anchor="middle" class="node-sub">annotation written</text>
+  <text x="1170" y="736" text-anchor="middle" class="node-sub">back by daemon</text>
+  <text x="1170" y="750" text-anchor="middle" class="node-sub">k8s.v1.cni.cncf.io/</text>
+  <text x="1170" y="764" text-anchor="middle" class="node-sub">network-status</text>
+  <text x="1170" y="778" text-anchor="middle" class="node-sub">JSON list of all</text>
+  <text x="1170" y="796" text-anchor="middle" class="node-sub">attached interfaces</text>
+
+  <!-- ==================== Arrows ==================== -->
+
+  <!-- kubelet -> multus-shim (CNI ADD via stdin/env) -->
+  <line x1="200" y1="184" x2="210" y2="262" stroke="#3b82f6" stroke-width="2.0" marker-end="url(#arrow-blue)"/>
+  <rect x="160" y="210" width="100" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="210" y="222" text-anchor="middle" class="arrow-label" fill="#cbd5e1">CNI ADD exec</text>
+
+  <!-- Pod annotation -> kube-apiserver (route up and over NAD box) -->
+  <path d="M 640,128 L 640,98 L 1000,98 L 1000,128" fill="none" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#arrow-blue)" stroke-dasharray="6,4"/>
+  <rect x="784" y="92" width="72" height="12" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="820" y="102" text-anchor="middle" class="arrow-label" fill="#cbd5e1">Pod create</text>
+
+  <!-- NAD CRD <-> kube-apiserver (stored as CRD) -->
+  <line x1="960" y1="170" x2="1000" y2="170" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)"/>
+
+  <!-- Pod annotation -> kubelet (kubelet reads Pod spec, but multus reads annotation later via daemon) -->
+  <!-- Skipped, would clutter -->
+
+  <!-- multus-shim -> multus.sock (HTTP POST) -->
+  <line x1="340" y1="320" x2="380" y2="320" stroke="#f97316" stroke-width="2.0" marker-end="url(#arrow-orange)"/>
+  <rect x="333" y="302" width="54" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="360" y="314" text-anchor="middle" class="arrow-label" fill="#cbd5e1">POST /cni</text>
+
+  <!-- multus.sock -> multus-daemon (UDS read) -->
+  <line x1="560" y1="320" x2="600" y2="320" stroke="#f97316" stroke-width="2.0" marker-end="url(#arrow-orange)"/>
+  <rect x="555" y="302" width="50" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="580" y="314" text-anchor="middle" class="arrow-label" fill="#cbd5e1">handle</text>
+
+  <!-- multus-daemon <-> kube-apiserver (informer list/watch on Pod and NAD) -->
+  <path d="M 920,300 L 940,300 L 940,210 L 1120,210 L 1120,184" fill="none" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="958" y="194" width="206" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1061" y="206" text-anchor="middle" class="arrow-label" fill="#cbd5e1">informer list/watch Pod + NAD</text>
+
+  <!-- multus-daemon -> NAD (read via informer cache, conceptual) -->
+  <path d="M 880,262 L 880,206 L 820,206 L 820,184" fill="none" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)" stroke-dasharray="6,4"/>
+  <rect x="813" y="208" width="74" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="850" y="220" text-anchor="middle" class="arrow-label" fill="#cbd5e1">read NAD</text>
+
+  <!-- multus-daemon -> kubelet PodResources gRPC (SR-IOV path) -->
+  <line x1="920" y1="340" x2="960" y2="340" stroke="#f43f5e" stroke-width="2.0" marker-end="url(#arrow-rose)"/>
+  <rect x="912" y="322" width="56" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="940" y="334" text-anchor="middle" class="arrow-label" fill="#cbd5e1">List()</text>
+
+  <!-- multus-daemon -> default delegate (chroot+exec) -->
+  <path d="M 660,382 L 660,410 L 180,410 L 180,476" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="295" y="397" width="190" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="390" y="409" text-anchor="middle" class="arrow-label" fill="#cbd5e1">chroot + exec default delegate</text>
+
+  <!-- multus-daemon -> macvlan -->
+  <line x1="700" y1="382" x2="386" y2="476" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- multus-daemon -> ipvlan -->
+  <line x1="740" y1="382" x2="582" y2="476" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- multus-daemon -> sriov -->
+  <line x1="780" y1="382" x2="788" y2="476" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- multus-daemon -> bridge -->
+  <line x1="820" y1="382" x2="994" y2="476" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- multus-daemon -> host-device -->
+  <line x1="860" y1="382" x2="1180" y2="476" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+
+  <!-- fan-out label near daemon bottom -->
+  <rect x="668" y="386" width="184" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="760" y="398" text-anchor="middle" class="arrow-label" fill="#cbd5e1">fan-out: 1 default + N secondary</text>
+
+  <!-- default delegate -> eth0 -->
+  <line x1="180" y1="592" x2="240" y2="676" stroke="#a855f7" stroke-width="2.0" marker-end="url(#arrow-purple)"/>
+  <rect x="143" y="618" width="116" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="200" y="630" text-anchor="middle" class="arrow-label" fill="#cbd5e1">create veth eth0</text>
+
+  <!-- macvlan -> net1 -->
+  <line x1="386" y1="592" x2="540" y2="676" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <rect x="406" y="618" width="116" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="464" y="630" text-anchor="middle" class="arrow-label" fill="#cbd5e1">create macvlan net1</text>
+
+  <!-- sriov -> net2 -->
+  <line x1="788" y1="592" x2="880" y2="676" stroke="#a855f7" stroke-width="2.0" marker-end="url(#arrow-purple)"/>
+  <rect x="773" y="618" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="833" y="630" text-anchor="middle" class="arrow-label" fill="#cbd5e1">move VF into netns</text>
+
+  <!-- multus-daemon -> network-status (route below layer 2 boxes, then down to layer 4) -->
+  <path d="M 800,382 L 800,410 L 1270,410 L 1270,676" fill="none" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)" stroke-dasharray="4,3"/>
+  <rect x="1192" y="486" width="148" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1266" y="498" text-anchor="middle" class="arrow-label" fill="#cbd5e1">PATCH annotation</text>
+
+  <!-- Legend -->
+  <rect x="40" y="846" width="1240" height="32" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="56" y1="862" x2="88" y2="862" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="94" y="866" class="legend-text">CNI exec / apiserver list-watch</text>
+  <line x1="316" y1="862" x2="348" y2="862" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="354" y="866" class="legend-text">shim &#8596; daemon over multus.sock</text>
+  <line x1="616" y1="862" x2="648" y2="862" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="654" y="866" class="legend-text">chroot+exec delegate (fan-out)</text>
+  <line x1="906" y1="862" x2="938" y2="862" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="944" y="866" class="legend-text">delegate creates Pod NIC</text>
+  <line x1="1136" y1="862" x2="1168" y2="862" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="1174" y="866" class="legend-text">PodResources (SR-IOV)</text>
+  <text x="1270" y="892" text-anchor="end" class="node-sub">Source: multus-cni v4.2.4 cmd/{multus, multus-shim, multus-daemon}, pkg/server/*</text>
+</svg>

@@ -8,6 +8,10 @@ description: kubelet 一次只能 invoke 一個 CNI plugin，multus 把自己塞
 
 你 KubeVirt VM 要兩個介面：cilium 的 pod network + 一張連到 storage VLAN 的 SR-IOV VF。打開 CNI spec 才發現：CNI 規範規定「kubelet 一次只 invoke 一個 CNI binary」。multus 怎麼解？答：把自己塞進那個唯一位置，內部再對任意數量的 delegate plugin 各自呼叫一次。
 
+![Multus 架構鳥瞰圖：kubernetes 側 (kubelet / NAD CRD / Pod)、multus 元件 (multus-shim binary / multus-daemon DaemonSet / multus.sock)、delegate CNI plugins (default + secondaries)、Pod netns (eth0 / net1 / net2 含 SR-IOV VF)](/diagrams/multus/architecture.png)
+
+*圖：multus 把自己塞進 kubelet 看到的唯一 CNI 位置，再 fan-out 給 default delegate + N 個 secondary delegate。thick mode 經 multus.sock 與 daemon 溝通，SR-IOV 透過 PodResources gRPC 查 kubelet 取得 device 分配。*
+
 ## CNI 的 1:1 限制
 
 ```
