@@ -79,6 +79,10 @@ PID 1: virt-launcher-monitor       ← watchdog
                   └─ notify-client (連回 virt-handler 報 event)
 ```
 
+![virt-launcher Pod 內部 process tree：PID 1 virt-launcher-monitor (watchdog) → virt-launcher (Go, cmd-server gRPC) → libvirtd (C, qemu monitor protocol) → qemu-kvm；右側說明每層為何不能合併（PID 1 reap、Go vs C 邊界、libvirt 標準 API、qemu 專注 hypervisor）](/diagrams/kubevirt/virt-handler-launcher-tree.png)
+
+*圖：左半呈現 PID 父子關係與 IPC 通道；右半解釋 4 層分隔的設計理由與失敗回收路徑（qemu crash → 整個 Pod 重建）。*
+
 `virt-launcher-monitor` 是 PID 1，唯一工作是「watch virt-launcher，掛了就讓 Pod 結束」。這樣可以避免 zombie 進程，也讓 Pod 有明確的 termination semantics。
 
 `virt-launcher` 本身做幾件事：

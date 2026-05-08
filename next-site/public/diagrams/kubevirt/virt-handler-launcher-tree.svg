@@ -1,0 +1,275 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1100" width="1700" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 12px; fill: #94a3b8; }
+    .panel-label { font-size: 14px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #cbd5e1; }
+    .node-meta { font-size: 10px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .why-bullet { font-size: 11px; fill: #e2e8f0; }
+    .why-head { font-size: 12px; font-weight: 700; }
+    .pid-tag { font-size: 11px; font-weight: 700; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+  </defs>
+  <rect width="1700" height="1100" fill="url(#bg-grad)"/>
+  <text x="850" y="36" text-anchor="middle" class="title">virt-launcher Pod &#8212; process tree &amp; layer rationale (why 4 processes, not 1)</text>
+  <text x="850" y="58" text-anchor="middle" class="subtitle">left: PID parent-child + IPC channels inside one VMI Pod &#8226; right: each layer's purpose, owner, and why it cannot be merged</text>
+
+  <!-- ================= TOP STRIP: virt-handler on host ================= -->
+  <rect x="40" y="80" width="1620" height="120" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="102" class="panel-label" fill="#10b981">Host (worker node) &#8212; outside the Pod</text>
+
+  <!-- virt-handler on host -->
+  <rect x="80" y="118" width="300" height="70" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="230" y="140" text-anchor="middle" class="node-title" fill="#10b981">virt-handler</text>
+  <text x="230" y="158" text-anchor="middle" class="node-sub">DaemonSet (per node, kubevirt ns)</text>
+  <text x="230" y="172" text-anchor="middle" class="node-sub">VirtualMachineController main loop</text>
+  <text x="230" y="184" text-anchor="middle" class="node-meta">cmd-server gRPC client + notify server</text>
+
+  <!-- migration-proxy box (right of virt-handler) -->
+  <rect x="410" y="118" width="240" height="70" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <text x="530" y="140" text-anchor="middle" class="node-title" fill="#10b981">migration-proxy</text>
+  <text x="530" y="158" text-anchor="middle" class="node-sub">UDS &#8596; TCP bridge</text>
+  <text x="530" y="172" text-anchor="middle" class="node-meta">live migration only; not in steady state</text>
+  <text x="530" y="184" text-anchor="middle" class="node-meta">handler &#8594; handler, not launcher &#8594; launcher</text>
+
+  <!-- host kernel KVM module -->
+  <rect x="1330" y="118" width="290" height="70" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="1475" y="140" text-anchor="middle" class="node-title" fill="#94a3b8">node OS kernel</text>
+  <text x="1475" y="158" text-anchor="middle" class="node-sub">Linux + kvm.ko module</text>
+  <text x="1475" y="172" text-anchor="middle" class="node-meta">/dev/kvm exposed via DevicePlugin</text>
+  <text x="1475" y="184" text-anchor="middle" class="node-meta">cgroup v2 + namespaces enforce Pod limits</text>
+
+  <!-- host -> Pod boundary marker -->
+  <line x1="40" y1="210" x2="1660" y2="210" stroke="#3b82f6" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/>
+  <text x="850" y="223" text-anchor="middle" class="node-meta" fill="#60a5fa">&#8595; Pod boundary: Pod's PID/mount/network namespace below; hostPath-mounted UDS bridges across &#8595;</text>
+
+  <!-- ================= LEFT PANEL: Process tree ================= -->
+  <rect x="40" y="240" width="900" height="820" rx="10" ry="10" fill="#0d1424" stroke="#a855f7" stroke-width="1.6"/>
+  <text x="60" y="266" class="panel-label" fill="#a855f7">virt-launcher Pod (one per VMI) &#8212; process tree inside Pod's PID namespace</text>
+  <text x="60" y="284" class="node-meta">single container; libvirtd + qemu run alongside virt-launcher inside the same Pod</text>
+
+  <!-- PID 1: virt-launcher-monitor -->
+  <rect x="80" y="320" width="820" height="120" rx="6" ry="6" fill="#1a0f2a" stroke="#a855f7" stroke-width="1.8"/>
+  <rect x="80" y="320" width="120" height="120" rx="6" ry="6" fill="#a855f7" opacity="0.18"/>
+  <text x="140" y="358" text-anchor="middle" class="pid-tag" fill="#e9d5ff">PID 1</text>
+  <text x="140" y="376" text-anchor="middle" class="node-meta" fill="#c4b5fd">init of</text>
+  <text x="140" y="390" text-anchor="middle" class="node-meta" fill="#c4b5fd">Pod's PID ns</text>
+  <text x="140" y="416" text-anchor="middle" class="node-meta" fill="#c4b5fd">watchdog</text>
+
+  <text x="220" y="350" class="node-title" fill="#a855f7">virt-launcher-monitor</text>
+  <text x="220" y="370" class="node-sub">cmd/virt-launcher-monitor/virt-launcher-monitor.go</text>
+  <text x="220" y="388" class="node-sub">tiny supervisor: forks virt-launcher, waits, reaps zombies, propagates SIGTERM</text>
+  <text x="220" y="402" class="node-sub">if virt-launcher dies for any reason &#8594; monitor exits &#8594; Pod terminates</text>
+  <text x="220" y="416" class="node-sub">Pod restart policy then recreates the whole Pod (no half-state)</text>
+  <text x="220" y="432" class="node-meta">owns: TERM signal forwarding, child reap, exit code mapping</text>
+
+  <!-- fork arrow: monitor -> launcher -->
+  <line x1="180" y1="440" x2="180" y2="490" stroke="#a855f7" stroke-width="2.0" marker-end="url(#arrow-purple)"/>
+  <rect x="200" y="450" width="220" height="18" rx="3" fill="#0d1424" stroke="#a855f7" stroke-width="1" opacity="0.95"/>
+  <text x="310" y="463" text-anchor="middle" class="arrow-label" fill="#e9d5ff">fork() + execve(virt-launcher)</text>
+
+  <!-- PID N: virt-launcher (Go) -->
+  <rect x="80" y="490" width="820" height="130" rx="6" ry="6" fill="#0a1f2e" stroke="#06b6d4" stroke-width="1.8"/>
+  <rect x="80" y="490" width="120" height="130" rx="6" ry="6" fill="#06b6d4" opacity="0.15"/>
+  <text x="140" y="528" text-anchor="middle" class="pid-tag" fill="#a5f3fc">PID N</text>
+  <text x="140" y="546" text-anchor="middle" class="node-meta" fill="#67e8f9">Go runtime</text>
+  <text x="140" y="560" text-anchor="middle" class="node-meta" fill="#67e8f9">k8s-native</text>
+  <text x="140" y="586" text-anchor="middle" class="node-meta" fill="#67e8f9">cmd-server</text>
+  <text x="140" y="600" text-anchor="middle" class="node-meta" fill="#67e8f9">RPC host</text>
+
+  <text x="220" y="520" class="node-title" fill="#06b6d4">virt-launcher (Go)</text>
+  <text x="220" y="540" class="node-sub">cmd/virt-launcher/virt-launcher.go &#8226; lifecycle wrapper around libvirt</text>
+  <text x="220" y="556" class="node-sub">cmd-server (gRPC over UDS): SyncVMI / KillVMI / MigrateVMI / FreezeVMI &#8230;</text>
+  <text x="220" y="572" class="node-sub">virtwrap.DomainManager &#8594; libvirt-go client RPC to libvirtd</text>
+  <text x="220" y="588" class="node-sub">notify-client: pushes libvirt domain events back to virt-handler</text>
+  <text x="220" y="602" class="node-sub">converter: VMI spec &#8594; libvirt domain XML (~300 Convert_* fns)</text>
+  <text x="220" y="616" class="node-meta">owns: KubeVirt-shaped API, k8s informer-friendly types, hot-plug coordination</text>
+
+  <!-- fork arrow: launcher -> libvirtd -->
+  <line x1="180" y1="620" x2="180" y2="670" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="200" y="630" width="280" height="18" rx="3" fill="#0d1424" stroke="#eab308" stroke-width="1" opacity="0.95"/>
+  <text x="340" y="643" text-anchor="middle" class="arrow-label" fill="#fde68a">spawns libvirtd; UDS at /var/run/libvirt/libvirt-sock</text>
+
+  <!-- PID M: libvirtd / virtqemud (C) -->
+  <rect x="80" y="670" width="820" height="130" rx="6" ry="6" fill="#2a1f0a" stroke="#eab308" stroke-width="1.8"/>
+  <rect x="80" y="670" width="120" height="130" rx="6" ry="6" fill="#eab308" opacity="0.15"/>
+  <text x="140" y="708" text-anchor="middle" class="pid-tag" fill="#fde68a">PID M</text>
+  <text x="140" y="726" text-anchor="middle" class="node-meta" fill="#fcd34d">C daemon</text>
+  <text x="140" y="740" text-anchor="middle" class="node-meta" fill="#fcd34d">upstream</text>
+  <text x="140" y="754" text-anchor="middle" class="node-meta" fill="#fcd34d">libvirt</text>
+  <text x="140" y="780" text-anchor="middle" class="node-meta" fill="#fcd34d">unmodified</text>
+
+  <text x="220" y="700" class="node-title" fill="#eab308">libvirtd / virtqemud</text>
+  <text x="220" y="720" class="node-sub">in-Pod daemon, listens on Unix socket; defineXML &#8594; createXML lifecycle</text>
+  <text x="220" y="736" class="node-sub">parses domain XML, spawns qemu-kvm, drives QMP / monitor protocol</text>
+  <text x="220" y="752" class="node-sub">owns block / network / device hot-plug, snapshots, live migration FSM</text>
+  <text x="220" y="768" class="node-sub">emits domain events: STARTED / SUSPENDED / SHUTOFF / MIGRATED</text>
+  <text x="220" y="784" class="node-sub">virt-launcher subscribes to events and forwards via notify-client</text>
+  <text x="220" y="800" class="node-meta">owns: industry-standard VM lifecycle abstraction, QMP fluency</text>
+
+  <!-- fork arrow: libvirtd -> qemu -->
+  <line x1="180" y1="800" x2="180" y2="850" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="200" y="810" width="320" height="18" rx="3" fill="#0d1424" stroke="#eab308" stroke-width="1" opacity="0.95"/>
+  <text x="360" y="823" text-anchor="middle" class="arrow-label" fill="#fde68a">fork(); qemu-kvm with QMP socket</text>
+
+  <!-- PID K: qemu-kvm -->
+  <rect x="80" y="850" width="820" height="180" rx="6" ry="6" fill="#0e2a18" stroke="#10b981" stroke-width="1.8"/>
+  <rect x="80" y="850" width="120" height="180" rx="6" ry="6" fill="#10b981" opacity="0.18"/>
+  <text x="140" y="888" text-anchor="middle" class="pid-tag" fill="#bbf7d0">PID K</text>
+  <text x="140" y="906" text-anchor="middle" class="node-meta" fill="#86efac">user-space</text>
+  <text x="140" y="920" text-anchor="middle" class="node-meta" fill="#86efac">hypervisor</text>
+  <text x="140" y="934" text-anchor="middle" class="node-meta" fill="#86efac">process</text>
+  <text x="140" y="970" text-anchor="middle" class="node-meta" fill="#86efac">vCPU</text>
+  <text x="140" y="984" text-anchor="middle" class="node-meta" fill="#86efac">threads</text>
+  <text x="140" y="1010" text-anchor="middle" class="node-meta" fill="#86efac">guest OS</text>
+
+  <text x="220" y="880" class="node-title" fill="#10b981">qemu-kvm (the actual VM)</text>
+  <text x="220" y="900" class="node-sub">user-space hypervisor; one process == one guest VM</text>
+  <text x="220" y="916" class="node-sub">vCPU threads run guest code via /dev/kvm ioctl(KVM_RUN)</text>
+  <text x="220" y="932" class="node-sub">virtio-net / virtio-blk / virtio-scsi backends inside this process</text>
+  <text x="220" y="948" class="node-sub">tap device terminates in Pod's network namespace (CNI-plumbed)</text>
+  <text x="220" y="964" class="node-sub">disk images come from PVC mounts, containerDisk overlays, ephemeral</text>
+  <text x="220" y="980" class="node-sub">VNC / serial console socket; qemu monitor protocol on QMP socket</text>
+  <text x="220" y="996" class="node-sub">guest OS boots inside; bound by cgroup limits + seccomp profile</text>
+  <text x="220" y="1014" class="node-meta">owns: instruction emulation, device emulation, KVM ioctl interface</text>
+
+  <!-- IPC arrow: virt-handler (host) -> virt-launcher (Pod) -->
+  <path d="M 230,188 C 230,250 540,300 660,490" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="690" y="270" width="220" height="18" rx="3" fill="#0d1424" stroke="#10b981" stroke-width="1" opacity="0.95"/>
+  <text x="800" y="283" text-anchor="middle" class="arrow-label" fill="#bbf7d0">cmd-server gRPC over UDS</text>
+  <text x="800" y="305" text-anchor="middle" class="node-meta" fill="#bbf7d0">/var/run/kubevirt/sockets/&lt;vmi-uid&gt;_sock</text>
+  <text x="800" y="319" text-anchor="middle" class="node-meta" fill="#bbf7d0">hostPath bind-mounted into Pod</text>
+
+  <!-- IPC arrow back: notify-client (Pod -> handler) -->
+  <path d="M 760,490 C 670,330 340,260 280,188" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="450" y="370" width="220" height="18" rx="3" fill="#0d1424" stroke="#10b981" stroke-width="1" opacity="0.95"/>
+  <text x="560" y="383" text-anchor="middle" class="arrow-label" fill="#bbf7d0">notify-client: domain events back</text>
+
+  <!-- side: launcher <-> libvirtd UDS -->
+  <path d="M 740,620 L 740,670" stroke="#eab308" stroke-width="1.6" stroke-dasharray="4,3"/>
+  <text x="760" y="650" class="node-meta" fill="#fde68a">libvirt-go RPC</text>
+
+  <!-- side: libvirtd <-> qemu QMP -->
+  <path d="M 740,800 L 740,850" stroke="#eab308" stroke-width="1.6" stroke-dasharray="4,3"/>
+  <text x="760" y="830" class="node-meta" fill="#fde68a">qemu monitor protocol (QMP)</text>
+
+  <!-- /dev/kvm ioctl from host into qemu -->
+  <path d="M 1475,188 C 1475,300 1100,500 870,920" fill="none" stroke="#475569" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="4,3"/>
+  <rect x="1180" y="500" width="160" height="18" rx="3" fill="#0d1424" stroke="#475569" stroke-width="1" opacity="0.95"/>
+  <text x="1260" y="513" text-anchor="middle" class="arrow-label" fill="#94a3b8">/dev/kvm ioctl</text>
+
+  <!-- ================= RIGHT PANEL: Why-the-layers ================= -->
+  <rect x="960" y="240" width="700" height="640" rx="10" ry="10" fill="#0d1424" stroke="#3b82f6" stroke-width="1.6"/>
+  <text x="980" y="266" class="panel-label" fill="#3b82f6">Why these 4 processes are not 1 &#8212; design rationale per layer</text>
+  <text x="980" y="284" class="node-meta">each row pairs with the same-color box on the left; merging adjacent layers loses the listed property</text>
+
+  <!-- Why row 1: monitor (purple) -->
+  <rect x="980" y="305" width="660" height="125" rx="6" ry="6" fill="#1a0f2a" stroke="#a855f7" stroke-width="1.4"/>
+  <text x="996" y="328" class="why-head" fill="#e9d5ff">virt-launcher-monitor &#8594; needs to be PID 1</text>
+  <text x="996" y="350" class="why-bullet">&#8226; Pod has exactly one PID 1 in its namespace; whoever owns it must reap children</text>
+  <text x="996" y="368" class="why-bullet">&#8226; if virt-launcher itself were PID 1, a panic / segfault leaves orphan libvirtd + qemu zombies</text>
+  <text x="996" y="386" class="why-bullet">&#8226; monitor is intentionally minimal: small attack surface, hard to crash, never updates state</text>
+  <text x="996" y="404" class="why-bullet">&#8226; clean Pod-level termination semantics &#8594; kubelet sees Pod exit &#8594; virt-controller recreates Pod</text>
+  <text x="996" y="422" class="why-bullet" fill="#fda4af">&#8226; merging into virt-launcher: lose crash containment; merging into libvirtd: would need C-side k8s logic</text>
+
+  <!-- Why row 2: launcher (cyan) -->
+  <rect x="980" y="440" width="660" height="125" rx="6" ry="6" fill="#0a1f2e" stroke="#06b6d4" stroke-width="1.4"/>
+  <text x="996" y="463" class="why-head" fill="#a5f3fc">virt-launcher (Go) &#8594; KubeVirt-native API surface, separate from libvirt</text>
+  <text x="996" y="485" class="why-bullet">&#8226; libvirt is C; KubeVirt code is Go &#8594; FFI in the same process is painful and hurts iteration speed</text>
+  <text x="996" y="503" class="why-bullet">&#8226; KubeVirt-shaped RPCs (SyncVMI / FreezeVMI / hot-plug Disk &#8230;) operate on VMI types, not domain XML</text>
+  <text x="996" y="521" class="why-bullet">&#8226; cmd-server gRPC is the ONLY surface virt-handler talks to &#8594; libvirt API can change without breaking handler</text>
+  <text x="996" y="539" class="why-bullet">&#8226; converter, container-disk, ephemeral-disk, virtwrap.DomainManager all live here in one Go binary</text>
+  <text x="996" y="557" class="why-bullet" fill="#fda4af">&#8226; merging into libvirtd: would fork upstream libvirt (anti-goal); k8s/Go ecosystem alignment lost</text>
+
+  <!-- Why row 3: libvirtd (yellow) -->
+  <rect x="980" y="575" width="660" height="125" rx="6" ry="6" fill="#2a1f0a" stroke="#eab308" stroke-width="1.4"/>
+  <text x="996" y="598" class="why-head" fill="#fde68a">libvirtd / virtqemud &#8594; reuse industry-standard VM management layer</text>
+  <text x="996" y="620" class="why-bullet">&#8226; libvirt is the de-facto Linux VM API: domain XML, QMP fluency, snapshots, migration FSM &#8230;</text>
+  <text x="996" y="638" class="why-bullet">&#8226; KubeVirt deliberately reuses it instead of re-implementing direct qemu QMP from Go</text>
+  <text x="996" y="656" class="why-bullet">&#8226; live migration uses libvirt's MigrateToURI3 + AUTO_CONVERGE / POSTCOPY built-in mechanics</text>
+  <text x="996" y="674" class="why-bullet">&#8226; same daemon used by oVirt, OpenStack, virsh &#8594; battle-tested, tracks qemu releases for free</text>
+  <text x="996" y="692" class="why-bullet" fill="#fda4af">&#8226; merging into qemu-kvm: qemu is per-VM, libvirtd manages the lifecycle around qemu &#8594; different lifetimes</text>
+
+  <!-- Why row 4: qemu (green) -->
+  <rect x="980" y="710" width="660" height="125" rx="6" ry="6" fill="#0e2a18" stroke="#10b981" stroke-width="1.4"/>
+  <text x="996" y="733" class="why-head" fill="#bbf7d0">qemu-kvm &#8594; pure hypervisor, one process per guest VM</text>
+  <text x="996" y="755" class="why-bullet">&#8226; qemu's job is instruction / device emulation + KVM ioctl &#8594; not lifecycle, not k8s, not RPC</text>
+  <text x="996" y="773" class="why-bullet">&#8226; one qemu process == one VM: cgroup limits, seccomp profile, OOM scope all naturally per-VM</text>
+  <text x="996" y="791" class="why-bullet">&#8226; QMP is qemu's stable management protocol; libvirtd is its standard consumer</text>
+  <text x="996" y="809" class="why-bullet">&#8226; vCPU = pthread; if guest panics, it's contained inside this process (and inside Pod cgroup)</text>
+  <text x="996" y="827" class="why-bullet" fill="#fda4af">&#8226; merging anything into qemu = bloating the most security-sensitive component &#8594; anti-pattern</text>
+
+  <!-- ================= FAILURE-MODE STRIP ================= -->
+  <rect x="960" y="900" width="700" height="160" rx="10" ry="10" fill="#0d1424" stroke="#f43f5e" stroke-width="1.6"/>
+  <text x="980" y="925" class="panel-label" fill="#f43f5e">Failure recovery: why these layers + PID 1 watchdog give clean error semantics</text>
+
+  <!-- Failure flow boxes -->
+  <rect x="980" y="940" width="120" height="40" rx="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1040" y="958" text-anchor="middle" class="node-sub" fill="#bbf7d0">qemu crashes</text>
+  <text x="1040" y="972" text-anchor="middle" class="node-meta">SIGSEGV / OOM</text>
+
+  <line x1="1100" y1="960" x2="1130" y2="960" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+
+  <rect x="1130" y="940" width="120" height="40" rx="4" fill="#0b1220" stroke="#eab308" stroke-width="1.2"/>
+  <text x="1190" y="958" text-anchor="middle" class="node-sub" fill="#fde68a">libvirtd</text>
+  <text x="1190" y="972" text-anchor="middle" class="node-meta">domain SHUTOFF</text>
+
+  <line x1="1250" y1="960" x2="1280" y2="960" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+
+  <rect x="1280" y="940" width="120" height="40" rx="4" fill="#0b1220" stroke="#06b6d4" stroke-width="1.2"/>
+  <text x="1340" y="958" text-anchor="middle" class="node-sub" fill="#a5f3fc">virt-launcher</text>
+  <text x="1340" y="972" text-anchor="middle" class="node-meta">notify event up</text>
+
+  <line x1="1400" y1="960" x2="1430" y2="960" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+
+  <rect x="1430" y="940" width="200" height="40" rx="4" fill="#0b1220" stroke="#10b981" stroke-width="1.2"/>
+  <text x="1530" y="958" text-anchor="middle" class="node-sub" fill="#bbf7d0">virt-handler reconcile</text>
+  <text x="1530" y="972" text-anchor="middle" class="node-meta">VMI.status = Failed</text>
+
+  <text x="980" y="1004" class="why-bullet">&#8226; if virt-launcher dies (panic / OOM): monitor (PID 1) sees child exit &#8594; monitor exits &#8594; Pod terminates clean</text>
+  <text x="980" y="1020" class="why-bullet">&#8226; virt-controller observes Pod gone &#8594; recreates virt-launcher Pod for the same VMI &#8594; full re-init from VMI spec</text>
+  <text x="980" y="1036" class="why-bullet">&#8226; no half-state: never have libvirtd alive without virt-launcher to drive it; never zombie qemu without libvirtd</text>
+  <text x="980" y="1052" class="why-bullet" fill="#fda4af">&#8226; restart granularity = whole Pod; KubeVirt does not try to surgically restart libvirtd or qemu in place</text>
+
+  <!-- ================= LEGEND ================= -->
+  <rect x="40" y="1075" width="1620" height="20" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="56" y1="1086" x2="88" y2="1086" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="94" y="1090" class="legend-text">fork() + execve (PID parent-child)</text>
+  <line x1="380" y1="1086" x2="412" y2="1086" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="418" y="1090" class="legend-text">cmd-server gRPC / notify-client (host &#8596; Pod via UDS)</text>
+  <line x1="850" y1="1086" x2="882" y2="1086" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="888" y="1090" class="legend-text">libvirt RPC / QMP (intra-Pod)</text>
+  <line x1="1180" y1="1086" x2="1212" y2="1086" stroke="#f43f5e" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="1218" y="1090" class="legend-text">crash propagation (qemu &#8594; handler)</text>
+  <text x="1640" y="1090" text-anchor="end" class="node-meta">Source: kubevirt v1.8.2 cmd/virt-launcher-monitor, cmd/virt-launcher, pkg/virt-launcher/virtwrap, pkg/virt-handler</text>
+</svg>
