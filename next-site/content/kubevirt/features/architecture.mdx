@@ -10,6 +10,10 @@ description: virt-operator / virt-api / virt-controller / virt-handler / virt-la
 
 ## 整體 process map
 
+![KubeVirt 架構鳥瞰圖：operator (virt-operator + KubeVirt CR)、cluster control plane (virt-api / virt-controller / CRDs)、per-node (virt-handler DaemonSet)、per-VMI Pod (virt-launcher-monitor → virt-launcher → libvirtd → qemu-kvm) 四層](/diagrams/kubevirt/architecture.png)
+
+*圖：5 個 process 拆成 4 層，箭頭為主要互動通道（CRD watch、cmd-server gRPC、libvirt domain socket、PID parent-child）。*
+
 ```
 ┌─────────────── control plane ────────────────┐
 │                                               │

@@ -1,0 +1,283 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 940" width="1320" height="940">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+  </defs>
+  <rect width="1320" height="940" fill="url(#bg-grad)"/>
+  <text x="660" y="38" text-anchor="middle" class="title">KubeVirt Architecture: operator &#8594; cluster control plane &#8594; per-node &#8594; per-VMI Pod</text>
+
+  <!-- Layer 1: Operator -->
+  <rect x="40" y="64" width="1240" height="130" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="86" class="layer-label" fill="#3b82f6">Layer 1 &#8212; Operator (install / upgrade KubeVirt itself)</text>
+
+  <!-- Layer 2: Cluster control plane -->
+  <rect x="40" y="220" width="1240" height="200" rx="8" ry="8" fill="#0f172a" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="242" class="layer-label" fill="#f97316">Layer 2 &#8212; Cluster control plane (Deployments + CRDs in namespace kubevirt)</text>
+
+  <!-- Layer 3: Per-node -->
+  <rect x="40" y="446" width="1240" height="170" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="468" class="layer-label" fill="#10b981">Layer 3 &#8212; Per-node (DaemonSet, one per worker)</text>
+
+  <!-- Layer 4: Per-VMI Pod -->
+  <rect x="40" y="642" width="1240" height="240" rx="8" ry="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="664" class="layer-label" fill="#a855f7">Layer 4 &#8212; Per-VMI Pod (virt-launcher Pod, one per running VirtualMachineInstance)</text>
+
+  <!-- ==================== Layer 1 nodes ==================== -->
+  <rect x="120" y="106" width="280" height="76" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="260" y="132" text-anchor="middle" class="node-title" fill="#3b82f6">virt-operator</text>
+  <text x="260" y="150" text-anchor="middle" class="node-sub">Deployment, leader-elect</text>
+  <text x="260" y="164" text-anchor="middle" class="node-sub">install / upgrade / uninstall</text>
+  <text x="260" y="178" text-anchor="middle" class="node-sub">CRDs + Deployments + RBAC</text>
+
+  <rect x="500" y="106" width="280" height="76" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="640" y="132" text-anchor="middle" class="node-title" fill="#06b6d4">KubeVirt CR</text>
+  <text x="640" y="150" text-anchor="middle" class="node-sub">cluster-scoped singleton</text>
+  <text x="640" y="164" text-anchor="middle" class="node-sub">desired version + config</text>
+  <text x="640" y="178" text-anchor="middle" class="node-sub">watched by virt-operator</text>
+
+  <rect x="880" y="106" width="320" height="76" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="1040" y="132" text-anchor="middle" class="node-title" fill="#f97316">kube-apiserver</text>
+  <text x="1040" y="150" text-anchor="middle" class="node-sub">aggregation layer registers virt-api</text>
+  <text x="1040" y="164" text-anchor="middle" class="node-sub">stores VM / VMI / VMIM in etcd</text>
+  <text x="1040" y="178" text-anchor="middle" class="node-sub">routes subresource calls to virt-api</text>
+
+  <!-- ==================== Layer 2 nodes ==================== -->
+  <rect x="80" y="262" width="240" height="140" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="200" y="288" text-anchor="middle" class="node-title" fill="#f97316">virt-api</text>
+  <text x="200" y="308" text-anchor="middle" class="node-sub">Deployment (HA)</text>
+  <text x="200" y="322" text-anchor="middle" class="node-sub">extension API server</text>
+  <text x="200" y="336" text-anchor="middle" class="node-sub">admission webhooks</text>
+  <text x="200" y="350" text-anchor="middle" class="node-sub">(validating + mutating)</text>
+  <text x="200" y="364" text-anchor="middle" class="node-sub">subresource API:</text>
+  <text x="200" y="378" text-anchor="middle" class="node-sub">/console /vnc /freeze</text>
+
+  <rect x="350" y="262" width="240" height="140" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="470" y="288" text-anchor="middle" class="node-title" fill="#f97316">virt-controller</text>
+  <text x="470" y="308" text-anchor="middle" class="node-sub">Deployment (HA leader)</text>
+  <text x="470" y="322" text-anchor="middle" class="node-sub">VM controller</text>
+  <text x="470" y="336" text-anchor="middle" class="node-sub">VMI controller</text>
+  <text x="470" y="350" text-anchor="middle" class="node-sub">Migration controller</text>
+  <text x="470" y="364" text-anchor="middle" class="node-sub">~10 more (pool / RS /</text>
+  <text x="470" y="378" text-anchor="middle" class="node-sub">snapshot / clone)</text>
+
+  <rect x="650" y="262" width="170" height="140" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="735" y="288" text-anchor="middle" class="node-title" fill="#06b6d4">VM</text>
+  <text x="735" y="306" text-anchor="middle" class="node-sub">VirtualMachine</text>
+  <text x="735" y="322" text-anchor="middle" class="node-sub">desired state</text>
+  <text x="735" y="338" text-anchor="middle" class="node-sub">runStrategy:</text>
+  <text x="735" y="352" text-anchor="middle" class="node-sub">Always | Manual</text>
+  <text x="735" y="366" text-anchor="middle" class="node-sub">Halted | RerunOnFailure</text>
+  <text x="735" y="384" text-anchor="middle" class="node-sub">owns &#8594; VMI</text>
+
+  <rect x="840" y="262" width="170" height="140" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="925" y="288" text-anchor="middle" class="node-title" fill="#06b6d4">VMI</text>
+  <text x="925" y="306" text-anchor="middle" class="node-sub">VirtualMachine</text>
+  <text x="925" y="320" text-anchor="middle" class="node-sub">Instance</text>
+  <text x="925" y="338" text-anchor="middle" class="node-sub">one running VM</text>
+  <text x="925" y="352" text-anchor="middle" class="node-sub">spec.domain (vCPU /</text>
+  <text x="925" y="366" text-anchor="middle" class="node-sub">memory / disks / NICs)</text>
+  <text x="925" y="384" text-anchor="middle" class="node-sub">owns &#8594; launcher Pod</text>
+
+  <rect x="1030" y="262" width="200" height="140" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1130" y="288" text-anchor="middle" class="node-title" fill="#06b6d4">VMIM</text>
+  <text x="1130" y="306" text-anchor="middle" class="node-sub">VirtualMachine</text>
+  <text x="1130" y="320" text-anchor="middle" class="node-sub">InstanceMigration</text>
+  <text x="1130" y="338" text-anchor="middle" class="node-sub">one-shot job</text>
+  <text x="1130" y="352" text-anchor="middle" class="node-sub">live-migrate VMI</text>
+  <text x="1130" y="366" text-anchor="middle" class="node-sub">references VMI by name</text>
+  <text x="1130" y="384" text-anchor="middle" class="node-sub">(no ownerRef)</text>
+
+  <!-- ==================== Layer 3 nodes ==================== -->
+  <rect x="120" y="488" width="280" height="110" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="260" y="514" text-anchor="middle" class="node-title" fill="#10b981">virt-handler</text>
+  <text x="260" y="532" text-anchor="middle" class="node-sub">DaemonSet (per node)</text>
+  <text x="260" y="546" text-anchor="middle" class="node-sub">watches own-node VMIs</text>
+  <text x="260" y="560" text-anchor="middle" class="node-sub">cmd-server gRPC client</text>
+  <text x="260" y="574" text-anchor="middle" class="node-sub">console / lifecycle HTTP</text>
+  <text x="260" y="588" text-anchor="middle" class="node-sub">peer to kubelet (manages VMs)</text>
+
+  <rect x="500" y="488" width="240" height="110" rx="6" ry="6" fill="#0b1220" stroke="#475569" stroke-width="1.5"/>
+  <text x="620" y="514" text-anchor="middle" class="node-title" fill="#94a3b8">kubelet</text>
+  <text x="620" y="532" text-anchor="middle" class="node-sub">runs virt-launcher Pod</text>
+  <text x="620" y="546" text-anchor="middle" class="node-sub">CRI gRPC to runtime</text>
+  <text x="620" y="560" text-anchor="middle" class="node-sub">applies cgroup limits</text>
+  <text x="620" y="574" text-anchor="middle" class="node-sub">CNI ADD &#8594; Pod netns</text>
+  <text x="620" y="588" text-anchor="middle" class="node-sub">does not know about VMs</text>
+
+  <rect x="840" y="488" width="280" height="110" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="980" y="514" text-anchor="middle" class="node-title" fill="#94a3b8">node OS kernel</text>
+  <text x="980" y="532" text-anchor="middle" class="node-sub">Linux + KVM module</text>
+  <text x="980" y="546" text-anchor="middle" class="node-sub">/dev/kvm exposed to Pod</text>
+  <text x="980" y="560" text-anchor="middle" class="node-sub">via DevicePlugin</text>
+  <text x="980" y="574" text-anchor="middle" class="node-sub">cgroup v2 / namespaces</text>
+  <text x="980" y="588" text-anchor="middle" class="node-sub">vfio-pci for passthrough</text>
+
+  <!-- ==================== Layer 4 nodes (per-VMI Pod internals) ==================== -->
+  <rect x="80" y="688" width="240" height="170" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="200" y="714" text-anchor="middle" class="node-title" fill="#a855f7">virt-launcher-monitor</text>
+  <text x="200" y="734" text-anchor="middle" class="node-sub">PID 1 of Pod</text>
+  <text x="200" y="748" text-anchor="middle" class="node-sub">exec wrapper</text>
+  <text x="200" y="762" text-anchor="middle" class="node-sub">forks virt-launcher</text>
+  <text x="200" y="776" text-anchor="middle" class="node-sub">reaps zombies</text>
+  <text x="200" y="790" text-anchor="middle" class="node-sub">propagates SIGTERM</text>
+  <text x="200" y="804" text-anchor="middle" class="node-sub">waits for child exit</text>
+  <text x="200" y="822" text-anchor="middle" class="node-sub">graceful shutdown</text>
+  <text x="200" y="840" text-anchor="middle" class="node-sub">timeout enforced</text>
+
+  <rect x="360" y="688" width="240" height="170" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="480" y="714" text-anchor="middle" class="node-title" fill="#a855f7">virt-launcher</text>
+  <text x="480" y="734" text-anchor="middle" class="node-sub">cmd-server (gRPC)</text>
+  <text x="480" y="748" text-anchor="middle" class="node-sub">listens on UDS for</text>
+  <text x="480" y="762" text-anchor="middle" class="node-sub">virt-handler RPCs</text>
+  <text x="480" y="776" text-anchor="middle" class="node-sub">SyncVMI / KillVMI</text>
+  <text x="480" y="790" text-anchor="middle" class="node-sub">converter: VMI spec</text>
+  <text x="480" y="804" text-anchor="middle" class="node-sub">&#8594; libvirt domain XML</text>
+  <text x="480" y="822" text-anchor="middle" class="node-sub">connects libvirt</text>
+  <text x="480" y="840" text-anchor="middle" class="node-sub">via go-libvirt RPC</text>
+
+  <rect x="640" y="688" width="240" height="170" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="760" y="714" text-anchor="middle" class="node-title" fill="#eab308">libvirtd / virtqemud</text>
+  <text x="760" y="734" text-anchor="middle" class="node-sub">in-Pod daemon</text>
+  <text x="760" y="748" text-anchor="middle" class="node-sub">unix socket API</text>
+  <text x="760" y="762" text-anchor="middle" class="node-sub">defineXML / createXML</text>
+  <text x="760" y="776" text-anchor="middle" class="node-sub">domain lifecycle</text>
+  <text x="760" y="790" text-anchor="middle" class="node-sub">forks qemu-kvm</text>
+  <text x="760" y="804" text-anchor="middle" class="node-sub">manages migration</text>
+  <text x="760" y="822" text-anchor="middle" class="node-sub">QMP / monitor socket</text>
+  <text x="760" y="840" text-anchor="middle" class="node-sub">events to virt-launcher</text>
+
+  <rect x="920" y="688" width="320" height="170" rx="6" ry="6" fill="#1c1917" stroke="#eab308" stroke-width="1.5"/>
+  <text x="1080" y="714" text-anchor="middle" class="node-title" fill="#eab308">qemu-kvm (guest VM)</text>
+  <text x="1080" y="734" text-anchor="middle" class="node-sub">user-space hypervisor process</text>
+  <text x="1080" y="748" text-anchor="middle" class="node-sub">vCPU threads via /dev/kvm ioctl</text>
+  <text x="1080" y="762" text-anchor="middle" class="node-sub">virtio-net / virtio-blk backends</text>
+  <text x="1080" y="776" text-anchor="middle" class="node-sub">tap device into Pod netns</text>
+  <text x="1080" y="790" text-anchor="middle" class="node-sub">disk image &#8594; PVC mount</text>
+  <text x="1080" y="804" text-anchor="middle" class="node-sub">VNC / serial console socket</text>
+  <text x="1080" y="822" text-anchor="middle" class="node-sub">guest OS boots inside</text>
+  <text x="1080" y="840" text-anchor="middle" class="node-sub">all bound by Pod cgroup limits</text>
+
+  <!-- ==================== Arrows ==================== -->
+
+  <!-- virt-operator <-> kube-apiserver: KubeVirt CR watch + apply -->
+  <line x1="400" y1="135" x2="500" y2="135" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="409" y="117" width="82" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="450" y="129" text-anchor="middle" class="arrow-label" fill="#cbd5e1">watch CR</text>
+
+  <line x1="780" y1="155" x2="880" y2="155" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="794" y="137" width="72" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="830" y="149" text-anchor="middle" class="arrow-label" fill="#cbd5e1">apply CRDs</text>
+
+  <!-- virt-operator -> virt-api / virt-controller (creates Deployments) -->
+  <path d="M 260,182 L 260,212 L 200,212 L 200,262" fill="none" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#arrow-blue)" stroke-dasharray="6,4"/>
+  <rect x="125" y="195" width="158" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="204" y="207" text-anchor="middle" class="arrow-label" fill="#cbd5e1">creates Deployment</text>
+
+  <path d="M 310,182 L 310,212 L 460,212 L 460,262" fill="none" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#arrow-blue)" stroke-dasharray="6,4"/>
+
+  <!-- virt-api <-> kube-apiserver (aggregation registration + admission webhook callback) -->
+  <path d="M 200,262 L 200,232 L 1040,232 L 1040,182" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <rect x="491" y="217" width="244" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="613" y="229" text-anchor="middle" class="arrow-label" fill="#cbd5e1">aggregation register / webhook callback</text>
+
+  <!-- virt-controller -> kube-apiserver (watch CRDs) -->
+  <path d="M 530,262 L 530,250 L 1080,250 L 1080,182" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <rect x="746" y="237" width="118" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="805" y="249" text-anchor="middle" class="arrow-label" fill="#cbd5e1">watch VM / VMI</text>
+
+  <!-- virt-controller -> VM (write status) -->
+  <line x1="590" y1="320" x2="650" y2="320" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+
+  <!-- VM -> VMI (owns) -->
+  <line x1="820" y1="332" x2="840" y2="332" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <rect x="797" y="314" width="46" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="820" y="326" text-anchor="middle" class="arrow-label" fill="#cbd5e1">owns</text>
+
+  <!-- VMIM -> VMI (reference) -->
+  <line x1="1030" y1="350" x2="1010" y2="350" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)" stroke-dasharray="4,3"/>
+  <rect x="990" y="356" width="60" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1020" y="368" text-anchor="middle" class="arrow-label" fill="#cbd5e1">refs VMI</text>
+
+  <!-- VMI -> virt-handler (informer watch) -->
+  <path d="M 925,402 L 925,432 L 260,432 L 260,488" fill="none" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="528" y="418" width="124" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="590" y="430" text-anchor="middle" class="arrow-label" fill="#cbd5e1">informer (own-node)</text>
+
+  <!-- VMI -> kubelet (Pod created via virt-controller) -->
+  <path d="M 970,402 L 970,432 L 620,432 L 620,488" fill="none" stroke="#f97316" stroke-width="1.6" marker-end="url(#arrow-orange)" stroke-dasharray="6,4"/>
+  <rect x="717" y="418" width="170" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="802" y="430" text-anchor="middle" class="arrow-label" fill="#cbd5e1">controller creates Pod</text>
+
+  <!-- kubelet -> virt-launcher-monitor (kubelet starts the Pod) -->
+  <path d="M 540,598 L 540,628 L 200,628 L 200,688" fill="none" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <rect x="324" y="619" width="92" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="370" y="631" text-anchor="middle" class="arrow-label" fill="#cbd5e1">kubelet exec</text>
+
+  <!-- virt-handler -> virt-launcher (cmd-server gRPC) -->
+  <line x1="320" y1="560" x2="360" y2="700" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="288" y="619" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="348" y="631" text-anchor="middle" class="arrow-label" fill="#cbd5e1">cmd-server gRPC</text>
+
+  <!-- virt-launcher-monitor -> virt-launcher (PID parent-child) -->
+  <line x1="320" y1="770" x2="360" y2="770" stroke="#a855f7" stroke-width="2.0" marker-end="url(#arrow-purple)"/>
+  <rect x="297" y="752" width="46" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="320" y="764" text-anchor="middle" class="arrow-label" fill="#cbd5e1">fork</text>
+
+  <!-- virt-launcher -> libvirtd (unix socket) -->
+  <line x1="600" y1="770" x2="640" y2="770" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="585" y="752" width="70" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="620" y="764" text-anchor="middle" class="arrow-label" fill="#cbd5e1">UDS RPC</text>
+
+  <!-- libvirtd -> qemu-kvm (libvirt domain) -->
+  <line x1="880" y1="770" x2="920" y2="770" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="855" y="752" width="90" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="900" y="764" text-anchor="middle" class="arrow-label" fill="#cbd5e1">spawn QEMU</text>
+
+  <!-- node OS kernel -> qemu (KVM ioctl) -->
+  <path d="M 1080,598 L 1080,628 L 1080,688" fill="none" stroke="#475569" stroke-width="1.8" marker-end="url(#arrow-green)" stroke-dasharray="4,3"/>
+  <rect x="1024" y="619" width="112" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1080" y="631" text-anchor="middle" class="arrow-label" fill="#cbd5e1">/dev/kvm ioctl</text>
+
+  <!-- Legend -->
+  <rect x="40" y="894" width="1240" height="32" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="56" y1="910" x2="88" y2="910" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="94" y="914" class="legend-text">operator install / CR watch</text>
+  <line x1="296" y1="910" x2="328" y2="910" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="334" y="914" class="legend-text">apiserver &#8596; control plane</text>
+  <line x1="556" y1="910" x2="588" y2="910" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="594" y="914" class="legend-text">CRD ownership / reference</text>
+  <line x1="826" y1="910" x2="858" y2="910" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="864" y="914" class="legend-text">node-local (informer / gRPC)</text>
+  <line x1="1086" y1="910" x2="1118" y2="910" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="1124" y="914" class="legend-text">PID parent-child (fork)</text>
+  <text x="1270" y="934" text-anchor="end" class="node-sub">Source: kubevirt v1.8.2 cmd/{virt-operator, virt-api, virt-controller, virt-handler, virt-launcher}</text>
+</svg>
