@@ -1,0 +1,366 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1100" width="1800" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 26px; font-weight: 700; fill: #f1f5f9; }
+    .subtitle { font-size: 15px; fill: #94a3b8; }
+    .layer-label { font-size: 14px; font-weight: 700; letter-spacing: 0.04em; }
+    .node-title { font-size: 16px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .pod-title { font-size: 12px; font-weight: 700; }
+    .pod-sub { font-size: 10px; fill: #cbd5e1; }
+    .vm-title { font-size: 13px; font-weight: 700; fill: #f1f5f9; }
+    .vm-sub { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .net-label { font-size: 11px; font-weight: 700; }
+    .axis-label { font-size: 11px; fill: #64748b; }
+    .annotation { font-size: 11px; fill: #94a3b8; font-style: italic; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f43f5e"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="1100" fill="url(#bg-grad)"/>
+
+  <!-- Header -->
+  <text x="900" y="44" text-anchor="middle" class="title">Day 30 整合 demo 拓樸</text>
+  <text x="900" y="70" text-anchor="middle" class="subtitle">3 baremetal Proxmox &#8594; 3 k8s node VM &#8594; cilium + multus + ceph + kubevirt 全部接上</text>
+
+  <!-- Layer band labels (left margin) -->
+  <text x="34" y="142" class="layer-label" fill="#94a3b8" transform="rotate(-90 34 142)">EXTERNAL</text>
+  <text x="34" y="270" class="layer-label" fill="#3b82f6" transform="rotate(-90 34 270)">PROXMOX BAREMETAL</text>
+  <text x="34" y="500" class="layer-label" fill="#10b981" transform="rotate(-90 34 500)">K8S NODE VM</text>
+  <text x="34" y="800" class="layer-label" fill="#a855f7" transform="rotate(-90 34 800)">PODS / VM WORKLOAD</text>
+
+  <!-- ===== External client (top) ===== -->
+  <rect x="80" y="100" width="300" height="76" rx="8" ry="8" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="100" y="124" class="node-title" fill="#06b6d4">外部 client</text>
+  <text x="100" y="142" class="node-sub">開發筆電 / LAN 上其他設備</text>
+  <text x="100" y="160" class="node-sub">curl http://web-vm-svc/ (cluster 內)</text>
+  <text x="100" y="174" class="node-sub">curl http://192.168.1.100/ (LAN)</text>
+
+  <!-- LAN router / vmbr0 -->
+  <rect x="730" y="100" width="340" height="76" rx="8" ry="8" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="750" y="124" class="node-title" fill="#06b6d4">LAN router + vmbr0 bridge</text>
+  <text x="750" y="142" class="node-sub">192.168.1.0/24 物理網段</text>
+  <text x="750" y="160" class="node-sub">multus bridge NAD 用的 uplink</text>
+  <text x="750" y="174" class="node-sub">繞過 cilium，直送 VM eth1</text>
+
+  <!-- k8s ClusterIP Service (right top) -->
+  <rect x="1420" y="100" width="300" height="76" rx="8" ry="8" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1440" y="124" class="node-title" fill="#10b981">Service web-vm-svc</text>
+  <text x="1440" y="142" class="node-sub">type: ClusterIP, port 80</text>
+  <text x="1440" y="160" class="node-sub">selector: kubevirt.io/vm=web-vm</text>
+  <text x="1440" y="174" class="node-sub">cilium service load-balance</text>
+
+  <!-- ===== Three baremetal node frames ===== -->
+  <!-- Node 1 -->
+  <rect x="80" y="200" width="540" height="780" rx="10" ry="10" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="100" y="228" class="node-title" fill="#3b82f6">pve-1 (baremetal)</text>
+  <text x="100" y="246" class="node-sub">Proxmox VE 9.0 &#8729; control-plane host</text>
+
+  <!-- Node 2 -->
+  <rect x="640" y="200" width="540" height="780" rx="10" ry="10" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="660" y="228" class="node-title" fill="#3b82f6">pve-2 (baremetal)</text>
+  <text x="660" y="246" class="node-sub">Proxmox VE 9.0 &#8729; web-vm 目前所在 host</text>
+
+  <!-- Node 3 -->
+  <rect x="1200" y="200" width="540" height="780" rx="10" ry="10" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="1220" y="228" class="node-title" fill="#3b82f6">pve-3 (baremetal)</text>
+  <text x="1220" y="246" class="node-sub">Proxmox VE 9.0 &#8729; live-migration 目標</text>
+
+  <!-- ===== K8s node VMs (inside each baremetal) ===== -->
+  <!-- k8s-node-1 on pve-1 -->
+  <rect x="100" y="270" width="500" height="690" rx="8" ry="8" fill="#0a1f1c" stroke="#10b981" stroke-width="1.4"/>
+  <text x="120" y="294" class="node-title" fill="#10b981">k8s-node-1 (Proxmox VM)</text>
+  <text x="120" y="312" class="node-sub">k8s 1.36 control plane</text>
+  <text x="120" y="328" class="node-sub">role: master + worker</text>
+
+  <!-- k8s-node-2 on pve-2 -->
+  <rect x="660" y="270" width="500" height="690" rx="8" ry="8" fill="#0a1f1c" stroke="#10b981" stroke-width="1.4"/>
+  <text x="680" y="294" class="node-title" fill="#10b981">k8s-node-2 (Proxmox VM)</text>
+  <text x="680" y="312" class="node-sub">k8s 1.36 worker</text>
+  <text x="680" y="328" class="node-sub">virt-launcher Pod 跑這</text>
+
+  <!-- k8s-node-3 on pve-3 -->
+  <rect x="1220" y="270" width="500" height="690" rx="8" ry="8" fill="#0a1f1c" stroke="#10b981" stroke-width="1.4"/>
+  <text x="1240" y="294" class="node-title" fill="#10b981">k8s-node-3 (Proxmox VM)</text>
+  <text x="1240" y="312" class="node-sub">k8s 1.36 worker</text>
+  <text x="1240" y="328" class="node-sub">migration target / Service endpoint</text>
+
+  <!-- ===== Node 1: control plane Pods + ceph ===== -->
+  <!-- kube-apiserver / etcd / scheduler / cm -->
+  <rect x="120" y="346" width="460" height="76" rx="6" ry="6" fill="#0f172a" stroke="#3b82f6" stroke-width="1"/>
+  <text x="138" y="366" class="pod-title" fill="#3b82f6">control plane (static Pods)</text>
+  <text x="138" y="384" class="pod-sub">kube-apiserver / etcd / scheduler / kube-controller-manager</text>
+  <text x="138" y="400" class="pod-sub">kubelet 從 /etc/kubernetes/manifests 啟</text>
+  <text x="138" y="416" class="pod-sub">Day 1-7 拆解過的 4 個元件</text>
+
+  <!-- cilium-operator + agent -->
+  <rect x="120" y="434" width="220" height="84" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1"/>
+  <text x="138" y="454" class="pod-title" fill="#10b981">cilium-operator</text>
+  <text x="138" y="470" class="pod-sub">CIDR 配發 / IPAM</text>
+  <text x="138" y="486" class="pod-sub">cilium-agent (DaemonSet)</text>
+  <text x="138" y="502" class="pod-sub">eBPF program 掛 lxc / veth</text>
+  <text x="138" y="514" class="pod-sub">KPR 取代 kube-proxy</text>
+
+  <!-- multus DS -->
+  <rect x="354" y="434" width="226" height="84" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1"/>
+  <text x="372" y="454" class="pod-title" fill="#10b981">multus-cni (DS)</text>
+  <text x="372" y="470" class="pod-sub">delegate 模式</text>
+  <text x="372" y="486" class="pod-sub">primary &#8594; cilium</text>
+  <text x="372" y="502" class="pod-sub">secondary &#8594; bridge-nad</text>
+  <text x="372" y="514" class="pod-sub">handles k8s.v1.cni.cncf.io/networks</text>
+
+  <!-- KubeVirt operator + virt-controller / virt-api -->
+  <rect x="120" y="530" width="460" height="84" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1"/>
+  <text x="138" y="550" class="pod-title" fill="#a855f7">virt-operator + virt-controller + virt-api</text>
+  <text x="138" y="566" class="pod-sub">reconcile VirtualMachine / VMI &#8594; 產 virt-launcher Pod spec</text>
+  <text x="138" y="582" class="pod-sub">migration controller 接 VirtualMachineInstanceMigration</text>
+  <text x="138" y="598" class="pod-sub">CDI controller (Day 28 用) 處理 DataVolume clone</text>
+  <text x="138" y="610" class="pod-sub">virt-handler (DS) 在每個 worker 跟 libvirtd 對話</text>
+
+  <!-- ceph-csi controller / provisioner -->
+  <rect x="120" y="624" width="460" height="68" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1"/>
+  <text x="138" y="644" class="pod-title" fill="#f97316">ceph-csi-rbd controller (provisioner)</text>
+  <text x="138" y="660" class="pod-sub">external-provisioner / attacher / resizer / snapshotter</text>
+  <text x="138" y="676" class="pod-sub">收 PVC &#8594; 對 ceph mon 下 rbd create &#8594; 產 PV</text>
+  <text x="138" y="688" class="pod-sub">node plugin (DS) 在每個 worker map RBD device</text>
+
+  <!-- ceph MON/OSD on pve-1 (baremetal-managed by Proxmox) -->
+  <rect x="120" y="710" width="460" height="80" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.4" stroke-dasharray="4,3"/>
+  <text x="138" y="730" class="pod-title" fill="#f97316">ceph daemons (Proxmox-managed, 跑在 pve-1)</text>
+  <text x="138" y="748" class="pod-sub">mon.pve-1  &#8729;  mgr.pve-1</text>
+  <text x="138" y="764" class="pod-sub">osd.0 (NVMe) &#8729; osd.1 (NVMe)</text>
+  <text x="138" y="780" class="pod-sub">不在 k8s 裡，由 Proxmox systemd unit 直接管</text>
+
+  <!-- Day notes / annotation node 1 -->
+  <rect x="120" y="806" width="460" height="138" rx="6" ry="6" fill="#0a1220" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="138" y="826" class="pod-title" fill="#94a3b8">本 node 在 demo 中</text>
+  <text x="138" y="846" class="pod-sub">&#8226; control plane 的所有 Pod</text>
+  <text x="138" y="862" class="pod-sub">&#8226; cilium-operator / multus / virt-controller / csi-provisioner</text>
+  <text x="138" y="878" class="pod-sub">&#8226; ceph mon + 兩個 OSD (Proxmox 管)</text>
+  <text x="138" y="894" class="pod-sub">&#8226; 不放 web-vm，避免 control plane 受影響</text>
+  <text x="138" y="912" class="pod-sub">&#8226; live migration 來源／目標都不在這</text>
+  <text x="138" y="932" class="annotation">Day 1-7 control plane &#8729; Day 8-14 CNI operator &#8729; Day 22-30 KubeVirt operator</text>
+
+  <!-- ===== Node 2: web-vm (the demo VM) + ceph mon/osd ===== -->
+  <!-- virt-handler -->
+  <rect x="680" y="346" width="460" height="56" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1"/>
+  <text x="698" y="366" class="pod-title" fill="#a855f7">virt-handler Pod</text>
+  <text x="698" y="382" class="pod-sub">socket /var/run/libvirt/libvirt-sock</text>
+  <text x="698" y="396" class="pod-sub">把 VMI spec 翻成 libvirt domain XML</text>
+
+  <!-- virt-launcher Pod + VM -->
+  <rect x="680" y="414" width="460" height="296" rx="8" ry="8" fill="#1a1430" stroke="#a855f7" stroke-width="1.6"/>
+  <text x="698" y="436" class="pod-title" fill="#a855f7">virt-launcher Pod (web-vm-xxxx)</text>
+  <text x="698" y="452" class="pod-sub">runs qemu-kvm via libvirtd in Pod</text>
+
+  <!-- VM box inside virt-launcher -->
+  <rect x="700" y="464" width="420" height="232" rx="6" ry="6" fill="#0f172a" stroke="#eab308" stroke-width="1.4"/>
+  <text x="718" y="484" class="vm-title" fill="#eab308">QEMU/KVM &#8729; web-vm (Fedora)</text>
+  <text x="718" y="500" class="vm-sub">CPU 2c / Mem 2Gi / machine q35</text>
+
+  <!-- VM eth0 -->
+  <rect x="718" y="510" width="190" height="56" rx="4" ry="4" fill="#0a1f1c" stroke="#10b981" stroke-width="1"/>
+  <text x="728" y="528" class="pod-sub" fill="#10b981" font-weight="700">eth0 (default)</text>
+  <text x="728" y="544" class="pod-sub">masquerade Pod IP</text>
+  <text x="728" y="558" class="pod-sub">cilium primary</text>
+
+  <!-- VM eth1 -->
+  <rect x="912" y="510" width="200" height="56" rx="4" ry="4" fill="#1a1f0a" stroke="#eab308" stroke-width="1"/>
+  <text x="922" y="528" class="pod-sub" fill="#eab308" font-weight="700">eth1 (bridge-net)</text>
+  <text x="922" y="544" class="pod-sub">192.168.1.100/24</text>
+  <text x="922" y="558" class="pod-sub">multus bridge-nad</text>
+
+  <!-- VM rootdisk -->
+  <rect x="718" y="576" width="190" height="56" rx="4" ry="4" fill="#1f130a" stroke="#f97316" stroke-width="1"/>
+  <text x="728" y="594" class="pod-sub" fill="#f97316" font-weight="700">rootdisk (virtio)</text>
+  <text x="728" y="610" class="pod-sub">/dev/vda</text>
+  <text x="728" y="624" class="pod-sub">&#8594; ceph-rbd PV</text>
+
+  <!-- VM cloud-init -->
+  <rect x="912" y="576" width="200" height="56" rx="4" ry="4" fill="#0f172a" stroke="#94a3b8" stroke-width="1"/>
+  <text x="922" y="594" class="pod-sub" fill="#cbd5e1" font-weight="700">cloud-init disk</text>
+  <text x="922" y="610" class="pod-sub">nocloud user-data</text>
+  <text x="922" y="624" class="pod-sub">apt nginx + ip cmd</text>
+
+  <!-- nginx process inside VM -->
+  <rect x="718" y="640" width="394" height="48" rx="4" ry="4" fill="#0a1f1c" stroke="#10b981" stroke-width="1"/>
+  <text x="728" y="658" class="pod-sub" fill="#10b981" font-weight="700">systemd &#8594; nginx -g 'daemon off;'</text>
+  <text x="728" y="676" class="pod-sub">listen :80 &#8729; serves /usr/share/nginx/html/index.html</text>
+
+  <!-- ceph-csi node plugin on node 2 -->
+  <rect x="680" y="722" width="460" height="56" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1"/>
+  <text x="698" y="742" class="pod-title" fill="#f97316">ceph-csi-rbd nodeplugin (DS)</text>
+  <text x="698" y="758" class="pod-sub">rbd map &#8594; /dev/rbdN &#8594; bind-mount 進 virt-launcher</text>
+  <text x="698" y="772" class="pod-sub">device by-id 路徑暴露給 qemu-kvm</text>
+
+  <!-- ceph mon/osd on pve-2 -->
+  <rect x="680" y="790" width="460" height="78" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.4" stroke-dasharray="4,3"/>
+  <text x="698" y="810" class="pod-title" fill="#f97316">ceph daemons (Proxmox-managed, 跑在 pve-2)</text>
+  <text x="698" y="826" class="pod-sub">mon.pve-2</text>
+  <text x="698" y="842" class="pod-sub">osd.2 (NVMe) &#8729; osd.3 (NVMe)</text>
+  <text x="698" y="858" class="pod-sub">primary OSD for RBD image (CRUSH 演算決定)</text>
+
+  <rect x="680" y="884" width="460" height="68" rx="6" ry="6" fill="#0a1220" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="698" y="904" class="pod-title" fill="#94a3b8">本 node 在 demo 中</text>
+  <text x="698" y="922" class="pod-sub">&#8226; web-vm 目前 host (live migration 之前)</text>
+  <text x="698" y="938" class="pod-sub">&#8226; ceph mon + OSD &#8729; virt-handler &#8729; csi nodeplugin</text>
+
+  <!-- ===== Node 3: ceph mon/osd + virt-handler (migration target) ===== -->
+  <rect x="1240" y="346" width="460" height="56" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1"/>
+  <text x="1258" y="366" class="pod-title" fill="#a855f7">virt-handler Pod</text>
+  <text x="1258" y="382" class="pod-sub">migration target 端的 libvirt</text>
+  <text x="1258" y="396" class="pod-sub">virtctl migrate web-vm 後接 dirty page</text>
+
+  <rect x="1240" y="414" width="460" height="100" rx="6" ry="6" fill="#0f172a" stroke="#a855f7" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="1258" y="434" class="pod-title" fill="#a855f7">migration target slot (空位)</text>
+  <text x="1258" y="450" class="pod-sub">virtctl migrate 後 virt-launcher 會在這 spawn</text>
+  <text x="1258" y="466" class="pod-sub">RBD image 由 ceph 端 unmap pve-2 &#8594; map pve-3</text>
+  <text x="1258" y="482" class="pod-sub">eth0 重新分 cilium IP，eth1 一樣 192.168.1.100</text>
+  <text x="1258" y="498" class="pod-sub">cutover &lt; 1s，nginx 不重啟</text>
+
+  <!-- Service endpoints / cilium service entry on node 3 -->
+  <rect x="1240" y="526" width="460" height="74" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1"/>
+  <text x="1258" y="546" class="pod-title" fill="#10b981">cilium-agent &#8729; service endpoint</text>
+  <text x="1258" y="562" class="pod-sub">收 ClusterIP 封包 &#8594; eBPF map lookup</text>
+  <text x="1258" y="578" class="pod-sub">DNAT &#8594; web-vm Pod IP</text>
+  <text x="1258" y="592" class="pod-sub">不需 iptables，直接 socket level</text>
+
+  <!-- ceph-csi nodeplugin -->
+  <rect x="1240" y="612" width="460" height="56" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1"/>
+  <text x="1258" y="632" class="pod-title" fill="#f97316">ceph-csi-rbd nodeplugin (DS)</text>
+  <text x="1258" y="648" class="pod-sub">migration 後負責 rbd map web-vm RBD image</text>
+  <text x="1258" y="662" class="pod-sub">準備好 /dev/rbdN 給 virt-launcher 接管</text>
+
+  <!-- ceph mon/osd on pve-3 -->
+  <rect x="1240" y="682" width="460" height="78" rx="6" ry="6" fill="#0f172a" stroke="#f97316" stroke-width="1.4" stroke-dasharray="4,3"/>
+  <text x="1258" y="702" class="pod-title" fill="#f97316">ceph daemons (Proxmox-managed, 跑在 pve-3)</text>
+  <text x="1258" y="718" class="pod-sub">mon.pve-3 (3 mon = quorum)</text>
+  <text x="1258" y="734" class="pod-sub">osd.4 (NVMe) &#8729; osd.5 (NVMe)</text>
+  <text x="1258" y="750" class="pod-sub">replica copy of RBD image (CRUSH replicated_rule, size=3)</text>
+
+  <!-- multus + sample network DaemonSet bits -->
+  <rect x="1240" y="780" width="460" height="78" rx="6" ry="6" fill="#0f172a" stroke="#10b981" stroke-width="1"/>
+  <text x="1258" y="800" class="pod-title" fill="#10b981">cilium-agent (DS) + multus-cni (DS)</text>
+  <text x="1258" y="816" class="pod-sub">每 node 都跑：service map + secondary CNI delegate</text>
+  <text x="1258" y="832" class="pod-sub">外部 LAN 的 192.168.1.100 直接灌進 vmbr0</text>
+  <text x="1258" y="850" class="pod-sub">繞過 cilium 的網段 (multus bridge mode)</text>
+
+  <rect x="1240" y="876" width="460" height="76" rx="6" ry="6" fill="#0a1220" stroke="#334155" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="1258" y="896" class="pod-title" fill="#94a3b8">本 node 在 demo 中</text>
+  <text x="1258" y="914" class="pod-sub">&#8226; live migration 目標 host</text>
+  <text x="1258" y="932" class="pod-sub">&#8226; ceph mon (quorum 第 3 票) + 2 OSD</text>
+  <text x="1258" y="948" class="pod-sub">&#8226; cilium service load-balance 也可在這裡終結</text>
+
+  <!-- ===== Connection arrows ===== -->
+  <!-- External client -> Service (cilium path) -->
+  <path d="M 230 178 L 230 220 L 1570 220 L 1570 178" stroke="#06b6d4" stroke-width="1.6" fill="none" stroke-dasharray="0" marker-end="url(#arrow-cyan)"/>
+  <text x="900" y="212" class="net-label" fill="#06b6d4" text-anchor="middle">curl http://web-vm-svc/ &#8594; ClusterIP &#8594; cilium DNAT</text>
+
+  <!-- External client -> LAN router -->
+  <line x1="380" y1="138" x2="730" y2="138" stroke="#06b6d4" stroke-width="1.6" stroke-dasharray="6,3" marker-end="url(#arrow-cyan)"/>
+  <text x="555" y="132" class="net-label" fill="#06b6d4" text-anchor="middle">LAN curl 192.168.1.100</text>
+
+  <!-- LAN router -> VM eth1 (multus path, dashed yellow) -->
+  <path d="M 900 178 L 900 470 L 1015 470 L 1015 510" stroke="#eab308" stroke-width="1.8" fill="none" stroke-dasharray="6,3" marker-end="url(#arrow-yellow)"/>
+  <text x="1075" y="338" class="net-label" fill="#eab308">multus bridge</text>
+  <text x="1075" y="352" class="annotation">vmbr0 &#8594; eth1</text>
+
+  <!-- Service -> cilium agent on node 3 -> VM eth0 (cross-node service load-balance, can hit either node) -->
+  <path d="M 1500 178 L 1500 526" stroke="#10b981" stroke-width="1.6" fill="none" marker-end="url(#arrow-green)"/>
+  <text x="1510" y="350" class="net-label" fill="#10b981">cilium svc</text>
+
+  <!-- cilium-agent node3 -> web-vm eth0 on node2 (cross-node Pod-to-Pod via cilium overlay) -->
+  <path d="M 1240 562 C 1180 562 1180 538 1108 538" stroke="#10b981" stroke-width="1.6" fill="none" stroke-dasharray="0" marker-end="url(#arrow-green)"/>
+  <text x="1170" y="556" class="net-label" fill="#10b981" text-anchor="middle">eBPF DNAT</text>
+  <text x="1170" y="570" class="annotation" text-anchor="middle">&#8594; Pod IP</text>
+
+  <!-- web-vm rootdisk -> ceph-csi nodeplugin -> ceph OSDs (orange) -->
+  <line x1="813" y1="632" x2="813" y2="722" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="700" y="704" class="net-label" fill="#f97316">qemu read/write</text>
+  <text x="700" y="718" class="annotation">&#8594; /dev/rbdN</text>
+
+  <line x1="910" y1="778" x2="910" y2="790" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+
+  <!-- Ceph cluster network: pve-1 OSDs <-> pve-2 OSDs <-> pve-3 OSDs (replicated, dashed orange) -->
+  <path d="M 580 750 C 620 750 640 750 680 830" stroke="#f97316" stroke-width="1.6" fill="none" stroke-dasharray="6,3"/>
+  <path d="M 1140 830 C 1180 830 1200 750 1240 720" stroke="#f97316" stroke-width="1.6" fill="none" stroke-dasharray="6,3"/>
+  <text x="1170" y="800" class="net-label" fill="#f97316" text-anchor="middle">cluster net</text>
+  <text x="610" y="780" class="net-label" fill="#f97316" text-anchor="middle">replication</text>
+
+  <!-- ceph public network ring (mon -> all clients) light orange -->
+  <path d="M 350 710 C 350 660 480 660 580 668" stroke="#f97316" stroke-width="1" stroke-dasharray="3,3" fill="none" opacity="0.7"/>
+
+  <!-- live migration arrow node2 -> node3 (purple/rose) -->
+  <path d="M 1140 480 C 1180 480 1200 460 1240 460" stroke="#f43f5e" stroke-width="2" fill="none" marker-end="url(#arrow-rose)"/>
+  <text x="1190" y="450" class="net-label" fill="#f43f5e" text-anchor="middle">virtctl migrate</text>
+  <text x="1190" y="494" class="annotation" text-anchor="middle">memory dirty page</text>
+
+  <!-- control plane reconcile arrows (blue, faint) from node1 to node2/node3 -->
+  <line x1="580" y1="380" x2="680" y2="380" stroke="#3b82f6" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
+  <line x1="580" y1="380" x2="640" y2="380" stroke="#3b82f6" stroke-width="0"/>
+  <path d="M 580 564 C 1100 280 1200 280 1240 360" stroke="#3b82f6" stroke-width="1.2" fill="none" stroke-dasharray="3,3" marker-end="url(#arrow-blue)" opacity="0.6"/>
+  <text x="900" y="280" class="annotation" text-anchor="middle" fill="#3b82f6">reconcile / API watch (control &#8594; nodes)</text>
+
+  <!-- ===== Legend (bottom strip) ===== -->
+  <g transform="translate(80, 1000)">
+    <rect x="0" y="0" width="1640" height="78" rx="8" ry="8" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+
+    <!-- Layer legend -->
+    <rect x="16" y="12" width="14" height="14" fill="none" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <text x="38" y="24" class="legend-text">Proxmox baremetal node</text>
+
+    <rect x="220" y="12" width="14" height="14" fill="none" stroke="#10b981" stroke-width="1.5"/>
+    <text x="242" y="24" class="legend-text">k8s node VM</text>
+
+    <rect x="380" y="12" width="14" height="14" fill="#1a1430" stroke="#a855f7" stroke-width="1.5"/>
+    <text x="402" y="24" class="legend-text">virt-launcher Pod / VM</text>
+
+    <rect x="580" y="12" width="14" height="14" fill="#0f172a" stroke="#f97316" stroke-width="1.5"/>
+    <text x="602" y="24" class="legend-text">ceph daemon (Proxmox-managed)</text>
+
+    <rect x="850" y="12" width="14" height="14" fill="#0f172a" stroke="#06b6d4" stroke-width="1.5"/>
+    <text x="872" y="24" class="legend-text">external (client / LAN router / Service)</text>
+
+    <!-- Network legend -->
+    <line x1="16" y1="50" x2="40" y2="50" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+    <text x="50" y="54" class="legend-text">cilium pod / service network (eth0)</text>
+
+    <line x1="320" y1="50" x2="344" y2="50" stroke="#eab308" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrow-yellow)"/>
+    <text x="354" y="54" class="legend-text">multus bridge (eth1, 192.168.1.0/24)</text>
+
+    <line x1="630" y1="50" x2="654" y2="50" stroke="#f97316" stroke-width="2" marker-end="url(#arrow-orange)"/>
+    <text x="664" y="54" class="legend-text">ceph-rbd I/O / cluster replication</text>
+
+    <line x1="900" y1="50" x2="924" y2="50" stroke="#f43f5e" stroke-width="2" marker-end="url(#arrow-rose)"/>
+    <text x="934" y="54" class="legend-text">live migration (memory dirty page)</text>
+
+    <line x1="1130" y1="50" x2="1154" y2="50" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
+    <text x="1164" y="54" class="legend-text">control plane reconcile / API watch</text>
+
+    <line x1="1380" y1="50" x2="1404" y2="50" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow-cyan)"/>
+    <text x="1414" y="54" class="legend-text">external HTTP request</text>
+  </g>
+</svg>
