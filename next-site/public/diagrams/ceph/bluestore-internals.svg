@@ -1,0 +1,443 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1100" width="1700" height="1100">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .section-label { font-size: 14px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .mono-val { font-size: 12px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+    .annotate { font-size: 11px; fill: #94a3b8; font-style: italic; }
+    .branch-title { font-size: 13px; font-weight: 700; }
+    .chunk-label { font-size: 10px; fill: #94a3b8; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#ef4444"/>
+    </marker>
+  </defs>
+  <rect width="1700" height="1100" fill="url(#bg-grad)"/>
+  <text x="850" y="36" text-anchor="middle" class="title">Ceph BlueStore Internals: queue_transactions &#8594; (deferred / direct) &#8594; RocksDB on BlueFS &#8594; Allocator &#8594; raw block</text>
+
+  <!-- =================================================================== -->
+  <!-- SECTION 1: top entry & two write paths                              -->
+  <!-- =================================================================== -->
+  <rect x="30" y="58" width="1640" height="240" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="80" class="section-label" fill="#3b82f6">Section 1 &#8212; entry: BlueStore::queue_transactions splits the op into deferred (small) vs direct (large) write paths</text>
+
+  <!-- entry node: osd-op -->
+  <rect x="60" y="106" width="220" height="92" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="170" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">osd-op (RADOS write)</text>
+  <text x="170" y="150" text-anchor="middle" class="node-sub">PrimaryLogPG.do_op</text>
+  <text x="170" y="166" text-anchor="middle" class="node-sub">build ObjectStore::Transaction</text>
+  <text x="170" y="184" text-anchor="middle" class="node-sub">offset / length / data buffer</text>
+
+  <!-- arrow to queue_transactions -->
+  <line x1="280" y1="152" x2="338" y2="152" stroke="#3b82f6" stroke-width="2.0" marker-end="url(#arrow-blue)"/>
+  <rect x="280" y="130" width="62" height="16" rx="3" fill="#0f172a"/>
+  <text x="311" y="142" text-anchor="middle" class="arrow-label">submit txn</text>
+
+  <!-- queue_transactions box -->
+  <rect x="340" y="106" width="280" height="92" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="480" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">BlueStore::queue_transactions</text>
+  <text x="480" y="150" text-anchor="middle" class="node-sub">_txc_create &#8594; _txc_calc_cost</text>
+  <text x="480" y="166" text-anchor="middle" class="node-sub">classify each write op</text>
+  <text x="480" y="184" text-anchor="middle" class="node-sub">src/os/bluestore/BlueStore.cc</text>
+
+  <!-- decision: deferred vs direct -->
+  <line x1="620" y1="152" x2="700" y2="152" stroke="#3b82f6" stroke-width="2.0" marker-end="url(#arrow-blue)"/>
+  <rect x="630" y="130" width="80" height="16" rx="3" fill="#0f172a"/>
+  <text x="670" y="142" text-anchor="middle" class="arrow-label">size check</text>
+
+  <!-- decision diamond rectangle -->
+  <rect x="700" y="106" width="220" height="92" rx="6" ry="6" fill="#1c1917" stroke="#eab308" stroke-width="1.8"/>
+  <text x="810" y="130" text-anchor="middle" class="node-title" fill="#eab308">classify by size</text>
+  <text x="810" y="150" text-anchor="middle" class="node-sub">len &lt; deferred_size ?</text>
+  <text x="810" y="166" text-anchor="middle" class="node-sub">(default 32KB on HDD,</text>
+  <text x="810" y="184" text-anchor="middle" class="node-sub">0 on SSD &#8594; always direct)</text>
+
+  <!-- branch label -->
+  <line x1="920" y1="130" x2="990" y2="106" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <line x1="920" y1="174" x2="990" y2="200" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+
+  <!-- deferred branch (top right) -->
+  <rect x="990" y="76" width="320" height="100" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="1150" y="100" text-anchor="middle" class="branch-title" fill="#eab308">A. deferred path (small write)</text>
+  <text x="1150" y="118" text-anchor="middle" class="node-sub">payload merged into RocksDB WAL</text>
+  <text x="1150" y="132" text-anchor="middle" class="node-sub">single fsync on WAL = durable</text>
+  <text x="1150" y="146" text-anchor="middle" class="node-sub">later: kv_finalize_thread bulk-flushes</text>
+  <text x="1150" y="160" text-anchor="middle" class="node-sub">into block device extents</text>
+  <text x="1150" y="174" text-anchor="middle" class="node-sub">avoids small-IO &#8242;read-modify-write&#8242; on HDD</text>
+
+  <!-- direct branch (bottom right) -->
+  <rect x="990" y="186" width="320" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1150" y="208" text-anchor="middle" class="branch-title" fill="#10b981">B. direct path (large write)</text>
+  <text x="1150" y="226" text-anchor="middle" class="node-sub">Allocator.allocate(len) &#8594; extent list</text>
+  <text x="1150" y="240" text-anchor="middle" class="node-sub">aio_write data direct to block dev</text>
+  <text x="1150" y="254" text-anchor="middle" class="node-sub">metadata (onode, extent map, csum)</text>
+  <text x="1150" y="268" text-anchor="middle" class="node-sub">to RocksDB; commit after both ack</text>
+  <text x="1150" y="282" text-anchor="middle" class="node-sub">no double-write of payload</text>
+
+  <!-- right column annotation: WAL vs FileStore reference -->
+  <rect x="1330" y="106" width="340" height="170" rx="6" ry="6" fill="#0a0a0a" stroke="#334155" stroke-dasharray="4,3"/>
+  <text x="1340" y="128" class="node-title" fill="#cbd5e1">why two paths?</text>
+  <text x="1340" y="148" class="mono-val">small write on HDD</text>
+  <text x="1340" y="162" class="annotate">- direct allocate + write costs head seek</text>
+  <text x="1340" y="178" class="annotate">- WAL is sequential append, much cheaper</text>
+  <text x="1340" y="196" class="annotate">- coalesce many small writes per WAL flush</text>
+  <text x="1340" y="220" class="mono-val">large write on any device</text>
+  <text x="1340" y="234" class="annotate">- doubling payload through WAL is waste</text>
+  <text x="1340" y="250" class="annotate">- direct allocate, single write, only meta in WAL</text>
+  <text x="1340" y="268" class="annotate">  &#8594; FileStore double-write avoided</text>
+
+  <!-- =================================================================== -->
+  <!-- SECTION 2: middle BlueStore + RocksDB + BlueFS                       -->
+  <!-- =================================================================== -->
+  <rect x="30" y="312" width="1640" height="380" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="334" class="section-label" fill="#10b981">Section 2 &#8212; BlueStore (object engine) + RocksDB (k/v metadata) + BlueFS (mini FS just for RocksDB SST + WAL files)</text>
+
+  <!-- BlueStore (object engine) - left -->
+  <rect x="60" y="358" width="440" height="300" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.8"/>
+  <text x="280" y="384" text-anchor="middle" class="node-title" fill="#10b981">BlueStore (object engine)</text>
+  <text x="280" y="402" text-anchor="middle" class="node-sub">src/os/bluestore/BlueStore.h class BlueStore</text>
+
+  <!-- inner: onode -->
+  <rect x="80" y="416" width="180" height="74" rx="4" ry="4" fill="#020617" stroke="#10b981"/>
+  <text x="170" y="436" text-anchor="middle" class="branch-title" fill="#10b981">onode (in-mem cache)</text>
+  <text x="170" y="452" text-anchor="middle" class="node-sub">per-object metadata</text>
+  <text x="170" y="466" text-anchor="middle" class="node-sub">extent_map, omap_head</text>
+  <text x="170" y="480" text-anchor="middle" class="node-sub">size, csum_type, alloc_hint</text>
+
+  <!-- inner: blob/extent -->
+  <rect x="280" y="416" width="200" height="74" rx="4" ry="4" fill="#020617" stroke="#10b981"/>
+  <text x="380" y="436" text-anchor="middle" class="branch-title" fill="#10b981">blob / extent</text>
+  <text x="380" y="452" text-anchor="middle" class="node-sub">logical &#8594; physical mapping</text>
+  <text x="380" y="466" text-anchor="middle" class="node-sub">offset on block device</text>
+  <text x="380" y="480" text-anchor="middle" class="node-sub">checksum, compression</text>
+
+  <!-- inner: txc lifecycle -->
+  <rect x="80" y="500" width="400" height="60" rx="4" ry="4" fill="#020617" stroke="#10b981"/>
+  <text x="280" y="518" text-anchor="middle" class="branch-title" fill="#10b981">TransContext (txc) state machine</text>
+  <text x="280" y="534" text-anchor="middle" class="node-sub">PREPARE &#8594; AIO_WAIT &#8594; KV_QUEUED &#8594; KV_SUBMITTED</text>
+  <text x="280" y="550" text-anchor="middle" class="node-sub">&#8594; KV_DONE &#8594; FINISHING &#8594; DONE (callback to PG)</text>
+
+  <!-- inner: kv sync thread -->
+  <rect x="80" y="570" width="190" height="74" rx="4" ry="4" fill="#020617" stroke="#10b981"/>
+  <text x="175" y="590" text-anchor="middle" class="branch-title" fill="#10b981">kv_sync_thread</text>
+  <text x="175" y="606" text-anchor="middle" class="node-sub">batches txc</text>
+  <text x="175" y="620" text-anchor="middle" class="node-sub">writes RocksDB batch</text>
+  <text x="175" y="634" text-anchor="middle" class="node-sub">single fsync per batch</text>
+
+  <!-- inner: deferred writer thread -->
+  <rect x="290" y="570" width="190" height="74" rx="4" ry="4" fill="#020617" stroke="#eab308"/>
+  <text x="385" y="590" text-anchor="middle" class="branch-title" fill="#eab308">kv_finalize_thread</text>
+  <text x="385" y="606" text-anchor="middle" class="node-sub">replays deferred</text>
+  <text x="385" y="620" text-anchor="middle" class="node-sub">payload to block dev</text>
+  <text x="385" y="634" text-anchor="middle" class="node-sub">cleans WAL entries</text>
+
+  <!-- RocksDB - right of BlueStore -->
+  <rect x="540" y="358" width="420" height="300" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.8"/>
+  <text x="750" y="384" text-anchor="middle" class="node-title" fill="#06b6d4">RocksDB (k/v store)</text>
+  <text x="750" y="402" text-anchor="middle" class="node-sub">LSM-tree, KeyValueDB *db in BlueStore</text>
+
+  <!-- memtable -->
+  <rect x="560" y="416" width="180" height="56" rx="4" ry="4" fill="#020617" stroke="#06b6d4"/>
+  <text x="650" y="434" text-anchor="middle" class="branch-title" fill="#06b6d4">memtable (RAM)</text>
+  <text x="650" y="450" text-anchor="middle" class="node-sub">in-memory writes</text>
+  <text x="650" y="464" text-anchor="middle" class="node-sub">flushed to L0 SST</text>
+
+  <!-- WAL -->
+  <rect x="760" y="416" width="180" height="56" rx="4" ry="4" fill="#020617" stroke="#eab308"/>
+  <text x="850" y="434" text-anchor="middle" class="branch-title" fill="#eab308">WAL (log file)</text>
+  <text x="850" y="450" text-anchor="middle" class="node-sub">crash-recovery log</text>
+  <text x="850" y="464" text-anchor="middle" class="node-sub">also holds deferred payload</text>
+
+  <!-- L0 SST -->
+  <rect x="560" y="484" width="380" height="42" rx="4" ry="4" fill="#020617" stroke="#06b6d4"/>
+  <text x="750" y="502" text-anchor="middle" class="branch-title" fill="#06b6d4">L0 SST files (immutable, sorted)</text>
+  <text x="750" y="516" text-anchor="middle" class="node-sub">compaction merges into deeper levels</text>
+
+  <!-- L1 SST -->
+  <rect x="560" y="534" width="380" height="32" rx="4" ry="4" fill="#020617" stroke="#06b6d4" opacity="0.85"/>
+  <text x="750" y="554" text-anchor="middle" class="node-sub">L1 SST  (10x size, fewer files)</text>
+
+  <!-- L2 SST -->
+  <rect x="560" y="572" width="380" height="28" rx="4" ry="4" fill="#020617" stroke="#06b6d4" opacity="0.7"/>
+  <text x="750" y="590" text-anchor="middle" class="node-sub">L2 SST  (...)</text>
+
+  <!-- what is stored -->
+  <rect x="560" y="608" width="380" height="44" rx="4" ry="4" fill="#020617" stroke="#06b6d4" stroke-dasharray="3,3"/>
+  <text x="750" y="624" text-anchor="middle" class="node-sub">keys stored: O.&lt;onode&gt;  M.&lt;omap&gt;  P.&lt;pglog&gt;</text>
+  <text x="750" y="640" text-anchor="middle" class="node-sub">                 b.&lt;allocator snap&gt;  L.&lt;collection&gt;</text>
+
+  <!-- BlueFS - right of RocksDB -->
+  <rect x="1000" y="358" width="320" height="300" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.8"/>
+  <text x="1160" y="384" text-anchor="middle" class="node-title" fill="#a855f7">BlueFS (mini filesystem)</text>
+  <text x="1160" y="402" text-anchor="middle" class="node-sub">src/os/bluestore/BlueFS.h class BlueFS</text>
+
+  <text x="1020" y="424" class="node-sub">why exist?</text>
+  <text x="1020" y="440" class="annotate">- RocksDB needs POSIX-ish file API</text>
+  <text x="1020" y="456" class="annotate">- BlueStore has no FS, only raw block</text>
+  <text x="1020" y="472" class="annotate">- BlueFS is &#8242;just enough&#8242; FS for RocksDB</text>
+
+  <text x="1020" y="498" class="node-sub">capabilities</text>
+  <text x="1020" y="514" class="annotate">- create / open / append / sync file</text>
+  <text x="1020" y="530" class="annotate">- log-structured directory (no inodes)</text>
+  <text x="1020" y="546" class="annotate">- replays its own log on mount</text>
+
+  <text x="1020" y="572" class="node-sub">file types</text>
+  <text x="1020" y="588" class="annotate">- *.sst   (RocksDB sorted-string tables)</text>
+  <text x="1020" y="604" class="annotate">- *.log   (RocksDB WAL)</text>
+  <text x="1020" y="620" class="annotate">- *.dbtmp / MANIFEST (RocksDB internals)</text>
+
+  <text x="1020" y="646" class="annotate">all files end up as extents on block device</text>
+
+  <!-- right side annotation: file source pointers + tiering -->
+  <rect x="1340" y="358" width="330" height="300" rx="6" ry="6" fill="#0a0a0a" stroke="#334155" stroke-dasharray="4,3"/>
+  <text x="1350" y="380" class="node-title" fill="#cbd5e1">device tiering (optional)</text>
+  <text x="1350" y="402" class="mono-val">block      &#8594; main slow device</text>
+  <text x="1350" y="418" class="annotate">                 (HDD or SSD; RADOS data)</text>
+  <text x="1350" y="438" class="mono-val">block.db   &#8594; faster (NVMe SSD)</text>
+  <text x="1350" y="454" class="annotate">                 holds RocksDB SST + BlueFS log</text>
+  <text x="1350" y="474" class="mono-val">block.wal  &#8594; fastest (NVDIMM / NVMe)</text>
+  <text x="1350" y="490" class="annotate">                 holds RocksDB WAL only</text>
+
+  <text x="1350" y="518" class="node-title" fill="#cbd5e1">spillover</text>
+  <text x="1350" y="538" class="annotate">- if block.db fills, RocksDB SST spills</text>
+  <text x="1350" y="554" class="annotate">  back to block; latency degrades</text>
+  <text x="1350" y="570" class="annotate">- &#8242;BlueFS spillover&#8242; warning surfaced</text>
+  <text x="1350" y="586" class="annotate">  by ceph health detail</text>
+
+  <text x="1350" y="614" class="node-title" fill="#cbd5e1">recovery</text>
+  <text x="1350" y="634" class="annotate">- BlueFS log replays on OSD start</text>
+  <text x="1350" y="650" class="annotate">- RocksDB WAL replays after that</text>
+
+  <!-- Arrows inside section 2 -->
+
+  <!-- BlueStore -> RocksDB metadata writes (kv_sync) -->
+  <line x1="500" y1="430" x2="540" y2="430" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="488" y="412" width="60" height="14" rx="3" fill="#0f172a"/>
+  <text x="518" y="423" text-anchor="middle" class="arrow-label">put kv</text>
+
+  <!-- BlueStore -> RocksDB WAL (deferred payload) -->
+  <line x1="500" y1="460" x2="540" y2="460" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="487" y="463" width="62" height="14" rx="3" fill="#0f172a"/>
+  <text x="518" y="474" text-anchor="middle" class="arrow-label">deferred</text>
+
+  <!-- RocksDB -> BlueFS (SST + WAL files) -->
+  <line x1="960" y1="450" x2="1000" y2="450" stroke="#06b6d4" stroke-width="2.0" marker-end="url(#arrow-cyan)"/>
+  <rect x="950" y="430" width="68" height="14" rx="3" fill="#0f172a"/>
+  <text x="984" y="441" text-anchor="middle" class="arrow-label">SST + WAL</text>
+
+  <!-- BlueFS -> back to RocksDB (file read) -->
+  <line x1="1000" y1="500" x2="960" y2="500" stroke="#06b6d4" stroke-width="1.5" marker-end="url(#arrow-cyan)" stroke-dasharray="4,3"/>
+  <rect x="950" y="503" width="68" height="14" rx="3" fill="#0f172a"/>
+  <text x="984" y="514" text-anchor="middle" class="arrow-label">file read</text>
+
+  <!-- =================================================================== -->
+  <!-- SECTION 3: bottom Allocator + raw block device                      -->
+  <!-- =================================================================== -->
+  <rect x="30" y="706" width="1640" height="340" rx="8" ry="8" fill="#0f172a" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="46" y="728" class="section-label" fill="#f97316">Section 3 &#8212; Allocator (Bitmap / AVL) + raw block device with shared regions for BlueStore object data and BlueFS</text>
+
+  <!-- Allocator box -->
+  <rect x="60" y="752" width="380" height="280" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.8"/>
+  <text x="250" y="776" text-anchor="middle" class="node-title" fill="#f97316">Allocator</text>
+  <text x="250" y="794" text-anchor="middle" class="node-sub">src/os/bluestore/Allocator.h</text>
+
+  <text x="80" y="816" class="node-sub">interface (abstract)</text>
+  <text x="80" y="832" class="mono-val">allocate(want, unit) &#8594; extent list</text>
+  <text x="80" y="848" class="mono-val">release(extent list)</text>
+  <text x="80" y="864" class="mono-val">init_add_free / init_rm_free</text>
+
+  <text x="80" y="888" class="node-sub">implementations</text>
+  <rect x="80" y="896" width="160" height="56" rx="4" ry="4" fill="#020617" stroke="#f97316"/>
+  <text x="160" y="914" text-anchor="middle" class="branch-title" fill="#f97316">BitmapAllocator</text>
+  <text x="160" y="928" text-anchor="middle" class="node-sub">1 bit per 4KB chunk</text>
+  <text x="160" y="942" text-anchor="middle" class="node-sub">low memory footprint</text>
+
+  <rect x="260" y="896" width="160" height="56" rx="4" ry="4" fill="#020617" stroke="#f97316"/>
+  <text x="340" y="914" text-anchor="middle" class="branch-title" fill="#f97316">AvlAllocator</text>
+  <text x="340" y="928" text-anchor="middle" class="node-sub">AVL tree of free extents</text>
+  <text x="340" y="942" text-anchor="middle" class="node-sub">larger contiguous picks</text>
+
+  <text x="80" y="976" class="node-sub">state durability</text>
+  <text x="80" y="992" class="annotate">- in-RAM during runtime</text>
+  <text x="80" y="1008" class="annotate">- periodic snapshot to RocksDB (b.* keys)</text>
+  <text x="80" y="1024" class="annotate">- replayed from BlueFS log on start</text>
+
+  <!-- Block device strip -->
+  <rect x="460" y="752" width="1080" height="280" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.8"/>
+  <text x="1000" y="776" text-anchor="middle" class="node-title" fill="#f97316">raw block device (e.g. /dev/sdb, opened O_DIRECT, no kernel FS)</text>
+  <text x="1000" y="794" text-anchor="middle" class="node-sub">src/blk/kernel/KernelDevice.cc &#8212; KernelDevice abstraction, AIO / io_uring</text>
+
+  <!-- chunk strip: 24 chunks, mark which area each belongs to -->
+  <!-- Layout: small reserved BlueFS at front, then long BlueStore data area, then a small free area at end -->
+  <!-- chunk size: 40 wide, 50 tall, starting x=480, y=820 -->
+
+  <!-- Background row line -->
+  <rect x="478" y="816" width="1044" height="58" rx="3" ry="3" fill="#020617" stroke="#475569" stroke-width="1"/>
+
+  <!-- 24 chunks of 40 wide each (total 960 + offsets) -->
+  <!-- BlueFS area: chunks 0-3 (purple) -->
+  <rect x="482" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+  <rect x="522" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+  <rect x="562" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+  <rect x="602" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+
+  <!-- BlueStore data: chunks 4-19 (some used green, some free dark) -->
+  <rect x="642" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="682" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="722" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="762" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="802" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="842" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="882" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="922" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="962" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="1002" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="1042" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="1082" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="1122" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="1162" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="1202" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+  <rect x="1242" y="820" width="38" height="50" rx="2" fill="#052e2b" stroke="#10b981" stroke-width="1.2"/>
+
+  <!-- BlueFS overflow / shared: chunks 20-21 (purple) -->
+  <rect x="1282" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+  <rect x="1322" y="820" width="38" height="50" rx="2" fill="#1e1b4b" stroke="#a855f7" stroke-width="1.2"/>
+
+  <!-- free tail: chunks 22-25 -->
+  <rect x="1362" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="1402" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="1442" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+  <rect x="1482" y="820" width="38" height="50" rx="2" fill="#020617" stroke="#475569" stroke-width="1"/>
+
+  <!-- chunk labels -->
+  <text x="500" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="540" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="580" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="620" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="660" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="700" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="740" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="780" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="820" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="860" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="900" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="940" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="980" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1020" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="1060" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1100" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1140" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1180" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="1220" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1260" y="848" text-anchor="middle" class="chunk-label" fill="#6ee7b7">D</text>
+  <text x="1300" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="1340" y="848" text-anchor="middle" class="chunk-label" fill="#c4b5fd">B</text>
+  <text x="1380" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="1420" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="1460" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+  <text x="1500" y="848" text-anchor="middle" class="chunk-label" fill="#475569">.</text>
+
+  <!-- chunk legend -->
+  <rect x="478" y="884" width="14" height="14" fill="#1e1b4b" stroke="#a855f7"/>
+  <text x="500" y="895" class="legend-text">B = BlueFS area (RocksDB SST/WAL files)</text>
+  <rect x="752" y="884" width="14" height="14" fill="#052e2b" stroke="#10b981"/>
+  <text x="774" y="895" class="legend-text">D = BlueStore object data extent</text>
+  <rect x="1006" y="884" width="14" height="14" fill="#020617" stroke="#475569"/>
+  <text x="1028" y="895" class="legend-text">. = free chunk (Allocator-managed)</text>
+  <text x="1500" y="895" text-anchor="end" class="annotate">each chunk &#8776; 4KB or min_alloc_size</text>
+
+  <!-- Allocator -> block device arrows (manages free space across both areas) -->
+  <line x1="440" y1="840" x2="478" y2="840" stroke="#f97316" stroke-width="2.0" marker-end="url(#arrow-orange)"/>
+  <rect x="430" y="822" width="60" height="14" rx="3" fill="#0f172a"/>
+  <text x="460" y="833" text-anchor="middle" class="arrow-label">tracks</text>
+
+  <!-- Allocator drives both BlueStore data + BlueFS allocation -->
+  <text x="710" y="800" class="annotate" fill="#f97316">free-space tracked by Allocator covers both BlueFS area and BlueStore data area on the same block device</text>
+
+  <!-- Optional separate WAL/DB device illustration -->
+  <rect x="478" y="924" width="1044" height="100" rx="6" ry="6" fill="#0a0a0a" stroke="#334155" stroke-dasharray="4,3"/>
+  <text x="1000" y="946" text-anchor="middle" class="node-title" fill="#cbd5e1">optional: separate block.db / block.wal device (NVMe SSD)</text>
+
+  <!-- WAL device strip -->
+  <rect x="498" y="958" width="200" height="44" rx="4" ry="4" fill="#1c1917" stroke="#eab308" stroke-width="1.5"/>
+  <text x="598" y="976" text-anchor="middle" class="branch-title" fill="#eab308">block.wal (small NVMe)</text>
+  <text x="598" y="994" text-anchor="middle" class="node-sub">RocksDB WAL only, hot writes</text>
+
+  <!-- DB device strip -->
+  <rect x="718" y="958" width="240" height="44" rx="4" ry="4" fill="#1c1917" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="838" y="976" text-anchor="middle" class="branch-title" fill="#06b6d4">block.db (NVMe)</text>
+  <text x="838" y="994" text-anchor="middle" class="node-sub">RocksDB SST + BlueFS metadata</text>
+
+  <!-- Main data device strip -->
+  <rect x="978" y="958" width="524" height="44" rx="4" ry="4" fill="#1c1917" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1240" y="976" text-anchor="middle" class="branch-title" fill="#10b981">block (HDD or SSD, biggest)</text>
+  <text x="1240" y="994" text-anchor="middle" class="node-sub">RADOS object data extents (the bulk)</text>
+
+  <text x="1500" y="1018" text-anchor="end" class="annotate">if block.db missing &#8594; SST &amp; WAL fall back onto main block device (single-device OSD)</text>
+
+  <!-- Cross-section arrows: section 1 -> section 2/3 -->
+  <!-- deferred branch -> RocksDB WAL -->
+  <path d="M 1150,176 L 1150,260 L 850,260 L 850,416" fill="none" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="1090" y="262" width="120" height="16" rx="3" fill="#0f172a"/>
+  <text x="1150" y="274" text-anchor="middle" class="arrow-label">payload to WAL</text>
+
+  <!-- direct branch -> Allocator (allocate) -->
+  <path d="M 1150,286 L 1150,732 L 250,732 L 250,752" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="690" y="734" width="170" height="16" rx="3" fill="#0f172a"/>
+  <text x="775" y="746" text-anchor="middle" class="arrow-label">allocate(extent list)</text>
+
+  <!-- direct branch metadata -> RocksDB -->
+  <path d="M 990,236 L 750,236 L 750,358" fill="none" stroke="#10b981" stroke-width="1.6" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="800" y="222" width="170" height="16" rx="3" fill="#0f172a"/>
+  <text x="885" y="234" text-anchor="middle" class="arrow-label">onode / extent metadata</text>
+
+  <!-- BlueStore -> block device (direct AIO data write) -->
+  <path d="M 280,658 L 280,690 L 1000,690 L 1000,752" fill="none" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="600" y="688" width="180" height="16" rx="3" fill="#0f172a"/>
+  <text x="690" y="700" text-anchor="middle" class="arrow-label">aio_write data extent</text>
+
+  <!-- BlueFS -> block device (BlueFS area on same device) -->
+  <path d="M 1160,658 L 1160,690 L 540,690 L 540,752" fill="none" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <rect x="800" y="660" width="180" height="16" rx="3" fill="#0f172a"/>
+  <text x="890" y="672" text-anchor="middle" class="arrow-label">SST / WAL extents</text>
+
+  <!-- Legend -->
+  <rect x="30" y="1056" width="1640" height="32" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="46" y1="1072" x2="78" y2="1072" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="84" y="1076" class="legend-text">op entry</text>
+  <line x1="190" y1="1072" x2="222" y2="1072" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="228" y="1076" class="legend-text">deferred path (WAL piggyback)</text>
+  <line x1="476" y1="1072" x2="508" y2="1072" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="514" y="1076" class="legend-text">direct path (allocate + AIO)</text>
+  <line x1="730" y1="1072" x2="762" y2="1072" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="768" y="1076" class="legend-text">RocksDB &#8596; BlueFS file IO</text>
+  <line x1="970" y1="1072" x2="1002" y2="1072" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="1008" y="1076" class="legend-text">BlueFS extents on block device</text>
+  <line x1="1240" y1="1072" x2="1272" y2="1072" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="1278" y="1076" class="legend-text">Allocator tracks free space</text>
+  <text x="1660" y="1094" text-anchor="end" class="annotate">Source: ceph v19.2.3 src/os/bluestore/{BlueStore, BlueFS, Allocator}.{h,cc}</text>
+</svg>

@@ -168,6 +168,10 @@ class BlueStore : public ObjectStore,
 };
 ```
 
+![Ceph OSD BlueStore 內部結構：BlueStore (object engine) + RocksDB (object metadata, omap, xattrs) on top of BlueFS (minimal FS for RocksDB SST + WAL)；Allocator (Bitmap/AVL) 同時管理 BlueStore object 區與 BlueFS 區的 free space；最底層是 raw block device，可選 separate WAL/DB device](/diagrams/ceph/bluestore-internals.png)
+
+*圖：上半段是 osd-op 進來後 BlueStore 對小寫 / 大寫的兩條 path（deferred vs direct），中段呈現 BlueStore / RocksDB / BlueFS 三者關係，下段顯示 Allocator 與 block device 上的區段配置。*
+
 三個關鍵元件：
 
 **Allocator**：管 raw block 的 free space。給 BlueStore 一個「我要 N bytes」的 request，Allocator 回 `[(offset, length), ...]` 的 extent list。多種策略：
