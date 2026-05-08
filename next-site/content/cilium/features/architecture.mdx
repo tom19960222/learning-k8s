@@ -10,6 +10,10 @@ description: cilium-agent / cilium-operator / hubble-relay 三個 process 的職
 
 ## 整體 process map
 
+![Cilium 架構鳥瞰圖：control plane (cilium-operator + CRDs)、per-node agent (cilium-agent + Hubble + Envoy)、kernel datapath (eBPF programs + BPF maps) 三層](/diagrams/cilium/architecture.png)
+
+*圖：以 control plane / per-node / kernel datapath 三層呈現，箭頭為主要互動通道（CRD watch、UDS API、xDS push、eBPF program load、BPF perf event）。*
+
 ```
 ┌─────────────── control plane ────────────────┐
 │                                               │

@@ -1,0 +1,283 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 900" width="1320" height="900">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#ef4444"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+  </defs>
+  <rect width="1320" height="900" fill="url(#bg-grad)"/>
+  <text x="660" y="40" text-anchor="middle" class="title">Cilium Architecture: control plane &#8594; per-node agent &#8594; eBPF datapath</text>
+
+  <!-- Layer containers -->
+  <rect x="40" y="70" width="1240" height="170" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="92" class="layer-label" fill="#3b82f6">Control Plane (cluster-wide, kube-system)</text>
+
+  <rect x="40" y="280" width="1240" height="200" rx="8" ry="8" fill="#0f172a" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="302" class="layer-label" fill="#f97316">Per-node Agent (DaemonSet, userspace, one per Linux node)</text>
+
+  <rect x="40" y="520" width="1240" height="200" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="542" class="layer-label" fill="#10b981">Kernel Datapath (eBPF programs + BPF maps, attached to tc clsact / XDP / cgroup hooks)</text>
+
+  <rect x="40" y="755" width="1240" height="105" rx="8" ry="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="775" class="layer-label" fill="#a855f7">User Plane (Pod traffic, veth pairs into host netns)</text>
+
+  <!-- Control plane nodes -->
+  <rect x="80" y="115" width="240" height="110" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="200.0" y="141" text-anchor="middle" class="node-title" fill="#f97316">kube-apiserver</text>
+  <text x="200.0" y="161" text-anchor="middle" class="node-sub">REST + watch front door</text>
+  <text x="200.0" y="175" text-anchor="middle" class="node-sub">stores Cilium CRDs</text>
+  <text x="200.0" y="189" text-anchor="middle" class="node-sub">in etcd</text>
+  <text x="200.0" y="207" text-anchor="middle" class="node-sub">(no direct etcd touch)</text>
+
+  <rect x="380" y="115" width="240" height="110" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="500.0" y="141" text-anchor="middle" class="node-title" fill="#3b82f6">cilium-operator</text>
+  <text x="500.0" y="161" text-anchor="middle" class="node-sub">Deployment, leader-elect</text>
+  <text x="500.0" y="175" text-anchor="middle" class="node-sub">IPAM (cluster-pool)</text>
+  <text x="500.0" y="189" text-anchor="middle" class="node-sub">CRD garbage collection</text>
+  <text x="500.0" y="207" text-anchor="middle" class="node-sub">cluster-wide reconcile</text>
+
+  <rect x="680" y="115" width="280" height="110" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="820.0" y="141" text-anchor="middle" class="node-title" fill="#06b6d4">Cilium CRDs</text>
+  <text x="820.0" y="161" text-anchor="middle" class="node-sub">CiliumNode &#183; CiliumEndpoint</text>
+  <text x="820.0" y="175" text-anchor="middle" class="node-sub">CiliumIdentity</text>
+  <text x="820.0" y="189" text-anchor="middle" class="node-sub">CiliumNetworkPolicy</text>
+  <text x="820.0" y="207" text-anchor="middle" class="node-sub">CiliumClusterwideNetworkPolicy</text>
+
+  <rect x="1020" y="115" width="240" height="110" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1140.0" y="141" text-anchor="middle" class="node-title" fill="#a855f7">hubble-relay</text>
+  <text x="1140.0" y="161" text-anchor="middle" class="node-sub">Deployment (optional)</text>
+  <text x="1140.0" y="175" text-anchor="middle" class="node-sub">aggregate N nodes&apos;</text>
+  <text x="1140.0" y="189" text-anchor="middle" class="node-sub">hubble agent gRPC</text>
+  <text x="1140.0" y="207" text-anchor="middle" class="node-sub">fan-in for hubble CLI / UI</text>
+
+  <!-- Per-node agent layer -->
+  <rect x="80" y="325" width="260" height="140" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="210.0" y="351" text-anchor="middle" class="node-title" fill="#f97316">cilium-agent</text>
+  <text x="210.0" y="371" text-anchor="middle" class="node-sub">DaemonSet, per node</text>
+  <text x="210.0" y="385" text-anchor="middle" class="node-sub">Hive cell DI graph</text>
+  <text x="210.0" y="399" text-anchor="middle" class="node-sub">endpoint manager</text>
+  <text x="210.0" y="413" text-anchor="middle" class="node-sub">policy compute</text>
+  <text x="210.0" y="427" text-anchor="middle" class="node-sub">clang + libbpf loader</text>
+  <text x="210.0" y="441" text-anchor="middle" class="node-sub">monitor agent (perf ring)</text>
+
+  <rect x="380" y="325" width="220" height="140" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="490.0" y="351" text-anchor="middle" class="node-title" fill="#a855f7">hubble agent</text>
+  <text x="490.0" y="371" text-anchor="middle" class="node-sub">in-process inside</text>
+  <text x="490.0" y="385" text-anchor="middle" class="node-sub">cilium-agent</text>
+  <text x="490.0" y="399" text-anchor="middle" class="node-sub">parses perf events</text>
+  <text x="490.0" y="413" text-anchor="middle" class="node-sub">to flow records</text>
+  <text x="490.0" y="427" text-anchor="middle" class="node-sub">gRPC server on UDS</text>
+  <text x="490.0" y="441" text-anchor="middle" class="node-sub">+ TCP for relay</text>
+
+  <rect x="640" y="325" width="220" height="140" rx="6" ry="6" fill="#0b1220" stroke="#eab308" stroke-width="1.5"/>
+  <text x="750.0" y="351" text-anchor="middle" class="node-title" fill="#eab308">Envoy proxy</text>
+  <text x="750.0" y="371" text-anchor="middle" class="node-sub">embedded, optional</text>
+  <text x="750.0" y="385" text-anchor="middle" class="node-sub">L7 policy enforcement</text>
+  <text x="750.0" y="399" text-anchor="middle" class="node-sub">(HTTP / gRPC / Kafka)</text>
+  <text x="750.0" y="413" text-anchor="middle" class="node-sub">xDS push from agent</text>
+  <text x="750.0" y="427" text-anchor="middle" class="node-sub">socket-redirect via</text>
+  <text x="750.0" y="441" text-anchor="middle" class="node-sub">bpf_sock cgroup hook</text>
+
+  <rect x="900" y="325" width="220" height="140" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1010.0" y="351" text-anchor="middle" class="node-title" fill="#10b981">cilium-cni</text>
+  <text x="1010.0" y="371" text-anchor="middle" class="node-sub">/opt/cni/bin/cilium-cni</text>
+  <text x="1010.0" y="385" text-anchor="middle" class="node-sub">thin binary, short-lived</text>
+  <text x="1010.0" y="399" text-anchor="middle" class="node-sub">invoked by containerd</text>
+  <text x="1010.0" y="413" text-anchor="middle" class="node-sub">on CNI ADD / DEL</text>
+  <text x="1010.0" y="427" text-anchor="middle" class="node-sub">unix socket &#8594; agent</text>
+  <text x="1010.0" y="441" text-anchor="middle" class="node-sub">returns IP/MAC</text>
+
+  <rect x="1160" y="325" width="100" height="140" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="1210.0" y="351" text-anchor="middle" class="node-title" fill="#475569">kubelet</text>
+  <text x="1210.0" y="375" text-anchor="middle" class="node-sub">CRI gRPC</text>
+  <text x="1210.0" y="389" text-anchor="middle" class="node-sub">to runtime</text>
+  <text x="1210.0" y="411" text-anchor="middle" class="node-sub">containerd</text>
+  <text x="1210.0" y="425" text-anchor="middle" class="node-sub">CRI-O</text>
+
+  <!-- Kernel datapath layer -->
+  <rect x="80" y="565" width="200" height="135" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="180.0" y="591" text-anchor="middle" class="node-title" fill="#10b981">bpf_lxc.c</text>
+  <text x="180.0" y="611" text-anchor="middle" class="node-sub">attached to Pod veth</text>
+  <text x="180.0" y="625" text-anchor="middle" class="node-sub">tc clsact ingress/egress</text>
+  <text x="180.0" y="639" text-anchor="middle" class="node-sub">policy enforcement</text>
+  <text x="180.0" y="653" text-anchor="middle" class="node-sub">identity lookup</text>
+  <text x="180.0" y="667" text-anchor="middle" class="node-sub">conntrack + NAT</text>
+  <text x="180.0" y="681" text-anchor="middle" class="node-sub">redirect to next hop</text>
+
+  <rect x="320" y="565" width="200" height="135" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="420.0" y="591" text-anchor="middle" class="node-title" fill="#10b981">bpf_host.c</text>
+  <text x="420.0" y="611" text-anchor="middle" class="node-sub">attached to host eth0</text>
+  <text x="420.0" y="625" text-anchor="middle" class="node-sub">tc clsact ingress/egress</text>
+  <text x="420.0" y="639" text-anchor="middle" class="node-sub">node-level policy</text>
+  <text x="420.0" y="653" text-anchor="middle" class="node-sub">service routing (KPR)</text>
+  <text x="420.0" y="667" text-anchor="middle" class="node-sub">decapsulate VXLAN/Geneve</text>
+  <text x="420.0" y="681" text-anchor="middle" class="node-sub">handoff to bpf_lxc</text>
+
+  <rect x="560" y="565" width="200" height="135" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="660.0" y="591" text-anchor="middle" class="node-title" fill="#10b981">bpf_xdp.c</text>
+  <text x="660.0" y="611" text-anchor="middle" class="node-sub">attached XDP_DRV /</text>
+  <text x="660.0" y="625" text-anchor="middle" class="node-sub">XDP_GENERIC mode</text>
+  <text x="660.0" y="639" text-anchor="middle" class="node-sub">earliest hook (pre-skb)</text>
+  <text x="660.0" y="653" text-anchor="middle" class="node-sub">DDoS drop</text>
+  <text x="660.0" y="667" text-anchor="middle" class="node-sub">LB DSR forwarding</text>
+  <text x="660.0" y="681" text-anchor="middle" class="node-sub">runs on NIC driver</text>
+
+  <rect x="800" y="565" width="200" height="135" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="900.0" y="591" text-anchor="middle" class="node-title" fill="#10b981">bpf_overlay.c</text>
+  <text x="900.0" y="611" text-anchor="middle" class="node-sub">attached to vxlan_sys /</text>
+  <text x="900.0" y="625" text-anchor="middle" class="node-sub">geneve_sys interface</text>
+  <text x="900.0" y="639" text-anchor="middle" class="node-sub">tunnel encap/decap</text>
+  <text x="900.0" y="653" text-anchor="middle" class="node-sub">pod-to-pod across nodes</text>
+  <text x="900.0" y="667" text-anchor="middle" class="node-sub">when not in native</text>
+  <text x="900.0" y="681" text-anchor="middle" class="node-sub">routing mode</text>
+
+  <rect x="1040" y="565" width="220" height="135" rx="6" ry="6" fill="#0a0a0a" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1150.0" y="591" text-anchor="middle" class="node-title" fill="#06b6d4">BPF maps</text>
+  <text x="1150.0" y="611" text-anchor="middle" class="node-sub">PolicyMap (per endpoint)</text>
+  <text x="1150.0" y="625" text-anchor="middle" class="node-sub">EndpointMap / IPCache</text>
+  <text x="1150.0" y="639" text-anchor="middle" class="node-sub">Identity &#8594; SecID</text>
+  <text x="1150.0" y="653" text-anchor="middle" class="node-sub">Service / Backend (KPR)</text>
+  <text x="1150.0" y="667" text-anchor="middle" class="node-sub">ConntrackMap</text>
+  <text x="1150.0" y="681" text-anchor="middle" class="node-sub">events ring (perf)</text>
+
+  <!-- User plane (pods) -->
+  <rect x="120" y="785" width="220" height="60" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="230.0" y="810" text-anchor="middle" class="node-title" fill="#a855f7">Pod (workload)</text>
+  <text x="230.0" y="828" text-anchor="middle" class="node-sub">veth peer in host netns</text>
+
+  <rect x="380" y="785" width="220" height="60" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="490.0" y="810" text-anchor="middle" class="node-title" fill="#a855f7">Pod (workload)</text>
+  <text x="490.0" y="828" text-anchor="middle" class="node-sub">L7-tagged via Envoy</text>
+
+  <rect x="640" y="785" width="220" height="60" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="750.0" y="810" text-anchor="middle" class="node-title" fill="#a855f7">remote node Pod</text>
+  <text x="750.0" y="828" text-anchor="middle" class="node-sub">via overlay tunnel</text>
+
+  <rect x="900" y="785" width="220" height="60" rx="6" ry="6" fill="#0b1220" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1010.0" y="810" text-anchor="middle" class="node-title" fill="#a855f7">external client</text>
+  <text x="1010.0" y="828" text-anchor="middle" class="node-sub">North-South via XDP / NodePort</text>
+
+  <!-- Arrows: control plane internal -->
+  <!-- operator <-> apiserver (CRD watch / write) -->
+  <line x1="380" y1="150" x2="320" y2="150" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="316.0" y="132" width="68" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="350" y="144" text-anchor="middle" class="arrow-label" fill="#cbd5e1">CRD watch</text>
+  <line x1="320" y1="180" x2="380" y2="180" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="320.0" y="186" width="60" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="350" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">CRD write</text>
+
+  <!-- operator -> CRDs (write) -->
+  <line x1="620" y1="170" x2="680" y2="170" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <rect x="617.5" y="152" width="65" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="650" y="164" text-anchor="middle" class="arrow-label" fill="#cbd5e1">create/GC</text>
+
+  <!-- relay <-> CRDs none; relay <-> apiserver none direct; relay -> hubble agents -->
+  <!-- hubble-relay -> hubble agent (gRPC) -->
+  <path d="M 1100,225 L 1100,260 L 490,260 L 490,325" fill="none" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="6,4"/>
+  <rect x="724.5" y="250" width="131" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="790" y="262" text-anchor="middle" class="arrow-label" fill="#cbd5e1">aggregate gRPC</text>
+
+  <!-- agent <-> apiserver via CRDs (watch/list) -->
+  <path d="M 210,325 L 210,255 L 200,255 L 200,225" fill="none" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="155.5" y="246" width="100" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="205" y="258" text-anchor="middle" class="arrow-label" fill="#cbd5e1">list / watch CRDs</text>
+
+  <!-- agent <-> CRDs (read) via apiserver — routed above agent boxes -->
+  <path d="M 300,325 L 300,265 L 940,265 L 940,225" fill="none" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)" stroke-dasharray="6,4"/>
+  <rect x="556.5" y="252" width="127" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="620" y="264" text-anchor="middle" class="arrow-label" fill="#cbd5e1">read CiliumEndpoint</text>
+
+  <!-- agent -> Envoy (xDS push) — routed above hubble agent box -->
+  <path d="M 320,325 L 320,313 L 660,313 L 660,325" fill="none" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="455.0" y="304" width="70" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="490" y="316" text-anchor="middle" class="arrow-label" fill="#cbd5e1">xDS push</text>
+
+  <!-- cilium-cni -> agent (unix socket) — routed below the agent boxes via layer bottom -->
+  <path d="M 920,465 L 920,475 L 220,475 L 220,465" fill="none" stroke="#f97316" stroke-width="2.0" marker-end="url(#arrow-orange)"/>
+  <rect x="525.0" y="479" width="90" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="570" y="491" text-anchor="middle" class="arrow-label" fill="#cbd5e1">UDS API call</text>
+
+  <!-- kubelet -> cilium-cni (CNI ADD via containerd) -->
+  <line x1="1160" y1="395" x2="1120" y2="395" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <rect x="1108.0" y="376" width="64" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1140" y="388" text-anchor="middle" class="arrow-label" fill="#cbd5e1">CNI ADD</text>
+
+  <!-- agent -> eBPF programs (load/replace) -->
+  <line x1="180" y1="465" x2="180" y2="565" stroke="#ef4444" stroke-width="2.2" marker-end="url(#arrow-rose)"/>
+  <rect x="125.0" y="495" width="110" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="180" y="507" text-anchor="middle" class="arrow-label" fill="#cbd5e1">libbpf load + pin</text>
+
+  <line x1="240" y1="465" x2="380" y2="565" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)" stroke-dasharray="6,4"/>
+  <line x1="270" y1="465" x2="600" y2="565" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)" stroke-dasharray="6,4"/>
+  <line x1="290" y1="465" x2="830" y2="565" stroke="#ef4444" stroke-width="1.6" marker-end="url(#arrow-rose)" stroke-dasharray="6,4"/>
+
+  <!-- agent -> BPF maps (write) -->
+  <path d="M 320,440 L 1080,540 L 1080,565" fill="none" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <rect x="666.5" y="468" width="127" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="730" y="480" text-anchor="middle" class="arrow-label" fill="#cbd5e1">write PolicyMap</text>
+
+  <!-- BPF maps -> agent (event ring read) for hubble/monitor -->
+  <path d="M 1180,565 L 1180,490 L 510,490 L 510,465" fill="none" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="4,3"/>
+  <rect x="827.5" y="478" width="125" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="890" y="490" text-anchor="middle" class="arrow-label" fill="#cbd5e1">perf event ring</text>
+
+  <!-- bpf programs -> Pod (datapath) -->
+  <line x1="180" y1="700" x2="230" y2="785" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="174.5" y="734" width="71" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="210" y="746" text-anchor="middle" class="arrow-label" fill="#cbd5e1">veth tc</text>
+
+  <line x1="420" y1="700" x2="490" y2="785" stroke="#eab308" stroke-width="2.0" marker-end="url(#arrow-yellow)"/>
+  <rect x="438.5" y="734" width="73" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="475" y="746" text-anchor="middle" class="arrow-label" fill="#cbd5e1">L7 redirect</text>
+
+  <line x1="900" y1="700" x2="750" y2="785" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)"/>
+  <rect x="787.5" y="734" width="105" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="840" y="746" text-anchor="middle" class="arrow-label" fill="#cbd5e1">VXLAN encap</text>
+
+  <line x1="660" y1="700" x2="1010" y2="785" stroke="#10b981" stroke-width="2.0" marker-end="url(#arrow-green)" stroke-dasharray="6,4"/>
+  <rect x="828.5" y="734" width="83" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="870" y="746" text-anchor="middle" class="arrow-label" fill="#cbd5e1">XDP drop/LB</text>
+
+  <!-- Legend -->
+  <rect x="40" y="868" width="1240" height="24" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="56" y1="880" x2="88" y2="880" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="94" y="884" class="legend-text">CRD watch / list (apiserver)</text>
+  <line x1="316" y1="880" x2="348" y2="880" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="354" y="884" class="legend-text">CRD / BPF map data</text>
+  <line x1="546" y1="880" x2="578" y2="880" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="584" y="884" class="legend-text">CNI / UDS RPC</text>
+  <line x1="746" y1="880" x2="778" y2="880" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="784" y="884" class="legend-text">eBPF program load</text>
+  <line x1="956" y1="880" x2="988" y2="880" stroke="#a855f7" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="994" y="884" class="legend-text">observability (perf ring / hubble)</text>
+</svg>
