@@ -1,0 +1,288 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 940" width="1320" height="940">
+  <style>
+    text { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Courier New', 'PingFang TC', 'Microsoft JhengHei', 'Microsoft YaHei', 'SimHei', monospace; fill: #e2e8f0; }
+    .title { font-size: 22px; font-weight: 700; fill: #f1f5f9; }
+    .layer-label { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
+    .node-title { font-size: 15px; font-weight: 700; }
+    .node-sub { font-size: 11px; fill: #94a3b8; }
+    .arrow-label { font-size: 11px; fill: #cbd5e1; }
+    .legend-text { font-size: 12px; fill: #cbd5e1; }
+  </style>
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f0f1a"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#f97316"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-yellow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#eab308"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#a855f7"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#ef4444"/>
+    </marker>
+  </defs>
+  <rect width="1320" height="940" fill="url(#bg-grad)"/>
+  <text x="660" y="38" text-anchor="middle" class="title">Ceph Architecture: clients &#8594; RADOS daemons &#8594; per-OSD BlueStore stack</text>
+
+  <!-- Layer 1: Clients -->
+  <rect x="40" y="64" width="1240" height="120" rx="8" ry="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="86" class="layer-label" fill="#3b82f6">Layer 1 &#8212; Clients (user-space libraries / S3 callers, talk directly to OSDs after MON map fetch)</text>
+
+  <!-- Layer 2: Daemons -->
+  <rect x="40" y="208" width="900" height="220" rx="8" ry="8" fill="#0f172a" stroke="#f97316" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="230" class="layer-label" fill="#f97316">Layer 2 &#8212; RADOS daemons (cluster-wide, deployed by cephadm / rook)</text>
+
+  <!-- Layer 2b: Cluster Maps (right side) -->
+  <rect x="960" y="208" width="320" height="220" rx="8" ry="8" fill="#0f172a" stroke="#06b6d4" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="976" y="230" class="layer-label" fill="#06b6d4">Cluster Maps (Paxos-replicated control state)</text>
+
+  <!-- Layer 3: Per-OSD storage stack -->
+  <rect x="40" y="452" width="1240" height="380" rx="8" ry="8" fill="#0f172a" stroke="#10b981" stroke-width="1.5" stroke-dasharray="6,4" opacity="0.95"/>
+  <text x="56" y="474" class="layer-label" fill="#10b981">Layer 3 &#8212; Per-OSD storage internals (one stack per ceph-osd process, typical one OSD per disk)</text>
+
+  <!-- ==================== Layer 1 nodes (Clients) ==================== -->
+  <rect x="80" y="106" width="220" height="68" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="190" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">librados</text>
+  <text x="190" y="148" text-anchor="middle" class="node-sub">C/C++/Python API</text>
+  <text x="190" y="162" text-anchor="middle" class="node-sub">Objecter dispatcher</text>
+
+  <rect x="320" y="106" width="220" height="68" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="430" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">librbd</text>
+  <text x="430" y="148" text-anchor="middle" class="node-sub">RBD block image</text>
+  <text x="430" y="162" text-anchor="middle" class="node-sub">KubeVirt / QEMU / krbd</text>
+
+  <rect x="560" y="106" width="220" height="68" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="670" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">libcephfs</text>
+  <text x="670" y="148" text-anchor="middle" class="node-sub">POSIX FS client</text>
+  <text x="670" y="162" text-anchor="middle" class="node-sub">talks to MDS + OSDs</text>
+
+  <rect x="800" y="106" width="220" height="68" rx="6" ry="6" fill="#0b1220" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="910" y="130" text-anchor="middle" class="node-title" fill="#3b82f6">RGW S3 clients</text>
+  <text x="910" y="148" text-anchor="middle" class="node-sub">HTTP S3 / Swift</text>
+  <text x="910" y="162" text-anchor="middle" class="node-sub">awscli / boto / s3cmd</text>
+
+  <rect x="1040" y="106" width="220" height="68" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="1150" y="130" text-anchor="middle" class="node-title" fill="#94a3b8">cephadm / rook</text>
+  <text x="1150" y="148" text-anchor="middle" class="node-sub">orchestrator</text>
+  <text x="1150" y="162" text-anchor="middle" class="node-sub">deploys daemons</text>
+
+  <!-- ==================== Layer 2 nodes (Daemons) ==================== -->
+  <rect x="60" y="252" width="200" height="160" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="160" y="278" text-anchor="middle" class="node-title" fill="#f97316">ceph-mon (3-5)</text>
+  <text x="160" y="298" text-anchor="middle" class="node-sub">odd count for quorum</text>
+  <text x="160" y="312" text-anchor="middle" class="node-sub">Paxos consensus peers</text>
+  <text x="160" y="326" text-anchor="middle" class="node-sub">holds cluster maps</text>
+  <text x="160" y="340" text-anchor="middle" class="node-sub">no data path</text>
+  <text x="160" y="354" text-anchor="middle" class="node-sub">src/ceph_mon.cc</text>
+  <text x="160" y="368" text-anchor="middle" class="node-sub">src/mon/Monitor.h</text>
+  <text x="160" y="386" text-anchor="middle" class="node-sub">tolerates floor(N/2) fail</text>
+
+  <rect x="280" y="252" width="180" height="160" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="370" y="278" text-anchor="middle" class="node-title" fill="#f97316">ceph-mgr</text>
+  <text x="370" y="298" text-anchor="middle" class="node-sub">1 active + standby</text>
+  <text x="370" y="312" text-anchor="middle" class="node-sub">metric aggregation</text>
+  <text x="370" y="326" text-anchor="middle" class="node-sub">dashboard module</text>
+  <text x="370" y="340" text-anchor="middle" class="node-sub">Prometheus exporter</text>
+  <text x="370" y="354" text-anchor="middle" class="node-sub">orchestrator API</text>
+  <text x="370" y="368" text-anchor="middle" class="node-sub">no data path</text>
+  <text x="370" y="386" text-anchor="middle" class="node-sub">src/ceph_mgr.cc</text>
+
+  <rect x="480" y="252" width="200" height="160" rx="6" ry="6" fill="#1c1917" stroke="#f97316" stroke-width="1.5"/>
+  <text x="580" y="278" text-anchor="middle" class="node-title" fill="#f97316">ceph-osd (per disk)</text>
+  <text x="580" y="298" text-anchor="middle" class="node-sub">N OSDs cluster-wide</text>
+  <text x="580" y="312" text-anchor="middle" class="node-sub">stores RADOS objects</text>
+  <text x="580" y="326" text-anchor="middle" class="node-sub">primary &#8594; replicas</text>
+  <text x="580" y="340" text-anchor="middle" class="node-sub">PG peering / scrub</text>
+  <text x="580" y="354" text-anchor="middle" class="node-sub">recovery / backfill</text>
+  <text x="580" y="368" text-anchor="middle" class="node-sub">heartbeat to peers</text>
+  <text x="580" y="386" text-anchor="middle" class="node-sub">src/ceph_osd.cc</text>
+
+  <rect x="700" y="252" width="110" height="160" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="755" y="278" text-anchor="middle" class="node-title" fill="#f97316">ceph-mds</text>
+  <text x="755" y="298" text-anchor="middle" class="node-sub">CephFS only</text>
+  <text x="755" y="312" text-anchor="middle" class="node-sub">POSIX inode</text>
+  <text x="755" y="326" text-anchor="middle" class="node-sub">+ dir tree</text>
+  <text x="755" y="340" text-anchor="middle" class="node-sub">metadata</text>
+  <text x="755" y="354" text-anchor="middle" class="node-sub">no data path</text>
+  <text x="755" y="368" text-anchor="middle" class="node-sub">(data goes</text>
+  <text x="755" y="382" text-anchor="middle" class="node-sub">to OSDs)</text>
+
+  <rect x="830" y="252" width="100" height="160" rx="6" ry="6" fill="#0b1220" stroke="#f97316" stroke-width="1.5"/>
+  <text x="880" y="278" text-anchor="middle" class="node-title" fill="#f97316">radosgw</text>
+  <text x="880" y="298" text-anchor="middle" class="node-sub">S3 / Swift</text>
+  <text x="880" y="312" text-anchor="middle" class="node-sub">gateway</text>
+  <text x="880" y="326" text-anchor="middle" class="node-sub">HTTP &#8594;</text>
+  <text x="880" y="340" text-anchor="middle" class="node-sub">RADOS op</text>
+  <text x="880" y="354" text-anchor="middle" class="node-sub">civetweb</text>
+  <text x="880" y="368" text-anchor="middle" class="node-sub">/ beast</text>
+  <text x="880" y="382" text-anchor="middle" class="node-sub">embedded</text>
+
+  <!-- ==================== Cluster Maps (right of layer 2) ==================== -->
+  <rect x="980" y="252" width="135" height="68" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1047" y="276" text-anchor="middle" class="node-title" fill="#06b6d4">monmap</text>
+  <text x="1047" y="294" text-anchor="middle" class="node-sub">MON list</text>
+  <text x="1047" y="308" text-anchor="middle" class="node-sub">+ addrs</text>
+
+  <rect x="1130" y="252" width="135" height="68" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1197" y="276" text-anchor="middle" class="node-title" fill="#06b6d4">osdmap</text>
+  <text x="1197" y="294" text-anchor="middle" class="node-sub">OSD up/in</text>
+  <text x="1197" y="308" text-anchor="middle" class="node-sub">epoch</text>
+
+  <rect x="980" y="338" width="135" height="68" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1047" y="362" text-anchor="middle" class="node-title" fill="#06b6d4">crushmap</text>
+  <text x="1047" y="380" text-anchor="middle" class="node-sub">topology +</text>
+  <text x="1047" y="394" text-anchor="middle" class="node-sub">rules</text>
+
+  <rect x="1130" y="338" width="135" height="68" rx="6" ry="6" fill="#0b1220" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="1197" y="362" text-anchor="middle" class="node-title" fill="#06b6d4">pgmap</text>
+  <text x="1197" y="380" text-anchor="middle" class="node-sub">PG state /</text>
+  <text x="1197" y="394" text-anchor="middle" class="node-sub">stats</text>
+
+  <!-- ==================== Layer 3 nodes (per-OSD stack) ==================== -->
+  <rect x="80" y="500" width="1200" height="80" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="680" y="528" text-anchor="middle" class="node-title" fill="#10b981">BlueStore (object engine)</text>
+  <text x="680" y="548" text-anchor="middle" class="node-sub">RADOS object &#8594; (data extent on raw block) + (omap / xattr / metadata in RocksDB)</text>
+  <text x="680" y="564" text-anchor="middle" class="node-sub">deferred writes / WAL / checksum / compression / mempools &#8212; src/os/bluestore/BlueStore.cc</text>
+
+  <rect x="80" y="600" width="380" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="270" y="626" text-anchor="middle" class="node-title" fill="#10b981">BlueFS (mini filesystem)</text>
+  <text x="270" y="646" text-anchor="middle" class="node-sub">user-space FS just for RocksDB files</text>
+  <text x="270" y="660" text-anchor="middle" class="node-sub">log-structured, no inodes</text>
+  <text x="270" y="674" text-anchor="middle" class="node-sub">shares the block device with BlueStore</text>
+  <text x="270" y="688" text-anchor="middle" class="node-sub">src/os/bluestore/BlueFS.cc</text>
+
+  <rect x="480" y="600" width="380" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="670" y="626" text-anchor="middle" class="node-title" fill="#10b981">RocksDB (k/v store)</text>
+  <text x="670" y="646" text-anchor="middle" class="node-sub">stores object metadata, omap,</text>
+  <text x="670" y="660" text-anchor="middle" class="node-sub">PG state, stats</text>
+  <text x="670" y="674" text-anchor="middle" class="node-sub">LSM-tree, SST files on BlueFS</text>
+  <text x="670" y="688" text-anchor="middle" class="node-sub">WAL keeps small writes durable</text>
+
+  <rect x="880" y="600" width="380" height="100" rx="6" ry="6" fill="#0b1220" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1070" y="626" text-anchor="middle" class="node-title" fill="#10b981">block device (raw NVMe / SSD / HDD)</text>
+  <text x="1070" y="646" text-anchor="middle" class="node-sub">no kernel filesystem in path</text>
+  <text x="1070" y="660" text-anchor="middle" class="node-sub">BlockDevice abstraction (KernelDevice)</text>
+  <text x="1070" y="674" text-anchor="middle" class="node-sub">direct AIO / io_uring</text>
+  <text x="1070" y="688" text-anchor="middle" class="node-sub">src/blk/kernel/KernelDevice.cc</text>
+
+  <rect x="80" y="720" width="1200" height="90" rx="6" ry="6" fill="#0a0a0a" stroke="#475569" stroke-width="1.5"/>
+  <text x="680" y="746" text-anchor="middle" class="node-title" fill="#94a3b8">Linux kernel block layer (no filesystem; OSD opens device with O_DIRECT)</text>
+  <text x="680" y="764" text-anchor="middle" class="node-sub">kernel does NOT see RADOS objects &#8212; just raw block IO from the OSD process</text>
+  <text x="680" y="780" text-anchor="middle" class="node-sub">historic FileStore (XFS) is deprecated; v19.2.3 default is BlueStore on raw device</text>
+  <text x="680" y="796" text-anchor="middle" class="node-sub">cgroup / IO scheduler still apply (per-OSD systemd unit)</text>
+
+  <!-- ==================== Arrows ==================== -->
+
+  <!-- Clients -> MON: bootstrap fetch monmap/osdmap -->
+  <path d="M 190,174 L 190,196 L 130,196 L 130,252" fill="none" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <rect x="65" y="186" width="130" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="130" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">bootstrap: get map</text>
+
+  <!-- Clients -> OSD: data path (after CRUSH compute) -->
+  <path d="M 430,174 L 430,196 L 580,196 L 580,252" fill="none" stroke="#3b82f6" stroke-width="2.2" marker-end="url(#arrow-blue)"/>
+  <rect x="478" y="186" width="170" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="563" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">CRUSH-placed read/write</text>
+
+  <!-- libcephfs -> MDS -->
+  <path d="M 670,174 L 670,196 L 740,196 L 740,252" fill="none" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <rect x="660" y="186" width="100" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="710" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">FS metadata</text>
+
+  <!-- RGW S3 clients -> radosgw -->
+  <path d="M 910,174 L 910,196 L 880,196 L 880,252" fill="none" stroke="#3b82f6" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <rect x="850" y="186" width="80" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="890" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">HTTP S3</text>
+
+  <!-- cephadm/rook -> MGR (orchestrator API) -->
+  <path d="M 1150,174 L 1150,196 L 410,196 L 410,252" fill="none" stroke="#a855f7" stroke-width="1.6" marker-end="url(#arrow-purple)" stroke-dasharray="6,4"/>
+  <rect x="1015" y="186" width="200" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1115" y="198" text-anchor="middle" class="arrow-label" fill="#cbd5e1">orchestrator deploy / upgrade</text>
+
+  <!-- MON Paxos peers (self-loop indicator) -->
+  <path d="M 80,290 L 60,290 L 60,360 L 80,360" fill="none" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <text x="36" y="328" text-anchor="middle" class="arrow-label" fill="#eab308" transform="rotate(-90 36 328)">Paxos</text>
+
+  <!-- MON <-> MGR (status / cluster log) -->
+  <line x1="260" y1="300" x2="280" y2="300" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <line x1="280" y1="330" x2="260" y2="330" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <rect x="225" y="306" width="70" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="260" y="318" text-anchor="middle" class="arrow-label" fill="#cbd5e1">map / stats</text>
+
+  <!-- OSD <-> OSD replication peers (self-loop on OSD box) -->
+  <path d="M 680,290 L 700,290 L 700,232 L 580,232 L 580,252" fill="none" stroke="#ef4444" stroke-width="2.0" marker-end="url(#arrow-rose)"/>
+  <rect x="565" y="216" width="160" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="645" y="228" text-anchor="middle" class="arrow-label" fill="#cbd5e1">replication primary &#8594; secondary</text>
+
+  <!-- MON -> Cluster Maps (publishes Paxos-committed maps; routed above daemon row) -->
+  <path d="M 260,252 L 260,240 L 1000,240 L 1000,252" fill="none" stroke="#06b6d4" stroke-width="2.0" marker-end="url(#arrow-cyan)"/>
+  <rect x="568" y="244" width="124" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="630" y="254" text-anchor="middle" class="arrow-label" fill="#cbd5e1">publishes maps</text>
+
+  <!-- OSD -> Cluster Maps (osdmap subscribe; routed below daemon row to crushmap bottom) -->
+  <path d="M 680,412 L 680,422 L 1050,422 L 1050,406" fill="none" stroke="#06b6d4" stroke-width="1.6" marker-end="url(#arrow-cyan)" stroke-dasharray="6,4"/>
+  <rect x="753" y="424" width="134" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="820" y="434" text-anchor="middle" class="arrow-label" fill="#cbd5e1">osdmap subscribe</text>
+
+  <!-- OSD -> BlueStore (per-OSD storage entry) -->
+  <line x1="580" y1="412" x2="580" y2="500" stroke="#10b981" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <rect x="510" y="446" width="142" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="580" y="458" text-anchor="middle" class="arrow-label" fill="#cbd5e1">RADOS object op</text>
+
+  <!-- BlueStore -> BlueFS (RocksDB files) -->
+  <line x1="270" y1="580" x2="270" y2="600" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="223" y="582" width="92" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="269" y="594" text-anchor="middle" class="arrow-label" fill="#cbd5e1">log files</text>
+
+  <!-- BlueStore -> RocksDB (omap / metadata writes) -->
+  <line x1="670" y1="580" x2="670" y2="600" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="608" y="582" width="120" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="668" y="594" text-anchor="middle" class="arrow-label" fill="#cbd5e1">omap / xattr put</text>
+
+  <!-- BlueStore -> block device (data extents direct AIO) -->
+  <line x1="1070" y1="580" x2="1070" y2="600" stroke="#10b981" stroke-width="2.2" marker-end="url(#arrow-green)"/>
+  <rect x="985" y="582" width="170" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1070" y="594" text-anchor="middle" class="arrow-label" fill="#cbd5e1">direct AIO data extent</text>
+
+  <!-- RocksDB -> BlueFS (SST + WAL files) -->
+  <line x1="480" y1="650" x2="460" y2="650" stroke="#eab308" stroke-width="1.8" marker-end="url(#arrow-yellow)"/>
+  <rect x="425" y="632" width="80" height="16" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="465" y="644" text-anchor="middle" class="arrow-label" fill="#cbd5e1">SST + WAL</text>
+
+  <!-- BlueFS -> block device (shares device; routed below storage row to avoid RocksDB) -->
+  <path d="M 460,700 L 460,710 L 1070,710 L 1070,700" fill="none" stroke="#eab308" stroke-width="1.6" marker-end="url(#arrow-yellow)"/>
+  <rect x="700" y="703" width="140" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="770" y="713" text-anchor="middle" class="arrow-label" fill="#cbd5e1">shared block area</text>
+
+  <!-- block device -> kernel block layer -->
+  <line x1="1070" y1="700" x2="1070" y2="720" stroke="#475569" stroke-width="1.8" marker-end="url(#arrow-green)" stroke-dasharray="4,3"/>
+  <rect x="1003" y="704" width="134" height="14" rx="3" fill="#0f172a" opacity="0.92"/>
+  <text x="1070" y="715" text-anchor="middle" class="arrow-label" fill="#cbd5e1">O_DIRECT to /dev/sdX</text>
+
+  <!-- Legend -->
+  <rect x="40" y="846" width="1240" height="32" rx="4" fill="#0f172a" stroke="#334155" opacity="0.95"/>
+  <line x1="56" y1="862" x2="88" y2="862" stroke="#3b82f6" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="94" y="866" class="legend-text">client &#8594; daemon</text>
+  <line x1="236" y1="862" x2="268" y2="862" stroke="#f97316" stroke-width="1.8" marker-end="url(#arrow-orange)"/>
+  <text x="274" y="866" class="legend-text">daemon &#8596; daemon (control)</text>
+  <line x1="496" y1="862" x2="528" y2="862" stroke="#06b6d4" stroke-width="1.8" marker-end="url(#arrow-cyan)"/>
+  <text x="534" y="866" class="legend-text">cluster map publish / subscribe</text>
+  <line x1="776" y1="862" x2="808" y2="862" stroke="#ef4444" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+  <text x="814" y="866" class="legend-text">OSD replication</text>
+  <line x1="956" y1="862" x2="988" y2="862" stroke="#10b981" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="994" y="866" class="legend-text">OSD &#8594; storage stack</text>
+  <text x="1270" y="892" text-anchor="end" class="node-sub">Source: ceph v19.2.3 src/{ceph_mon, ceph_mgr, ceph_osd, mon/Monitor, os/bluestore, blk/kernel/KernelDevice}</text>
+</svg>
