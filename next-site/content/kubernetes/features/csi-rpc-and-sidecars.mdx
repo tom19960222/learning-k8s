@@ -55,6 +55,10 @@ Day20 的架構圖把 driver container 與 sidecar container 放在同一個 Pod
 
 所以 CSI driver 作者最核心要寫的是 storage backend 的 RPC 實作。Kubernetes informer/workqueue/leader election/retry 這些 controller plumbing，盡量由 sidecar 承擔。
 
+![Kubernetes CSI volume lifecycle swimlane：user / apiserver / external-provisioner / external-attacher / kubelet / node-driver-registrar / CSI controller container / CSI node container / storage backend，5 phases (Provision → Bind → Attach → Stage → Publish) 標明每個 sidecar 在哪一步觸發](/diagrams/kubernetes/csi-volume-lifecycle.png)
+
+*圖：以 swimlane 顯示一個 PVC 從建立到掛進 Pod 的完整路徑；每個 sidecar 各司其職，箭頭即 CSI gRPC 與 k8s API 物件變化。*
+
 ## Dynamic provisioning source path
 
 `kubernetes/pkg/controller/volume/persistentvolume/pv_controller.go` 的 `provisionClaimOperationExternal()` 不會呼叫 `CreateVolume`。它只在 PVC 上標出 external provisioner name，並發 event。
