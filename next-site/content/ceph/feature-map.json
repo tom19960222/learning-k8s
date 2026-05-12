@@ -1,0 +1,16 @@
+{
+  "projectId": "ceph",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "MON / OSD / MGR / MDS / RGW 五大 daemon 角色與資料分層", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "osd-and-bluestore", "label": "OSD & BlueStore", "description": "OSD 行程與 BlueStore 後端：直寫 raw block device", "featureSlug": "osd-and-bluestore", "category": "lifecycle", "position": {"x": 150, "y": 220}},
+    {"id": "crush-and-placement", "label": "CRUSH & PG", "description": "用 CRUSH 演算法將 object 對映到 PG 再對映到 OSD", "featureSlug": "crush-and-placement", "category": "controller", "position": {"x": 650, "y": 220}},
+    {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}}
+  ],
+  "edges": [
+    {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
+    {"id": "e-arch-crush", "source": "architecture", "target": "crush-and-placement", "label": "defines"},
+    {"id": "e-crush-osd", "source": "crush-and-placement", "target": "osd-and-bluestore", "label": "maps to", "animated": true},
+    {"id": "e-rbd-crush", "source": "rbd-and-csi", "target": "crush-and-placement", "label": "queries"},
+    {"id": "e-rbd-osd", "source": "rbd-and-csi", "target": "osd-and-bluestore", "label": "writes via", "animated": true}
+  ]
+}

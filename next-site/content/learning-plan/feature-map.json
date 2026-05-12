@@ -1,0 +1,16 @@
+{
+  "projectId": "learning-plan",
+  "nodes": [
+    {"id": "week1", "label": "Week 1 — 基礎", "description": "Day 1-7：kind/minikube、kubectl、Pod/Deployment 基礎", "featureSlug": "day-01", "category": "infra", "position": {"x": 150, "y": 50}},
+    {"id": "week2", "label": "Week 2 — 進階", "description": "Day 8-14：CNI、CSI、Cilium、Ceph 起手", "featureSlug": "day-08", "category": "api", "position": {"x": 400, "y": 50}},
+    {"id": "week3", "label": "Week 3 — 整合", "description": "Day 15-21：KubeVirt VM、Multus 多網卡、bare-metal 串接", "featureSlug": "day-15", "category": "controller", "position": {"x": 650, "y": 50}},
+    {"id": "week4", "label": "Week 4 — 實戰", "description": "Day 22-28：Proxmox 3-node 部署、live migration、災難演練", "featureSlug": "day-22", "category": "lifecycle", "position": {"x": 400, "y": 220}},
+    {"id": "finale", "label": "Final — 完賽總結", "description": "Day 29-30：總複習與後續路徑", "featureSlug": "day-30", "category": "addon", "position": {"x": 400, "y": 390}}
+  ],
+  "edges": [
+    {"id": "e-w1-w2", "source": "week1", "target": "week2", "label": "builds on", "animated": true},
+    {"id": "e-w2-w3", "source": "week2", "target": "week3", "label": "builds on", "animated": true},
+    {"id": "e-w3-w4", "source": "week3", "target": "week4", "label": "builds on", "animated": true},
+    {"id": "e-w4-finale", "source": "week4", "target": "finale", "label": "concludes", "animated": true}
+  ]
+}

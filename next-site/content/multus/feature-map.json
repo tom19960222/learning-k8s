@@ -1,0 +1,15 @@
+{
+  "projectId": "multus",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "meta-plugin 角色：在 kubelet 與下層 CNI 之間穿插", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "k8s-integration-and-status", "label": "K8s 整合 & Status", "description": "NetworkAttachmentDefinition CRD、Pod annotation、network-status", "featureSlug": "k8s-integration-and-status", "category": "api", "position": {"x": 150, "y": 220}},
+    {"id": "delegate-and-cmdadd", "label": "Delegate & CmdAdd", "description": "依序呼叫每個 delegate CNI、合併結果", "featureSlug": "delegate-and-cmdadd", "category": "controller", "position": {"x": 650, "y": 220}},
+    {"id": "thick-shim-and-daemon", "label": "Thick Shim & Daemon", "description": "thick 模式：CNI binary 是 shim，邏輯跑在 multus daemon", "featureSlug": "thick-shim-and-daemon", "category": "lifecycle", "position": {"x": 400, "y": 390}}
+  ],
+  "edges": [
+    {"id": "e-arch-k8s", "source": "architecture", "target": "k8s-integration-and-status", "label": "defines"},
+    {"id": "e-arch-delegate", "source": "architecture", "target": "delegate-and-cmdadd", "label": "defines"},
+    {"id": "e-k8s-delegate", "source": "k8s-integration-and-status", "target": "delegate-and-cmdadd", "label": "triggers"},
+    {"id": "e-delegate-thick", "source": "delegate-and-cmdadd", "target": "thick-shim-and-daemon", "label": "runs in", "animated": true}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "projectId": "kubevirt",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "virt-api / virt-controller / virt-handler / virt-launcher 四元件分層", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "controllers", "label": "virt-controller", "description": "VM 決策核心：建立 VMI、管理 virt-launcher Pod", "featureSlug": "controllers", "category": "controller", "position": {"x": 150, "y": 220}},
+    {"id": "virt-handler-and-launcher", "label": "virt-handler + launcher", "description": "節點層 VM agent：呼叫 libvirt/QEMU 啟動 VM", "featureSlug": "virt-handler-and-launcher", "category": "controller", "position": {"x": 650, "y": 220}},
+    {"id": "live-migration", "label": "Live Migration", "description": "不停機 VM 遷移：記憶體複製與切換機制", "featureSlug": "live-migration", "category": "lifecycle", "position": {"x": 150, "y": 390}},
+    {"id": "topology-spread-constraints", "label": "Topology Spread", "description": "VM 排程時的 zone/topology 分散約束", "featureSlug": "topology-spread-constraints", "category": "api", "position": {"x": 400, "y": 390}},
+    {"id": "windows-vm-features", "label": "Windows VM", "description": "Windows guest 專屬：viostor、virtio-net、QEMU GA", "featureSlug": "windows-vm-features", "category": "addon", "position": {"x": 650, "y": 390}}
+  ],
+  "edges": [
+    {"id": "e-arch-ctrl", "source": "architecture", "target": "controllers", "label": "defines"},
+    {"id": "e-arch-handler", "source": "architecture", "target": "virt-handler-and-launcher", "label": "defines"},
+    {"id": "e-ctrl-handler", "source": "controllers", "target": "virt-handler-and-launcher", "label": "delegates", "animated": true},
+    {"id": "e-ctrl-migration", "source": "controllers", "target": "live-migration", "label": "coordinates"},
+    {"id": "e-migration-handler", "source": "live-migration", "target": "virt-handler-and-launcher", "label": "triggers", "animated": true},
+    {"id": "e-ctrl-topology", "source": "controllers", "target": "topology-spread-constraints", "label": "uses"},
+    {"id": "e-handler-windows", "source": "virt-handler-and-launcher", "target": "windows-vm-features", "label": "supports"},
+    {"id": "e-arch-topology", "source": "architecture", "target": "topology-spread-constraints", "label": "schedules with"}
+  ]
+}

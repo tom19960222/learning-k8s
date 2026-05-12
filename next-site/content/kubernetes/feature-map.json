@@ -1,0 +1,25 @@
+{
+  "projectId": "kubernetes",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "control plane / node 元件分層與互動模型", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "api-server", "label": "API Server", "description": "REST API 入口、認證授權、watch 與 etcd 互動", "featureSlug": "api-server", "category": "api", "position": {"x": 150, "y": 220}},
+    {"id": "controllers", "label": "Controller Manager", "description": "Deployment/ReplicaSet 等 controller 的 reconcile 迴圈", "featureSlug": "controllers", "category": "controller", "position": {"x": 400, "y": 220}},
+    {"id": "kubelet", "label": "kubelet", "description": "Node agent：podspec → 容器、CNI 設定、CSI 掛載", "featureSlug": "kubelet", "category": "infra", "position": {"x": 650, "y": 220}},
+    {"id": "extension-interfaces", "label": "擴展介面", "description": "CRI / CNI / CSI 三大擴充規格的入口", "featureSlug": "extension-interfaces", "category": "api", "position": {"x": 400, "y": 390}},
+    {"id": "cni-learning-map", "label": "CNI 子體系", "description": "Pod 網路：CNI plugin 規格、datapath、IPAM", "featureSlug": "cni-learning-map", "category": "addon", "position": {"x": 150, "y": 560}},
+    {"id": "csi-learning-map", "label": "CSI 子體系", "description": "Volume 動態 provision、attach/mount、sidecar 套件", "featureSlug": "csi-learning-map", "category": "addon", "position": {"x": 400, "y": 560}},
+    {"id": "runtime-learning-map", "label": "Runtime 子體系", "description": "CRI 與容器 runtime：containerd / CRI-O / OCI runtime", "featureSlug": "runtime-learning-map", "category": "addon", "position": {"x": 650, "y": 560}}
+  ],
+  "edges": [
+    {"id": "e-arch-api", "source": "architecture", "target": "api-server", "label": "defines"},
+    {"id": "e-arch-ctrl", "source": "architecture", "target": "controllers", "label": "defines"},
+    {"id": "e-arch-kubelet", "source": "architecture", "target": "kubelet", "label": "defines"},
+    {"id": "e-ctrl-ext", "source": "controllers", "target": "extension-interfaces", "label": "exposes"},
+    {"id": "e-ext-cni", "source": "extension-interfaces", "target": "cni-learning-map", "label": "specifies"},
+    {"id": "e-ext-csi", "source": "extension-interfaces", "target": "csi-learning-map", "label": "specifies"},
+    {"id": "e-ext-runtime", "source": "extension-interfaces", "target": "runtime-learning-map", "label": "specifies"},
+    {"id": "e-kubelet-cni", "source": "kubelet", "target": "cni-learning-map", "label": "invokes", "animated": true},
+    {"id": "e-kubelet-csi", "source": "kubelet", "target": "csi-learning-map", "label": "invokes", "animated": true},
+    {"id": "e-kubelet-runtime", "source": "kubelet", "target": "runtime-learning-map", "label": "invokes", "animated": true}
+  ]
+}

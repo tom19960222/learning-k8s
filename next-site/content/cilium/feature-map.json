@@ -1,0 +1,15 @@
+{
+  "projectId": "cilium",
+  "nodes": [
+    {"id": "architecture", "label": "整體架構", "description": "agent / operator / CLI / Hubble 元件與 eBPF datapath 定位", "featureSlug": "architecture", "category": "infra", "position": {"x": 400, "y": 50}},
+    {"id": "agent-and-datapath", "label": "Agent & Datapath", "description": "節點 agent 載入 eBPF、處理 Pod 流量轉送", "featureSlug": "agent-and-datapath", "category": "controller", "position": {"x": 400, "y": 220}},
+    {"id": "identity-and-policy", "label": "Identity & Policy", "description": "以 identity 為單位的 L3/L4/L7 NetworkPolicy", "featureSlug": "identity-and-policy", "category": "api", "position": {"x": 150, "y": 390}},
+    {"id": "hubble-and-observability", "label": "Hubble & 觀測", "description": "從 eBPF event 流出的 flow log 與服務地圖", "featureSlug": "hubble-and-observability", "category": "addon", "position": {"x": 650, "y": 390}}
+  ],
+  "edges": [
+    {"id": "e-arch-agent", "source": "architecture", "target": "agent-and-datapath", "label": "deploys"},
+    {"id": "e-agent-policy", "source": "agent-and-datapath", "target": "identity-and-policy", "label": "enforces"},
+    {"id": "e-agent-hubble", "source": "agent-and-datapath", "target": "hubble-and-observability", "label": "feeds", "animated": true},
+    {"id": "e-policy-hubble", "source": "identity-and-policy", "target": "hubble-and-observability", "label": "observed by"}
+  ]
+}
