@@ -1,0 +1,4 @@
+interface:
+  display_name: "Source-first Topic Page"
+  short_description: "Turn source research into MDX pages"
+  default_prompt: "Use $source-first-topic-page to research this topic from source code and add a feature page."
