@@ -1,0 +1,389 @@
+---
+layout: doc
+title: Ceph — Recovery throttle 動態調整與 mClock 互動
+description: osd_recovery_max_active 下調對 in-flight recovery 的影響、injectargs 完整生效路徑、Squid mClock scheduler 的 rollback 陷阱。
+---
+
+## 場景
+
+半夜 backfill 雷暴，client latency 開始噴。oncall 想收緊 recovery throttle，把每個 OSD 同時跑的 recovery op 從 10 壓到 3：
+
+```bash
+ceph tell osd.* injectargs --osd-recovery-max-active 3
+```
+
+下指令前，三個必答題：
+
+1. 現在 in-flight 的 recovery 已經是 10 個，新值是 3 — **已啟動的會被 kill 嗎？**
+2. 多久生效？有沒有 hysteresis 要等？
+3. v19 (Squid) 預設 mClock scheduler 下，這個改動會不會悄悄被 rollback？
+
+下面三題的答案都直接出自 v19.2.3 OSD 原始碼，不靠官方 doc 二手轉述。
+
+## TL;DR — 結論先講
+
+- **不會 cancel in-flight op。** 新值只收緊「下一個 op 能不能啟動」的閘門 (`OSDService::_recover_now`)；已經跑的 op 跑完後才透過 `finish_recovery_op` → `_maybe_queue_recovery` 重新評估。
+- **沒有 hysteresis、沒有 grace period。** 改完那一刻 `cct->_conf` 已生效，下次比較立刻看到新 max。
+- **Squid 預設 mClock scheduler 會把這次 inject rollback。** `OSD::handle_conf_change` 內部呼叫 `maybe_override_options_for_qos`，會以 mon command `config rm` 把改動撤掉並發 cluster log warning。要實際生效必須先 `ceph config set osd osd_mclock_override_recovery_settings true`。
+
+接下來逐段用程式碼證實。
+
+## 三個 option 的關係
+
+實際上有三個 key，互相 see_also：
+
+| Option | 預設 | 適用 | runtime flag |
+|---|---|---|---|
+| `osd_recovery_max_active` | `0`（停用 = 走 hdd/ssd 分支）| 全域 override，非 0 時優先 | ✓ |
+| `osd_recovery_max_active_hdd` | `3` | primary device 是 rotational | ✓ |
+| `osd_recovery_max_active_ssd` | `10` | primary device 是 non-rotational | ✓ |
+
+三者都標記 `runtime`（可線上調整），定義在 `src/common/options/osd.yaml.in:1372-1424`：
+
+```yaml
+# File: src/common/options/osd.yaml.in (line 1372)
+- name: osd_recovery_max_active
+  type: uint
+  level: advanced
+  desc: Number of simultaneous active recovery operations per OSD (overrides _ssd
+    and _hdd if non-zero)
+  note: This value is only used if it is non-zero. Normally it
+    is ``0``, which means that the ``hdd`` or ``ssd`` values
+    (below) are used, depending on the type of the primary
+    device backing the OSD.
+    This setting is automatically reset when the mClock scheduler is used.
+  default: 0
+  see_also:
+  - osd_recovery_max_active_hdd
+  - osd_recovery_max_active_ssd
+  - osd_mclock_override_recovery_settings
+  flags:
+  - runtime
+```
+
+`runtime` flag 的語意在 `src/common/options.h`：
+
+```cpp
+// File: src/common/options.h (line 132)
+enum flag_t {
+  FLAG_RUNTIME = 0x1,         ///< option can be changed at runtime
+  FLAG_NO_MON_UPDATE = 0x2,
+  FLAG_STARTUP = 0x4,
+  // ...
+};
+```
+
+換言之：runtime 可改、無需重啟 OSD。但「可改」不等於「實際生效」— Squid 還有 mClock 那層 rollback 在後面（後面詳述）。
+
+## OSD 怎麼讀這個值
+
+OSD 每次需要判斷 throttle 時都直接讀 `cct->_conf`，**沒有快取**：
+
+```cpp
+// File: src/osd/OSD.cc (line 3695)
+int OSD::get_recovery_max_active()
+{
+  if (cct->_conf->osd_recovery_max_active)
+    return cct->_conf->osd_recovery_max_active;
+  if (store_is_rotational)
+    return cct->_conf->osd_recovery_max_active_hdd;
+  else
+    return cct->_conf->osd_recovery_max_active_ssd;
+}
+```
+
+「沒有快取」這點很重要：只要 `handle_conf_change` 改動了底層 config，下一次 `get_recovery_max_active()` 被呼叫時看到的就是新值。沒有需要 reload、reset、或 kick 的東西。
+
+## 啟動閘門：`_recover_now()`
+
+要不要再啟動下一個 recovery op，由 `OSDService::_recover_now` 判斷。核心比較是這一行：
+
+```cpp
+// File: src/osd/OSD.cc (line 9499)
+bool OSDService::_recover_now(uint64_t *available_pushes)
+{
+  if (available_pushes)
+      *available_pushes = 0;
+
+  if (ceph_clock_now() < defer_recovery_until) { /* ... */ return false; }
+  if (recovery_paused) { /* ... */ return false; }
+
+  uint64_t max = osd->get_recovery_max_active();
+  if (max <= recovery_ops_active + recovery_ops_reserved) {
+    dout(15) << __func__ << " active " << recovery_ops_active
+             << " + reserved " << recovery_ops_reserved
+             << " >= max " << max << dendl;
+    return false;
+  }
+
+  if (available_pushes)
+    *available_pushes = max - recovery_ops_active - recovery_ops_reserved;
+
+  return true;
+}
+```
+
+重點三件事：
+
+1. 這是**單向閘門** — 只回答「能不能啟動下一個 op」，**從不檢視已啟動的 op**。
+2. max 的對照是 `active + reserved` 兩者之和，不是只比 active。reserved 是「已預約待啟動」的部分。
+3. 不滿足時不會丟錯、不會掛載、不會 cancel — 就是 return false，呼叫端會把這次嘗試擱置。
+
+## 計數變化：`start_recovery_op` ↑、`finish_recovery_op` ↓
+
+啟動 op 時 active 加一：
+
+```cpp
+// File: src/osd/OSD.cc (line 9628)
+void OSDService::start_recovery_op(PG *pg, const hobject_t& soid)
+{
+  std::lock_guard l(recovery_lock);
+  dout(10) << "start_recovery_op " << *pg << " " << soid
+           << " (" << recovery_ops_active << "/"
+           << osd->get_recovery_max_active() << " rops)" << dendl;
+  recovery_ops_active++;
+  // ...
+}
+```
+
+op 完成時減一，**並主動嘗試 queue 下一個**：
+
+```cpp
+// File: src/osd/OSD.cc (line 9644)
+void OSDService::finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue)
+{
+  std::lock_guard l(recovery_lock);
+  // ...
+  ceph_assert(recovery_ops_active > 0);
+  recovery_ops_active--;
+  // ...
+  _maybe_queue_recovery();
+}
+```
+
+`_maybe_queue_recovery()` 是「下一輪嘗試」的唯一觸發點 — 每個 op 跑完才會問一次「現在可以再起一個嗎」。沒有獨立 timer、沒有定期掃描。
+
+## 自然收斂時序
+
+把上面三段拼起來，下調 `osd_recovery_max_active` 後實際發生的事：
+
+![下調 osd_recovery_max_active 後 active 與 max 隨時間的變化：t1 inject 後 max 立即變為 3，但 active 仍是 10，需等 in-flight op 逐個跑完才收斂](/diagrams/ceph/recovery-throttle-dynamics.png)
+
+```
+時間  active  reserved  max  發生什麼
+────  ──────  ────────  ───  ──────────────────────────────────────
+t0     10       0       10   inject 前：滿載運轉
+t1     10       0        3   injectargs 進來，cct->_conf 立即更新
+                              （已啟動的 10 個完全沒收到任何訊號）
+t2      9       0        3   一個 op 跑完 → finish_recovery_op
+                              → _maybe_queue_recovery → _recover_now
+                              → 3 <= 9，return false，不啟動新 op
+t3      8       0        3   另一個 op 跑完，同上，仍不啟動
+...
+t10     3       0        3   active = max，邊界仍是「<=」，不啟動
+t11     2       0        3   再跑完一個，2 < 3，下一個 op 可以進來
+                              → start_recovery_op，active 又升到 3
+```
+
+關鍵理解：
+
+- t1 改值瞬間沒有任何 op 被中斷；只是「之後是否啟動新 op」的判斷標準變了。
+- 收斂速度 = 每個 in-flight op 跑完所需時間。如果 op 很大、跑很久，可能要等不少時間才看到 active 落到新 max。
+- 沒有 hysteresis：邊界精確就是 `if (max <= active + reserved) return false`。等到 `active + reserved < max` 那一刻新 op 立刻可以進。
+
+<Callout type="warning" title="幾個容易誤會的點">
+- `max` 比的是 **active + reserved**，不是只比 active。如果有大量 PG 在 reservation 排隊，即便 active 還沒滿，新 op 也可能被擋。
+- in-flight op 不會收到任何來自 throttle 變化的訊號 — 不會降速、不會 cancel、不會 priority 重排。
+- 上調 max 同樣是「下次 `_recover_now` 被叫到時自然生效」。但「下次被叫」依賴有 op 完成（`finish_recovery_op`）或新的 PG enqueue（`_maybe_queue_recovery` 也會在 PG 路徑呼叫）。如果 OSD 完全 idle，調大 max 不會憑空生出新 op，這合理但偶爾會嚇到人。
+</Callout>
+
+## injectargs 怎麼進到 OSD
+
+從 `ceph tell` 到 `_recover_now` 看到新值，整條路徑：
+
+```
+ceph tell osd.0 injectargs --osd-recovery-max-active 3
+            │
+            ▼
+┌─────────────────────────────────────────────────────────┐
+│ admin socket / mon command handler                      │
+│   ceph_context.cc::handle_command("injectargs")         │
+└─────────────────────────────────────────────────────────┘
+            │
+            ▼  _conf.injectargs(args, &ss)
+┌─────────────────────────────────────────────────────────┐
+│ ConfigProxy::injectargs (config_proxy.h)                │
+│   1. config.injectargs → parse_injectargs(CONF_OVERRIDE)│
+│   2. _gather_changes(values.changed, ...)               │
+│   3. _call_observers(rev_obs)  ← key 進到 changed set   │
+└─────────────────────────────────────────────────────────┘
+            │
+            ▼  observer callback
+┌─────────────────────────────────────────────────────────┐
+│ OSD::handle_conf_change(conf, changed)  (OSD.cc:9918)   │
+│   if (changed.count("osd_recovery_max_active") || ...)  │
+│     → maybe_override_options_for_qos(&changed)          │
+└─────────────────────────────────────────────────────────┘
+```
+
+OSD 在 init 階段把自己註冊成 config observer，所有 runtime config 變動都會走進 `handle_conf_change`。針對 recovery max 那段：
+
+```cpp
+// File: src/osd/OSD.cc (line 9918)
+void OSD::handle_conf_change(const ConfigProxy& conf,
+                             const std::set <std::string> &changed)
+{
+  std::lock_guard l{osd_lock};
+
+  if (changed.count("osd_max_backfills") ||
+      changed.count("osd_recovery_max_active") ||
+      changed.count("osd_recovery_max_active_hdd") ||
+      changed.count("osd_recovery_max_active_ssd")) {
+    if (!maybe_override_options_for_qos(&changed) &&
+        changed.count("osd_max_backfills")) {
+      // Scheduler is not "mclock". Fallback to earlier behavior
+      service.local_reserver.set_max(cct->_conf->osd_max_backfills);
+      service.remote_reserver.set_max(cct->_conf->osd_max_backfills);
+    }
+  }
+  // ... 其他 key 處理 ...
+}
+```
+
+注意這段裡**沒有任何 cancel／kick／reset 的呼叫**對 `osd_recovery_max_active*`。這是「值已經寫進 `cct->_conf`」的事後通知，邏輯只決定要不要做額外動作。
+
+對 `osd_max_backfills` 它會主動把 reserver 的 max 設下去（reserver 是 stateful 的，必須主動同步），但 `osd_recovery_max_active*` 沒有對應的 stateful 結構需要更新 — `_recover_now` 每次都重讀 `cct->_conf`。
+
+## Squid 陷阱：mClock 預設會 rollback
+
+v19 (Squid) 預設 scheduler 是 `mclock_scheduler`，而 mClock 把 recovery throttle 視為自己的權責。`maybe_override_options_for_qos` 在 mClock 啟用時會把使用者的 inject 撤回去：
+
+```cpp
+// File: src/osd/OSD.cc (line 10171)
+bool OSD::maybe_override_options_for_qos(const std::set<std::string> *changed)
+{
+  if (op_queue_type_t::mClockScheduler == osd_op_queue_type()) {
+    static const std::map<std::string, uint64_t> recovery_qos_defaults {
+      {"osd_recovery_max_active", 0},
+      {"osd_recovery_max_active_hdd", 3},
+      {"osd_recovery_max_active_ssd", 10},
+      {"osd_max_backfills", 1},
+    };
+
+    if (changed != nullptr) {
+      if (cct->_conf.get_val<bool>("osd_mclock_override_recovery_settings")) {
+        // 走允許路徑：但這段只處理 osd_max_backfills，其他 key 落到下面
+        if (changed->count("osd_max_backfills")) {
+          service.local_reserver.set_max(cct->_conf->osd_max_backfills);
+          service.remote_reserver.set_max(cct->_conf->osd_max_backfills);
+        }
+      } else {
+        // 走 rollback 路徑：找出被改的 key，發 mon command 把它從 config db 移除
+        std::string key;
+        if      (changed->count("osd_max_backfills"))         key = "osd_max_backfills";
+        else if (changed->count("osd_recovery_max_active"))   key = "osd_recovery_max_active";
+        else if (changed->count("osd_recovery_max_active_hdd")) key = "osd_recovery_max_active_hdd";
+        else if (changed->count("osd_recovery_max_active_ssd")) key = "osd_recovery_max_active_ssd";
+        else return true;
+
+        auto val = recovery_qos_defaults.find(key);
+        if (val != recovery_qos_defaults.end() &&
+            cct->_conf.get_val<uint64_t>(key) != val->second) {
+          // 對 "osd" 和 "osd.<id>" 各發一條 config rm 命令到 mon
+          // ...
+          monc->start_mon_command(vcmd, {}, nullptr, nullptr, nullptr);
+
+          clog->warn() << "Change to " << key << " on osd."
+                       << std::to_string(whoami) << " did not take effect."
+                       << " Enable osd_mclock_override_recovery_settings before"
+                       << " setting this option.";
+        }
+      }
+    }
+    return true;
+  }
+  return false;
+}
+```
+
+幾個重點：
+
+1. 在 mClock 模式下，任何對 `osd_recovery_max_active*` 的 inject 都會觸發 `monc->start_mon_command("config rm ...")`，把這個 key 從 mon config db 撤掉。
+2. 同時送一條 cluster log warning：「Change to `osd_recovery_max_active*` on osd.X did not take effect」。`ceph -W cluster` 或 `ceph health detail` 能看到。
+3. 唯一允許 override 的途徑是 `ceph config set osd osd_mclock_override_recovery_settings true`。
+4. **但即便 override 啟用**，這段程式碼只主動處理 `osd_max_backfills`（把 reserver 同步）。`osd_recovery_max_active*` 因為不需要主動 sync（`_recover_now` 每次重讀），開了 override 就放它過去 — 因此「啟用 override + inject recovery max」確實會生效。
+
+<Callout type="danger" title="Squid 上 oncall 最常踩的坑">
+在 mClock scheduler 下直接 `ceph tell osd.* injectargs --osd-recovery-max-active 3`：
+
+- 命令會回 success（因為 config 解析成功）
+- `ceph -s` 沒有錯誤
+- 但 mon db 端會被 `config rm` 撤掉，cluster log 留一條 warn
+- 下次 OSD 重啟、或別人 query 都會看到舊預設
+
+正確姿勢：
+```
+ceph config set osd osd_mclock_override_recovery_settings true
+ceph config set osd osd_recovery_max_active_hdd 3   # 或對應 ssd / 全域 override
+```
+
+用 `config set`（持久化到 mon db）而不是 `injectargs`（只是 ephemeral runtime 改動），這樣才能跨 OSD 重啟存活。
+</Callout>
+
+## 驗證指令
+
+在你的 cluster 上跑下面三條，逐步對照前面的程式碼路徑。`injectargs` / `config set` 屬於可逆操作，但 production 上仍建議先在低流量視窗驗證：
+
+```bash
+# 1. 確認目前 scheduler 是哪一個
+ceph config show osd.0 osd_op_queue
+# 預期 v19 預設：mclock_scheduler
+
+# 2. 觀察 in-flight recovery 計數（在另一個 terminal）
+watch -n 1 'ceph daemon osd.0 dump_recovery_reservations | jq .'
+# 或：ceph daemon osd.0 perf dump | jq .osd.recovery_ops
+
+# 3. 直接 inject（在 mclock 預設下會觸發 rollback）
+ceph tell osd.0 injectargs --osd-recovery-max-active 3
+# 同時看 cluster log
+ceph -W cluster
+# 預期看到：cluster [WRN] Change to osd_recovery_max_active on osd.0 did not take effect...
+```
+
+要實際生效並觀察「自然收斂」：
+
+```bash
+ceph config set osd osd_mclock_override_recovery_settings true
+ceph config set osd osd_recovery_max_active_hdd 3
+# 觀察 ceph daemon osd.0 dump_recovery_reservations 的 active count，
+# 它會從原本的值「逐個 op 完成後自然下降」，不會瞬間掉。
+```
+
+## 同場加映：跟 `osd_max_backfills` 的差別
+
+很多人把 backfill 與 recovery 搞混。在 `handle_conf_change` 的視角上，兩者待遇不同：
+
+| Key | mClock 預設 | 改動如何生效 |
+|---|---|---|
+| `osd_recovery_max_active*` | 被 rollback | 每次 `_recover_now` 重讀，自然收斂 |
+| `osd_max_backfills` | 被 rollback | `set_max` 直接寫入 local/remote reserver，已預約的不退、但新預約立刻看新上限 |
+
+差別根因：reserver 是 stateful（要主動同步），recovery active count 是純讀取（不用同步）。
+
+## 延伸閱讀
+
+- [Ceph — OSD daemon 與 BlueStore](/ceph/osd-and-bluestore)：OSD 內部結構、PG / PrimaryLogPG、`OpThreadPool` 與 reserver 的位置
+- [Ceph — CRUSH 與 Placement](/ceph/crush-and-placement)：為什麼 OSD 失效會觸發 recovery、PG 怎麼決定哪些 object 要搬
+
+## 引用的原始碼（v19.2.3, commit c92aebb）
+
+- `src/common/options/osd.yaml.in:1372-1424` — `osd_recovery_max_active{,_hdd,_ssd}` 定義與 runtime flag
+- `src/common/options.h:132` — `FLAG_RUNTIME` enum 語意
+- `src/osd/OSD.cc:3695-3703` — `OSD::get_recovery_max_active()`
+- `src/osd/OSD.cc:9499-9526` — `OSDService::_recover_now()`，閘門比較在 line 9515
+- `src/osd/OSD.cc:9628-9642` — `OSDService::start_recovery_op()`
+- `src/osd/OSD.cc:9644-9664` — `OSDService::finish_recovery_op()` + `_maybe_queue_recovery()`
+- `src/osd/OSD.cc:9918-9933` — `OSD::handle_conf_change()` recovery 區塊
+- `src/osd/OSD.cc:10171-10241` — `OSD::maybe_override_options_for_qos()` mClock rollback
+- `src/common/config_proxy.h:264-274` — `ConfigProxy::injectargs()`
+- `src/common/config.cc:844-885` — `parse_injectargs()`

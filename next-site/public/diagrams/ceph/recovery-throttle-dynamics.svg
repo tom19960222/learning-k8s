@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" font-family="-apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="700" fill="#ffffff"/>
+  <text x="600" y="48" text-anchor="middle" font-size="22" font-weight="700" fill="#0f172a">下調 osd_recovery_max_active 後 in-flight recovery 的自然收斂</text>
+  <text x="600" y="74" text-anchor="middle" font-size="14" fill="#475569">改值只收緊閘門，已啟動的 op 跑完才釋放 slot — 無 cancel、無 hysteresis</text>
+  <line x1="110" y1="520" x2="1130" y2="520" stroke="#0f172a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="110" y1="520" x2="110" y2="120" stroke="#0f172a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="1120" y="550" text-anchor="end" font-size="13" fill="#0f172a">time</text>
+  <text x="50" y="116" text-anchor="start" font-size="13" fill="#0f172a">op count</text>
+  <line x1="110" y1="520" x2="1120" y2="520" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="98" y="525" text-anchor="end" font-size="12" fill="#475569">0</text>
+  <line x1="110" y1="424" x2="1120" y2="424" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="98" y="429" text-anchor="end" font-size="12" fill="#475569">3</text>
+  <line x1="110" y1="360" x2="1120" y2="360" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="98" y="365" text-anchor="end" font-size="12" fill="#475569">5</text>
+  <line x1="110" y1="200" x2="1120" y2="200" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="98" y="205" text-anchor="end" font-size="12" fill="#475569">10</text>
+  <line x1="110" y1="520" x2="110" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="110" y="542" text-anchor="middle" font-size="12" fill="#475569">t0</text>
+  <line x1="205" y1="520" x2="205" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="205" y="542" text-anchor="middle" font-size="12" fill="#475569">t1</text>
+  <line x1="300" y1="520" x2="300" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="300" y="542" text-anchor="middle" font-size="12" fill="#475569">t2</text>
+  <line x1="395" y1="520" x2="395" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="395" y="542" text-anchor="middle" font-size="12" fill="#475569">t3</text>
+  <line x1="490" y1="520" x2="490" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="490" y="542" text-anchor="middle" font-size="12" fill="#475569">t4</text>
+  <line x1="585" y1="520" x2="585" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="585" y="542" text-anchor="middle" font-size="12" fill="#475569">t5</text>
+  <line x1="680" y1="520" x2="680" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="680" y="542" text-anchor="middle" font-size="12" fill="#475569">t6</text>
+  <line x1="775" y1="520" x2="775" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="775" y="542" text-anchor="middle" font-size="12" fill="#475569">t7</text>
+  <line x1="870" y1="520" x2="870" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="870" y="542" text-anchor="middle" font-size="12" fill="#475569">t8</text>
+  <line x1="965" y1="520" x2="965" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="965" y="542" text-anchor="middle" font-size="12" fill="#475569">t9</text>
+  <line x1="1060" y1="520" x2="1060" y2="525" stroke="#0f172a" stroke-width="1"/>
+  <text x="1060" y="542" text-anchor="middle" font-size="12" fill="#475569">t10</text>
+  <path d="M 110,200 L 205,200 L 205,200 L 300,200 L 300,232 L 395,232 L 395,264 L 490,264 L 490,296 L 585,296 L 585,328 L 680,328 L 680,360 L 775,360 L 775,392 L 870,392 L 870,424 L 965,424 L 965,424 L 1060,424 L 1060,424" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+  <circle cx="110" cy="200" r="4" fill="#2563eb"/>
+  <circle cx="205" cy="200" r="4" fill="#2563eb"/>
+  <circle cx="300" cy="232" r="4" fill="#2563eb"/>
+  <circle cx="395" cy="264" r="4" fill="#2563eb"/>
+  <circle cx="490" cy="296" r="4" fill="#2563eb"/>
+  <circle cx="585" cy="328" r="4" fill="#2563eb"/>
+  <circle cx="680" cy="360" r="4" fill="#2563eb"/>
+  <circle cx="775" cy="392" r="4" fill="#2563eb"/>
+  <circle cx="870" cy="424" r="4" fill="#2563eb"/>
+  <circle cx="965" cy="424" r="4" fill="#2563eb"/>
+  <circle cx="1060" cy="424" r="4" fill="#2563eb"/>
+  <path d="M 110,200 L 205,200 L 205,424 L 300,424 L 300,424 L 395,424 L 395,424 L 490,424 L 490,424 L 585,424 L 585,424 L 680,424 L 680,424 L 775,424 L 775,424 L 870,424 L 870,424 L 965,424 L 965,424 L 1060,424 L 1060,424" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6,4"/>
+  <line x1="205" y1="92" x2="205" y2="418" stroke="#ea580c" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowOrange)"/>
+  <rect x="110" y="84" width="190" height="22" rx="4" fill="#fff7ed" stroke="#ea580c" stroke-width="1"/>
+  <text x="205" y="99" text-anchor="middle" font-size="12" fill="#9a3412" font-weight="600">t1: injectargs → max 變 3</text>
+  <rect x="780" y="374" width="180" height="22" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+  <text x="870" y="389" text-anchor="middle" font-size="12" fill="#1e40af" font-weight="600">active 收斂到 max</text>
+  <rect x="205" y="130" width="665" height="390" fill="#fef3c7" opacity="0.35"/>
+  <text x="537.5" y="158" text-anchor="middle" font-size="13" fill="#92400e" font-weight="600">in-flight op 逐個跑完，每次 finish_recovery_op 重新評估</text>
+  <text x="537.5" y="178" text-anchor="middle" font-size="12" fill="#92400e">_recover_now 持續 return false（max ≤ active + reserved）</text>
+  <g transform="translate(110,580)">
+    <rect x="0" y="0" width="540" height="80" rx="8" fill="#f9fafb" stroke="#e5e7eb"/>
+    <line x1="20" y1="22" x2="60" y2="22" stroke="#2563eb" stroke-width="2.5"/>
+    <circle cx="40" cy="22" r="4" fill="#2563eb"/>
+    <text x="70" y="26" font-size="13" fill="#0f172a">recovery_ops_active（已啟動的 op 數）</text>
+    <line x1="20" y1="48" x2="60" y2="48" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="6,4"/>
+    <text x="70" y="52" font-size="13" fill="#0f172a">osd_recovery_max_active（閘門上限，runtime 即時讀）</text>
+  </g>
+  <g transform="translate(700,580)">
+    <rect x="0" y="0" width="430" height="80" rx="8" fill="#fef2f2" stroke="#fecaca"/>
+    <text x="20" y="24" font-size="12" font-weight="600" fill="#991b1b">Squid 預設 mClock 提醒</text>
+    <text x="20" y="44" font-size="11" fill="#7f1d1d">直接 injectargs 會被 maybe_override_options_for_qos rollback</text>
+    <text x="20" y="62" font-size="11" fill="#7f1d1d">需先 ceph config set osd osd_mclock_override_recovery_settings true</text>
+  </g>
+</svg>

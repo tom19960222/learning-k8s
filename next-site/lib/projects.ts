@@ -311,11 +311,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'ceph'),
     color: 'rose',
     accentClass: 'border-rose-500 text-rose-400',
-    features: ['architecture', 'crush-and-placement', 'osd-and-bluestore', 'rbd-and-csi'],
+    features: ['architecture', 'crush-and-placement', 'osd-and-bluestore', 'recovery-throttle-runtime', 'rbd-and-csi'],
     featureGroups: [
       { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
       { label: 'Placement 演算法', icon: '🧮', slugs: ['crush-and-placement'] },
-      { label: 'OSD + Storage 引擎', icon: '💾', slugs: ['osd-and-bluestore'] },
+      { label: 'OSD + Storage 引擎', icon: '💾', slugs: ['osd-and-bluestore', 'recovery-throttle-runtime'] },
       { label: 'RBD + k8s 接點', icon: '🔗', slugs: ['rbd-and-csi'] },
     ],
     usecases: [],
