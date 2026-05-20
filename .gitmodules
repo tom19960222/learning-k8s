@@ -26,3 +26,13 @@
 [submodule "molearn"]
 	path = molearn
 	url = https://github.com/hwchiu/molearn.git
+[submodule "libvirt"]
+	path = libvirt
+	url = https://gitlab.com/libvirt/libvirt.git
+	branch = v12.3.0
+	shallow = true
+[submodule "qemu"]
+	path = qemu
+	url = https://github.com/qemu/qemu.git
+	branch = v11.0.0
+	shallow = true
