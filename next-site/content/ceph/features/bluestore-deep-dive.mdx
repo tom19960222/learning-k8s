@@ -1,0 +1,624 @@
+---
+layout: doc
+title: Ceph — BlueStore Deep Dive
+description: BlueStore 內部結構：三裝置布局 (block / block.db / block.wal)、RocksDB key prefix、BlueFS、TransContext 狀態機、deferred write、min_alloc_size、checksum 與 compression — 都對到 v19.2.3 原始碼。
+---
+
+## 場景
+
+你已經知道 Ceph 上層概念：MON 維 cluster state、OSD 真的存資料、CRUSH 決定 object 落到哪幾顆 OSD。今天的問題是 OSD **內部那一層**：
+
+- client 寫 4 KB 跟寫 4 MB 走的路徑不一樣，差在哪？
+- `block.db` 滿了出現 `BLUEFS_SPILLOVER` 警告，是誰算的、影響什麼？
+- `ceph -s` 偶爾跳 `BLUESTORE_SLOW_OP_ALERT`，從 BlueStore 角度看是哪段卡？
+- 為什麼 `/var/lib/ceph/osd/ceph-N/block` 是個 symlink、目錄本身又是 tmpfs？
+
+這頁不重複講「BlueStore 是 OSD backend」這種定義（[osd-and-bluestore](./osd-and-bluestore) 已經建立過骨架了），而是把 BlueStore 內部從 device 布局、metadata schema、寫入路徑、到背景流程，逐層對到 v19.2.3 原始碼。
+
+<Callout type="info" title="前置閱讀">
+  本頁假設你已讀過 [osd-and-bluestore](./osd-and-bluestore) 的 OSD daemon 大致結構，並對 `ObjectStore` 抽象、PG、RADOS write op flow 有印象。
+</Callout>
+
+## BlueStore 在 OSD 內的位置
+
+```
+ceph-osd process
+  │
+  ├── Messenger          ← 收 client / peer OSD op
+  ├── OpThreadPool       ← dispatch 到 PG
+  ├── PG (PrimaryLogPG)  ← op handling, replication, pg log
+  │
+  └── ObjectStore (抽象介面)
+       └── BlueStore     ← 本頁主題
+            ├── BlockDevice (bdev)      ← raw block IO (libaio / io_uring)
+            ├── Allocator               ← free space 管理
+            ├── RocksDB (db)            ← 所有 metadata
+            └── BlueFS                  ← 服務 RocksDB 的極簡 FS
+```
+
+`BlueStore` 是 `ObjectStore` 的實作之一：
+
+File: src/os/bluestore/BlueStore.h (line 236)
+
+```cpp
+class BlueStore : public ObjectStore,
+                  public md_config_obs_t {
+  // ...
+};
+```
+
+PG 透過 `ObjectStore::Transaction` 把寫入意圖（write、setattr、omap_setkeys、remove ...）丟給 BlueStore，BlueStore 負責把這份 transaction 同時落到 **block device 上的 object data** 與 **RocksDB 裡的 metadata**，並維持兩者原子。
+
+## 三裝置布局：BDEV_WAL / BDEV_DB / BDEV_SLOW
+
+BlueStore 對外可以看到一顆 disk，也可以看到三顆。三個角色都在 BlueFS 端定義：
+
+File: src/os/bluestore/BlueFS.h (line 252-257)
+
+```cpp
+static constexpr unsigned MAX_BDEV = 5;
+static constexpr unsigned BDEV_WAL  = 0;
+static constexpr unsigned BDEV_DB   = 1;
+static constexpr unsigned BDEV_SLOW = 2;
+static constexpr unsigned BDEV_NEWWAL = 3;   // device migration target
+static constexpr unsigned BDEV_NEWDB  = 4;
+```
+
+同檔案的註解講得很直接：
+
+File: src/os/bluestore/BlueFS.h (line 516-521)
+
+```cpp
+/*
+ * There are up to 3 block devices:
+ *
+ *  BDEV_DB   db/      - the primary db device
+ *  BDEV_WAL  db.wal/  - a small, fast device, specifically for the WAL
+ *  BDEV_SLOW db.slow/ - a big, slow device, to spill over to as BDEV_DB fills
+ */
+std::vector<BlockDevice*> bdev;
+std::vector<IOContext*> ioc;
+std::vector<Allocator*> alloc;
+```
+
+注意這裡的角色分派：
+
+| 你看到的 symlink | BlueFS 內的角色 | 慣例上放的硬體 |
+|---|---|---|
+| `block` | **BDEV_SLOW**（同時也是 object data 主裝置） | HDD / SSD / NVMe，看 cluster 設計 |
+| `block.db` | **BDEV_DB**（RocksDB SST / 部分 metadata） | NVMe / SSD（比 block 快） |
+| `block.wal` | **BDEV_WAL**（RocksDB WAL） | 又比 block.db 更快或同等的 NVMe |
+
+只給一顆 disk 時，BlueFS 把 RocksDB 的 SST 跟 WAL 都塞到 BDEV_SLOW 上（也就是 `block`），DB device 並沒消失只是「shared」。`_open_bluefs()` 在做 volume selector 時就會根據三裝置實際大小決定哪些 SST level 放哪裡：
+
+File: src/os/bluestore/BlueStore.cc (line 7628-7647)
+
+```cpp
+if (cct->_conf->bluestore_volume_selection_policy == "fit_to_fast") {
+  vselector = new FitToFastVolumeSelector(
+    bluefs->get_block_device_size(BlueFS::BDEV_WAL)  * 95 / 100,
+    bluefs->get_block_device_size(BlueFS::BDEV_DB)   * 95 / 100,
+    bluefs->get_block_device_size(BlueFS::BDEV_SLOW) * 95 / 100);
+} else {
+  // RocksDBBlueFSVolumeSelector：根據 write_buffer_size、max_bytes_for_level_base
+  // 等 RocksDB 參數估算每個 level 該放哪顆 device
+}
+```
+
+這就是「為什麼 block.db 給太小會 spillover」的程式入口 — volume selector 拿到 BDEV_DB 容量後，發現某個 SST level 放不下，就 fallback 到 BDEV_SLOW。
+
+## OSD 目錄為什麼是 tmpfs + symlink
+
+實體上 `block` / `block.db` / `block.wal` 都是 LVM logical volume（或 raw partition），不是檔案。OSD 目錄只是把它們以 symlink 形式擺起來，方便 ceph-osd 進程 open。`ceph-volume` 做的就是這件事：
+
+File: src/ceph-volume/ceph_volume/util/prepare.py (line 190-206)
+
+```python
+def mount_tmpfs(path):
+    process.run([
+        'mount', '-t', 'tmpfs', 'tmpfs', path
+    ])
+
+def create_osd_path(osd_id, tmpfs=False):
+    path = '/var/lib/ceph/osd/%s-%s' % (conf.cluster, osd_id)
+    system.mkdir_p('/var/lib/ceph/osd/%s-%s' % (conf.cluster, osd_id))
+    if tmpfs:
+        mount_tmpfs(path)
+```
+
+File: src/ceph-volume/ceph_volume/util/prepare.py (line 304-318)
+
+```python
+def _link_device(device, device_type, osd_id):
+    device_path = '/var/lib/ceph/osd/%s-%s/%s' % (
+        conf.cluster,
+        osd_id,
+        device_type
+    )
+    command = ['ln', '-s', device, device_path]
+    system.chown(device)
+    process.run(command)
+```
+
+`device_type` 會是 `block` / `block.db` / `block.wal`。**OSD 目錄本身不存資料** — 跑在 tmpfs 上，重開機就消失，每次 `ceph-volume lvm activate` 重建。真正的東西在那幾個 symlink 指向的 block device 裡。所以你 `ls -lh /var/lib/ceph/osd/ceph-N/` 看到的容量總是很小，不必擔心。
+
+## RocksDB key prefix：metadata 的 schema
+
+BlueStore 把所有 metadata 都塞進同一個 RocksDB instance，用 single-letter prefix 區分用途：
+
+File: src/os/bluestore/BlueStore.cc (line 120-131)
+
+```cpp
+const string PREFIX_SUPER        = "S";  // field -> value
+const string PREFIX_STAT         = "T";  // field -> value(int64 array)
+const string PREFIX_COLL         = "C";  // collection name -> cnode_t
+const string PREFIX_OBJ          = "O";  // object name -> onode_t
+const string PREFIX_OMAP         = "M";  // u64 + keyname -> value
+const string PREFIX_PGMETA_OMAP  = "P";  // u64 + keyname -> value(for meta coll)
+const string PREFIX_PERPOOL_OMAP = "m";  // s64 + u64 + keyname -> value
+const string PREFIX_PERPG_OMAP   = "p";  // u64(pool) + u32(hash) + u64(id) + keyname -> value
+const string PREFIX_DEFERRED     = "L";  // id -> deferred_transaction_t
+const string PREFIX_ALLOC        = "B";  // u64 offset -> u64 length (freelist)
+const string PREFIX_ALLOC_BITMAP = "b";  // (see BitmapFreelistManager)
+const string PREFIX_SHARED_BLOB  = "X";  // u64 SB id -> shared_blob_t
+```
+
+讀這張表就知道「BlueStore 重啟時要從 RocksDB 還原什麼狀態」：
+
+- `O`（onode）：每個 RADOS object 的 inline metadata — size、xattr、extent map 指到 block device 上哪段、checksum 種類⋯⋯ 一個 `O:` key 對到一個 object，**這是 BlueStore 最熱的 key family**。
+- `M` / `m` / `p`（omap）：RADOS 的 object map，CephFS dir entry、RGW bucket index 都是這種，量大時 omap-heavy。
+- `L`（deferred transaction）：小寫先放這裡，後面會講。
+- `B` / `b`（freelist / bitmap）：Allocator 的 on-disk 狀態。OSD crash 後 BlueStore 用 `B` 重建 in-memory Allocator。
+- `X`（shared blob）：snapshot / clone 共用的 extent，CoW 用。
+
+`SHARED_BLOB` 是 BlueStore 對 snapshot 的關鍵：rbd snapshot 不抄一份，而是讓兩個 onode 指向同一個 shared blob，等到某邊寫時才 CoW 分裂。RocksDB 裡多一筆 `X:` 紀錄就夠了，比 FileStore 用 hard-link xfs file 乾淨得多。
+
+## BlueFS：為什麼要再做一個 FS
+
+RocksDB 是「LSM 引擎」，但它假設下面有 POSIX filesystem 給它 `open()` / `write()` / `fsync()` / `rename()`。BlueStore 不想用 xfs，所以做了 BlueFS — 極簡 user-space FS，只要應付 RocksDB 的呼叫模式即可：
+
+- 沒有 hard link、沒有 rename across dir、沒有 inode permission；只有 `dir/file` 兩層。
+- File 切成多個 `bluefs_extent_t`，**這些 extent 可以橫跨 BDEV_WAL / BDEV_DB / BDEV_SLOW**，由 volume selector 決定該放哪。
+- BlueFS 的 metadata 跟 transaction log 寫在自己的 log file 上，重啟靠 replay。
+
+當你看到 `BLUEFS_SPILLOVER`：
+
+File: src/os/bluestore/BlueStore.cc (line 18885-18931)
+
+```cpp
+size_t used = bluefs && bluefs_layout.shared_bdev == BlueFS::BDEV_SLOW ?
+  bluefs->get_used(BlueFS::BDEV_SLOW) : 0;
+if (used > 0) {
+    auto db_used = bluefs->get_used(BlueFS::BDEV_DB);
+    auto db_total = bluefs->get_block_device_size(BlueFS::BDEV_DB);
+    ostringstream ss;
+    ss << "spilled over " << byte_u_t(used)
+       << " metadata from 'db' device (" << byte_u_t(db_used)
+       << " used of " << byte_u_t(db_total) << ") to slow device";
+    spillover_alert = ss.str();
+}
+// ...
+if (!spillover_alert.empty() &&
+    cct->_conf->bluestore_warn_on_bluefs_spillover) {
+  alerts.emplace("BLUEFS_SPILLOVER", spillover_alert);
+}
+```
+
+`spilled over X metadata from 'db' device ... to slow device` — 直接讀程式碼就知道警告字串是怎麼組的，也知道**前提**是 `shared_bdev == BDEV_SLOW`：也就是說 BlueFS 已經把 BDEV_DB 用滿，必須把部分 RocksDB SST 寫到 BDEV_SLOW 上。HDD + 小 NVMe DB 的 cluster 最容易撞到。
+
+## 寫入路徑：TransContext 狀態機
+
+OSD 把一個 `Transaction` 丟進來，BlueStore 包成 `TransContext`（簡稱 txc），用一個確定性狀態機推到 finish。狀態定義在 BlueStore.h：
+
+File: src/os/bluestore/BlueStore.h (line 1834-1860)
+
+```cpp
+typedef enum {
+  STATE_PREPARE,
+  STATE_AIO_WAIT,
+  STATE_IO_DONE,
+  STATE_KV_QUEUED,        // queued for kv_sync_thread submission
+  STATE_KV_SUBMITTED,     // submitted to kv; not yet synced
+  STATE_KV_DONE,
+  STATE_DEFERRED_QUEUED,  // in deferred_queue (pending or running)
+  STATE_DEFERRED_CLEANUP, // remove deferred kv record
+  STATE_DEFERRED_DONE,
+  STATE_FINISHING,
+  STATE_DONE,
+} state_t;
+```
+
+主推進器 `_txc_state_proc` 是個無限迴圈 + switch，每個 state 做完事就 `set_state()` 跳下一個：
+
+File: src/os/bluestore/BlueStore.cc (line 14149-14245)
+
+```cpp
+void BlueStore::_txc_state_proc(TransContext *txc)
+{
+  while (true) {
+    switch (txc->get_state()) {
+    case TransContext::STATE_PREPARE:
+      if (txc->ioc.has_pending_aios()) {
+        txc->set_state(TransContext::STATE_AIO_WAIT);
+        txc->had_ios = true;
+        _txc_aio_submit(txc);
+        return;
+      }
+      // ** fall-thru **
+
+    case TransContext::STATE_AIO_WAIT:
+      // ...
+      _txc_finish_io(txc);  // may trigger blocked txc's too
+      return;
+
+    case TransContext::STATE_IO_DONE:
+      // ...
+      txc->set_state(TransContext::STATE_KV_QUEUED);
+      // push to kv_queue; kv_sync_thread 會處理
+      return;
+
+    case TransContext::STATE_KV_SUBMITTED:
+      _txc_committed_kv(txc);
+      // fall-thru
+    case TransContext::STATE_KV_DONE:
+      if (txc->deferred_txn) {
+        txc->set_state(TransContext::STATE_DEFERRED_QUEUED);
+        _deferred_queue(txc);
+        return;
+      }
+      txc->set_state(TransContext::STATE_FINISHING);
+      break;
+    // ...
+    }
+  }
+}
+```
+
+每段 state 都被 `BlueStoreThrottle::log_state_latency` 計時。`ceph daemon osd.N perf dump` 裡 `state_kv_queued_lat` / `state_aio_wait_lat` 這些指標就是從這裡 emit 的 — 哪段慢，直接對應到上面哪個 case label。
+
+簡化 path：
+
+```
+client write (RADOS op)
+  │
+  ▼
+PrimaryLogPG.do_op → 建 ObjectStore::Transaction
+  │
+  ▼
+BlueStore::queue_transactions → 建 TransContext (txc)
+  │
+  ▼  STATE_PREPARE
+  │   _do_write_data 把 IO 拆成 small/big、決定 deferred or direct
+  │
+  ▼  STATE_AIO_WAIT      (有 direct write 要等 libaio 完成)
+  ▼  STATE_IO_DONE       (block device 寫好了)
+  ▼  STATE_KV_QUEUED     (推到 kv_queue)
+  │
+  │   kv_sync_thread 拉一批 txc，組 RocksDB transaction，commit
+  │
+  ▼  STATE_KV_SUBMITTED  (RocksDB 寫好但還沒 sync)
+  ▼  STATE_KV_DONE       (RocksDB sync 完成 → 可以回 ack)
+  │
+  ▼  if deferred: STATE_DEFERRED_QUEUED → 之後 batch flush
+  │
+  ▼  STATE_FINISHING → STATE_DONE
+```
+
+關鍵：**ack 給 client 是在 `STATE_KV_DONE` 之後**（OSD 收到 callback 才回上層）。也就是 BlueStore 要先把 metadata sync 進 RocksDB 才算「committed」。對 HDD OSD，這個 RocksDB sync 大半是發生在 BDEV_DB / BDEV_WAL 上 — 如果 DB 在 NVMe，metadata sync 快很多，這就是 separate DB device 對 HDD 的最大價值。
+
+## Small write vs big write：min_alloc_size 是分水嶺
+
+`_do_write_data` 是 `BlueStore::write()` 的核心。它依 `min_alloc_size` 把寫入切三段：
+
+File: src/os/bluestore/BlueStore.cc (line 17148-17188)
+
+```cpp
+void BlueStore::_do_write_data(
+  TransContext *txc, CollectionRef& c, OnodeRef& o,
+  uint64_t offset, uint64_t length, bufferlist& bl,
+  WriteContext *wctx)
+{
+  uint64_t end = offset + length;
+  bufferlist::iterator p = bl.begin();
+
+  if (offset / min_alloc_size == (end - 1) / min_alloc_size &&
+      (length != min_alloc_size)) {
+    // we fall within the same block
+    _do_write_small(txc, c, o, offset, length, p, wctx);
+  } else {
+    uint64_t head_offset, head_length;
+    uint64_t middle_offset, middle_length;
+    uint64_t tail_offset, tail_length;
+
+    head_offset = offset;
+    head_length = p2nphase(offset, min_alloc_size);
+    tail_offset = p2align(end, min_alloc_size);
+    tail_length = p2phase(end, min_alloc_size);
+    middle_offset = head_offset + head_length;
+    middle_length = length - head_length - tail_length;
+
+    if (head_length) _do_write_small(txc, c, o, head_offset, head_length, p, wctx);
+    _do_write_big(txc, c, o, middle_offset, middle_length, p, wctx);
+    if (tail_length) _do_write_small(txc, c, o, tail_offset, tail_length, p, wctx);
+  }
+}
+```
+
+整段邏輯就是「把 write 切成 head（unaligned）+ middle（aligned 大塊）+ tail（unaligned）」，head/tail 走 small path、middle 走 big path。
+
+`min_alloc_size` 在 mkfs 時決定，predefault 是 4 KiB（HDD 與 SSD 都一樣）：
+
+File: src/common/options/global.yaml.in (line 4497-4515)
+
+```yaml
+- name: bluestore_min_alloc_size_hdd
+  default: 4_K
+- name: bluestore_min_alloc_size_ssd
+  default: 4_K
+```
+
+File: src/os/bluestore/BlueStore.cc (line 8508-8516)
+
+```cpp
+else if (cct->_conf->bluestore_min_alloc_size) {
+  min_alloc_size = cct->_conf->bluestore_min_alloc_size;
+} else {
+  ceph_assert(bdev);
+  if (_use_rotational_settings()) {
+    min_alloc_size = cct->_conf->bluestore_min_alloc_size_hdd;
+  } else {
+    min_alloc_size = cct->_conf->bluestore_min_alloc_size_ssd;
+  }
+}
+```
+
+<Callout type="warning" title="min_alloc_size 是 mkfs-time 決定">
+  上面 yaml 把 `flags: [create]` 列出來，表示這個值只能在 OSD 建立時生效。線上改 config 不會讓既有 OSD 的 min_alloc_size 變動 — 要改，得重建 OSD。
+</Callout>
+
+## Deferred write：避免 read-modify-write 的小 IO
+
+`_do_write_small`（length < min_alloc_size）會評估能不能塞進現存 blob：如果可以，且寫入大小小於 `prefer_deferred_size`，就**不立刻寫 block device**，而是把這次 IO 先記到 RocksDB 的 `PREFIX_DEFERRED` (`L:`) 下，等之後批次 flush。
+
+File: src/os/bluestore/BlueStore.cc (line 16170-16182)
+
+```cpp
+if (!g_conf()->bluestore_debug_omit_block_device_write) {
+  if (b_len < prefer_deferred_size) {
+    dout(20) << __func__ << " deferring small 0x" << std::hex
+             << b_len << std::dec << " unused write via deferred" << dendl;
+    bluestore_deferred_op_t *op = _get_deferred_op(txc, bl.length());
+    op->op = bluestore_deferred_op_t::OP_WRITE;
+    b->get_blob().map(
+      b_off, b_len,
+      [&](uint64_t offset, uint64_t length) {
+        op->extents.emplace_back(bluestore_pextent_t(offset, length));
+        return 0;
+      });
+    op->data = bl;
+```
+
+`prefer_deferred_size` 的預設值 HDD 跟 SSD 完全不一樣：
+
+File: src/common/options/global.yaml.in (line 4546-4564)
+
+```yaml
+- name: bluestore_prefer_deferred_size_hdd
+  default: 64_K
+- name: bluestore_prefer_deferred_size_ssd
+  default: 0
+```
+
+也就是說 **HDD OSD 預設把 64 KiB 以下的小寫先進 deferred queue，SSD/NVMe OSD 預設整個關掉 deferred**。理由很合理：HDD 的 seek 成本高，把多個小寫批起來再下盤可以省 IOPS；SSD 沒這問題，直接寫快多了。
+
+選擇邏輯在 `_set_throttle_params` 附近：
+
+File: src/os/bluestore/BlueStore.cc (line 6996-6998)
+
+```cpp
+prefer_deferred_size = cct->_conf->bluestore_prefer_deferred_size_hdd;
+// ... 或者:
+prefer_deferred_size = cct->_conf->bluestore_prefer_deferred_size_ssd;
+```
+
+依 device 自報 rotational flag 切。
+
+Big write path 也會在「可重用既有 blob 且大小不超 `prefer_deferred_size * 2`」的條件下走 deferred：
+
+File: src/os/bluestore/BlueStore.cc (line 16579-16599)
+
+```cpp
+uint64_t prefer_deferred_size_snapshot = prefer_deferred_size.load();
+while (length > 0) {
+  // ...
+  if (prefer_deferred_size_snapshot &&
+      l <= prefer_deferred_size_snapshot * 2) {
+    // 嘗試 defer 寫入到既有 blob 的 head/tail 空間
+```
+
+實務影響：HDD OSD 觀察 `perf dump` 的 `submitted_deferred_writes` / `issued_deferred_write_bytes` 數字會明顯增加；SSD OSD 預設這兩個 counter 接近 0。要在 SSD 上強制開 deferred 通常沒意義，反而多一次 RocksDB write。
+
+## Checksum：預設 crc32c，read path 一律驗
+
+每個 blob 都帶 csum_type 與 csum array。預設算法：
+
+File: src/common/options/global.yaml.in (line 4453-4470)
+
+```yaml
+- name: bluestore_csum_type
+  default: crc32c
+  enum_values: [none, crc32c, crc32c_16, crc32c_8, xxhash32, xxhash64]
+```
+
+寫入時在 `_do_alloc_write` 內把每個 blob 算 checksum：
+
+File: src/os/bluestore/BlueStore.cc (line 16802)
+
+```cpp
+// checksum
+int64_t csum = wctx->csum_type;
+```
+
+read 路徑跑 `_verify_csum`：
+
+File: src/os/bluestore/BlueStore.cc (line 12787-12824)
+
+```cpp
+int BlueStore::_verify_csum(OnodeRef& o,
+                            const bluestore_blob_t* blob, uint64_t blob_xoffset,
+                            const bufferlist& bl,
+                            uint64_t logical_offset)
+{
+  int bad;
+  uint64_t bad_csum;
+  auto start = mono_clock::now();
+  int r = blob->verify_csum(blob_xoffset, bl, &bad, &bad_csum);
+  // ...
+  if (r < 0) {
+    if (r == -1) {
+      // build PExtentVector for the bad block(s)
+      derr << __func__ << " bad "
+           << Checksummer::get_csum_type_string(blob->csum_type)
+           << "/0x" << std::hex << blob->get_csum_chunk_size()
+           << " checksum at blob offset 0x" << bad
+           << ", got 0x" << bad_csum << ", expected 0x"
+           << blob->get_csum_item(bad / blob->get_csum_chunk_size()) << std::dec
+           << ", device location " << pex
+```
+
+這就是 deep-scrub 抓 silent corruption 的原始碼層機制：scrubbing 主動讀 object → `_do_read` → `_verify_csum`，如果 disk 偷偷壞 bit，這裡會回 `-EIO`，PG 就會被標 `inconsistent`。csum chunk size 預設跟 block_size 一樣：
+
+File: src/os/bluestore/BlueStore.cc (line 17207)
+
+```cpp
+// apply basic csum block size
+wctx->csum_order = block_size_order;
+```
+
+`block_size_order` 通常是 12（= 4 KiB），所以每 4 KiB 一個 crc32c。
+
+<Callout type="tip" title="`bluestore_retry_disk_reads`">
+  csum mismatch 不會一次就回 EIO — 預設會 retry 3 次（`bluestore_retry_disk_reads = 3`，定義在 global.yaml.in:4471-4482），目的是處理偶發的 spurious read error。連續 retry 都不過才認定為真的壞。
+</Callout>
+
+## Compression：per-blob、aggressive / passive / force / none
+
+壓縮預設關閉：
+
+File: src/common/options/global.yaml.in (line 4566-4590)
+
+```yaml
+- name: bluestore_compression_mode
+  default: none
+  enum_values: [none, passive, aggressive, force]
+- name: bluestore_compression_algorithm
+  default: snappy
+```
+
+實際選擇邏輯在 `_choose_write_options`：
+
+File: src/os/bluestore/BlueStore.cc (line 17221-17226)
+
+```cpp
+wctx->compress = (cm != Compressor::COMP_NONE) &&
+  ((cm == Compressor::COMP_FORCE) ||
+   (cm == Compressor::COMP_AGGRESSIVE &&
+    (alloc_hints & CEPH_OSD_ALLOC_HINT_FLAG_INCOMPRESSIBLE) == 0) ||
+   (cm == Compressor::COMP_PASSIVE &&
+    (alloc_hints & CEPH_OSD_ALLOC_HINT_FLAG_COMPRESSIBLE)));
+```
+
+`passive` 跟 `aggressive` 都會看 client 給的 `alloc_hint`（RBD / RGW 寫入時可以 hint）。然後在 `_do_alloc_write` 真的壓：
+
+File: src/os/bluestore/BlueStore.cc (line 16830-16864)
+
+```cpp
+int r = c->compress(wi.bl, t, compressor_message);
+uint64_t want_len_raw = wi.blob_length * crr;
+uint64_t want_len = p2roundup(want_len_raw, min_alloc_size);
+// ...
+uint64_t result_len = p2roundup(compressed_len, min_alloc_size);
+if (r == 0 && result_len <= want_len && result_len < wi.blob_length) {
+  // ... 接受壓縮結果
+  txc->statfs_delta.compressed() += compressed_len;
+  txc->statfs_delta.compressed_original() += wi.blob_length;
+  txc->statfs_delta.compressed_allocated() += result_len;
+}
+```
+
+注意三件事：
+
+1. **壓縮失敗或壓不下** (`result_len > want_len`)，BlueStore 會拒收壓縮結果、直接寫原始 data。`l_bluestore_compress_rejected_count` 這個 counter 就是抓這種情況。
+2. **單位是 blob，不是 transaction**。同一個 write 可能產生多個 blob，每個獨立決定壓不壓 — `_choose_write_options` 那段註解寫得明白：「All blobs will be deferred or none will」，但 compression 是 per-blob。
+3. **`statfs_delta` 三個值** (`compressed` / `compressed_original` / `compressed_allocated`) 對應到 `ceph df` 看到的壓縮統計。
+
+## Allocator：給 `_do_alloc_write` 找位置
+
+`Allocator` 是個抽象，作用就是「給 N bytes，回 `[(offset, length), ...]`」。
+
+File: src/os/bluestore/Allocator.h (line 24)
+
+```cpp
+class Allocator {
+  // abstract interface
+};
+```
+
+可選的實作（同目錄 `BitmapAllocator.cc` / `AvlAllocator.cc` / `HybridAllocator.cc` / `Btree2Allocator.cc` 等）各有取捨；v19 預設用的是 hybrid（一段範圍用 AVL tree 管，超量用 bitmap 退化）。Allocator 不負責持久化 — 它的 on-disk state 是由 `FreelistManager` 透過 RocksDB `PREFIX_ALLOC` (`B:`) 與 `PREFIX_ALLOC_BITMAP` (`b:`) 維護的（見上面的 RocksDB schema），OSD 啟動時拿 freelist 重建 in-memory Allocator。
+
+## 背景：BLUESTORE_SLOW_OP_ALERT
+
+如果 BlueStore 偵測到 op 卡太久，會主動 emit alert：
+
+File: src/os/bluestore/BlueStore.cc (line 18901-18907)
+
+```cpp
+if (cct->_conf->bluestore_slow_ops_warn_threshold) {
+  size_t qsize = _trim_slow_op_event_queue(mono_clock::now());
+  if (qsize >= cct->_conf->bluestore_slow_ops_warn_threshold) {
+    ostringstream ss;
+    ss << "observed slow operation indications in BlueStore";
+    alerts.emplace("BLUESTORE_SLOW_OP_ALERT", ss.str());
+  }
+}
+```
+
+結合上面的 state machine：`state_aio_wait_lat`（block device）與 `state_kv_queued_lat` / `state_kv_submitted_lat`（RocksDB）哪段尖，幾乎決定你該往哪裡查。AIO wait 高 → block device 慢；KV queued 高 → RocksDB compaction 或 BDEV_DB 滿。
+
+## Debug 路徑：BlueStore 相關 alert 對到原始碼哪段
+
+| ceph 顯示 | 出處 | 真正在講什麼 |
+|---|---|---|
+| `BLUEFS_SPILLOVER` | BlueStore.cc:18927-18931 | BDEV_DB 滿，RocksDB SST 寫到 BDEV_SLOW |
+| `BLUESTORE_SLOW_OP_ALERT` | BlueStore.cc:18901-18907 | 內部 op 等待過久（看哪個 state 慢） |
+| `BLUESTORE_SPURIOUS_READ_ERRORS` | BlueStore.cc:18911-18915 | csum retry 觸發過，但最終讀回（device 邊緣狀態） |
+| `BLUESTORE_DISK_SIZE_MISMATCH` | BlueStore.cc:18917-18920 | bdev 容量跟 BlueStore 記的對不上 |
+| `BLUESTORE_LEGACY_STATFS` | BlueStore.cc:18922-18925 | 老格式 statfs，建議 repair |
+| `BLUESTORE_NO_PER_PG_OMAP` | BlueStore.cc:18933-18937 | omap 還用舊 schema，沒分到 `p:` |
+
+讀完這頁，下次看到任何 BLUESTORE/BLUEFS 前綴的 alert，直接 `rg -n "<alert key>" src/os/bluestore/` 通常一兩跳就能找到 emit 點與條件。
+
+## 收穫檢查
+
+- `block.db` 不夠大時，BlueStore 怎麼決定哪些 SST 要 spill 到 BDEV_SLOW？對應到哪個 class？
+- 為什麼 HDD OSD 預設 `prefer_deferred_size = 64K`、SSD OSD 預設 `0`？
+- TransContext 從 STATE_PREPARE 到 STATE_KV_DONE 之間，哪些 state 真的會等 block device IO？哪些是純 RocksDB 路徑？
+- 同一個 write 同時觸發壓縮失敗與 deferred 條件，BlueStore 最後寫進 block device 的是壓縮資料還是原始 data？
+- `ceph-volume lvm zap` 之後為什麼 OSD 目錄就沒了 — 跟 tmpfs 有什麼關係？
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [osd-and-bluestore](./osd-and-bluestore) — OSD daemon 結構、PrimaryLogPG、replication flow 的上層脈絡
+  - [crush-and-placement](./crush-and-placement) — 上一層：CRUSH 把 object 對到 OSD set 後，這頁就是該 OSD 內部發生的事
+  - [recovery-throttle-runtime](./recovery-throttle-runtime) — recovery / backfill 怎麼跟 BlueStore 共用 IO 預算
+</Callout>
+
+## 原始碼路徑
+
+- `src/os/bluestore/BlueStore.h` — `class BlueStore` (line 236), `TransContext::state_t` (line 1834)
+- `src/os/bluestore/BlueStore.cc` — `_txc_state_proc` (line 14149), `_do_write_data` (line 17148), `_do_write_small` (line 16052), `_do_write_big` (line 16564), `_do_alloc_write` (line 16777), `_verify_csum` (line 12787), spillover alert (line 18885)
+- `src/os/bluestore/BlueFS.h` — BDEV_* constants (line 252), three-device comment (line 516)
+- `src/os/bluestore/Allocator.h` — abstract Allocator (line 24)
+- `src/common/options/global.yaml.in` — `bluestore_csum_type` (line 4453), `bluestore_min_alloc_size_hdd` (line 4497), `bluestore_prefer_deferred_size_hdd` (line 4546), `bluestore_compression_mode` (line 4566)
+- `src/ceph-volume/ceph_volume/util/prepare.py` — `mount_tmpfs` / `create_osd_path` (line 190), `_link_device` (line 304)

@@ -311,17 +311,17 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'ceph'),
     color: 'rose',
     accentClass: 'border-rose-500 text-rose-400',
-    features: ['architecture', 'crush-and-placement', 'osd-and-bluestore', 'recovery-throttle-runtime', 'rbd-and-csi'],
+    features: ['architecture', 'crush-and-placement', 'osd-and-bluestore', 'bluestore-deep-dive', 'mclock-osd-scheduler', 'recovery-throttle-runtime', 'rbd-and-csi'],
     featureGroups: [
       { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
       { label: 'Placement 演算法', icon: '🧮', slugs: ['crush-and-placement'] },
-      { label: 'OSD + Storage 引擎', icon: '💾', slugs: ['osd-and-bluestore', 'recovery-throttle-runtime'] },
+      { label: 'OSD + Storage 引擎', icon: '💾', slugs: ['osd-and-bluestore', 'bluestore-deep-dive', 'mclock-osd-scheduler', 'recovery-throttle-runtime'] },
       { label: 'RBD + k8s 接點', icon: '🔗', slugs: ['rbd-and-csi'] },
     ],
     usecases: [],
     difficulty: '🔴 進階',
     difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
-    problemStatement: 'HDFS 用 NameNode 記 block 位置，ceph 沒有這個東西 — client 自己用 CRUSH 算式定位 object。這 4 頁從原始碼層拆：MON 的 Paxos quorum、CRUSH 為什麼能不用中央 server、OSD + BlueStore 怎麼真的存資料、RBD 怎麼接 k8s PVC。',
+    problemStatement: 'HDFS 用 NameNode 記 block 位置，ceph 沒有這個東西 — client 自己用 CRUSH 算式定位 object。這幾頁從原始碼層拆：MON 的 Paxos quorum、CRUSH 為什麼能不用中央 server、OSD + BlueStore 怎麼真的存資料、mClock 怎麼分配 OSD I/O、RBD 怎麼接 k8s PVC。',
     story: {
       protagonist: '🧑‍💻 平台 SRE 你自己',
       challenge: '你的 KubeVirt VM 要用持久 storage。聽說 ceph 是 cloud-native 的標準解，但 ceph 對你還是黑盒：MON / OSD / MDS / RGW 一堆 daemon、CRUSH 是什麼魔法、BlueStore 為什麼不用 filesystem。今天決定從 ceph_osd.cc 開始把它拆透。',
@@ -329,9 +329,10 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
         { step: 1, icon: '🏗️', actor: '你', action: '讀 architecture：3 類 daemon + RADOS', detail: 'MON (Paxos quorum, cluster state), OSD (per disk, 真正存資料), MGR (metric/orchestrator)。RADOS 是底層 object store，所有東西都建在它上面。' },
         { step: 2, icon: '🧮', actor: '你', action: '讀 CRUSH：為什麼不用中央 metadata server', detail: 'object → PG (hash) → OSD set (CRUSH algorithm)。client 拿 CRUSHMap 後自己算，O(1) 沒有 lookup。加 OSD 時只有少數 PG 需要重 placement (stable property 來自 straw2)。' },
         { step: 3, icon: '💾', actor: '你', action: '讀 OSD + BlueStore：raw block 直接管', detail: 'PrimaryLogPG.do_op 走完整 replicate flow。BlueStore 直接管 raw block + RocksDB metadata，避開 filesystem 的 double write 與粗 fsync。' },
-        { step: 4, icon: '🔗', actor: '你', action: '讀 RBD + ceph-csi：50GB image 是一坨什麼', detail: 'RBD image = 一個 header object + N 個 4MB data object。librbd 把 block read/write 翻成 RADOS object op；ceph-csi 把 librbd 包成 k8s PVC backend；rook 是 operator 把整套部署當 CRD 管。' },
+        { step: 4, icon: '⏱️', actor: '你', action: '讀 mClock：client I/O 與 recovery 怎麼排隊', detail: 'mClock 是 OSD op queue scheduler，用 reservation / weight / limit 在 client、recovery、scrub、snap trim、PG delete 之間做 QoS。' },
+        { step: 5, icon: '🔗', actor: '你', action: '讀 RBD + ceph-csi：50GB image 是一坨什麼', detail: 'RBD image = 一個 header object + N 個 4MB data object。librbd 把 block read/write 翻成 RADOS object op；ceph-csi 把 librbd 包成 k8s PVC backend；rook 是 operator 把整套部署當 CRD 管。' },
       ],
-      outcome: '從此 ceph 不是黑盒。你看 ceph -s 知道每個 PG 狀態 (active+clean / degraded / scrubbing) 真實意義；ceph osd df 看 OSD 利用率不平均時知道是 CRUSH 的 weight 問題；KubeVirt VM 看到 RBD 慢時知道該追 BlueStore 還是 client 端。',
+      outcome: '從此 ceph 不是黑盒。你看 ceph -s 知道每個 PG 狀態 (active+clean / degraded / scrubbing) 真實意義；ceph osd df 看 OSD 利用率不平均時知道是 CRUSH 的 weight 問題；KubeVirt VM 看到 RBD 慢時知道該追 mClock queue、BlueStore 還是 client 端。',
     },
     learningPaths: {
       beginner: [
@@ -342,10 +343,13 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       intermediate: [
         { slug: 'crush-and-placement', note: '深入 PG 與 stable placement property' },
         { slug: 'osd-and-bluestore', note: 'replication / recovery / scrubbing flow' },
+        { slug: 'mclock-osd-scheduler', note: 'client I/O、recovery、scrub 在 OSD queue 裡怎麼做 QoS' },
         { slug: 'rbd-and-csi', note: 'RBD image → RADOS object 切片邏輯' },
       ],
       advanced: [
         { slug: 'osd-and-bluestore', note: 'BlueStore allocator 演算法、BlueFS for RocksDB' },
+        { slug: 'bluestore-deep-dive', note: 'TransContext 狀態機、deferred write、min_alloc_size、checksum / compression' },
+        { slug: 'mclock-osd-scheduler', note: 'reservation / weight / limit、profile 與 capacity 估算' },
         { slug: 'crush-and-placement', note: 'straw2 算法為什麼 stable，CRUSHMap rule 設計' },
         { slug: 'architecture', note: 'MON Paxos 的 leader / peon 角色' },
       ],

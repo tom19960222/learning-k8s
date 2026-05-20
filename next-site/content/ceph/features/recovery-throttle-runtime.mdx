@@ -321,13 +321,246 @@ bool OSD::maybe_override_options_for_qos(const std::set<std::string> *changed)
 - 但 mon db 端會被 `config rm` 撤掉，cluster log 留一條 warn
 - 下次 OSD 重啟、或別人 query 都會看到舊預設
 
-正確姿勢：
-```
-ceph config set osd osd_mclock_override_recovery_settings true
-ceph config set osd osd_recovery_max_active_hdd 3   # 或對應 ssd / 全域 override
+更糟的情境：用持久化版 `ceph config set osd osd_recovery_max_active 1`（沒先開 override）會引發一輪 **mon→OSD→mon ping-pong**，每顆 OSD 各送一條 cluster log warn — 後一節 §「`ceph config set` 路徑」會把整條時序拆給你看。
+</Callout>
+
+## `ceph config set` 路徑：完整 ping-pong
+
+`injectargs` 是 ephemeral admin socket call，只進那幾顆被命令到的 OSD 的 `cct->_conf`。`ceph config set` 是持久化版本，會把值寫進 mon 的 config store，然後 mon push 給所有匹配的 OSD。看起來「更正確」、實際上**在 mClock 預設下更糟**：因為值真的被寫進 mon db，然後被你叫的 OSD 自己 `config rm` 撤掉。
+
+### 跟 `injectargs` 的差別
+
+| 面向 | `injectargs` | `ceph config set` |
+|---|---|---|
+| 寫入位置 | OSD 端 cct->_conf（ephemeral）| mon db config store（persistent）|
+| 觸發目標 | 命令打到的那幾顆 OSD | mon push 觸發**所有**符合 mask 的 OSD |
+| mClock rollback 結果 | `config rm` 對 mon db 是 no-op；cct 端值還在直到 OSD 重啟 | mon db 真被寫入、再被 `config rm` 移除；OSD cct 短暫變動隨即還原 |
+| cluster log warn | 1 條 / 命令打到的 OSD | 1 條 / **每**顆 OSD（cluster-wide 風暴）|
+| 跨 OSD 重啟存活 | 否 | 否（被 rollback 移除了）|
+
+**重點**：`config set` 表面上是「持久化」指令，但在 mClock 預設下，它是「自殺式持久化」— 寫入後立刻被自己叫的 OSD 撤掉。
+
+### mon 端寫入：`ConfigMonitor::prepare_command`
+
+`ceph config set` 與 `ceph config rm` 都走同一個 handler，分支用 `prefix` 判斷：
+
+```cpp
+// File: src/mon/ConfigMonitor.cc (line 533)
+if (prefix == "config set" ||
+    prefix == "config rm") {
+  string who, name, value;
+  cmd_getval(cmdmap, "who", who);
+  cmd_getval(cmdmap, "name", name);
+  cmd_getval(cmdmap, "value", value);
+  name = ConfFile::normalize_key_name(name);
+
+  // ... validate option exists, parse value ...
+
+  string section;
+  OptionMask mask;
+  ConfigMap::parse_mask(who, &section, &mask);
+
+  string key;                          // 例：osd/osd_recovery_max_active
+  if (section.size()) key += section + "/";
+  else                key += "global/";
+  string mask_str = mask.to_str();
+  if (mask_str.size()) key += mask_str + "/";
+  key += name;
+
+  if (prefix == "config set") {
+    bufferlist bl; bl.append(value);
+    pending[key] = bl;                 // 寫進 pending KV
+  } else {
+    pending[key].reset();              // null = 刪除標記
+  }
+  goto update;
+}
 ```
 
-用 `config set`（持久化到 mon db）而不是 `injectargs`（只是 ephemeral runtime 改動），這樣才能跨 OSD 重啟存活。
+`pending` 隨後透過 `encode_pending_to_kvmon()` 走 paxos 提案 → 提交。
+
+### mon push：`check_all_subs` → `send_config`
+
+paxos 提交完成後 ConfigMonitor 通知所有訂閱 `config` 的 session：
+
+```cpp
+// File: src/mon/ConfigMonitor.cc (line 963)
+void ConfigMonitor::check_all_subs()
+{
+  auto subs = mon.session_map.subs.find("config");
+  if (subs == mon.session_map.subs.end()) return;
+  int updated = 0, total = 0;
+  auto p = subs->second->begin();
+  while (!p.end()) {
+    auto sub = *p; ++p; ++total;
+    if (maybe_send_config(sub->session)) ++updated;
+  }
+}
+```
+
+實際送訊息用 `MConfig`：
+
+```cpp
+// File: src/mon/ConfigMonitor.cc (line 927)
+void ConfigMonitor::send_config(MonSession *s)
+{
+  auto m = new MConfig(s->last_config);
+  s->con->send_message(m);
+}
+```
+
+### OSD 端接收：`MonClient::handle_config`
+
+OSD 收到 `MConfig` 後，把整份「mon 認為這顆 OSD 應該套用的 key/value 集合」套到 `cct->_conf`，然後觸發 observer：
+
+```cpp
+// File: src/mon/MonClient.cc (line 457)
+void MonClient::handle_config(MConfig *m)
+{
+  // ... 略過 bootstrap 分支 ...
+  boost::asio::post(finish_strand,
+    [m, cct = boost::intrusive_ptr<CephContext>(cct),
+     config_notify_cb = config_notify_cb,
+     config_cb = config_cb]() {
+      cct->_conf.set_mon_vals(cct.get(), m->config, config_cb);
+      if (config_notify_cb) {
+        config_notify_cb();
+      }
+      m->put();
+    });
+}
+```
+
+`set_mon_vals` 算出哪些 key 真的變了，丟給 observer chain — 同一條 `OSD::handle_conf_change` 路徑，跟 `injectargs` 完全一樣，只是來源不同。
+
+### 完整 ping-pong 時序
+
+下面是「未先 `ceph config set osd osd_mclock_override_recovery_settings true`」就直接 `ceph config set osd osd_recovery_max_active 1` 的逐步演進：
+
+```
+t0   user: ceph config set osd osd_recovery_max_active 1
+              │
+              ▼
+t1   mon: ConfigMonitor::prepare_command
+         pending["osd/osd_recovery_max_active"] = "1"
+t2   mon: KVMonitor paxos 提交 → ConfigMonitor::update_from_paxos
+         → check_all_subs()
+t3   mon: 對每個訂閱 config 的 OSD session send_config()
+         → MConfig{ osd/osd_recovery_max_active: 1, ... }
+              │
+              ▼  (N 顆 OSD 各自處理，以下以 osd.X 為例)
+t4   osd.X: MonClient::handle_config
+         → cct->_conf.set_mon_vals → ConfigProxy::_call_observers
+t5   osd.X: OSD::handle_conf_change
+         → changed = { "osd_recovery_max_active" }
+         → maybe_override_options_for_qos(&changed)
+t6   osd.X: mClock + osd_mclock_override_recovery_settings=false
+         + cct 當前值(1) ≠ recovery_qos_defaults["osd_recovery_max_active"](0)
+         → monc->start_mon_command("config rm who=osd  name=osd_recovery_max_active")
+         → monc->start_mon_command("config rm who=osd.X name=osd_recovery_max_active")
+         → clog->warn("Change to osd_recovery_max_active on osd.X did not take effect ...")
+              │
+              ▼  (N 顆 OSD 各送 2 條 config rm，外加各 1 條 warn — 風暴開始)
+t7   mon: ConfigMonitor 處理多條 config rm
+         who=osd 的真的移除 "osd/osd_recovery_max_active"
+         who=osd.X 的對 mon db 不匹配，no-op（但仍佔 paxos round）
+t8   mon: paxos 再提交 → check_all_subs → 再推一輪 MConfig
+         （這次沒有 osd_recovery_max_active，OSD 看到的是 default 0）
+              │
+              ▼
+t9   osd.X: handle_conf_change 再次觸發，changed 仍含 osd_recovery_max_active
+         但 cct->_conf.get_val(key) = 0 == recovery_qos_defaults[key] (0)
+         → maybe_override_options_for_qos 的 rollback 分支 if 條件不成立
+         → 不再發 config rm，不再 warn   ← ping-pong 在這裡自動止血
+              │
+              ▼
+t10  終態：mon db 無此 key、所有 OSD cct 回到 default、cluster log 留 N 條 warn
+```
+
+### 為什麼 ping-pong 只跑兩輪、不會無限循環
+
+第二輪 `handle_conf_change` 看到的 cct 值已經回到 default，所以 rollback 邏輯的這個 if 不成立：
+
+```cpp
+// File: src/osd/OSD.cc (line 10212)
+auto val = recovery_qos_defaults.find(key);
+if (val != recovery_qos_defaults.end() &&
+    cct->_conf.get_val<uint64_t>(key) != val->second) {
+  // ... 發 config rm + clog warn ...
+}
+```
+
+整段 rollback 只在「當前值 ≠ default」時觸發，所以最多兩輪：第一輪 user 設成非 default、OSD 撤回；第二輪 mon 通知 default、OSD 不做事。
+
+### cluster log 風暴與如何辨識
+
+oncall 用 `ceph -s` 看不到這些 warn（`ceph -s` 只 surface health summary）。`ceph -W cluster` 即時可看，但若已經錯過要事後翻：
+
+```bash
+ceph log last 200 cluster | grep "did not take effect"
+# 預期看到 N 條（= cluster OSD 數）：
+# cluster [WRN] Change to osd_recovery_max_active on osd.0 did not take effect. Enable osd_mclock_override_recovery_settings before setting this option.
+# cluster [WRN] Change to osd_recovery_max_active on osd.1 did not take effect. ...
+# ...
+```
+
+另一個檢驗指標是 `ceph config dump`：你以為 `set` 了，但 grep 不到那個 key：
+
+```bash
+ceph config dump | grep osd_recovery_max_active
+# 預期：空（key 已被 OSD rollback 移除）
+```
+
+### 為什麼會發兩條 `config rm`：`who="osd"` 與 `who="osd.X"`
+
+`maybe_override_options_for_qos` 對每顆 OSD 都會發兩條 `config rm`：
+
+```cpp
+// File: src/osd/OSD.cc (line 10215)
+static const std::vector<std::string> osds = {
+  "osd",
+  "osd." + std::to_string(whoami)
+};
+for (auto osd : osds) {
+  std::string cmd =
+    "{"
+      "\"prefix\": \"config rm\", "
+      "\"who\": \"" + osd + "\", "
+      "\"name\": \"" + key + "\""
+    "}";
+  vector<std::string> vcmd{cmd};
+  monc->start_mon_command(vcmd, {}, nullptr, nullptr, nullptr);
+}
+```
+
+實際匹配關係：
+
+- user 下的 `ceph config set osd osd_recovery_max_active 1` → mon db key = `osd/osd_recovery_max_active`
+- rollback 發 `config rm who=osd  name=osd_recovery_max_active` → **真的移除** ✓
+- rollback 發 `config rm who=osd.<id> name=osd_recovery_max_active` → mon db key 不存在，no-op
+
+兩條都發是因為使用者也可能用個別 mask（例如 `ceph config set osd.0 osd_recovery_max_active 1`）；同一段程式碼涵蓋兩種情境。代價是 mon 多跑一輪 paxos round per OSD。
+
+<Callout type="tip" title="正確順序（持久化 + 不被 rollback）">
+要讓 `osd_recovery_max_active*` 在 Squid 持久化生效，**順序非常重要**：
+
+```bash
+# 1) 先開 override flag
+ceph config set osd osd_mclock_override_recovery_settings true
+
+# 2) 才設 recovery max active（hdd / ssd / 全域 override 三選一）
+ceph config set osd osd_recovery_max_active_hdd 3
+
+# 3) 確認 key 真的留在 mon db
+ceph config dump | grep osd_recovery_max_active
+# 預期看到那一行；如果不見了，代表你忘了 step 1，被 rollback 了
+
+# 4) 事後檢查 cluster log 沒 warn
+ceph log last 50 cluster | grep "did not take effect"
+# 預期空
+```
+
+順序反過來不行：先 set `osd_recovery_max_active_hdd`、再 set `osd_mclock_override_recovery_settings`，第一條會在 OSD 收到 push 時被 rollback，因為當下 override 還是 false。
 </Callout>
 
 ## 驗證指令
@@ -359,6 +592,25 @@ ceph config set osd osd_recovery_max_active_hdd 3
 # 它會從原本的值「逐個 op 完成後自然下降」，不會瞬間掉。
 ```
 
+要重現「忘記開 override」的 ping-pong：
+
+```bash
+# 確保 override 是 false（預設）
+ceph config get osd osd_mclock_override_recovery_settings
+# 預期：false
+
+# 跳過 step 1 直接 set
+ceph config set osd osd_recovery_max_active 1
+
+# 立刻查 mon db；早一點查可能還在，晚幾秒就被 rollback 撤了
+ceph config dump | grep osd_recovery_max_active
+# 等 1-2 秒再查一次，預期變空
+
+# 看 cluster log 風暴
+ceph log last 200 cluster | grep "did not take effect"
+# 預期看到 N 條 warn（= cluster OSD 總數）
+```
+
 ## 同場加映：跟 `osd_max_backfills` 的差別
 
 很多人把 backfill 與 recovery 搞混。在 `handle_conf_change` 的視角上，兩者待遇不同：
@@ -387,3 +639,8 @@ ceph config set osd osd_recovery_max_active_hdd 3
 - `src/osd/OSD.cc:10171-10241` — `OSD::maybe_override_options_for_qos()` mClock rollback
 - `src/common/config_proxy.h:264-274` — `ConfigProxy::injectargs()`
 - `src/common/config.cc:844-885` — `parse_injectargs()`
+- `src/mon/ConfigMonitor.cc:533-597` — `ConfigMonitor::prepare_command` 處理 `config set` / `config rm`
+- `src/mon/ConfigMonitor.cc:915-932` — `maybe_send_config` / `send_config` 產生 `MConfig` 訊息
+- `src/mon/ConfigMonitor.cc:963-981` — `check_all_subs` 廣播給所有訂閱 config 的 OSD
+- `src/mon/MonClient.cc:457-481` — `MonClient::handle_config` → `set_mon_vals` → observer chain
+- `src/osd/OSD.cc:10215-10231` — rollback 發兩條 `config rm`（`who=osd` 與 `who=osd.<id>`）

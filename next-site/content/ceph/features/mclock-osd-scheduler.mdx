@@ -1,0 +1,460 @@
+---
+layout: doc
+title: Ceph — mClock OSD I/O scheduler
+description: Squid 預設的 OSD op queue：mClock 如何用 reservation / weight / limit 在 client I/O、recovery、scrub、snap trim 與 PG delete 之間做 QoS scheduling。
+---
+
+## 場景
+
+Ceph cluster 最怕的不是「有 background work」，而是 background work 跟線上 client I/O 混在同一顆 OSD 裡互搶到不可預測：recovery 一開始跑，client latency 爆；client workload 一重，degraded PG 又補不回來。
+
+mClock 就是 Squid 版 OSD 預設的 op queue scheduler。它不是把 `osd_recovery_max_active` 這類 concurrency 數字再包一層，而是在 OSD 每個 shard 的 queue 裡，按照 op 類型與 QoS 參數決定下一個 work item 何時被 worker thread 拿走。
+
+## mClock 在 OSD 裡的位置
+
+先把它放回 OSD 的實際路徑。network 收到的 op、recovery context、scrub event、snap trim、PG delete 這些工作，最後都會變成 `OpSchedulerItem` 進入 `ShardedOpWQ`。每個 `OSDShard` 有自己的 scheduler；`osd_op_queue` 決定這個 scheduler 是 WPQ 還是 mClock。
+
+```
+client / peer OSD message
+          │
+          ▼
+OSDService::enqueue_back()
+          │
+          ▼
+ShardedOpWQ::_enqueue()
+          │  hash PG id → shard
+          ▼
+OSDShard.scheduler
+          │
+          ├─ mClockScheduler::enqueue()    normal QoS queue
+          ├─ high_priority queue           immediate / high-priority path
+          │
+          ▼
+ShardedOpWQ::_process()
+          │  scheduler->dequeue()
+          ▼
+OpSchedulerItem::run()
+          │
+          ▼
+PG / PrimaryLogPG / scrub / recovery / BlueStore
+```
+
+`osd_op_queue` 的預設值在 Squid 是 `mclock_scheduler`，而且這個選項標明需要 restart 才能換 scheduler：
+
+```yaml
+# File: src/common/options/osd.yaml.in (line 988)
+- name: osd_op_queue
+  type: str
+  level: advanced
+  desc: which operation priority queue algorithm to use
+  fmt_desc: This sets the type of queue to be used for prioritizing ops
+    within each OSD.
+  default: mclock_scheduler
+  enum_values:
+  - wpq
+  - mclock_scheduler
+  - debug_random
+```
+
+OSD 啟動時會先解析 `osd_op_queue`，再替每個 shard 建立 `OSDShard`。重點不是「整個 OSD 只有一條 queue」，而是每個 shard 都有一個 scheduler instance：
+
+```cpp
+// File: src/osd/OSD.cc (line 2459)
+// initialize shards
+num_shards = get_num_op_shards();
+for (uint32_t i = 0; i < num_shards; i++) {
+  OSDShard *one_shard = new OSDShard(
+    i,
+    cct,
+    this,
+    op_queue,
+    op_queue_cut_off);
+  shards.push_back(one_shard);
+}
+```
+
+真正選 scheduler 的 factory 在 `OpScheduler.cc`。如果是 FileStore 會強制走 WPQ；如果是 `mclock_scheduler`，才建立 `mClockScheduler`：
+
+```cpp
+// File: src/osd/scheduler/OpScheduler.cc (line 24)
+OpSchedulerRef make_scheduler(...)
+{
+  if (op_queue_type_t::WeightedPriorityQueue == osd_scheduler ||
+      osd_objectstore == "filestore") {
+    return std::make_unique<
+      ClassedOpQueueScheduler<WeightedPriorityQueue<OpSchedulerItem, client>>>(...);
+  } else if (op_queue_type_t::mClockScheduler == osd_scheduler) {
+    return std::make_unique<
+      mClockScheduler>(cct, whoami, num_shards, shard_id, is_rotational,
+        op_queue_cut_off, monc);
+  }
+}
+```
+
+所以 mClock 的邊界很清楚：它管的是 OSD op queue 裡「下一個 item 何時被 dequeue」。BlueStore 寫入 latency、RocksDB compaction、網路 timeout、PG 分布不均，不會因為換 scheduler 就消失；那是 queue 之後或 queue 之外的問題。
+
+## service class 怎麼切
+
+mClock 不是直接看「這是 read 還是 write」就做全部判斷。Ceph 先把每個 queued item 分成 scheduler class：
+
+```cpp
+// File: src/osd/scheduler/OpSchedulerItem.h (line 33)
+enum class op_scheduler_class : uint8_t {
+  background_recovery = 0,
+  background_best_effort,
+  immediate,
+  client,
+};
+```
+
+對外部 client I/O，`PGOpItem` 只要看到 `CEPH_MSG_OSD_OP` 或 `CEPH_MSG_OSD_BACKOFF` 就歸到 `client`；其他 OSD message 進 `immediate`：
+
+```cpp
+// File: src/osd/scheduler/OpSchedulerItem.h (line 243)
+op_scheduler_class get_scheduler_class() const final {
+  auto type = op->get_req()->get_type();
+  if (type == CEPH_MSG_OSD_OP ||
+      type == CEPH_MSG_OSD_BACKOFF) {
+    return op_scheduler_class::client;
+  } else {
+    return op_scheduler_class::immediate;
+  }
+}
+```
+
+background 類型大致分兩層。recovery 相關 item 會依 priority 映射到 `background_recovery` 或 `background_best_effort`；scrub、snap trim、PG delete 則直接是 best-effort：
+
+| source class / function | scheduler class | 意義 |
+|---|---|---|
+| `PGOpItem::get_scheduler_class()` | `client` / `immediate` | client op 與部分 OSD message |
+| `PGPeeringItem::get_scheduler_class()` | `immediate` | peering 事件不排進一般 mClock QoS queue |
+| `PGRecovery::get_scheduler_class()` | priority 決定 | recovery work item |
+| `PGRecoveryContext::get_scheduler_class()` | priority 決定 | recovery context |
+| `PGRecoveryMsg::get_scheduler_class()` | priority 決定 | recovery message |
+| `PGScrubItem::get_scheduler_class()` | `background_best_effort` | scrub / deep-scrub 事件 |
+| `PGSnapTrim::get_scheduler_class()` | `background_best_effort` | snap trim |
+| `PGDelete::get_scheduler_class()` | `background_best_effort` | PG delete |
+
+這裡有一個容易誤會的地方：官方 docs 常把 background service 分成 recovery、scrub、snap trim、PG deletion；但 v19.2.3 的 scheduler source 實際只有三個會進 dmClock 的大桶：`client`、`background_recovery`、`background_best_effort`。scrub、snap trim、PG delete 是被收進 `background_best_effort` 這個桶裡。
+
+## reservation / weight / limit 的真正用途
+
+dmClock 的 `ClientInfo` 就是三個參數：`reservation`、`weight`、`limit`。Ceph 的 `mClockScheduler::ClientRegistry` 會替 `client`、`background_recovery`、`background_best_effort` 三個 class 準備這些值。
+
+```cpp
+// File: src/dmclock/src/dmclock_server.h (line 97)
+struct ClientInfo {
+  double reservation;  // minimum
+  double weight;       // proportional
+  double limit;        // maximum
+
+  double reservation_inv;
+  double weight_inv;
+  double limit_inv;
+
+  inline void update(double _reservation, double _weight, double _limit) {
+   reservation = _reservation;
+   weight = _weight;
+   limit = _limit;
+   reservation_inv = (0.0 == reservation) ? 0.0 : 1.0 / reservation;
+   weight_inv = (0.0 == weight) ? 0.0 : 1.0 / weight;
+   limit_inv = (0.0 == limit) ? 0.0 : 1.0 / limit;
+  }
+};
+```
+
+每個 request 進 dmClock queue 時會算三種 tag：reservation tag、proportion tag、limit tag。dequeue 時先看 reservation 是否到期，再看在 limit 內的 request 用 weight/proportion 競爭；都不能跑時，回傳下一個可跑時間：
+
+```cpp
+// File: src/dmclock/src/dmclock_server.h (line 1131)
+// try constraint (reservation) based scheduling
+auto& reserv = resv_heap.top();
+if (reserv.has_request() &&
+    reserv.next_request().tag.reservation <= now) {
+  return NextReq(HeapId::reservation);
+}
+
+// no existing reservations before now, so try weight-based
+// scheduling
+auto limits = &limit_heap.top();
+while (limits->has_request() &&
+       !limits->next_request().tag.ready &&
+       limits->next_request().tag.limit <= now) {
+  limits->next_request().tag.ready = true;
+  ready_heap.promote(*limits);
+```
+
+用白話說：
+
+- `reservation` 是最低保證；時間到了就先補它。
+- `limit` 是上限；還沒到 limit tag 的 request 不會變成 ready。
+- `weight` 是剩餘資源分配比例；沒有 reservation 債要還時，ready queue 用 proportion tag 選下一個。
+
+這跟 WPQ 不同。WPQ 是 priority / cost queue；mClock 是把每個 class 放進 capacity-aware 的時間模型裡。
+
+## profile 怎麼展開成低階參數
+
+實務上你通常改 `osd_mclock_profile`，不是直接改九個低階 QoS key。source 裡的 built-in profile 很直接：
+
+| profile | client | background recovery | background best-effort |
+|---|---|---|---|
+| `balanced` | reservation 50%, weight 1, limit MAX | reservation 50%, weight 1, limit MAX | reservation MIN, weight 1, limit 90% |
+| `high_client_ops` | reservation 60%, weight 2, limit MAX | reservation 40%, weight 1, limit MAX | reservation MIN, weight 1, limit 70% |
+| `high_recovery_ops` | reservation 30%, weight 1, limit MAX | reservation 70%, weight 2, limit MAX | reservation MIN, weight 1, limit MAX |
+| `custom` | 不套 built-in defaults | 不套 built-in defaults | 由你自己設定 |
+
+`balanced` 的 source 長這樣；其他兩個 profile 就在前面幾行，數字與上表一致：
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 324)
+/**
+ * balanced
+ *
+ * Client Allocation:
+ *   reservation: 50% | weight: 1 | limit: 0 (max) |
+ * Background Recovery Allocation:
+ *   reservation: 50% | weight: 1 | limit: 0 (max) |
+ * Background Best Effort Allocation:
+ *   reservation: 0 (min) | weight: 1 | limit: 90% |
+ */
+static constexpr profile_t balanced_profile{
+  { .5, 1, 0 },
+  { .5, 1, 0 },
+  {  0, 1, .9 }
+};
+```
+
+`set_config_defaults_from_profile()` 只有 shard 0 會寫 default，然後把 profile 值塞進 `osd_mclock_scheduler_*_{res,wgt,lim}`。profile 是 `custom` 時，函式直接 return，表示不覆蓋你的低階設定。
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 340)
+const profile_t *profile = nullptr;
+auto mclock_profile = cct->_conf.get_val<std::string>("osd_mclock_profile");
+if (mclock_profile == "high_client_ops") {
+  profile = &high_client_ops_profile;
+} else if (mclock_profile == "high_recovery_ops") {
+  profile = &high_recovery_ops_profile;
+} else if (mclock_profile == "balanced") {
+  profile = &balanced_profile;
+} else if (mclock_profile == "custom") {
+  return;
+}
+```
+
+built-in profile 還有一個保護：你如果在 `balanced` / `high_client_ops` / `high_recovery_ops` 下硬改低階 QoS key，`mClockScheduler::handle_conf_change()` 會把 key 從 mon config store 移除，並把 ephemeral value 移回 default。只有 `custom` 會接受低階 QoS key 變更。
+
+## capacity 是 mClock 的刻度尺
+
+mClock 的 res/lim 是「OSD capacity 的比例」，所以它需要知道這顆 OSD 大約能跑多少 IOPS 與 sequential bandwidth。這不是裝飾性設定；它會直接變成 scheduler 內部的 cost 單位。
+
+source 先依裝置類型取 HDD 或 SSD 的設定，再算出兩個內部值：
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 215)
+void mClockScheduler::set_osd_capacity_params_from_config()
+{
+  uint64_t osd_bandwidth_capacity;
+  double osd_iop_capacity;
+
+  std::tie(osd_bandwidth_capacity, osd_iop_capacity) = [&, this] {
+    if (is_rotational) {
+      return std::make_tuple(
+        cct->_conf.get_val<Option::size_t>(
+          "osd_mclock_max_sequential_bandwidth_hdd"),
+        cct->_conf.get_val<double>("osd_mclock_max_capacity_iops_hdd"));
+```
+
+下面這兩行是核心換算：
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 237)
+osd_bandwidth_cost_per_io =
+  static_cast<double>(osd_bandwidth_capacity) / osd_iop_capacity;
+osd_bandwidth_capacity_per_shard = static_cast<double>(osd_bandwidth_capacity)
+  / static_cast<double>(num_shards);
+```
+
+`osd_bandwidth_cost_per_io` 會讓小 random I/O 也被換算成「等價 sequential bytes」成本；`osd_bandwidth_capacity_per_shard` 則把整顆 OSD 的 capacity 分配到每個 shard。這也是為什麼 HDD cluster 估錯 capacity 會很痛：你把腳踏車登記成高鐵，scheduler 會照高鐵時刻表派工。
+
+Squid 會在 OSD initialization 時嘗試跑 OSD bench，自動覆寫 `osd_mclock_max_capacity_iops_hdd` 或 `osd_mclock_max_capacity_iops_ssd`。如果結果超過該裝置類型的門檻，source 會留下 cluster warning 並保留原值：
+
+```cpp
+// File: src/osd/OSD.cc (line 10110)
+// Run osd bench: write 100 4MiB objects with blocksize 4KiB
+int64_t count = 12288000; // Count of bytes to write
+int64_t bsize = 4096;     // Block size
+int64_t osize = 4194304;  // Object size
+int64_t onum = 100;       // Count of objects to write
+double elapsed = 0.0;     // Time taken to complete the test
+double iops = 0.0;
+stringstream ss;
+int ret = run_osd_bench_test(count, bsize, osize, onum, &elapsed, ss);
+```
+
+因此你在 production 或 homelab 看 mClock，不要只問「profile 是什麼」，也要問「capacity 是不是可信」。
+
+## immediate / high priority 不走一般 QoS queue
+
+source 裡沒有把所有 item 都丟進 dmClock。`mClockScheduler::enqueue()` 會先檢查 scheduler class 與 priority：
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 441)
+void mClockScheduler::enqueue(OpSchedulerItem&& item)
+{
+  auto id = get_scheduler_id(item);
+  unsigned priority = item.get_priority();
+
+  if (op_scheduler_class::immediate == id.class_id) {
+    enqueue_high(immediate_class_priority, std::move(item));
+  } else if (priority >= cutoff_priority) {
+    enqueue_high(priority, std::move(item));
+  } else {
+    auto cost = calc_scaled_cost(item.get_cost());
+    item.set_qos_cost(cost);
+```
+
+只有最後那個 `else` 會進 `scheduler.add_request()`，也就是 dmClock proper。dequeue 時也一樣：先清 `high_priority`，再呼叫 `scheduler.pull_request()`：
+
+```cpp
+// File: src/osd/scheduler/mClockScheduler.cc (line 513)
+WorkItem mClockScheduler::dequeue()
+{
+  if (!high_priority.empty()) {
+    auto iter = high_priority.begin();
+    WorkItem ret{std::move(iter->second.back())};
+    iter->second.pop_back();
+    // ...
+    return ret;
+  } else {
+    mclock_queue_t::PullReq result = scheduler.pull_request();
+```
+
+單元測試也把這件事寫死：`TestAllQueuesEnqueueDequeue` 先放普通 mClock item，再放 `immediate` item，再放高 priority item；期待 dequeue 順序是 immediate → high priority → mClock queue。
+
+這是排程邊界。mClock 管的是一般 QoS queue；peering 這類立即性工作不會被 background_best_effort 的 limit 卡死，否則 cluster 可能連恢復狀態機都跑不動。
+
+## 跟 recovery throttle 的關係
+
+Squid 的 source 跟舊文章很容易混在一起。v19.2.3 這份 source/doc 的行為是：
+
+- `osd_op_queue` 預設是 `mclock_scheduler`。
+- built-in profile 會鎖住低階 QoS key，不讓你直接改 res/wgt/lim。
+- recovery/backfill 相關 key 也被 mClock 保護，預設不讓你直接改。
+- 想改 `osd_recovery_max_active*` 或 `osd_max_backfills`，要先開 `osd_mclock_override_recovery_settings=true`。
+
+這段 rollback source 已經在 [Recovery throttle 動態調整與 mClock 互動](/ceph/features/recovery-throttle-runtime) 詳細拆過；這裡只放關鍵入口：
+
+```cpp
+// File: src/osd/OSD.cc (line 10171)
+bool OSD::maybe_override_options_for_qos(const std::set<std::string> *changed)
+{
+  if (op_queue_type_t::mClockScheduler == osd_op_queue_type()) {
+    static const std::map<std::string, uint64_t> recovery_qos_defaults {
+      {"osd_recovery_max_active", 0},
+      {"osd_recovery_max_active_hdd", 3},
+      {"osd_recovery_max_active_ssd", 10},
+      {"osd_max_backfills", 1},
+    };
+```
+
+所以如果你看到某篇舊測試文章說 mClock profile 會把 `osd_max_backfills` / `osd_recovery_max_active` 放大到 1000，不要直接套到 Squid。以本頁的 pinned source 為準，v19.2.3 的 rollback defaults 是 `1`、`0`、`3`、`10`。
+
+## 怎麼查與怎麼調
+
+下面指令需要真實 Ceph cluster。本頁只用 v19.2.3 source 與 repo 內 doc 驗證語意；在你環境跑後再對照實際回傳值。
+
+先查 scheduler 與 profile：
+
+```bash
+ceph config get osd osd_op_queue
+ceph config get osd osd_mclock_profile
+```
+
+一般線上 workload 先維持預設：
+
+```bash
+ceph config set osd osd_mclock_profile balanced
+```
+
+client latency 優先時：
+
+```bash
+ceph config set osd osd_mclock_profile high_client_ops
+```
+
+大量 degraded、短時間想拉高 recovery 進度時：
+
+```bash
+ceph config set osd osd_mclock_profile high_recovery_ops
+```
+
+檢查 capacity 設定：
+
+```bash
+ceph config show osd.0 osd_mclock_max_capacity_iops_hdd
+ceph config show osd.0 osd_mclock_max_capacity_iops_ssd
+ceph config show osd.0 osd_mclock_max_sequential_bandwidth_hdd
+ceph config show osd.0 osd_mclock_max_sequential_bandwidth_ssd
+```
+
+只有你真的知道底層 OSD 能力時，才手動覆寫 capacity：
+
+```bash
+ceph config set osd.0 osd_mclock_max_capacity_iops_hdd 350
+```
+
+如果要直接改低階 res/wgt/lim，先切 `custom`。但這代表你要自己維持三個 class 的比例，不再享受 built-in profile 的 guardrail：
+
+```bash
+ceph config set osd osd_mclock_profile custom
+ceph config set osd.0 osd_mclock_scheduler_client_res 0.5
+```
+
+## 邊界與除錯
+
+看到 slow ops 時，不要把 mClock 當成唯一旋鈕。它在 source 裡只負責 `OpSchedulerItem` 從 queue 被拿走的順序與時間；拿走之後的 PG lock、BlueStore transaction、RocksDB、device latency、network、OSDMap / peering 狀態，都不是 mClock 自己能修好的層。
+
+實務上我會先把問題拆成三段：
+
+1. queue 前：op 是不是大量進來？是不是某些 PG / OSD 特別熱？
+2. queue 內：`osd_op_queue`、`osd_mclock_profile`、capacity 是否合理？
+3. queue 後：`ceph osd perf`、BlueStore slow ops、RocksDB compaction、device / network latency 是否正常？
+
+常用對照指令：
+
+```bash
+ceph -s
+ceph health detail
+ceph osd perf
+ceph osd df tree
+ceph config get osd osd_op_queue
+ceph config get osd osd_mclock_profile
+ceph daemon osd.0 dump_op_pq_state
+ceph daemon osd.0 perf dump
+```
+
+如果是 HDD cluster，而且 slow request 多半卡在 queue 相關狀態，還要注意 shard 設定。Ceph repo 內 troubleshooting doc 特別提到：mClock + HDD + 多 shard 在大規模故障情境下可能出現 slow requests / slow recovery，建議的修正是 `osd_op_num_shards_hdd=1`、`osd_op_num_threads_per_shard_hdd=5`，但這需要 OSD restart，不能當成無痛 runtime toggle。
+
+## 接下來 / 相關頁面
+
+- [Ceph — OSD daemon 與 BlueStore](/ceph/features/osd-and-bluestore) — 看 mClock dequeue 之後，op 怎麼進 PG 與 BlueStore。
+- [Ceph — Recovery throttle 動態調整與 mClock 互動](/ceph/features/recovery-throttle-runtime) — 專門拆 `osd_recovery_max_active*`、`osd_max_backfills` 與 mClock rollback。
+- [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi) — 看 client I/O 從 RBD / librados 進到 OSD queue 前的路徑。
+
+## 引用的原始碼（v19.2.3, commit c92aebb）
+
+- `src/common/options/osd.yaml.in:988-1009` — `osd_op_queue` 預設 `mclock_scheduler`
+- `src/osd/OSD.cc:2419-2467` — OSD 解析 queue type 並初始化 shards
+- `src/osd/scheduler/OpScheduler.cc:24-44` — `make_scheduler()` 選 WPQ 或 `mClockScheduler`
+- `src/osd/scheduler/OpSchedulerItem.h:33-38` — scheduler class enum
+- `src/osd/scheduler/OpSchedulerItem.h:204-211,243-250,276-300,522-575,613-615` — client / recovery / scrub / snap trim / PG delete 分類
+- `src/dmclock/src/dmclock_server.h:97-119,147-182,1124-1195,1459-1489` — dmClock ClientInfo、tag 計算與 dequeue 順序
+- `src/osd/scheduler/mClockScheduler.cc:117-188` — `ClientRegistry` 把 config 轉成 ClientInfo
+- `src/osd/scheduler/mClockScheduler.cc:215-240` — capacity → cost per I/O / capacity per shard
+- `src/osd/scheduler/mClockScheduler.cc:285-389` — built-in profile 數值與 default 展開
+- `src/osd/scheduler/mClockScheduler.cc:441-548` — high priority queue 與 dmClock queue 的 enqueue/dequeue
+- `src/osd/scheduler/mClockScheduler.cc:558-660` — mClock config observer 與 built-in profile 低階參數 rollback
+- `src/osd/OSD.cc:10064-10168` — OSD bench 自動估 IOPS capacity 與 threshold warning
+- `src/osd/OSD.cc:10171-10241` — recovery/backfill option rollback defaults
+- `src/test/osd/TestMClockScheduler.cc:199-268` — immediate / high priority / mClock queue dequeue 順序測試
+- `qa/standalone/misc/mclock-config.sh:201-230,304-378` — recovery override 與 built-in profile 低階參數保護測試

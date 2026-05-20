@@ -58,5 +58,29 @@
     ],
     "answer": 0,
     "explanation": "RBD image = 1 個 metadata object (rbd_header.<image_id>，含 size、object_size 預設 4MB、stripe、snapshot list、features) + 邏輯上 N=size/object_size 個 data object (rbd_data.<image_id>.<chunk_index>)。50 GB / 4MB = 12800 個 chunk。但 thin provisioned: 只有真寫過的 chunk 才在 RADOS 落 object。寫入時 librbd 算 chunk_index = offset / object_size、object_name = rbd_data.<id>.<hex(idx)>，再透過 librados → CRUSH → primary OSD。不同 chunk 的 primary OSD 不同 (CRUSH input 不同)，所以大 IO 自動 parallelize 到多 OSD。實際佔用 raw space 還要乘 replication factor (預設 3)。"
+  },
+  {
+    "id": 6,
+    "question": "Squid 的 mClock scheduler 在 OSD 裡主要解決什麼問題？",
+    "options": [
+      "它在 OSD op queue 中把 client、background recovery、background best-effort 等 class 依 reservation、weight、limit 做 QoS scheduling，決定下一個 queued item 何時被 worker thread 拿走",
+      "它取代 CRUSH，直接決定每個 object 應該落在哪些 OSD",
+      "它在 BlueStore 裡重新排列 RocksDB SST file，避免 compaction 造成 latency",
+      "它把 `osd_max_backfills` 永久設成 1000，靠高 concurrency 加速 recovery"
+    ],
+    "answer": 0,
+    "explanation": "mClock 是 OSD op queue scheduler，source 在 `src/osd/scheduler/mClockScheduler.cc`，class 來源是 `src/osd/scheduler/OpSchedulerItem.h`。它用 dmClock 的 reservation / weight / limit 在 client、background_recovery、background_best_effort 之間排隊；CRUSH placement、BlueStore compaction 都不是它的職責。v19.2.3 的 recovery/backfill defaults 也不是 1000，而是在 `src/osd/OSD.cc:10176-10180` 顯示的 `osd_max_backfills=1`、`osd_recovery_max_active=0/3/10`。"
+  },
+  {
+    "id": 7,
+    "question": "在 built-in mClock profile (`balanced` / `high_client_ops` / `high_recovery_ops`) 下直接修改 `osd_mclock_scheduler_client_res` 會怎樣？",
+    "options": [
+      "變更會被還原；`mClockScheduler::handle_conf_change()` 會在非 `custom` profile 下移除低階 QoS key，保留 profile 預設值",
+      "會立刻生效，而且自動平均調整 background recovery 與 best-effort 的 reservation",
+      "只會影響新建立的 OSD，既有 OSD 完全不會收到 config change",
+      "會讓 OSD 自動切回 WPQ，因為 built-in profile 不允許 mClock"
+    ],
+    "answer": 0,
+    "explanation": "`src/osd/scheduler/mClockScheduler.cc:623-659` 顯示：如果改到低階 QoS key，只有 `osd_mclock_profile == \"custom\"` 才會更新 `ClientRegistry`；built-in profile 會對 `osd` / `osd.<id>` 發 `config rm` 並移除 ephemeral value。`qa/standalone/misc/mclock-config.sh:304-378` 也驗證 built-in profile 下低階參數不能被修改。"
   }
 ]
