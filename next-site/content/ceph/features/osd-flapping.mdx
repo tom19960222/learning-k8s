@@ -1,0 +1,583 @@
+---
+layout: doc
+title: Ceph — Node flapping 在 MON / OSD 原始碼裡的行為
+description: 20 OSD node + 3 monitor 的 cluster 裡，single node 與 rack-wide node 以不同頻率反覆 down/up，OSD heartbeat、MON failure_info、down_pending_out、laggy EMA、subtree_limit 在 v19.2.3 原始碼中各自怎麼反應。
+---
+
+## 場景
+
+某個 ceph cluster：
+
+- 20 個 OSD node（每個 node 跑 N 顆 OSD，N 取決於磁碟數）
+- 3 個 monitor node
+- CRUSH 拓樸：node 上面有 rack bucket
+
+某晚資料中心電力 / 交換器抖，6 種 flapping pattern 都可能出現：
+
+| # | 範圍 | 頻率 |
+|---|---|---|
+| A1 | 1 個 node | 1 分鐘內 down/up 5 次 |
+| A2 | 1 個 node | 10 分鐘內 down/up 5 次 |
+| A3 | 1 個 node | 60 分鐘內 down/up 5 次 |
+| B1 | 同 rack 5 個 node | 1 分鐘內各 down/up 5 次 |
+| B2 | 同 rack 5 個 node | 10 分鐘內各 down/up 5 次 |
+| B3 | 同 rack 5 個 node | 60 分鐘內各 down/up 5 次 |
+
+每種 pattern 落到 ceph 原始碼裡都有不同的進入點與不同的「擋牆」會被觸發。下面從 v19.2.3 原始碼一路追到結果。
+
+## 三層 detection：OSD ↔ OSD / OSD → MON / MON tick
+
+故障判定不是 MON 一個元件決定的，而是三層串接：
+
+```
+           peer OSD (heartbeat front + back TCP)
+                         │
+                         │  is_unhealthy(now) == true
+                         ▼
+                  failure_queue[osd]
+                         │
+                         │  send_failures() → MOSDFailure
+                         ▼
+           OSDMonitor::prepare_failure()
+                         │
+                         │  add_report(reporter, failed_since)
+                         ▼
+           failure_info[target_osd].reporters
+                         │
+                         │  tick() → check_failures()
+                         ▼
+   ≥ mon_osd_min_down_reporters 個 reporter
+   分布在 ≥ mon_osd_min_down_reporters 個
+   mon_osd_reporter_subtree_level (host) bucket
+                         │
+                         │  failed_for ≥ get_grace_time(...)
+                         ▼
+              pending_inc.new_state[osd] = CEPH_OSD_UP   ← mark DOWN
+                         │
+                         ▼
+              下次 paxos commit → osdmap epoch+1
+                         │
+                         ▼
+              down_pending_out[osd] = now      (見 OSDMonitor.cc:929)
+                         │
+                         │  tick() (5 秒一次) 連續檢查
+                         ▼
+   down 持續 ≥ mon_osd_down_out_interval
+   且 containing_subtree_is_down(rack) == false
+   且 can_mark_out() (in_ratio ≥ mon_osd_min_in_ratio)
+                         ▼
+              pending_inc.new_weight[osd] = CEPH_OSD_OUT  ← mark OUT
+                         │
+                         ▼
+              PG re-peer → backfill / recovery
+```
+
+「mark DOWN」與「mark OUT」是兩個獨立階段，預設 grace 都是 10 分鐘但語意不同：down 是「我不接 client I/O」，out 是「CRUSH 不再放 PG 在我身上」。flapping 的尷尬區間就在這兩個 timer 之間。
+
+## OSD 側的失敗偵測：deadline + 立刻拒連
+
+每個 OSD 跟自己的 heartbeat peer（front + back 兩條 TCP）每隔 `osd_heartbeat_interval`（預設 6 秒）互 ping 一次。每次發出 ping 時把 deadline 記進 `ping_history`：
+
+```cpp
+// File: src/osd/OSD.cc (line 6227)
+utime_t now = ceph_clock_now();
+auto mnow = service.get_mnow();
+utime_t deadline = now;
+deadline += cct->_conf->osd_heartbeat_grace;
+```
+
+判斷對方有沒有掛是看「最舊的未回應 ping 是否已逾期」：
+
+```cpp
+// File: src/osd/OSD.h (line 1394)
+bool is_unhealthy(utime_t now) const {
+  if (ping_history.empty()) {
+    return false;
+  }
+  utime_t oldest_deadline = ping_history.begin()->second.first;
+  return now > oldest_deadline;
+}
+```
+
+`heartbeat_check` 每次 tick 都掃 `heartbeat_peers`，unhealthy 的丟進 `failure_queue`：
+
+```cpp
+// File: src/osd/OSD.cc (line 6173)
+if (p->second.is_unhealthy(now)) {
+  utime_t oldest_deadline = p->second.ping_history.begin()->second.first;
+  if (p->second.last_rx_back == utime_t() ||
+      p->second.last_rx_front == utime_t()) {
+    derr << "heartbeat_check: no reply from " ... << dendl;
+    failure_queue[p->first] = p->second.first_tx;
+  } else {
+    ...
+    failure_queue[p->first] = std::min(p->second.last_rx_back, p->second.last_rx_front);
+  }
+}
+```
+
+`osd_heartbeat_grace` 預設 20 秒（`src/common/options/global.yaml.in:2856-2864`）。意思是：peer 至少 **連續 20 秒 ping 不回**，這顆 OSD 才會把 peer 算成可疑。
+
+**但有一條 shortcut**：peer 的 TCP 連線收到 RST（例如 OSD process 乾淨退出、kernel 還在），messenger 直接走 `ms_handle_refused`，發 `FLAG_IMMEDIATE` 的 failure：
+
+```cpp
+// File: src/osd/OSD.cc (line 6756)
+// I'm cheating mon heartbeat grace logic, because we know it's not going
+// to respawn alone. +1 so we won't hit any boundary case.
+monc->send_mon_message(
+  new MOSDFailure(
+    monc->get_fsid(),
+    id,
+    osdmap->get_addrs(id),
+    cct->_conf->osd_heartbeat_grace + 1,
+    osdmap->get_epoch(),
+    MOSDFailure::FLAG_IMMEDIATE | MOSDFailure::FLAG_FAILED
+    ));
+```
+
+於是 ceph 對「程式死掉 vs node 斷電」會走兩條不同路：
+
+- **OSD process 正常退（systemd stop、ceph-volume restart）**：TCP RST → 立即 mark-down，跳過 20 秒 grace。
+- **node 斷電 / 拔網**：connection silent timeout → 走 20 秒 grace。
+
+下面 6 個情境裡的「down 多久」差距就從這裡來。
+
+## OSD 自我保護：5 次/600s 就自殺
+
+在 OSD 真的還活著、但 MON 卻把它 mark down 的場景（網路抖、heartbeat path 斷而 client path 沒斷），OSD 收到新的 osdmap 時會發現「我自己被標為 down」：
+
+```cpp
+// File: src/osd/OSD.cc (line 8523)
+if (!osdmap->is_up(whoami)) {
+  if (service.is_preparing_to_stop() || service.is_stopping()) {
+    service.got_stop_ack();
+  } else {
+    clog->warn() << "Monitor daemon marked osd." << whoami << " down, "
+                    "but it is still running";
+    ...
+  }
+  ...
+}
+```
+
+接著走 rebind + 把這次事件記進 `osd_markdown_log`，並檢查最近 `osd_max_markdown_period` 秒內已經發生幾次：
+
+```cpp
+// File: src/osd/OSD.cc (line 8574)
+//add markdown log
+utime_t now = ceph_clock_now();
+utime_t grace = utime_t(cct->_conf->osd_max_markdown_period, 0);
+osd_markdown_log.push_back(now);
+if ((int)osd_markdown_log.size() > cct->_conf->osd_max_markdown_count) {
+  derr << __func__ << " marked down "
+       << osd_markdown_log.size()
+       << " > osd_max_markdown_count "
+       << cct->_conf->osd_max_markdown_count
+       << " in last " << grace << " seconds, shutting down"
+       << dendl;
+  do_restart = false;
+  do_shutdown = true;
+}
+```
+
+`tick()` 開頭會主動把過期的條目剔掉，所以 `osd_markdown_log` 永遠只裝最近 `osd_max_markdown_period` 秒內的事件：
+
+```cpp
+// File: src/osd/OSD.cc (line 6342)
+utime_t now = ceph_clock_now();
+// throw out any obsolete markdown log
+utime_t grace = utime_t(cct->_conf->osd_max_markdown_period, 0);
+while (!osd_markdown_log.empty() &&
+        osd_markdown_log.front() + grace < now)
+  osd_markdown_log.pop_front();
+```
+
+預設值：
+
+```yaml
+# File: src/common/options/osd.yaml.in (line 857)
+# shutdown the OSD if stuatus flipping more than max_markdown_count times in recent max_markdown_period seconds
+- name: osd_max_markdown_period
+  type: int
+  level: advanced
+  default: 10_min
+  with_legacy: true
+- name: osd_max_markdown_count
+  type: int
+  level: advanced
+  default: 5
+  with_legacy: true
+```
+
+關鍵：**比較式是 `size() > 5`**，也就是「第 6 次被誤標 down」才會自殺。第 5 次只會 log warning。這影響下面對 A1 / A2 / B1 / B2 的判斷。
+
+而且這個計數器**只在 OSD process 沒重啟、純粹被 MON 誤判 down 時**累積。真的斷電重開機，process 是新的，`osd_markdown_log` 空白重來。所以這個機制只防「網路抖 + process 還活著」，不防「整 node 反覆 reboot」。
+
+## MON 側的 reporter quorum
+
+MON 收到 `MOSDFailure` 後丟進 `failure_info[target_osd].reporters`。`check_failure` 兩件事：
+
+1. **依 subtree level 去重 reporter**（預設 `host`，所以同 host 上的多個 OSD 報只算 1 票）。
+2. **湊到門檻才實際 mark down**（預設 2 個不同 host 的 reporter）。
+
+```cpp
+// File: src/mon/OSDMonitor.cc (line 3260)
+set<string> reporters_by_subtree;
+auto reporter_subtree_level = g_conf().get_val<string>("mon_osd_reporter_subtree_level");
+ceph_assert(fi.reporters.size());
+for (auto p = fi.reporters.begin(); p != fi.reporters.end();) {
+  // get the parent bucket whose type matches with "reporter_subtree_level".
+  // fall back to OSD if the level doesn't exist.
+  if (osdmap.exists(p->first)) {
+    auto reporter_loc = osdmap.crush->get_full_location(p->first);
+    if (auto iter = reporter_loc.find(reporter_subtree_level);
+        iter == reporter_loc.end()) {
+      reporters_by_subtree.insert("osd." + to_string(p->first));
+    } else {
+      reporters_by_subtree.insert(iter->second);
+    }
+    ++p;
+  } else {
+    fi.cancel_report(p->first);;
+    p = fi.reporters.erase(p);
+  }
+}
+if (reporters_by_subtree.size() < g_conf().get_val<uint64_t>("mon_osd_min_down_reporters")) {
+  return false;
+}
+const utime_t failed_for = now - fi.get_failed_since();
+const utime_t grace = get_grace_time(now, target_osd, fi);
+if (failed_for >= grace) {
+  ...
+  pending_inc.new_state[target_osd] = CEPH_OSD_UP;
+  ...
+  return true;
+}
+return false;
+```
+
+預設值在 `src/common/options/global.yaml.in:1890-1913`：
+
+```yaml
+- name: mon_osd_min_down_reporters
+  default: 2
+- name: mon_osd_reporter_subtree_level
+  default: host
+```
+
+意義：**整個 rack 突然壞**，剩下的健康 OSD 還是輕鬆湊到 2 個不同 host 報，所以 mark-down 一定會發生。reporter quorum 不是 rack flapping 的瓶頸。
+
+## Grace 不固定：laggy EMA 會吃進去
+
+MON 不是用固定 20 秒當 grace，而是依「這顆 OSD 過去是否常被誤判 down」動態加長：
+
+```cpp
+// File: src/mon/OSDMonitor.cc (line 3204)
+utime_t OSDMonitor::get_grace_time(utime_t now,
+                                   int target_osd,
+                                   failure_info_t& fi) const
+{
+  utime_t orig_grace(g_conf()->osd_heartbeat_grace, 0);
+  if (!g_conf()->mon_osd_adjust_heartbeat_grace) {
+    return orig_grace;
+  }
+  utime_t grace = orig_grace;
+  double halflife = (double)g_conf()->mon_osd_laggy_halflife;
+  double decay_k = ::log(.5) / halflife;
+  ...
+  const osd_xinfo_t& xi = osdmap.get_xinfo(target_osd);
+  const utime_t failed_for = now - fi.get_failed_since();
+  double decay = exp((double)failed_for * decay_k);
+  double my_grace = decay * (double)xi.laggy_interval * xi.laggy_probability;
+  grace += my_grace;
+
+  // consider the peers reporting a failure a proxy for a potential
+  // 'subcluster' over the overall cluster that is similarly
+  // laggy.
+  double peer_grace = 0;
+  for (auto& [reporter, report] : fi.reporters) {
+    if (osdmap.exists(reporter)) {
+      const osd_xinfo_t& xi = osdmap.get_xinfo(reporter);
+      utime_t elapsed = now - xi.down_stamp;
+      double decay = exp((double)elapsed * decay_k);
+      peer_grace += decay * (double)xi.laggy_interval * xi.laggy_probability;
+    }
+  }
+  peer_grace /= (double)fi.reporters.size();
+  grace += peer_grace;
+  ...
+}
+```
+
+`xi.laggy_probability` 與 `xi.laggy_interval` 怎麼變？OSD 重新 boot 時 MON `preprocess_boot` 走 EMA：
+
+```cpp
+// File: src/mon/OSDMonitor.cc (line 3700)
+if (m->boot_epoch == 0) {
+  xi.laggy_probability *= (1.0 - g_conf()->mon_osd_laggy_weight);
+  xi.laggy_interval *= (1.0 - g_conf()->mon_osd_laggy_weight);
+  dout(10) << " not laggy, new xi " << xi << dendl;
+} else {
+  if (xi.down_stamp.sec()) {
+    int interval = ceph_clock_now().sec() -
+      xi.down_stamp.sec();
+    if (g_conf()->mon_osd_laggy_max_interval &&
+        (interval > g_conf()->mon_osd_laggy_max_interval)) {
+      interval =  g_conf()->mon_osd_laggy_max_interval;
+    }
+    xi.laggy_interval =
+      interval * g_conf()->mon_osd_laggy_weight +
+      xi.laggy_interval * (1.0 - g_conf()->mon_osd_laggy_weight);
+  }
+  xi.laggy_probability =
+    g_conf()->mon_osd_laggy_weight +
+    xi.laggy_probability * (1.0 - g_conf()->mon_osd_laggy_weight);
+  dout(10) << " laggy, now xi " << xi << dendl;
+}
+```
+
+`boot_epoch == 0` 是「乾淨初次 boot」；`boot_epoch != 0` 代表「上一次 boot 還沒結束就又 down 又 up」—— 也就是 flapping。在 flapping 分支裡：
+
+- `laggy_probability` 加權平均：weight=0.3，所以一次 flap 後從 0 跳到 0.3，再一次到 0.51，依序 0.657 / 0.760 / 0.832。
+- `laggy_interval` 也用同樣 EMA，但 interval 取「down 了多久」並 cap 在 `mon_osd_laggy_max_interval = 5 min = 300s`（`src/common/options/mon.yaml.in:863-874`）。
+
+預設值：
+
+```yaml
+# File: src/common/options/mon.yaml.in (line 840)
+- name: mon_osd_laggy_halflife
+  default: 1_hr
+- name: mon_osd_laggy_weight
+  default: 0.3
+- name: mon_osd_laggy_max_interval
+  default: 5_min
+```
+
+額外 grace 是 `decay × laggy_interval × laggy_probability`，其中 `decay = exp(failed_for × ln(0.5)/halflife)`。短時間內 decay≈1，所以可以把 `my_grace ≈ laggy_interval × laggy_probability` 當近似。下面情境表會直接套這個算式。
+
+## down → out 的 timer：down_pending_out 與 rack 護欄
+
+OSD 真的被 mark down 後，paxos 提交新 osdmap，`OSDMonitor::update_from_paxos` 把它登記進 `down_pending_out`：
+
+```cpp
+// File: src/mon/OSDMonitor.cc (line 922)
+bool marked_osd_down = false;
+for (int o = 0; o < osdmap.get_max_osd(); o++) {
+  if (osdmap.is_out(o))
+    continue;
+  auto found = down_pending_out.find(o);
+  if (osdmap.is_down(o)) {
+    // populate down -> out map
+    if (found == down_pending_out.end()) {
+      dout(10) << " adding osd." << o << " to down_pending_out map" << dendl;
+      down_pending_out[o] = ceph_clock_now();
+      marked_osd_down = true;
+    }
+  } else {
+    if (found != down_pending_out.end()) {
+      dout(10) << " removing osd." << o << " from down_pending_out map" << dendl;
+      down_pending_out.erase(found);
+    }
+  }
+}
+```
+
+每次 MON tick（5 秒一次）都會掃這張表，看誰已經 down 夠久該被 mark out。重點在那個 rack 護欄：
+
+```cpp
+// File: src/mon/OSDMonitor.cc (line 5147)
+// mark down osds out?
+if (can_mark_out(-1)) {
+  string down_out_subtree_limit = g_conf().get_val<string>(
+    "mon_osd_down_out_subtree_limit");
+  set<int> down_cache;  // quick cache of down subtrees
+
+  map<int,utime_t>::iterator i = down_pending_out.begin();
+  while (i != down_pending_out.end()) {
+    int o = i->first;
+    utime_t down = now;
+    down -= i->second;
+    ++i;
+
+    if (osdmap.is_down(o) &&
+        osdmap.is_in(o) &&
+        can_mark_out(o)) {
+      utime_t orig_grace(g_conf()->mon_osd_down_out_interval, 0);
+      utime_t grace = orig_grace;
+      double my_grace = 0.0;
+
+      if (g_conf()->mon_osd_adjust_down_out_interval) {
+        // scale grace period the same way we do the heartbeat grace.
+        const osd_xinfo_t& xi = osdmap.get_xinfo(o);
+        double halflife = (double)g_conf()->mon_osd_laggy_halflife;
+        double decay_k = ::log(.5) / halflife;
+        double decay = exp((double)down * decay_k);
+        ...
+        my_grace = decay * (double)xi.laggy_interval * xi.laggy_probability;
+        grace += my_grace;
+      }
+
+      // is this an entire large subtree down?
+      if (down_out_subtree_limit.length()) {
+        int type = osdmap.crush->get_type_id(down_out_subtree_limit);
+        if (type > 0) {
+          if (osdmap.containing_subtree_is_down(cct, o, type, &down_cache)) {
+            dout(10) << "tick entire containing " << down_out_subtree_limit
+                     << " subtree for osd." << o
+                     << " is down; resetting timer" << dendl;
+            // reset timer, too.
+            down_pending_out[o] = now;
+            continue;
+          }
+        }
+      }
+
+      bool down_out = !osdmap.is_destroyed(o) &&
+        g_conf()->mon_osd_down_out_interval > 0 && down.sec() >= grace;
+      ...
+      if (down_out || destroyed_out) {
+        ...
+        pending_inc.new_weight[o] = CEPH_OSD_OUT;
+        pending_inc.new_state[o] |= CEPH_OSD_AUTOOUT;
+        ...
+      }
+```
+
+關鍵兩條檢查：
+
+1. `containing_subtree_is_down(cct, o, rack_type)`：從這顆 OSD 沿 CRUSH 往上爬到 rack，若 rack 底下所有 OSD 都 down，就 **reset `down_pending_out[o] = now`** 並 continue。實作見 `src/osd/OSDMap.cc:319-355`：
+   ```cpp
+   bool OSDMap::containing_subtree_is_down(CephContext *cct, int id, int subtree_type, set<int> *down_cache) const
+   {
+     ...
+     int current = id;
+     while (true) {
+       ...
+       if (!subtree_is_down(current, down_cache)) {
+         return false;
+       }
+       if (type >= subtree_type) {
+         return true;
+       }
+       crush->get_immediate_parent_id(current, &current);
+     }
+   }
+   ```
+   只要 rack 內 **還有一顆 OSD up**，這條就回 false → 繼續往下走 mark-out 流程。
+
+2. `can_mark_out(-1)`：全 cluster `in_ratio` 不能低於 `mon_osd_min_in_ratio = 0.75`：
+   ```cpp
+   // File: src/mon/OSDMonitor.cc (line 3141)
+   bool OSDMonitor::can_mark_out(int i)
+   {
+     ...
+     int in = osdmap.get_num_in_osds() - pending_inc.get_net_marked_out(&osdmap);
+     float in_ratio = (float)in / (float)num_osds;
+     if (in_ratio < g_conf()->mon_osd_min_in_ratio) {
+       ...
+       return false;
+     }
+     return true;
+   }
+   ```
+
+預設值：
+
+```yaml
+# File: src/common/options/mon.yaml.in (line 946)
+- name: mon_osd_down_out_interval
+  default: 10_min
+- name: mon_osd_down_out_subtree_limit
+  default: rack
+- name: mon_osd_min_up_ratio
+  default: 0.3
+- name: mon_osd_min_in_ratio
+  default: 0.75
+```
+
+## 把 6 個情境逐一對照進原始碼
+
+下面三個 column 對應上面三層 detection 的實際路徑。所有「會 / 不會 mark down」「會 / 不會 mark out」「OSD 會 / 不會自殺」都是直接看 v19.2.3 程式碼推出來的，不靠官方 doc 二手詮釋。
+
+### 共通假設
+
+- 假設 6 個情境裡 node down 是「斷電 / 拔網」型（silent timeout），不是 OSD process 乾淨退出。所以走 `osd_heartbeat_grace` 20 秒這條路，不走 `ms_handle_refused` 立刻 down。
+- 每個 OSD node 上有同質的數顆 OSD；同 rack 5 個 node 假設代表 25% 的 cluster 容量。
+- CRUSH 拓樸有 rack bucket，且該 rack 上**只**有那 5 個 node（這是觸發 `mon_osd_down_out_subtree_limit = rack` 的條件 — 見 `OSDMap::containing_subtree_is_down`：rack 底下要全 down）。
+
+### A1：1 個 node，1 分鐘內 5 次 flap
+
+- 每次 down/up cycle ≈ 12 秒，**小於 `osd_heartbeat_grace=20s`**。多數 cycle 在 grace 到期前 node 就回來，peer OSD `is_unhealthy()` 還沒持續到 deadline 全過，`failure_queue` 條目會被新 ping 的 last_rx 給「擦掉」。
+- 但 OSD 一回來通常 MON 已收到 `MOSDFailure`（多 peer、同時被觸發），即使 `failed_for < grace` 也可能因為下一輪 tick 拿到的 `failed_for` 已經 ≥ grace 而 mark down。**結果：5 次 flap 中通常會有 1–3 次成功 mark down**，難以給確切數字。
+- 每次 mark down + 回來，MON `preprocess_boot` 走 laggy 分支：`laggy_probability` 累積到 ≈ 0.3 → 0.51 → 0.657。`laggy_interval` 因每次 down 只 ~12s，EMA 慢慢爬到約 8–10s。下次 mark down 的 grace ≈ 20 + 0.3 × 10 ≈ 23s，幾乎沒拉長。
+- `down_pending_out`：每次 up 都會 `erase()` 整條記錄（`OSDMonitor.cc:935-937`），timer 一直被 reset，**遠不到 `mon_osd_down_out_interval = 600s`，永遠不會 mark out**。
+- OSD self-shutdown：若 OSD process 沒真的死（網路抖型）而被誤標 down，`osd_markdown_log` push 5 次，size=5 **不大於** 5，**還不會自殺**。
+- 連帶 PG 行為：mark down 時 primary 改派，PG 進 peering；node 回來、osdmap 再更新後 PG 重新 peer 一次。client I/O 在每次 peering 視窗（幾百 ms）內會看到短暫卡頓。
+
+### A2：1 個 node，10 分鐘內 5 次 flap
+
+- 每次 down/up cycle ≈ 120 秒，**遠大於 20 秒 grace**。每次 cycle 都會穩定觸發 mark down。
+- laggy 累積：5 次 flap 後 `laggy_probability ≈ 0.832`，`laggy_interval` EMA 漸近 cycle 的 down time（≈ 110s，未到 cap 300）。下一次 mark down 的 grace ≈ 20 + 110 × 0.832 ≈ 110s — 已經接近 2 分鐘。`mon_osd_adjust_down_out_interval = true` 把同一份 laggy 帶進 mark-out 的 grace：mark-out 真實 grace ≈ 600 + 110 × 0.832 ≈ 690s。
+- `down_pending_out`：每次 down 120s 後 node 又回來，erase 一次。**timer 持續 reset，永遠不會 mark out**。
+- OSD self-shutdown：若是 node 真斷電型，process 重啟，`osd_markdown_log` 空，**不會自殺**；若是網路抖型 + process 還活著，10 分鐘內第 6 次被誤標 down 才會自殺（5 次還沒到）。
+
+### A3：1 個 node，60 分鐘內 5 次 flap
+
+- 每次 cycle ≈ 12 分鐘 = 720 秒，**大於 `mon_osd_down_out_interval = 600s`**。
+- 第 1 次 down 後，`down_pending_out` 跑滿 600s（外加 laggy 加成 — 第一次 laggy 都是 0，所以 grace 嚴格就是 600s），OSD 被 mark out → CRUSH 重算 → PG 開始 backfill 到其他 node。
+- 720s 後 node 回來，MON `preprocess_boot`：`AUTOOUT` flag set → `mon_osd_auto_mark_auto_out_in = true`（`mon.yaml.in:916-927`）→ 自動 mark in。這時 PG 又開始 backfill 回原 node（如果 CRUSH 把 PG 還配回它）。
+- 5 個 cycle 下來：每個 cycle 都觸發一輪 backfill out + backfill in。**這個 pattern 對 cluster I/O 的破壞力遠大於 A1/A2**，因為每次 mark-out 都搬一遍 data。
+- laggy 累積會逐 cycle 把 `mon_osd_down_out_interval` 的有效 grace 拉長（mark-out 的 my_grace 用相同 EMA），但 cycle 720s > 600s + 累積 grace 前段 cycles，所以仍可能成功 mark out。後續 cycle 因 grace 拉到 ~830s 也許就剛好不 mark out — 邊界依賴 cycle 是否「精準」12 分鐘。
+
+### B1：同 rack 5 個 node，1 分鐘內各 5 次 flap
+
+- 每個 node 的行為跟 A1 同：cycle 12s < grace 20s，多數不 mark down。
+- 即使 mark down 同時發生，`containing_subtree_is_down(rack)` 在 `OSDMonitor::tick()` 才被檢查 — 而 tick 是「mark-out 階段」的護欄，**不是 mark-down 階段的護欄**。所以 mark-down 依然會發生（reporter quorum 來自 rack 外 15 個 node 的 OSD，輕鬆湊滿 2 個不同 host）。
+- `down_pending_out` reset 邏輯跟 A1 一樣，永遠不到 600s，**不會 mark out**。subtree_limit 在 B1 沒有實質作用，因為沒有任何 OSD 撐到 mark-out 階段。
+- 全 cluster 同時有 25% node 反覆 down/up，client I/O 會看到大量 short peering windows。
+
+### B2：同 rack 5 個 node，10 分鐘內各 5 次 flap
+
+- 每個 node cycle 120s > grace 20s → 每個 cycle 都會 mark down。
+- 當 5 個 node 上的 OSD 全部同時被 mark down，從任何一顆 OSD 沿 CRUSH 往 rack 爬，rack 底下所有 OSD 都 down → `containing_subtree_is_down(rack)` 回 true → `down_pending_out[o] = now` 被 reset。**rack 護欄首次發揮作用：即使 down 超過 600s 也不會 mark out**。
+- 邊界場景：若 5 個 node 不是同時掛（例如錯開幾十秒），有幾個瞬間 rack 內還有 1–2 個 node 是 up 的 — 這時護欄不成立，那些 down 滿 600s 的 OSD 會被 mark out。要嚴格觸發護欄，需要這 5 個 node「down 期間有交集」。
+- `can_mark_out(-1)`：25% node down，若每 node 有 N 顆 OSD，全 cluster `in_ratio` 可能掉到 0.75（恰好等於 `mon_osd_min_in_ratio` 預設值）。等於門檻邊界 — `in_ratio < 0.75` 才會擋下，等於 0.75 不會擋。實務上會剛好過關允許繼續 mark-out，但會在 cluster log 看到接近護欄的 dout。
+- OSD self-shutdown 機制照 A2 邏輯：5 次還沒到。
+
+### B3：同 rack 5 個 node，60 分鐘內各 5 次 flap
+
+- 每個 node cycle 12 分鐘 > 600s → 每個 cycle 各 node 滿足 mark-out 條件。
+- 但只要 5 個 node down 的時間「有任意一刻同時 down」，subtree_limit 在那一刻 reset timer。如果 5 個 node down 期同步（同時 down、同時 up），整個 12 分鐘 down 期 rack 都是全 down → timer 一直被 reset，**不會 mark out**，跟 B2 一樣。
+- 如果錯開，例如每個 node 進入 cycle 的時間有 1–2 分鐘的偏差，**會有「rack 內還有 1–2 個 up」的窗口**，那些 down 滿 600s 的 OSD 會被 mark out。一旦 mark out，PG 開始 backfill 到 rack 外的 node；node 回來會自動 mark in（`mon_osd_auto_mark_auto_out_in`）→ 反向 backfill。**這是最傷的 pattern**：rack 內每個 node 都被搬出又搬回。
+- laggy 累積到很高（5 次 flap，`laggy_probability ≈ 0.832`，`laggy_interval` 漸近 cap 300s），下次 mark-down 的 grace ≈ 20 + 300 × 0.832 ≈ 270s — 接近 5 分鐘。也就是後段 cycle 即使有 cycle 12 分鐘，前面 5 分鐘可能還沒 mark down，等於少觸發幾次 mark-down。
+- `mon_osd_adjust_down_out_interval` 一樣作用在 mark-out grace：600 + 300 × 0.832 ≈ 850s — 接近 14 分鐘。後段 cycle 已 hard 過不了 mark-out 門檻。
+
+### 對照表
+
+| 情境 | 每 cycle 下 mark down？ | 累計 mark out？ | OSD self-shutdown？ | 主要 cluster 壓力 |
+|---|---|---|---|---|
+| A1 | 偶發（cycle < grace 20s） | 不會（timer reset） | 否（5 不大於 5） | 多次 peering windows |
+| A2 | 每 cycle 都會 | 不會（timer reset） | 否（5 不大於 5） | mark-down 後 PG 短暫 undersized |
+| A3 | 每 cycle 都會 | **會**（cycle > 600s） | 否（process 重啟清空） | 每 cycle 一輪 backfill out + 回填 |
+| B1 | 偶發 | 不會 | 否 | 全 cluster 多次 peering |
+| B2 | 每 cycle 都會 | **不會（rack 護欄）** | 否 | 連續 degraded，client I/O 卡 |
+| B3 | 每 cycle 都會 | 同步 → 不會；錯開 → **會** | 否 | 最差：rack 內 backfill 雙向反覆 |
+
+## 邊界與除錯
+
+幾條從 source 推出來、實務排查時最常忘的事：
+
+- **mark-down 跟 mark-out 是不同 grace、不同護欄**。看 `ceph -s` 出現 `osds: down, out` 才代表 600s timer 過了；只是 `down` 不代表會自動 backfill。
+- **`mon_osd_down_out_subtree_limit = rack` 不會擋 mark-down**。整個 rack 掛了，OSD 還是會被標 down — backfill 沒發生是因為 mark-out 階段被擋，不是因為 MON 沒看到失敗。要看是否被護欄擋，看 `ceph -m <leader> daemon mon.<id> log` 找 `entire containing rack subtree ... is down; resetting timer`。
+- **subtree 護欄要求 rack 內全部 OSD 都 down**（`OSDMap::containing_subtree_is_down`）。5 個 node 裡有 1 個還活著或剛回來，護欄就立刻失效，**那些已 down 滿 600s 的 OSD 會在下個 tick 被 mark out**。錯開時間的 flap pattern 反而比同步 flap 更慘。
+- **`osd_max_markdown_count = 5` 的判斷是 `>`**（`OSD.cc:8578`），表示第 6 次誤標 down 才自殺，不是第 5 次。
+- **斷電 vs OSD process 退**：前者走 20 秒 grace，後者走 `ms_handle_refused` 的 `FLAG_IMMEDIATE`（`OSD.cc:6756`），grace 跳過。debug 時可以從 `ceph -w` 是否看到 `immediate failed by osd.X` 區分。
+- **`laggy_probability` 和 `laggy_interval` 是持久化的**（`osd_xinfo_t` encode 進 OSDMap — 見 `src/osd/OSDMap.cc:148-170`），下次 boot 還在；要清掉得用 `ceph osd rm-noout` 之類 admin 操作或 OSD `destroy + recreate`。
+- **`mon_osd_min_in_ratio = 0.75` 是「卡死保險」**，不是「平常閥值」。一旦 25% 以上 OSD out，MON 自動停止再 mark out，避免 cascade 大規模 backfill 把剩下 75% 也壓死。25% rack 失效是它的設計觸發點。
+
+## 接下來 / 相關頁面
+
+- [crush-and-placement](/ceph/features/crush-and-placement) — rack bucket 跟 `step chooseleaf firstn 0 type host` 的對應，理解為什麼 rack-wide flap 對 PG 影響取決於 CRUSH rule。
+- [osd-and-bluestore](/ceph/features/osd-and-bluestore) — mark-down 後 PG `peering → active+undersized+degraded` 的 replicate flow。
+- [mclock-osd-scheduler](/ceph/features/mclock-osd-scheduler) — flap 過後 backfill 跟 client I/O 在 OSD op queue 上怎麼 share。
+- [recovery-throttle-runtime](/ceph/features/recovery-throttle-runtime) — backfill 風暴時用 `osd_recovery_max_active` injectargs 收緊的細節（含 mClock rollback 陷阱）。

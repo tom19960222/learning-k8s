@@ -7,6 +7,7 @@
     {"id": "crush-and-placement", "label": "CRUSH & PG", "description": "用 CRUSH 演算法將 object 對映到 PG 再對映到 OSD", "featureSlug": "crush-and-placement", "category": "controller", "position": {"x": 700, "y": 220}},
     {"id": "mclock-osd-scheduler", "label": "mClock QoS", "description": "OSD op queue 用 reservation / weight / limit 分配 I/O", "featureSlug": "mclock-osd-scheduler", "category": "lifecycle", "position": {"x": 400, "y": 260}},
     {"id": "recovery-throttle-runtime", "label": "Recovery throttle", "description": "mClock 下 recovery/backfill tunable 的 runtime rollback 與 override", "featureSlug": "recovery-throttle-runtime", "category": "tooling", "position": {"x": 100, "y": 390}},
+    {"id": "osd-flapping", "label": "Node flapping", "description": "MON failure_info / down_pending_out / subtree_limit / laggy EMA 對 single 與 rack-wide flap 的反應", "featureSlug": "osd-flapping", "category": "controller", "position": {"x": 700, "y": 390}},
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}}
   ],
   "edges": [
@@ -16,6 +17,8 @@
     {"id": "e-osd-bluestore-deep", "source": "osd-and-bluestore", "target": "bluestore-deep-dive", "label": "dives into"},
     {"id": "e-osd-mclock", "source": "osd-and-bluestore", "target": "mclock-osd-scheduler", "label": "queues"},
     {"id": "e-mclock-recovery", "source": "mclock-osd-scheduler", "target": "recovery-throttle-runtime", "label": "guards"},
+    {"id": "e-osd-flapping", "source": "osd-and-bluestore", "target": "osd-flapping", "label": "fails over"},
+    {"id": "e-flapping-crush", "source": "osd-flapping", "target": "crush-and-placement", "label": "subtree_limit"},
     {"id": "e-rbd-crush", "source": "rbd-and-csi", "target": "crush-and-placement", "label": "queries"},
     {"id": "e-rbd-osd", "source": "rbd-and-csi", "target": "osd-and-bluestore", "label": "writes via", "animated": true},
     {"id": "e-rbd-mclock", "source": "rbd-and-csi", "target": "mclock-osd-scheduler", "label": "enters queue"}
