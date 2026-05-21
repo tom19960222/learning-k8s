@@ -1,0 +1,286 @@
+---
+layout: doc
+title: Ceph — osd safe-to-destroy 在 v19.2.3 原始碼裡檢查了什麼
+description: ceph osd safe-to-destroy 不檢查 min_size，它檢查的是另外三件事：OSD 是否已不在 osdmap、是否還有 PG mapping 到它（acting/up_not_acting）、以及 cluster 不是 active+clean 時 OSD 是否仍持有 PG 資料。三條中任一條未過就拒絕毀掉。
+---
+
+## 場景
+
+`ok-to-stop` 回答的是「現在 stop 這顆 daemon、PG 還活著嗎」。`safe-to-destroy` 回答的是更激烈的問題：「**永久**把這顆 OSD 從 cluster 拔掉、刪 cephx key、把 raw block device 扔掉，會不會丟資料？」
+
+操作上，你會在這個流程的尾巴呼叫它：mark out → reweight 0 → 等 PG drain → safe-to-destroy → destroy/purge。它是 destroy 動作前最後一道安全網。下面從 v19.2.3 原始碼追它真正檢查的三件事。
+
+## 命令路由：跟 ok-to-stop 同樣是 mgr 處理
+
+跟 `osd ok-to-stop` 一樣註冊在 mgr 端：
+
+File: `ceph/src/mgr/MgrCommands.h` (line 157)
+
+```cpp
+COMMAND("osd safe-to-destroy name=ids,type=CephString,n=N",
+	"check whether osd(s) can be safely destroyed without reducing data durability",
+	"osd", "r")
+```
+
+注意敘述差異：`ok-to-stop` 是 "without reducing immediate data availability"（不會讓 PG 立刻 inactive），`safe-to-destroy` 是 "without reducing data durability"（不會減少資料持久性）。前者是可用性、後者是耐久性。
+
+handler 與 `osd destroy` / `osd purge` 三條命令共用同一個 branch — 因為 destroy / purge 在 mgr 端會先跑跟 safe-to-destroy 完全一樣的檢查、確認通過才把實際的 `destroy-actual` / `purge-actual` 命令 forward 給 MON。對 `osd safe-to-destroy` 來說它只走檢查、不執行 destroy。
+
+## 整體流程：unknown gate → 逐顆過三條規則 → 分桶
+
+handler 開頭先擋掉 unknown PG，這跟 ok-to-stop 同樣的 fail-fast：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1712)
+
+```cpp
+cluster_state.with_osdmap_and_pgmap([&](const OSDMap& osdmap, const PGMap& pg_map) {
+    if (pg_map.num_pg_unknown > 0) {
+      ss << pg_map.num_pg_unknown << " pgs have unknown state; cannot draw"
+         << " any conclusions";
+      r = -EAGAIN;
+      return;
+    }
+    int num_active_clean = 0;
+    for (auto& p : pg_map.num_pg_by_state) {
+      unsigned want = PG_STATE_ACTIVE|PG_STATE_CLEAN;
+      if ((p.first & want) == want) {
+        num_active_clean += p.second;
+      }
+    }
+```
+
+`num_pg_unknown` 是 PGMap 預先 aggregate 好的「state == 0 的 PG 總數」（定義在 `ceph/src/mon/PGMap.h:46`）；只要 > 0 就直接 `-EAGAIN`。
+
+接著算出「目前有幾個 PG 是 active+clean」，這個數字決定第三條規則要不要套。然後對每顆使用者指定的 OSD 逐顆過三條：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1726)
+
+```cpp
+for (auto osd : osds) {
+  if (!osdmap.exists(osd)) {
+    safe_to_destroy.insert(osd);
+    continue;  // clearly safe to destroy
+  }
+  auto q = pg_map.num_pg_by_osd.find(osd);
+  if (q != pg_map.num_pg_by_osd.end()) {
+    if (q->second.acting > 0 || q->second.up_not_acting > 0) {
+      active_osds.insert(osd);
+      affected_pgs += q->second.acting + q->second.up_not_acting;
+      continue;
+    }
+  }
+  if (num_active_clean < pg_map.num_pg) {
+    auto p = pg_map.osd_stat.find(osd);
+    if (p == pg_map.osd_stat.end() || !osdmap.is_up(osd)) {
+      missing_stats.insert(osd);
+      continue;
+    } else if (p->second.num_pgs > 0) {
+      stored_pgs.insert(osd);
+      continue;
+    }
+  }
+  safe_to_destroy.insert(osd);
+}
+```
+
+下面把每條規則拆開。
+
+### 規則 1 — 不在 osdmap 裡的、視為 idempotent safe
+
+如果 `osdmap.exists(osd)` 回 false（OSD 已經被 destroy/purge 過，或從沒存在），直接歸到 safe，繼續下一顆。這讓 `safe-to-destroy` 可以重複呼叫不會出錯，cephadm 的 OSD removal queue 才能用「重試直到成功」的 pattern 推進。
+
+### 規則 2 — 任何 PG 還 map 到這顆，立刻 active_osds
+
+`pg_count` 是 PGMap 預先聚合好的計數結構，定義在 `ceph/src/mon/PGMap.h` (line 53)：
+
+```cpp
+struct pg_count {
+  int32_t acting = 0;
+  int32_t up_not_acting = 0;
+  int32_t primary = 0;
+  ...
+};
+```
+
+| 欄位 | 含義 |
+|---|---|
+| `acting` | OSD 目前在多少個 PG 的 acting set 裡（真正承擔 read/write 角色） |
+| `up_not_acting` | OSD 在 up set 但還沒進 acting（通常是 backfill target 還沒被 promote） |
+| `primary` | 在多少個 PG 擔任 primary |
+
+`safe-to-destroy` 看 `acting > 0 OR up_not_acting > 0`，兩條任一中就視為「**還在 cluster placement plan 裡**」、進 `active_osds`、回 `-EBUSY`。`primary` 故意不看，因為 primary 已含在 acting 裡。
+
+這是正確流程下、operator 沒先 drain 的最常見失敗原因：明明 `ceph osd out 5` 跑過了，但 PG 還沒搬完（backfill 進行中），這時的 osd.5 還在 up set 但被排除出 acting，`up_not_acting` 通常為 0 / `acting` 為 0，但實務上 backfill 進行中時 osd.5 是 backfill **source**、acting 還有它。所以正確等待條件是「cluster 完全進入 active+clean、osd.5 的 `acting` 與 `up_not_acting` 都歸 0」。
+
+### 規則 3 — cluster 不是 active+clean 時，OSD 仍持有 PG 資料就拒絕
+
+第三條只在「整個 cluster 不健康」時才檢查 — 也就是 `num_active_clean < pg_map.num_pg`。Healthy cluster 不必管這條，因為規則 2 已經把所有「還有 PG 角色」的 OSD 擋掉了。
+
+不健康的 cluster 裡會分兩種失敗：
+
+```cpp
+if (num_active_clean < pg_map.num_pg) {
+  auto p = pg_map.osd_stat.find(osd);
+  if (p == pg_map.osd_stat.end() || !osdmap.is_up(osd)) {
+    missing_stats.insert(osd);
+    continue;
+  } else if (p->second.num_pgs > 0) {
+    stored_pgs.insert(osd);
+    continue;
+  }
+}
+```
+
+| 條件 | 桶 | 回傳碼 |
+|---|---|---|
+| OSD 沒有 osd_stat report，**或** OSD is_up == false | `missing_stats` | `-EAGAIN` |
+| OSD 有 stat、是 up、但 `num_pgs > 0`（仍持有 PG 資料） | `stored_pgs` | `-EBUSY` |
+
+`osd_stat_t::num_pgs` 是 OSD 自己 report 上來的「我手上有多少個 PG 物件存在」(`ceph/src/osd/osd_types.h:2531`)。即使 PG mapping 已經切離 osd.5，只要 osd.5 還沒把 local 的 PG dir 清完，這個數字就 > 0。
+
+第二桶 `missing_stats` 的設計尤其重要：**已經 down 的 OSD，在 cluster 不健康時不會被認定 safe**。乍看怪 — 我都已經 down 了、不就應該可以 destroy？原因是：MON 不知道這顆下次起來會不會帶回某些 PG 還活著、但別處已不健康的 shard。要 destroy down 的 OSD，必須讓 cluster 先回到 fully active+clean，這條 gate 才會跳過。
+
+## 三類錯誤的拼裝與 message 順序
+
+handler 拼錯誤訊息的順序是固定的（safe_to_destroy 先列、active 次之、missing_stats、stored_pgs 最後），這是給人讀的：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1758)
+
+```cpp
+if (!r && (!active_osds.empty() ||
+           !missing_stats.empty() || !stored_pgs.empty())) {
+   if (!safe_to_destroy.empty()) {
+     ss << "OSD(s) " << safe_to_destroy
+        << " are safe to destroy without reducing data durability. ";
+   }
+   if (!active_osds.empty()) {
+     ss << "OSD(s) " << active_osds << " have " << affected_pgs
+        << " pgs currently mapped to them. ";
+   }
+   if (!missing_stats.empty()) {
+     ss << "OSD(s) " << missing_stats << " have no reported stats, and not all"
+        << " PGs are active+clean; we cannot draw any conclusions. ";
+   }
+   if (!stored_pgs.empty()) {
+     ss << "OSD(s) " << stored_pgs << " last reported they still store some PG"
+        << " data, and not all PGs are active+clean; we cannot be sure they"
+        << " aren't still needed.";
+   }
+   if (!active_osds.empty() || !stored_pgs.empty()) {
+     r = -EBUSY;
+   } else {
+     r = -EAGAIN;
+   }
+}
+```
+
+最終回傳碼的決策樹：
+
+| 桶內容 | return code |
+|---|---|
+| 全進 `safe_to_destroy` | `0` |
+| 有 `active_osds` 或 `stored_pgs` | `-EBUSY` |
+| 只有 `missing_stats` | `-EAGAIN` |
+| 有 unknown PG | `-EAGAIN`（在 handler 開頭就 return） |
+
+`-EBUSY` 是「**有資料風險、不要 destroy**」；`-EAGAIN` 是「**現在判斷不準、等 cluster 穩定再試**」。兩者要分清，因為 cephadm / 自動化腳本對它們的反應應該不同（busy 是要 alert operator、again 是 retry）。
+
+## 邊界：`ok-to-stop` vs `safe-to-destroy` 真的不同
+
+兩條命令名字相像但檢查邏輯沒有任何交集：
+
+| 維度 | ok-to-stop | safe-to-destroy |
+|---|---|---|
+| 問的問題 | 立刻停 daemon，PG 還能 active 嗎 | 永久毀掉 OSD，會丟資料嗎 |
+| 走進的迴圈 | per-PG（pg_stat 全表） | per-OSD（指定的那幾顆） |
+| 看的 pool 屬性 | `pi->min_size` | （不看） |
+| 看的 PG state | `PG_STATE_ACTIVE` | （不直接看；改看 `num_active_clean == num_pg`） |
+| 看的 OSD 統計 | （不看 osd_stat） | `osd_stat[osd].num_pgs`、`num_pg_by_osd[osd]` |
+| 看 osdmap.exists | 否 | 是（不存在 = idempotent safe） |
+| 對 OSDMap pruning 敏感 | 否 | 否（v19.2.3 此版本沒檢查 historical osdmap） |
+
+兩條互補：rolling 升級時用 `ok-to-stop` 控節奏，永久汰換時用 `safe-to-destroy` 控資料安全。
+
+## destroy 那一端的最後一道實體門
+
+`safe-to-destroy` 只是建議，不會阻止你硬幹。實際在 MON 端 `osd destroy-actual` / `osd purge-actual` 的處理還有另一層提醒：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 12949)
+
+```cpp
+bool sure = false;
+cmd_getval(cmdmap, "yes_i_really_mean_it", sure);
+if (!sure) {
+  ss << "Are you SURE?  Did you verify with 'ceph osd safe-to-destroy'?  "
+     << "This will mean real, permanent data loss, as well "
+     << "as deletion of cephx and lockbox keys. "
+     << "Pass --yes-i-really-mean-it if you really do.";
+  err = -EPERM;
+  goto reply_no_propose;
+} else if (!osdmap.exists(id)) {
+  ss << "osd." << id << " does not exist";
+  err = 0;
+  goto reply_no_propose;
+} else if (osdmap.is_up(id)) {
+  ss << "osd." << id << " is not `down`.";
+  err = -EBUSY;
+  goto reply_no_propose;
+}
+```
+
+兩條額外硬性條件：必須先帶 `--yes-i-really-mean-it`，而且 OSD 必須是 `down` 狀態 — destroy/purge 不能直接打掉 up 著的 OSD。注意「destroy up 的 OSD」直接由 MON 拒絕、不是由 safe-to-destroy 阻擋。
+
+<Callout type="danger" title="safe-to-destroy 不替你判斷 EC pool 的 k 安全邊界">
+  原始碼層級 `safe-to-destroy` 看的是「是否 PG 仍然 map 到此 OSD」加「OSD 是否仍持有 PG 資料」。它不檢查「pool 的副本拓樸 / EC k+m 配置在毀掉這顆後還能不能撐住下一顆故障」。要做這種推理你需要看 `ceph osd df`、`ceph pg dump` 與 CRUSH rule。
+</Callout>
+
+## cephadm / Rook 在 OSD removal queue 怎麼呼它
+
+cephadm 的 OSD 移除流程就是「drain → safe-to-destroy → destroy」這條鏈：
+
+File: `ceph/src/pybind/mgr/cephadm/services/osd.py` (line 573)
+
+```python
+def safe_to_destroy(self, osd_ids: List[int]) -> bool:
+    """ Queries the safe-to-destroy flag for OSDs """
+    cmd_args = {'prefix': 'osd safe-to-destroy',
+                'ids': [str(x) for x in osd_ids]}
+    return self._run_mon_cmd(cmd_args, error_ok=True)
+
+def destroy_osd(self, osd_id: int) -> bool:
+    """ Destroys an OSD (forcefully) """
+    cmd_args = {'prefix': 'osd destroy-actual',
+                'id': int(osd_id),
+                'yes_i_really_mean_it': True}
+    return self._run_mon_cmd(cmd_args)
+```
+
+removal worker 每輪都重新評估一次每顆排隊中的 OSD：
+
+File: `ceph/src/pybind/mgr/cephadm/services/osd.py` (line 868)
+
+```python
+for osd in all_osds:
+    if not osd.force:
+        if not osd.is_empty:
+            logger.debug(f"{osd} is not empty yet. Waiting a bit more")
+            new_queue.add(osd)
+            continue
+    if not osd.safe_to_destroy():
+        logger.debug(
+            f"{osd} is not safe-to-destroy yet. Waiting a bit more")
+        new_queue.add(osd)
+        continue
+    if not osd.down():
+        ...
+```
+
+兩道擋牆：先確認 `is_empty`（local pg_count 歸零）、再呼 `safe_to_destroy` — 兩個都通過才把 OSD daemon mark down 再呼 `destroy_osd`。`force=true` 可以略過 is_empty，但不會略過 safe_to_destroy 的 mgr 端檢查。Rook 在 k8s 上做 OSD replace（壞硬碟換新硬碟）走的也是這條邏輯。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — osd ok-to-stop 在原始碼裡檢查了什麼](./osd-ok-to-stop) — 互補的「停 daemon 不毀資料」檢查，邏輯走的是 per-PG min_size
+  - [Ceph — PG health states](./pg-health-states) — 為什麼 `num_active_clean == num_pg` 是這條命令的關鍵閘門
+  - [Ceph — Node flapping](./osd-flapping) — `osdmap.exists / is_up / is_destroyed` 等 OSDMap 狀態轉換的細節
+</Callout>

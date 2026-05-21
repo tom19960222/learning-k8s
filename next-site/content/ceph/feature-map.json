@@ -9,6 +9,8 @@
     {"id": "recovery-throttle-runtime", "label": "Recovery throttle", "description": "mClock 下 recovery/backfill tunable 的 runtime rollback 與 override", "featureSlug": "recovery-throttle-runtime", "category": "tooling", "position": {"x": 100, "y": 390}},
     {"id": "osd-flapping", "label": "Node flapping", "description": "MON failure_info / down_pending_out / subtree_limit / laggy EMA 對 single 與 rack-wide flap 的反應", "featureSlug": "osd-flapping", "category": "controller", "position": {"x": 700, "y": 390}},
     {"id": "pg-health-states", "label": "PG health states", "description": "PG state、OSD fullness、OSDMAP flags 與 slow ops 如何升成線上風險", "featureSlug": "pg-health-states", "category": "controller", "position": {"x": 700, "y": 530}},
+    {"id": "osd-ok-to-stop", "label": "osd ok-to-stop", "description": "每 PG 跑一次 min_size 模擬：扣掉這幾顆後 acting 還夠不夠維持 active", "featureSlug": "osd-ok-to-stop", "category": "tooling", "position": {"x": 400, "y": 660}},
+    {"id": "osd-safe-to-destroy", "label": "osd safe-to-destroy", "description": "三條規則：osdmap.exists / pg map 仍在此 OSD / 不健康 cluster 中仍持有 PG 資料", "featureSlug": "osd-safe-to-destroy", "category": "tooling", "position": {"x": 700, "y": 660}},
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}}
   ],
   "edges": [
@@ -24,6 +26,10 @@
     {"id": "e-health-recovery", "source": "pg-health-states", "target": "recovery-throttle-runtime", "label": "blocks"},
     {"id": "e-rbd-crush", "source": "rbd-and-csi", "target": "crush-and-placement", "label": "queries"},
     {"id": "e-rbd-osd", "source": "rbd-and-csi", "target": "osd-and-bluestore", "label": "writes via", "animated": true},
-    {"id": "e-rbd-mclock", "source": "rbd-and-csi", "target": "mclock-osd-scheduler", "label": "enters queue"}
+    {"id": "e-rbd-mclock", "source": "rbd-and-csi", "target": "mclock-osd-scheduler", "label": "enters queue"},
+    {"id": "e-okstop-health", "source": "osd-ok-to-stop", "target": "pg-health-states", "label": "reads PG state"},
+    {"id": "e-okstop-crush", "source": "osd-ok-to-stop", "target": "crush-and-placement", "label": "walks tree on --max"},
+    {"id": "e-safedestroy-health", "source": "osd-safe-to-destroy", "target": "pg-health-states", "label": "needs active+clean"},
+    {"id": "e-okstop-safedestroy", "source": "osd-ok-to-stop", "target": "osd-safe-to-destroy", "label": "complements"}
   ]
 }

@@ -1,0 +1,292 @@
+---
+layout: doc
+title: Ceph — osd ok-to-stop 在 v19.2.3 原始碼裡檢查了什麼
+description: ceph osd ok-to-stop 不是 MON 處理、是 ceph-mgr 處理；每個 PG 逐一檢查 pool 是否存在、PG 是否 active、acting set 扣掉這幾顆後是否還 ≥ min_size，三個條件都過才算 ok_to_stop。
+---
+
+## 場景
+
+你要對某個 OSD 做維護：rolling kernel upgrade、抽硬碟換更大顆、把 OSD daemon 停下來看 perf counter。停之前你想確認「把這顆 down 掉，會不會有 PG 變 inactive」。`ceph osd ok-to-stop 5` 就是給這個問題的判斷工具。
+
+但這條命令的回答品質完全取決於它**檢查了什麼**。它不是看 OSDMap 有沒有 spare、也不是查歷史，而是逐一 walk 每一個 PG，模擬把這幾顆 OSD 從 acting set 抽掉之後 PG 還活不活得了。下面從 v19.2.3 原始碼追整條路徑。
+
+## 命令路由：mgr 接、不是 mon 接
+
+OSD 相關命令在原始碼裡分兩處註冊：`src/mon/MonCommands.h` 註冊由 MON 處理的（osd map 修改類），`src/mgr/MgrCommands.h` 註冊由 ceph-mgr 處理的（read-only 統計查詢類）。`ok-to-stop` 在後者：
+
+File: `ceph/src/mgr/MgrCommands.h` (line 160)
+
+```cpp
+COMMAND("osd ok-to-stop name=ids,type=CephString,n=N "\
+	"name=max,type=CephInt,req=false",
+	"check whether osd(s) can be safely stopped without reducing immediate"\
+	" data availability", "osd", "r")
+```
+
+`r` 是 read perm，意味著它不會改 OSDMap。client 端的 `ceph osd ok-to-stop ...` 經由 librados → ceph-mgr 進入 `DaemonServer::_handle_command`，而 `MonClient` 看到這個 prefix 會把命令 forward 到 mgr，不是 mon。
+
+`ids` 接受多顆 OSD（`n=N` 表 1 或更多），`max` 是可選的「最多擴張到幾顆」上限，預設 1。
+
+## 三條 PG-層級的檢查
+
+handler 走進這個 branch：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1844)
+
+```cpp
+} else if (prefix == "osd ok-to-stop") {
+  std::vector<string> ids;
+  cmd_getval(cmdctx->cmdmap, "ids", ids);
+  std::set<int> osds;
+  int64_t max = 1;
+  cmd_getval(cmdctx->cmdmap, "max", max);
+  int r;
+  cluster_state.with_osdmap([&](const OSDMap& osdmap) {
+      r = osdmap.parse_osd_id_list(ids, &osds, &ss);
+    });
+```
+
+接著呼 `_maximize_ok_to_stop_set`，它內部第一件事就是先把使用者指定的那幾顆送進 `_check_offlines_pgs`。真正做檢查的是這個 function，每個 PG 跑一次：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1001)
+
+```cpp
+void DaemonServer::_check_offlines_pgs(
+  const std::set<int>& osds,
+  const OSDMap& osdmap,
+  const PGMap& pgmap,
+  offline_pg_report *report)
+{
+  *report = offline_pg_report();
+  report->osds = osds;
+
+  for (const auto& q : pgmap.pg_stat) {
+    std::set<int32_t> pg_acting;
+    bool found = false;
+    if (q.second.state == 0) {
+      report->unknown.insert(q.first);
+      continue;
+    }
+```
+
+把 `q.second` 想成「這個 PG 的 PGMap 統計快照」，含 `state` (bitmask)、`acting` (現在的 OSD 陣列)、`avail_no_missing` (PG 是 DEGRADED 時、扣掉 missing 後實際可用的 shard)。
+
+對每個 PG，function 走三步：
+
+### Step 1 — 列出「扣掉這幾顆後」剩餘的 acting
+
+如果 PG 是 DEGRADED，要看 `avail_no_missing`（degraded 下不能用 acting，因為其中可能含有 missing object 的 OSD）；否則直接看 `acting`。出現在使用者指定集合裡的 OSD 跳過，剩下的進 `pg_acting`：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1018)
+
+```cpp
+if (q.second.state & PG_STATE_DEGRADED) {
+  for (auto& anm : q.second.avail_no_missing) {
+    if (osds.count(anm.osd)) {
+      found = true;
+      continue;
+    }
+    if (anm.osd != CRUSH_ITEM_NONE) {
+      pg_acting.insert(anm.osd);
+    }
+  }
+} else {
+  for (auto& a : q.second.acting) {
+    if (osds.count(a)) {
+      found = true;
+      continue;
+    }
+    if (a != CRUSH_ITEM_NONE) {
+      pg_acting.insert(a);
+    }
+  }
+}
+if (!found) {
+  continue;
+}
+```
+
+`found` 為 false 表示這個 PG 完全沒有 mapping 到使用者要停的 OSD，整顆跳過 — 它不會被影響。`CRUSH_ITEM_NONE` 是 acting 陣列裡的空位（EC pool 才會出現），同樣跳過。
+
+### Step 2 — 三個 dangerous 條件擇一就 not_ok
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1042)
+
+```cpp
+const pg_pool_t *pi = osdmap.get_pg_pool(q.first.pool());
+bool dangerous = false;
+if (!pi) {
+  report->bad_no_pool.insert(q.first);
+  dangerous = true;
+}
+if (!(q.second.state & PG_STATE_ACTIVE)) {
+  report->bad_already_inactive.insert(q.first);
+  dangerous = true;
+}
+if (pg_acting.size() < pi->min_size) {
+  report->bad_become_inactive.insert(q.first);
+  dangerous = true;
+}
+if (dangerous) {
+  report->not_ok.insert(q.first);
+} else {
+  report->ok.insert(q.first);
+  ...
+}
+```
+
+三條檢查直接列：
+
+| 條件 | 對應分類 | 意義 |
+|---|---|---|
+| `pool` 在 OSDMap 已不存在 | `bad_no_pool` | pool 正在 creating 或 deleting；無法判斷 |
+| PG 當前 state 沒有 `PG_STATE_ACTIVE` (`1ULL << 1`) | `bad_already_inactive` | 這個 PG 現在就已經 inactive，停 OSD 不會「讓它 inactive」、但 ok-to-stop 還是拒絕 |
+| 扣掉之後 `pg_acting.size() < pi->min_size` | `bad_become_inactive` | pool 的 min_size 是 PG 維持 active 的下限；剩太少就會掉到 inactive |
+
+`min_size` 的型別是 `__u8`，預設 replicated pool = 2、EC pool 看 k 值決定，定義在 `ceph/src/osd/osd_types.h` (line 1453)：
+
+```cpp
+__u8 size = 0, min_size = 0;  ///< number of osds in each pg
+```
+
+注意第三條：是「扣完之後夠不夠 min_size」，不是「夠不夠 size」。也就是說，3 replica pool / min_size 2 的 PG，停 1 顆完全 ok（剩 2 = min_size 2），停 2 顆 not_ok（剩 1 < 2）。
+
+### Step 3 — 把通過的 PG 分 ok / ok-but-degraded
+
+通過 dangerous 三條的 PG 還會再標一次：原本就 DEGRADED 的進 `ok_become_more_degraded`，原本健康的進 `ok_become_degraded`。這只是給人讀的副產品，不影響回傳碼。
+
+## ok_to_stop() 的判定式
+
+整個 report 結構長這樣：
+
+File: `ceph/src/mgr/DaemonServer.h` (line 53)
+
+```cpp
+struct offline_pg_report {
+  std::set<int> osds;
+  std::set<pg_t> ok, not_ok, unknown;
+  std::set<pg_t> ok_become_degraded, ok_become_more_degraded;
+  std::set<pg_t> bad_no_pool, bad_already_inactive, bad_become_inactive;
+
+  bool ok_to_stop() const {
+    return not_ok.empty() && unknown.empty();
+  }
+```
+
+`ok_to_stop()` 的判定就一行：**沒有 not_ok PG，也沒有 unknown PG**。
+
+注意 unknown 也算失敗（在 handler 那邊回 `-EAGAIN`），這代表 mgr 的 PGMap cache 裡有 `state == 0` 的 PG — 通常是新建 PG 還沒回 stat、或 mgr 剛起來還沒 collect 完。這時你應該等一下再下令，不是強行 stop。
+
+## max 與 _maximize_ok_to_stop_set 的擴張
+
+如果使用者下的是 `ceph osd ok-to-stop 5 --max 4`，function 會試著「在保證 ok 的前提下，往 CRUSH 樹上走、把同 parent bucket 下的 sibling OSD 也納進來」，直到湊到 max 或失敗為止：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1096)
+
+```cpp
+while (true) {
+  int r = osdmap.crush->get_immediate_parent_id(parent, &parent);
+  if (r < 0) {
+    return;
+  }
+  children.clear();
+  r = osdmap.crush->get_all_children(parent, &children);
+  ...
+  for (auto o : children) {
+    if (o >= 0 && osdmap.is_up(o) && osds.count(o) == 0) {
+      osds.insert(o);
+      _check_offlines_pgs(osds, osdmap, pgmap, &report);
+      if (!report.ok_to_stop()) {
+        osds.erase(o);
+        ++failed;
+        continue;
+      }
+      *out_report = report;
+      ...
+```
+
+實際上是貪婪：從 `orig_osds` 裡的第一顆當 anchor，往 parent 跳一層（host → rack → root），每跳一層就試把同層下面所有 sibling OSD 加進來，每加一顆就重跑 `_check_offlines_pgs`，加完仍 ok 就保留、會壞就 erase。`max` 是這次擴張的上限。
+
+對使用者來說最常用的價值：`ceph osd ok-to-stop osd.5 --max 100` 告訴你「同個 host 上跟 osd.5 一起、最多可以一次停幾顆」。
+
+## 回傳碼
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 1877)
+
+```cpp
+if (!out_report.unknown.empty()) {
+  ss << out_report.unknown.size() << " pgs have unknown state; "
+     << "cannot draw any conclusions";
+  cmdctx->reply(-EAGAIN, ss);
+}
+if (!out_report.ok_to_stop()) {
+  ss << "unsafe to stop osd(s) at this time (" << out_report.not_ok.size() << " PGs are or would become offline)";
+  cmdctx->reply(-EBUSY, ss);
+} else {
+  cmdctx->reply(0, ss);
+}
+```
+
+| return code | 條件 | 你該做什麼 |
+|---|---|---|
+| `0` | 三條 dangerous 全部沒踩到、沒有 unknown | 可以停 |
+| `-EAGAIN` (`11`) | 有 PG state == 0（mgr cache 不完整） | 等一下再試 |
+| `-EBUSY` (`16`) | 至少一個 PG 落在 bad_no_pool / bad_already_inactive / bad_become_inactive | **不要** 停；先看 `not_ok` 哪些 PG，補完 recovery 再來 |
+
+## 邊界與除錯
+
+ok-to-stop 不檢查的東西也很重要：
+
+| ok-to-stop 不會看 | 為什麼重要 |
+|---|---|
+| OSD 上的 object 數量、容量 | 它只關心「停了之後 PG 還能不能 active」，不關心搬不搬得回來 |
+| recovery / backfill 是否在跑 | 停下後會中斷 recovery，但只要剩餘 acting ≥ min_size 它認為 OK |
+| 與此同時其他 OSD 是否 down | 它讀的是當下 OSDMap / PGMap snapshot，沒有時間窗 |
+| historic OSDMap pruning（osdmap_first_committed） | 那是 `safe-to-destroy` 的事，不是 `ok-to-stop` 的 |
+
+兩個常見的「為什麼結果不對」場景：
+
+**剛建好 pool 馬上問**：新建的 PG 在 peering 之前 `state == 0`，會落到 `unknown.insert(q.first)`，整批 return `-EAGAIN`。`ceph -s` 看到 `creating+peering` 字樣就先等。
+
+**recovery 中問**：mgr 的 `pg_stat` 是 PG primary 定期 report 上來的、有 lag。如果你剛把 osd.3 mark out、馬上問 `osd ok-to-stop 5`，可能 mgr 還看不到「osd.3 已不在 acting 裡」這件事，回的結果是基於舊 acting 算的。等 `ceph -s` 進入穩定再問。
+
+<Callout type="warning" title="ok-to-stop 不是 safe-to-destroy">
+  `ok-to-stop` 只回答「現在停會不會讓 PG 立刻掉到 inactive」。它**不檢查**「資料是否已經有別處副本可以代替」。要永久毀掉 OSD，必須額外跑 `osd safe-to-destroy`。兩者是互補關係，不是同義。
+</Callout>
+
+## cephadm / Rook 場景下誰呼它
+
+cephadm 升級 OSD 的時候會等這條命令通過再 stop daemon：
+
+File: `ceph/src/pybind/mgr/cephadm/upgrade.py` (line 524)
+
+```python
+def _wait_for_ok_to_stop(
+        self, s: DaemonDescription,
+        known: Optional[List[str]] = None,
+) -> bool:
+    assert s.daemon_type is not None
+    assert s.daemon_id is not None
+    tries = 4
+    while tries > 0:
+        ...
+        r = self.mgr.cephadm_services[daemon_type_to_service(s.daemon_type)].ok_to_stop([
+            s.daemon_id], known=known, force=True)
+        if not r.retval:
+            logger.info(f'Upgrade: {r.stdout}')
+            return True
+        ...
+        time.sleep(15)
+        tries -= 1
+    return False
+```
+
+retry 4 次、每次間隔 15 秒，總共最多等 60 秒；逾時就放棄這顆、繼續升別的。Rook 在 k8s 上跑 OSD rolling upgrade 走的是類似邏輯（透過 ceph-mgr orchestrator interface 呼到同一條），所以你在 KubeVirt + Rook 環境下做 ceph daemon 升級時，看到的 ok-to-stop 也是這個 logic 在背後決定的。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — osd safe-to-destroy 在原始碼裡檢查了什麼](./osd-safe-to-destroy) — 同樣是 mgr 命令，但檢查的是「永久毀掉這顆會不會掉資料」的三條規則
+  - [Ceph — PG health states](./pg-health-states) — `ok-to-stop` 的依賴：PG 的 state bitmask 與 active/clean 的具體意義
+  - [Ceph — CRUSH & PG](./crush-and-placement) — `_maximize_ok_to_stop_set` 用的 `get_immediate_parent_id` / `get_all_children` 是 CRUSH 拓樸 API
+</Callout>
