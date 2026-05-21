@@ -1,0 +1,646 @@
+---
+layout: doc
+title: Ceph — PG / OSD 危險狀態與 health 判定
+description: 從 v19.2.3 原始碼追 PG state、OSD fullness、OSDMAP flags 與 slow ops 如何變成 health check，整理哪些狀態會直接影響線上 read、write、recovery 與資料安全。
+---
+
+## 場景
+
+`ceph -s` 裡同時出現 `inactive`、`incomplete`、`stale`、`down+peering`、`undersized+degraded`、`backfillfull`、`nearfull`、`full` 時，最麻煩的不是字很多，而是不知道哪個會擋線上 read、哪個只是 recovery 背景流量、哪個代表資料副本已經少一份。
+
+Ceph v19.2.3 把這些訊號分成三條路：PG state 由 OSD peering state machine 產生，MON 的 `PGMap` 再把 PG state 聚合成 `PG_AVAILABILITY`、`PG_DEGRADED`、`PG_DAMAGED` 等 health check；OSD 自己依使用率回報 `nearfull` / `backfillfull` / `full`，MON 把它寫進 OSDMap；另外還有 OSDMap flag、slow ops、MON/MGR 自身 health check。這頁只整理會危害線上環境的 RADOS / PG / OSD / MON-MGR health 訊號，不展開 CephFS MDS 專用狀態。
+
+```
+OSD peering state machine
+  -> PG_STATE_* bit
+  -> PGMap::get_health_checks()
+  -> PG_AVAILABILITY / PG_DEGRADED / PG_DAMAGED / PG_*_FULL
+
+OSD disk usage
+  -> OSDService::recalc_full_state()
+  -> MOSDFull
+  -> OSDMap flags and pool flags
+  -> OSD_FULL / OSD_BACKFILLFULL / OSD_NEARFULL / POOL_FULL
+
+OSDMap flags and daemon metrics
+  -> pause / no* flags / slow ops / daemon down
+  -> OSDMAP_FLAGS / SLOW_OPS / MON_DOWN / MGR_DOWN
+```
+
+## 先把狀態分成四種風險
+
+不是所有 `HEALTH_WARN` 的風險一樣。線上判讀時先分四類：
+
+| 風險 | 代表狀態 | 線上會發生什麼 |
+|---|---|---|
+| 可用性中斷 | `inactive`、`down`、stuck `peering`、`stale`、`incomplete`、`PG_AVAILABILITY` | PG 沒有 active primary 或沒有足夠完整副本，read/write 可能卡住或不可服務 |
+| 副本數不足 | `undersized`、`degraded`、`OSD_DOWN`、`PG_DEGRADED` | 仍可服務，但任何下一顆 OSD 掛掉都更接近資料遺失 |
+| repair 被擋 | `recovery_toofull`、`backfill_toofull`、`OSD_BACKFILLFULL`、`OSDMAP_FLAGS` 裡的 `norecover` / `nobackfill` | 已經知道要修，但 recovery/backfill 無法前進，風險停在現場 |
+| 資料可能損壞 | `inconsistent`、`recovery_unfound`、`backfill_unfound`、`snaptrim_error`、`OSD_SCRUB_ERRORS`、`PG_DAMAGED` | scrub 或 recovery 找到不一致、找不到物件、或修復失敗，不能當成一般容量警告 |
+
+`nearfull` 比較像「還沒著火的容量告警」；`full` 則會直接進入 write availability 問題。`SLOW_OPS` 不一定表示資料不安全，但代表線上 request 已經被卡住，應該跟 PG/OSD state 一起看。
+
+## PG state 怎麼變成 health check
+
+PG state 的字串來源不是 `ceph status` 自己編的，而是 `PG_STATE_*` bit。使用者常看的 `down`、`degraded`、`incomplete`、`stale`、`backfill_toofull`、`recovery_toofull` 都在同一組 bit 裡。
+
+```cpp
+// File: ceph/src/osd/osd_types.h (line 1013)
+#define PG_STATE_DOWN               (1ULL << 4)  // a needed replica is down, PG offline
+#define PG_STATE_RECOVERY_UNFOUND   (1ULL << 5)  // recovery stopped due to unfound
+#define PG_STATE_BACKFILL_UNFOUND   (1ULL << 6)  // backfill stopped due to unfound
+#define PG_STATE_DEGRADED           (1ULL << 10) // pg contains objects with reduced redundancy
+#define PG_STATE_INCONSISTENT       (1ULL << 11) // pg replicas are inconsistent (but shouldn't be)
+#define PG_STATE_PEERING            (1ULL << 12) // pg is (re)peering
+#define PG_STATE_INCOMPLETE         (1ULL << 16) // incomplete content, peering failed.
+#define PG_STATE_STALE              (1ULL << 17) // our state for this pg is stale, unknown.
+#define PG_STATE_BACKFILL_TOOFULL   (1ULL << 21) // backfill can't proceed: too full
+#define PG_STATE_UNDERSIZED         (1ULL << 23) // pg acting < pool size
+#define PG_STATE_RECOVERY_TOOFULL   (1ULL << 28) // recovery can't proceed: too full
+```
+
+MON 的 `PGMap::get_health_checks()` 再決定哪些 PG state 會升成 health check。注意 `inactive` 不是一個 `PG_STATE_INACTIVE` bit；它是反向判定：「不是所有 PG 都有 `PG_STATE_ACTIVE`」且卡超過門檻。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 2425)
+std::map<unsigned, PgStateResponse> state_to_response = {
+  { PG_STATE_INCONSISTENT,     {DAMAGED,     {}} },
+  { PG_STATE_INCOMPLETE,       {UNAVAILABLE, {}} },
+  { PG_STATE_SNAPTRIM_ERROR,   {DAMAGED,     {}} },
+  { PG_STATE_RECOVERY_UNFOUND, {DAMAGED,     {}} },
+  { PG_STATE_BACKFILL_UNFOUND, {DAMAGED,     {}} },
+  { PG_STATE_BACKFILL_TOOFULL, {BACKFILL_FULL, {}} },
+  { PG_STATE_RECOVERY_TOOFULL, {RECOVERY_FULL, {}} },
+  { PG_STATE_DEGRADED,         {DEGRADED,    {}} },
+  { PG_STATE_DOWN,             {UNAVAILABLE, {}} },
+  { PG_STATE_PEERING,          {UNAVAILABLE, [](const pg_stat_t &p){return p.last_peered;}    } },
+  { PG_STATE_UNDERSIZED,       {DEGRADED,    [](const pg_stat_t &p){return p.last_fullsized;} } },
+  { PG_STATE_STALE,            {UNAVAILABLE, [](const pg_stat_t &p){return p.last_unstale;}   } },
+  { PG_STATE_ACTIVE,           {UNAVAILABLE, [](const pg_stat_t &p){return p.last_active;}, true} }
+};
+```
+
+這段 code 有兩個重點：
+
+- 沒有 `stuck_since` 的狀態會立刻報 health，例如 `incomplete`、`down`、`degraded`、`inconsistent`、`recovery_unfound`。
+- `peering`、`undersized`、`stale`、`inactive` 會先等 `mon_pg_stuck_threshold`。如果還在變動，MON 不急著報；如果持續卡住，才變成 `PG_AVAILABILITY` 或 `PG_DEGRADED`。
+
+MON 最後把 consequence 轉成 health code 與 severity：
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 2572)
+case UNAVAILABLE:
+  health_code = "PG_AVAILABILITY";
+  sev = HEALTH_WARN;
+  summary = "Reduced data availability: ";
+  break;
+case DEGRADED:
+  health_code = "PG_DEGRADED";
+  summary = "Degraded data redundancy: ";
+  sev = HEALTH_WARN;
+  break;
+case DAMAGED:
+  health_code = "PG_DAMAGED";
+  summary = "Possible data damage: ";
+  sev = HEALTH_ERR;
+  break;
+```
+
+所以 `HEALTH_WARN` 不等於安全。`PG_AVAILABILITY` 是 WARN，但已經是 availability 類問題；`PG_DAMAGED` 與 `PG_RECOVERY_FULL` 是 ERR，代表資料或 recovery 已經進入更硬的失敗。
+
+## 可用性危險：inactive、down、peering、stale、incomplete
+
+這一組的共同點是 PG 不能穩定進入 active state。active 代表 primary 與 replicas 已經完成 peering，PG 可以開始對外服務；不是 active 時，線上 client 可能等 map、等 primary、或被暫停。
+
+| 狀態 | 原始碼判定 | 常見情境 | 線上影響 |
+|---|---|---|---|
+| `inactive` | `PG_STATE_ACTIVE` 的反向檢查；PGMap 把它命名成 `inactive` | peering 一直沒有收斂，或 primary 換手後仍未 active | PG 沒有可服務的 active primary，read/write 會卡 |
+| `down` | `PriorSet::pg_down` 或進入 `PeeringState::Down` | peering 需要的歷史 interval 裡有必要 OSD 不在線 | PG offline，`QueryState` 直接說 not enough up instances |
+| `peering` | 進入 `PeeringState::Peering` 時 set | OSDMap 變動、OSD down/up、acting set 重新計算 | 短暫正常；超過 stuck threshold 才是 availability 問題 |
+| `stale` | PG 的 `acting_primary` 已經 down，MON 將舊 stat 標成 stale | primary OSD 掛掉後 MON 沒有新 primary 的 PG stat | MON 對 PG 的狀態是舊的，不能信任現況 |
+| `incomplete` | `PeeringState::Incomplete` | 找不到足夠 complete instances，peering failed | PG 缺少可完成 log 的副本，可能需要復原或降低 `min_size` 才能前進 |
+
+`down` 的判定在 peering 前期就會發生。OSD 先計算 prior set；如果它認為 PG 需要的歷史副本目前 down，就 set `PG_STATE_DOWN`。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 1323)
+if (prior.pg_down) {
+  state_set(PG_STATE_DOWN);
+}
+```
+
+真正進入 Down state 時，Ceph 會清掉 `peering`，set `down`，並把 blocking OSD 記到 `blocked_by`。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 7143)
+ps->state_clear(PG_STATE_PEERING);
+ps->state_set(PG_STATE_DOWN);
+
+auto &prior_set = context< Peering >().prior_set;
+ceph_assert(ps->blocked_by.empty());
+ps->blocked_by.insert(prior_set.down.begin(), prior_set.down.end());
+pl->publish_stats_to_osd();
+```
+
+`incomplete` 比 `down` 更接近資料面問題：不是只有 OSD 暫時 down，而是目前沒有足夠 complete instances 讓 PG 組出一致的 log。`QueryState` 的 comment 直接說明了這點。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 7213)
+ps->state_clear(PG_STATE_PEERING);
+ps->state_set(PG_STATE_INCOMPLETE);
+
+PastIntervals::PriorSet &prior_set = context< Peering >().prior_set;
+ceph_assert(ps->blocked_by.empty());
+ps->blocked_by.insert(prior_set.down.begin(), prior_set.down.end());
+pl->publish_stats_to_osd();
+```
+
+對 `incomplete`，PGMap 甚至會在 detail 裡提示：如果 pool 的 `min_size` 大於 1，降低 `min_size` 有可能讓 PG 前進。這不是建議你直接降，而是說 source 裡把它當成 peering blocked 的逃生口。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 2550)
+if (pg_info.state & PG_STATE_INCOMPLETE) {
+  const pg_pool_t *pi = osdmap.get_pg_pool(pg_id.pool());
+  if (pi && pi->min_size > 1) {
+    ss << " (reducing pool "
+       << osdmap.get_pool_name(pg_id.pool())
+       << " min_size from " << (int)pi->min_size
+       << " may help; search ceph.com/docs for 'incomplete')";
+  }
+}
+```
+
+`stale` 則是 MON 層面的「我手上的 PG stat 已經舊了」。當 PG 的 `acting_primary` down，MON 會把該 PG 標成 `PG_STATE_STALE` 並記下 `last_unstale`，後面由 PGMap 的 stuck check 決定是否報 `PG_AVAILABILITY`。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 3849)
+dout(10) << __func__ << " marking pg " << pgid
+         << " stale (acting_primary " << newstat->acting_primary
+         << ")" << dendl;
+newstat->state |= PG_STATE_STALE;
+newstat->last_unstale = ceph_clock_now();
+```
+
+## 副本數危險：undersized、degraded、OSD_DOWN
+
+`undersized` 是 acting set 比 pool size 少；`degraded` 是物件副本統計真的顯示有 degraded objects。兩者常一起出現，但不是同一件事。
+
+| 狀態 | 原始碼判定 | 常見情境 | 線上影響 |
+|---|---|---|---|
+| `undersized` | `get_pg_size() > actingset.size()` | pool size 3，但目前 acting set 只剩 2 或 1 | PG 可能仍 active，但容錯層數變少 |
+| `degraded` | `num_objects_degraded` 非 0 | 副本缺失、recovery 尚未補齊 | read/write 可能仍可跑，但再故障會更危險 |
+| `OSD_DOWN` / `OSD_[bucket]_DOWN` | OSDMap 發現 in OSD down，或整個 CRUSH subtree down | OSD process 掛、node 掛、rack/network 斷 | 造成 PG peering、degraded、undersized，嚴重時進 availability 問題 |
+
+`undersized` 的判定很直接：acting set 的數量少於 pool 期待的 PG size。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 2964)
+// num_objects_degraded if calculated should reflect this too, unless no
+// missing and we are about to go clean.
+if (get_osdmap()->get_pg_size(info.pgid.pgid) > actingset.size()) {
+  state_set(PG_STATE_UNDERSIZED);
+}
+```
+
+`degraded` 則來自統計。`update_calc_stats()` 算出 `num_objects_degraded`；publish 前如果這個值非 0，就 set `PG_STATE_DEGRADED`。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 3844)
+psdout(20) << "degraded " << degraded
+       << (estimate ? " (est)": "") << dendl;
+psdout(20) << "misplaced " << misplaced
+       << (estimate ? " (est)": "")<< dendl;
+
+info.stats.stats.sum.num_objects_degraded = degraded;
+info.stats.stats.sum.num_objects_unfound = get_num_unfound();
+info.stats.stats.sum.num_objects_misplaced = misplaced;
+```
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 3887)
+update_calc_stats();
+if (info.stats.stats.sum.num_objects_degraded) {
+  state_set(PG_STATE_DEGRADED);
+} else {
+  state_clear(PG_STATE_DEGRADED);
+}
+```
+
+OSD down 的 health check 在 OSDMap 層聚合。它會同時報單顆 OSD down，也會依 CRUSH bucket 類型報 `OSD_HOST_DOWN`、`OSD_RACK_DOWN` 這類 subtree down。
+
+```cpp
+// File: ceph/src/osd/OSDMap.cc (line 7315)
+string err = string("OSD_") +
+  string(crush->get_type_name(type)) + "_DOWN";
+boost::to_upper(err);
+auto& d = checks->add(err, HEALTH_WARN, ss.str(),
+                      subtree_type_down[type].size());
+```
+
+```cpp
+// File: ceph/src/osd/OSDMap.cc (line 7340)
+ostringstream ss;
+ss << down_in_osds.size() << " osds down";
+auto& d = checks->add("OSD_DOWN", HEALTH_WARN, ss.str(),
+                      down_in_osds.size());
+```
+
+這類 WARN 要看範圍：單顆 OSD down 可能只是 background recovery；同 rack 大量 down 會讓很多 PG 同時變成 `stale`、`peering`、`undersized` 或 `inactive`。
+
+## Recovery 被擋：recovery_toofull、backfill_toofull、unfound
+
+`recovery_toofull` 和 `backfill_toofull` 都是「Ceph 知道要補資料，但目的端太滿」。差別在 recovery/backfill 的路徑不同，PGMap 也把 severity 分開：`PG_BACKFILL_FULL` 是 WARN，`PG_RECOVERY_FULL` 是 ERR。
+
+| 狀態 | health check | 判定方式 | 線上影響 |
+|---|---|---|---|
+| `backfill_toofull` | `PG_BACKFILL_FULL` | backfill reservation 被 remote too full 撤銷，或 backfill scan 發現目的 OSD backfillfull | placement 重平衡停住，資料還在舊位置 |
+| `recovery_toofull` | `PG_RECOVERY_FULL` | recovery 目的端 full，不能補缺失副本 | 缺副本狀態不能恢復，持續暴露資料風險 |
+| `backfill_unfound` | `PG_DAMAGED` | backfill 找不到需要的物件 | recovery/backfill 停在 unfound object |
+| `recovery_unfound` | `PG_DAMAGED` | recovery 找不到需要的物件 | 可能要人工標記 lost 或從其他來源救資料 |
+| `OBJECT_UNFOUND` | `OBJECT_UNFOUND` | 聚合後 `num_objects_unfound` 非 0 | 有明確物件找不到，不能當成普通 degraded |
+
+backfill 路徑裡，remote reservation 因 too full 被撤銷時會 set `PG_STATE_BACKFILL_TOOFULL` 並 cancel backfill。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 5139)
+ps->state_set(PG_STATE_BACKFILL_TOOFULL);
+ps->state_clear(PG_STATE_BACKFILLING);
+cancel_backfill();
+```
+
+recovery 找不到物件時，state machine 會 set `PG_STATE_RECOVERY_UNFOUND`，釋放 reservation，回到 NotRecovering。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 5839)
+psdout(10) << "recovery has unfound, can't continue" << dendl;
+ps->state_set(PG_STATE_RECOVERY_UNFOUND);
+pl->cancel_local_background_io_reservation();
+release_reservations(true);
+return transit<NotRecovering>();
+```
+
+`OBJECT_UNFOUND` 是 PG stats 的聚合 health check，只要 `num_objects_unfound` 非 0 就會出現。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 3068)
+if (pg_sum.stats.sum.num_objects_unfound &&
+    pg_sum.stats.sum.num_objects) {
+  double pc = (double)pg_sum.stats.sum.num_objects_unfound /
+    (double)pg_sum.stats.sum.num_objects * (double)100.0;
+  char b[20];
+  snprintf(b, sizeof(b), "%.3lf", pc);
+  ostringstream ss;
+  ss << pg_sum.stats.sum.num_objects_unfound
+     << "/" << pg_sum.stats.sum.num_objects << " objects unfound (" << b << "%)";
+  auto& d = checks->add("OBJECT_UNFOUND", HEALTH_WARN, ss.str(),
+                        pg_sum.stats.sum.num_objects_unfound);
+```
+
+## 容量危險：nearfull、backfillfull、full、failsafe
+
+OSD fullness 不是 MON 直接量磁碟，而是 OSD 自己把 local usage 算成 state，再送 `MOSDFull` 給 MON。預設門檻在 `global.yaml.in`：
+
+```yaml
+# File: ceph/src/common/options/global.yaml.in (line 1572)
+- name: mon_osd_full_ratio
+  type: float
+  default: 0.95
+- name: mon_osd_backfillfull_ratio
+  type: float
+  default: 0.9
+- name: mon_osd_nearfull_ratio
+  type: float
+  default: 0.85
+```
+
+還有 OSD local 的 failsafe full，預設 0.97。它比一般 `full` 更硬，因為 OSD 會開始 drop updates，避免自己滿到無法啟動。
+
+```yaml
+# File: ceph/src/common/options/global.yaml.in (line 3328)
+# what % full makes an OSD "full" (failsafe)
+- name: osd_failsafe_full_ratio
+  type: float
+  default: 0.97
+```
+
+OSD 的 `recalc_full_state()` 依序判斷 failsafe、full、backfillfull、nearfull。注意 `nearfull` 用 physical ratio `pratio`，`full` / `backfillfull` 用 `ratio`。
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 817)
+if (pratio > failsafe_ratio) {
+  return FAILSAFE;
+} else if (ratio > full_ratio) {
+  return FULL;
+} else if (ratio > backfillfull_ratio) {
+  return BACKFILLFULL;
+} else if (pratio > nearfull_ratio) {
+  return NEARFULL;
+}
+```
+
+狀態改變後，OSD 送 `MOSDFull` 給 MON，MON 再把 `CEPH_OSD_NEARFULL`、`CEPH_OSD_BACKFILLFULL`、`CEPH_OSD_FULL` 寫進 OSDMap。
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 6920)
+void OSD::send_full_update()
+{
+  if (!service.need_fullness_update())
+    return;
+  unsigned state = 0;
+  if (service.is_full()) {
+    state = CEPH_OSD_FULL;
+  } else if (service.is_backfillfull()) {
+    state = CEPH_OSD_BACKFILLFULL;
+  } else if (service.is_nearfull()) {
+    state = CEPH_OSD_NEARFULL;
+  }
+  monc->send_mon_message(new MOSDFull(get_osdmap_epoch(), state));
+}
+```
+
+MON/OSDMap 端的 health code：
+
+| 狀態 | health | 會發生什麼 |
+|---|---|---|
+| `nearfull` / `OSD_NEARFULL` | `HEALTH_WARN` | 早期容量壓力；Ceph 會提高 delete priority，但不代表 write 已停 |
+| `backfillfull` / `OSD_BACKFILLFULL` | `HEALTH_WARN` | backfill 可能被擋，PG 可能進 `backfill_toofull` |
+| `full` / `OSD_FULL` | `HEALTH_ERR` | pool/cluster 可能標 full，client write 會被 pause 或拿到 `ENOSPC` / `EDQUOT` |
+| failsafe full | cluster log error，不一定先經 OSDMap health | OSD 直接 drop updates；recovery push 甚至會 abort，屬於立即擴容或清空間等級 |
+| `OSD_OUT_OF_ORDER_FULL` | `HEALTH_ERR` | `nearfull`、`backfillfull`、`full`、failsafe ratio 排序不合理，OSD 與 MON 會自動拉高門檻但設定本身危險 |
+
+寫入路徑上，pool 被標 `FLAG_FULL` 之後，write op 會依 client flag 回 `ENOSPC` / `EDQUOT`，或對不懂 full flag 的舊 client 回 `EAGAIN`。
+
+```cpp
+// File: ceph/src/osd/PrimaryLogPG.cc (line 8904)
+if ((ctx->delta_stats.num_bytes > 0 ||
+     ctx->delta_stats.num_objects > 0) &&
+    pool.info.has_flag(pg_pool_t::FLAG_FULL)) {
+  auto m = ctx->op->get_req<MOSDOp>();
+  if (ctx->reqid.name.is_mds() ||
+      m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) {
+    dout(20) << __func__ << " full, but proceeding due to FULL_FORCE or MDS"
+             << dendl;
+  } else if (m->has_flag(CEPH_OSD_FLAG_FULL_TRY)) {
+    return pool.info.has_flag(pg_pool_t::FLAG_FULL_QUOTA) ? -EDQUOT : -ENOSPC;
+  } else {
+    return -EAGAIN;
+  }
+}
+```
+
+這就是為什麼 `nearfull` 可以排進容量計畫，`backfillfull` 要看 recovery 是否停住，`full` 則要當成線上 write incident。
+
+## OSDMAP flags：不是壞掉，但會讓壞掉恢復不了
+
+`OSDMAP_FLAGS` 很容易被忽略，因為它常是人手動設的：`noout`、`norecover`、`nobackfill`、`noscrub`。但對線上環境，flag 的危險在於它會改變自動恢復機制。
+
+```cpp
+// File: ceph/src/osd/OSDMap.cc (line 7474)
+uint64_t warn_flags =
+  CEPH_OSDMAP_PAUSERD |
+  CEPH_OSDMAP_PAUSEWR |
+  CEPH_OSDMAP_PAUSEREC |
+  CEPH_OSDMAP_NOUP |
+  CEPH_OSDMAP_NODOWN |
+  CEPH_OSDMAP_NOIN |
+  CEPH_OSDMAP_NOOUT |
+  CEPH_OSDMAP_NOBACKFILL |
+  CEPH_OSDMAP_NORECOVER |
+  CEPH_OSDMAP_NOSCRUB |
+  CEPH_OSDMAP_NODEEP_SCRUB |
+  CEPH_OSDMAP_NOTIERAGENT |
+  CEPH_OSDMAP_NOSNAPTRIM |
+  CEPH_OSDMAP_NOREBALANCE;
+```
+
+幾個要特別處理的 flag：
+
+| flag | 原始碼效果 | 線上風險 |
+|---|---|---|
+| `pauserd` | Objecter 判定 read target should pause | read 被暫停 |
+| `pausewr` | Objecter 判定 write target should pause；full / pool full 也會走同一條 pausewr 邏輯 | write 被暫停 |
+| `norecover` | OSD `activate_map()` 直接 `pause_recovery()` | degraded/undersized 無法修回 clean |
+| `nobackfill` | `PrimaryLogPG` defer backfill | OSD out/in 或 CRUSH reweight 後資料搬不動 |
+| `norebalance` | 非 degraded 的 backfill 會 defer | rebalance 停住，可能長期 misplaced |
+| `noscrub` / `nodeep-scrub` | scrubber abort scrub/deep-scrub | latent corruption 更晚被發現 |
+| `noout` | OSD down 後不自動 out | 維修時有用；忘記清掉會讓 PG 長期 stuck/degraded |
+
+Objecter 端把 `pauserd`、`pausewr`、full flag、pool full 都合併成 target pause 判定：
+
+```cpp
+// File: ceph/src/osdc/Objecter.cc (line 2667)
+bool Objecter::target_should_be_paused(op_target_t *t)
+{
+  const pg_pool_t *pi = osdmap->get_pg_pool(t->base_oloc.pool);
+  bool pauserd = osdmap->test_flag(CEPH_OSDMAP_PAUSERD);
+  bool pausewr = osdmap->test_flag(CEPH_OSDMAP_PAUSEWR) ||
+    (t->respects_full() && (_osdmap_full_flag() || _osdmap_pool_full(*pi)));
+
+  return (t->flags & CEPH_OSD_FLAG_READ && pauserd) ||
+    (t->flags & CEPH_OSD_FLAG_WRITE && pausewr) ||
+    (osdmap->get_epoch() < epoch_barrier);
+}
+```
+
+`norecover` 則在 OSD 套用新 map 時直接 pause recovery：
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 9103)
+// norecover?
+if (osdmap->test_flag(CEPH_OSDMAP_NORECOVER)) {
+  if (!service.recovery_is_paused()) {
+    dout(1) << "pausing recovery (NORECOVER flag set)" << dendl;
+    service.pause_recovery();
+  }
+}
+```
+
+這類 flag 的處理原則是：維修時可以短暫用，但 `ceph health detail` 看到它時要當成「自動恢復被改寫」來追，不要只看 PG 是否還在服務。
+
+## 資料損壞與 scrub 類狀態
+
+這組不是容量問題，也不是單純 OSD down。它代表 Ceph 已經在資料一致性或修復路徑上看到異常。
+
+| 狀態 / health | 判定 | 線上意義 |
+|---|---|---|
+| `inconsistent` | `num_scrub_errors` 非 0 會 set `PG_STATE_INCONSISTENT` | PG replicas 內容不一致，下一步是定位與 repair |
+| `OSD_SCRUB_ERRORS` | PGMap 聚合 `pg_sum.stats.sum.num_scrub_errors` | cluster 層已看到 scrub errors |
+| `snaptrim_error` | `PG_STATE_SNAPTRIM_ERROR` 對應 `PG_DAMAGED` | snap trim 停在錯誤狀態 |
+| `failed_repair` | repair 有 error 但無法修復時 set `PG_STATE_FAILED_REPAIR` | repair 沒把錯誤清掉，不能只重跑 scrub 當解法 |
+| `PG_NOT_SCRUBBED` / `PG_NOT_DEEP_SCRUBBED` | scrub stamp 超過 interval 加 warn ratio | 不是已知損壞，但檢查太久沒跑，風險變暗 |
+
+`inconsistent` 的 source path 很短：publish stats 前，如果 scrub error count 非 0，就 set `PG_STATE_INCONSISTENT`。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 3860)
+if (info.stats.stats.sum.num_scrub_errors) {
+  psdout(10) << "inconsistent due to " <<
+    info.stats.stats.sum.num_scrub_errors << " scrub errors" << dendl;
+  state_set(PG_STATE_INCONSISTENT);
+} else {
+  state_clear(PG_STATE_INCONSISTENT);
+  state_clear(PG_STATE_FAILED_REPAIR);
+}
+```
+
+PGMap 也會把 scrub error 聚合成 `OSD_SCRUB_ERRORS`，severity 是 `HEALTH_ERR`。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 2642)
+// OSD_SCRUB_ERRORS
+if (pg_sum.stats.sum.num_scrub_errors) {
+  ostringstream ss;
+  ss << pg_sum.stats.sum.num_scrub_errors << " scrub errors";
+  checks->add("OSD_SCRUB_ERRORS", HEALTH_ERR, ss.str(),
+              pg_sum.stats.sum.num_scrub_errors);
+}
+```
+
+`PG_NOT_SCRUBBED` / `PG_NOT_DEEP_SCRUBBED` 是另一種警訊。它不是說已經壞，而是檢查太久沒跑；在 production 上代表你對 bit rot、silent corruption 的可見度降低。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 3266)
+if (cct->_conf->mon_warn_pg_not_scrubbed_ratio) {
+  double scrub_max_interval = 0;
+  pool->opts.get(pool_opts_t::SCRUB_MAX_INTERVAL, &scrub_max_interval);
+  if (scrub_max_interval <= 0) {
+    scrub_max_interval = cct->_conf->osd_scrub_max_interval;
+  }
+  const double age = (cct->_conf->mon_warn_pg_not_scrubbed_ratio * scrub_max_interval) +
+    scrub_max_interval;
+  utime_t cutoff = now;
+  cutoff -= age;
+  if (p.second.last_scrub_stamp < cutoff) {
+```
+
+## Slow ops：不是 PG state，但會直接打線上 latency
+
+v19.2.3 的 OSD 會把慢 request 上報給 MGR。判定門檻是 `osd_op_complaint_time`，預設 30 秒；OSD 的 `get_health_metrics()` 會掃 in-flight ops，超過門檻就計數。
+
+```yaml
+# File: ceph/src/common/options/global.yaml.in (line 3129)
+# how many seconds old makes an op complaint-worthy
+- name: osd_op_complaint_time
+  type: float
+  level: advanced
+  default: 30
+```
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 7831)
+auto too_old = now;
+too_old -= cct->_conf.get_val<double>("osd_op_complaint_time");
+int slow = 0;
+```
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 7845)
+if (op.get_initiated() < too_old) {
+  stringstream ss;
+  ss << "slow request " << op.get_desc()
+     << " initiated "
+     << op.get_initiated()
+     << " currently "
+     << op.state_string();
+  lgeneric_subdout(cct,osd,20) << ss.str() << dendl;
+}
+```
+
+MGR 收到 daemon metric 後建立 `SLOW_OPS` health check，summary 會列慢 op 數與最老 op 卡住多久。
+
+```cpp
+// File: ceph/src/mgr/DaemonHealthMetricCollector.cc (line 13)
+class SlowOps final : public DaemonHealthMetricCollector {
+  bool _is_relevant(daemon_metric type) const override {
+    return type == daemon_metric::SLOW_OPS;
+  }
+  health_check_t& _get_check(health_check_map_t& cm) const override {
+    return cm.get_or_add("SLOW_OPS", HEALTH_WARN, "", 1);
+  }
+```
+
+遇到 `SLOW_OPS` 時，不要只重啟 daemon。先對照同時間是否有 `backfillfull`、`recovery_toofull`、`norecover`、`OSD_DOWN`、BlueStore slow op、或 client I/O 尖峰。它是症狀聚合，不是單一根因。
+
+## Control plane 也會危害線上：MON_DOWN、MON_DISK_CRIT、MGR_DOWN
+
+PG/OSD 是 data path，但 MON/MGR health 不能忽略：
+
+| health | 判定 | 線上影響 |
+|---|---|---|
+| `MON_DOWN` | quorum 裡少於 monmap 的 MON 數，且超過 mkfs / uptime grace | 還有 quorum 時 I/O 可跑，但 map 更新、OSD down/out 判定的容錯變少 |
+| `MON_CLOCK_SKEW` | timecheck skew 非 OK | Paxos lease、auth、map 時序可能出問題 |
+| `MON_DISK_CRIT` | MON store 可用空間百分比低於 critical 門檻 | MON 可能無法 commit 新 map，cluster control plane 風險很高 |
+| `MGR_DOWN` | 沒 active mgr，且超過 grace | 部分 health aggregation、modules、dashboard、orchestrator 失效；data path 不一定停，但觀測能力下降 |
+
+MON disk critical 是 `HEALTH_ERR`：
+
+```cpp
+// File: ceph/src/mon/HealthMonitor.cc (line 598)
+// MON_DISK_{LOW,CRIT,BIG}
+health_check_map_t next;
+if (stats.fs_stats.avail_percent <= g_conf()->mon_data_avail_crit) {
+  stringstream ss, ss2;
+  ss << "mon%plurals% %names% %isorare% very low on available space";
+  auto& d = next.add("MON_DISK_CRIT", HEALTH_ERR, ss.str(), 1);
+  ss2 << "mon." << mon.name << " has " << stats.fs_stats.avail_percent
+      << "% avail";
+  d.detail.push_back(ss2.str());
+}
+```
+
+`MON_DOWN` 是 WARN，但對 production 要看剩幾票：3 MON 掛 1 顆仍有 quorum；再掛 1 顆就不能 commit 新 state。
+
+```cpp
+// File: ceph/src/mon/HealthMonitor.cc (line 814)
+if (actual < max &&
+    (rcnow - created) > g_conf().get_val<std::chrono::seconds>("mon_down_mkfs_grace") &&
+    (mcnow - starttime) > g_conf().get_val<std::chrono::seconds>("mon_down_uptime_grace")) {
+  ostringstream ss;
+  ss << (max-actual) << "/" << max << " mons down, quorum "
+     << mon.get_quorum_names();
+  auto& d = checks->add("MON_DOWN", HEALTH_WARN, ss.str(), max - actual);
+```
+
+MGR down 的 severity 會隨 inactive 時間升級；超過 `mon_mgr_inactive_grace` 後從 WARN 變 ERR。
+
+```cpp
+// File: ceph/src/mon/MgrMonitor.cc (line 333)
+if (mon.osdmon()->osdmap.get_num_osds() > 0 &&
+     now > mon.monmap->created + g_conf().get_val<int64_t>("mon_mgr_mkfs_grace")) {
+  health_status_t level = HEALTH_WARN;
+  if (first_seen_inactive != utime_t() &&
+      now - first_seen_inactive > g_conf().get_val<int64_t>("mon_mgr_inactive_grace")) {
+    level = HEALTH_ERR;
+  }
+  return level;
+}
+```
+
+## 現場判讀順序
+
+看到一串狀態時，用這個順序排處理優先級：
+
+1. 先抓 availability：`inactive`、`down`、stuck `peering`、`stale`、`incomplete`、`PG_AVAILABILITY`。這些會讓 PG 無法穩定服務。
+2. 再抓資料損壞：`PG_DAMAGED`、`inconsistent`、`recovery_unfound`、`backfill_unfound`、`OSD_SCRUB_ERRORS`、`OBJECT_UNFOUND`。這些不是等 recovery 就一定會好。
+3. 再抓容量硬擋：`full`、`POOL_FULL`、`recovery_toofull`、`backfill_toofull`、`OSD_BACKFILLFULL`。這些會讓 write 或 repair 停住。
+4. 再看副本數不足：`undersized+degraded`、`OSD_DOWN`、`OBJECT_MISPLACED`。如果它還在 active，線上可能暫時能服務，但容錯已下降。
+5. 最後看人為 flag 與長期風險：`noout`、`norecover`、`nobackfill`、`noscrub`、`PG_NOT_SCRUBBED`、`SLOW_OPS`。它們常是「為了維修暫時開的」，但忘記清掉會讓 cluster 長期不收斂。
+
+對照你一開始列的狀態：
+
+| 看到的字 | 最可能對應 | 優先級 |
+|---|---|---|
+| `inactive` | PGMap 對 `PG_STATE_ACTIVE` 的 inverted stuck check | 最高，可用性 |
+| `incomplete` | `PG_STATE_INCOMPLETE` | 最高，可用性加資料風險 |
+| `stale` | acting primary down，PG stat 舊 | 高，可用性 |
+| `down+peering` | prior set 有必要 OSD down 或 Down state | 高，可用性 |
+| `undersized+degraded` | acting set 少於 pool size，加上 degraded objects 非 0 | 中高，容錯下降 |
+| `backfillfull` | OSDMap / pool backfillfull 或 PG `backfill_toofull` | 中高，repair/rebalance 被擋 |
+| `nearfull` | OSD physical usage 超過 nearfull ratio | 中，容量預警 |
+| `full` | OSD/pool full 或 client pause write | 最高，write incident |
+
+## 接下來 / 相關頁面
+
+- [Ceph — Node flapping 在 MON / OSD 原始碼裡的行為](/ceph/features/osd-flapping) — OSD down/up 如何變成 MON failure_info、down_pending_out 與 mark out。
+- [Ceph — Recovery throttle 動態調整與 mClock 互動](/ceph/features/recovery-throttle-runtime) — `degraded` 後 recovery/backfill 的併發與 mClock rollback 陷阱。
+- [Ceph — CRUSH 與 PG placement](/ceph/features/crush-and-placement) — PG 為什麼是 Ceph recovery、scrub、peering 的工作單位。
