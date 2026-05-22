@@ -311,10 +311,10 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'ceph'),
     color: 'rose',
     accentClass: 'border-rose-500 text-rose-400',
-    features: ['architecture', 'crush-and-placement', 'osd-and-bluestore', 'bluestore-deep-dive', 'mclock-osd-scheduler', 'recovery-throttle-runtime', 'osd-flapping', 'pg-health-states', 'mon-clock-skew-detection', 'osd-ok-to-stop', 'osd-safe-to-destroy', 'rbd-and-csi'],
+    features: ['architecture', 'crush-and-placement', 'pool-pgnum-pgpnum', 'osd-and-bluestore', 'bluestore-deep-dive', 'mclock-osd-scheduler', 'recovery-throttle-runtime', 'osd-flapping', 'pg-health-states', 'mon-clock-skew-detection', 'osd-ok-to-stop', 'osd-safe-to-destroy', 'rbd-and-csi'],
     featureGroups: [
       { label: '從這裡開始', icon: '🚀', slugs: ['architecture'] },
-      { label: 'Placement 演算法', icon: '🧮', slugs: ['crush-and-placement'] },
+      { label: 'Placement 演算法', icon: '🧮', slugs: ['crush-and-placement', 'pool-pgnum-pgpnum'] },
       { label: 'OSD + Storage 引擎', icon: '💾', slugs: ['osd-and-bluestore', 'bluestore-deep-dive', 'mclock-osd-scheduler', 'recovery-throttle-runtime'] },
       { label: '故障偵測與恢復', icon: '🚨', slugs: ['osd-flapping', 'pg-health-states', 'mon-clock-skew-detection'] },
       { label: 'OSD 維運命令', icon: '🛠️', slugs: ['osd-ok-to-stop', 'osd-safe-to-destroy'] },

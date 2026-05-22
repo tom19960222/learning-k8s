@@ -5,6 +5,7 @@
     {"id": "osd-and-bluestore", "label": "OSD & BlueStore", "description": "OSD 行程與 BlueStore 後端：直寫 raw block device", "featureSlug": "osd-and-bluestore", "category": "lifecycle", "position": {"x": 100, "y": 220}},
     {"id": "bluestore-deep-dive", "label": "BlueStore Deep Dive", "description": "TransContext 狀態機、deferred、BlueFS、min_alloc_size、checksum / compression", "featureSlug": "bluestore-deep-dive", "category": "lifecycle", "position": {"x": 100, "y": 530}},
     {"id": "crush-and-placement", "label": "CRUSH & PG", "description": "用 CRUSH 演算法將 object 對映到 PG 再對映到 OSD", "featureSlug": "crush-and-placement", "category": "controller", "position": {"x": 700, "y": 220}},
+    {"id": "pool-pgnum-pgpnum", "label": "pg_num / pgp_num", "description": "5 個欄位 target/actual/pending，mgr adjust_pgs() 每 2s 推進、受 max_pg_num_change 與 misplaced ratio throttle", "featureSlug": "pool-pgnum-pgpnum", "category": "controller", "position": {"x": 1000, "y": 220}},
     {"id": "mclock-osd-scheduler", "label": "mClock QoS", "description": "OSD op queue 用 reservation / weight / limit 分配 I/O", "featureSlug": "mclock-osd-scheduler", "category": "lifecycle", "position": {"x": 400, "y": 260}},
     {"id": "recovery-throttle-runtime", "label": "Recovery throttle", "description": "mClock 下 recovery/backfill tunable 的 runtime rollback 與 override", "featureSlug": "recovery-throttle-runtime", "category": "tooling", "position": {"x": 100, "y": 390}},
     {"id": "osd-flapping", "label": "Node flapping", "description": "MON failure_info / down_pending_out / subtree_limit / laggy EMA 對 single 與 rack-wide flap 的反應", "featureSlug": "osd-flapping", "category": "controller", "position": {"x": 700, "y": 390}},
@@ -33,6 +34,9 @@
     {"id": "e-safedestroy-health", "source": "osd-safe-to-destroy", "target": "pg-health-states", "label": "needs active+clean"},
     {"id": "e-okstop-safedestroy", "source": "osd-ok-to-stop", "target": "osd-safe-to-destroy", "label": "complements"},
     {"id": "e-arch-clockskew", "source": "architecture", "target": "mon-clock-skew-detection", "label": "MON quorum"},
-    {"id": "e-clockskew-health", "source": "mon-clock-skew-detection", "target": "pg-health-states", "label": "MON_CLOCK_SKEW"}
+    {"id": "e-clockskew-health", "source": "mon-clock-skew-detection", "target": "pg-health-states", "label": "MON_CLOCK_SKEW"},
+    {"id": "e-crush-pgnum", "source": "crush-and-placement", "target": "pool-pgnum-pgpnum", "label": "sized by"},
+    {"id": "e-pgnum-osd", "source": "pool-pgnum-pgpnum", "target": "osd-and-bluestore", "label": "splits / merges"},
+    {"id": "e-pgnum-health", "source": "pool-pgnum-pgpnum", "target": "pg-health-states", "label": "defers on degraded"}
   ]
 }

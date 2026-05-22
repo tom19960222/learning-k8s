@@ -1,0 +1,408 @@
+---
+layout: doc
+title: Ceph — pg_num 與 pgp_num 在 v19.2.3 原始碼裡如何收斂
+description: pg_num 與 pgp_num 是兩個獨立的旋鈕，背後映射到 pg_pool_t 的 5 個欄位 (pg_num / pgp_num / pg_num_pending / pg_num_target / pgp_num_target)。user-facing 命令只改 *_target，mgr 的 adjust_pgs() tick 才會分批把 actual 推向 target，每步受 mgr_max_pg_num_change 與 target_max_misplaced_ratio 兩個門檻 throttle。
+---
+
+## 場景
+
+你的 pool 原本 `pg_num=128 / pgp_num=128`，object 一直加、`ceph osd df` 看到分布不均，pg-autoscale 又因為某些 quota 估計問題沒幫你調。你下了 `ceph osd pool set mypool pg_num 512`，等了幾分鐘，`ceph osd pool get mypool pg_num` 回 `pg_num: 132` — 不是 512、也不是還沒變、是某個中間數。
+
+為什麼？兩個原因：v19.2.3 上的 ceph 並不是「下一筆 osdmap epoch 直接把 pg_num 變到 512」，而是 **target 與 actual 解耦**：使用者只設 target，mgr 每個 tick 拿著一束 throttle 規則小步推進；同時 `pg_num` 與 `pgp_num` 是兩個獨立旋鈕，前者控制「物理 PG 數量」、後者控制「object 真正怎麼分布到 PG」。下面從原始碼層一路追到 OSD 端的 split / merge。
+
+## pg_pool_t 的 5 個 PG-relevant 欄位
+
+第一件事是搞清楚原始碼層真實有幾個欄位。`pg_pool_t` 的定義裡這 5 個欄位才是 truth source：
+
+File: `ceph/src/osd/osd_types.h` (line 1458)
+
+```cpp
+private:
+  __u32 pg_num = 0, pgp_num = 0;  ///< number of pgs
+  __u32 pg_num_pending = 0;       ///< pg_num we are about to merge down to
+  __u32 pg_num_target = 0;        ///< pg_num we should converge toward
+  __u32 pgp_num_target = 0;       ///< pgp_num we should converge toward
+```
+
+| 欄位 | 意義 | 誰會寫 |
+|---|---|---|
+| `pg_num` | 實際存在的 PG 數量。每次 +1 = 一次 split；每次 −1 = 一次 merge | mgr → mon（via `pg_num_actual`） |
+| `pgp_num` | object 真正會 hash 到的 PG 範圍。新增的 PG 在 `pgp_num <= n < pg_num` 區間內**還沒接 object**，先處於「empty placeholder」狀態 | mgr → mon（via `pgp_num_actual`） |
+| `pg_num_pending` | merge 進行中的中間狀態。下次只會減 1，所以 `pg_num = N` 想降到 `N-1` 時，`pg_num_pending` 會先變 `N-1`，等 OSD 完成 merge handshake 後 `pg_num` 才跟著降 | mon merge handshake |
+| `pg_num_target` | 使用者打算把 `pg_num` 推到哪個數字 | mon（直接由 `ceph osd pool set pg_num N` 觸發） |
+| `pgp_num_target` | 使用者打算把 `pgp_num` 推到哪個數字 | mon |
+
+`pg_num` 與 `pgp_num` 都被 `private:` 保護 — 不能直接賦值，只能透過 setter。setter 的關鍵在它們同時還會更新 `last_change`，所以**每次 actual 移動都會產生新的 osdmap epoch、形成 client 端的新 interval**。
+
+## 兩層命令：user-facing vs mgr-facing
+
+`ceph osd pool set <pool> pg_num` 是 user 命令，它**不直接**改 `pg_num`。看 OSDMonitor.cc 的 `prepare_command_pool_set`：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8549)
+
+```cpp
+} else if (var == "pg_num") {
+  if (p.has_flag(pg_pool_t::FLAG_NOPGCHANGE)) {
+    ss << "pool pg_num change is disabled; you must unset nopgchange flag for the pool first";
+    return -EPERM;
+  }
+  ...
+  if (n == (int)p.get_pg_num_target()) {
+    return 0;
+  }
+  ...
+  if (n > (int)p.get_pg_num_target()) {
+    int r = check_pg_num(pool, n, p.get_size(), p.get_crush_rule(), &ss);
+    if (r) {
+      return r;
+    }
+    ...
+  }
+```
+
+注意這幾條防護：
+
+- `FLAG_NOPGCHANGE` 可以從外面把 pool 鎖住
+- 與當前 `pg_num_target` 一樣 → no-op 回 0
+- 上界 `mon_max_pool_pg_num`（預設 65536）、`pg_num_max` per-pool option
+- 下界 `pg_num_min` per-pool option
+- 增加時呼 `check_pg_num()` — 計算「全 cluster 加上這次擴張後的總 PG / OSD」是否超過 `mon_max_pg_per_osd × OSDs`
+- 減少 PG 需要 nautilus 以上的 OSD
+
+通過所有檢查後：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8608)
+
+```cpp
+} else {
+  // set targets; mgr will adjust pg_num_actual and pgp_num later.
+  // make pgp_num track pg_num if it already matches.  if it is set
+  // differently, leave it different and let the user control it
+  // manually.
+  if (p.get_pg_num_target() == p.get_pgp_num_target()) {
+    p.set_pgp_num_target(n);
+  }
+  p.set_pg_num_target(n);
+}
+```
+
+兩個關鍵行為：
+
+1. **使用者命令只寫 `pg_num_target`**（與 `pgp_num_target`，如果原本兩者相等）；`pg_num` 本身完全沒動
+2. **隱含的 pgp_num 連動**：如果你之前沒手動把 `pgp_num` 設得跟 `pg_num` 不同，這次設 `pg_num` 會自動把 `pgp_num_target` 同步推到同一個目標 — 這是大多數 operator 預期的行為
+
+對應地，`pg_num_actual` 是內部命令、由 mgr 呼，會**直接**改 `pg_num`：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8516)
+
+```cpp
+if (n > (int)p.get_pg_num()) {
+  ...
+  p.set_pg_num(n);   // split: 一次只加 N
+} else {
+  ...
+  if (n < (int)p.get_pg_num() - 1) {
+    ss << "specified pg_num " << n << " < pg_num (" << p.get_pg_num()
+       << ") - 1; only single pg decrease is currently supported";
+    return -EINVAL;
+  }
+  p.set_pg_num_pending(n);
+  ...
+}
+```
+
+增加可以一次跳很多，減少**一次只能 −1**（透過 `pg_num_pending`）。為什麼差這麼大下面解釋。
+
+`pgp_num` 的處理對稱：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8641)
+
+```cpp
+} else if (var == "pgp_num") {
+  ...
+  if (n > (int)p.get_pg_num_target()) {
+    ss << "specified pgp_num " << n << " > pg_num " << p.get_pg_num_target();
+    return -EINVAL;
+  }
+  ...
+  p.set_pgp_num_target(n);
+```
+
+`pgp_num` 不能超過 `pg_num_target`，這條約束保證 object hash 不會落到不存在的 PG。
+
+## 只調 pg_num：物理 split / merge
+
+當你只把 `pg_num` 從 128 改成 256（沒動 pgp_num）：
+
+| 步驟 | 欄位變化 | 對 client 的可見效果 |
+|---|---|---|
+| `ceph osd pool set pool pg_num 256` | `pg_num_target = 256`（若 pgp_num_target == pg_num_target，連帶也設）；`pg_num` 仍 128 | 無 |
+| 下一次 mgr `adjust_pgs()` tick | mgr 呼 `pg_num_actual <步長>`，monitor 把 `pg_num` 從 128 加到例如 132（取 min(left, max_jump - pg_gap, target - current)） | 多 4 個 empty PG (id 128~131) 開始 split |
+| OSD 收到新 osdmap | `OSD::split_pgs()` 把舊 PG 的物件按新 split bits 分到 child PG | 部分讀寫會看到 `peering` 短暫卡頓 |
+| 重複 tick 直到 `pg_num == pg_num_target == 256` | `pg_num` 每幾秒加一束 | object placement 完全未變（因為 pgp_num 還是 128） |
+
+**重點**：純粹調 `pg_num` 只是「**準備更多 PG 容器**」。客戶端用 `hash(object) % pgp_num` 找 PG，所以新建的 PG（id ≥ pgp_num）暫時沒有 object 進入。沒有真正的資料搬移。
+
+merge 的時序差一點：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 2830)
+
+```cpp
+} else if (p.get_pg_num_target() < p.get_pg_num()) {
+  // pg_num decrease (merge)
+  pg_t merge_source(p.get_pg_num() - 1, i.first);
+  pg_t merge_target = merge_source.get_parent();
+  bool ok = true;
+
+  if (p.get_pg_num() != p.get_pg_num_pending()) {
+    dout(10) << "pool " << i.first
+             << " pg_num_target " << p.get_pg_num_target()
+             << " pg_num " << p.get_pg_num()
+             << " - decrease and pg_num_pending != pg_num, waiting"
+             << dendl;
+    ok = false;
+  } else if (p.get_pg_num() == p.get_pgp_num()) {
+    dout(10) << "pool " << i.first
+             ...
+             << " - decrease blocked by pgp_num "
+             << p.get_pgp_num()
+             << dendl;
+    ok = false;
+  }
+```
+
+merge 是兩步握手：
+
+1. mgr 呼 `pg_num_actual = N-1` → monitor 寫入 `pg_num_pending = N-1`（**`pg_num` 還是 N**）。merge source 是 `pg_t(N-1, pool)`，target 是它的 parent
+2. 兩顆 PG 必須都 `active+clean`、`acting` set 完全一致、沒有 `upmap`，否則卡住等下一個 tick
+3. OSD 完成 merge 準備後送 `MOSDPGReadyToMerge`，monitor 在 `prepare_pg_ready_to_merge` 真正把 `pg_num` 減 1（呼 `dec_pg_num()`）
+
+ok 條件還有 **`pg_num == pgp_num` 會擋住 merge** — 必須先把 `pgp_num` 降下來，才能繼續減 `pg_num`。換句話說，merge 比 split 慢得多、而且強制走 `pgp_num` → `pg_num` 的順序。
+
+## 只調 pgp_num：data movement 而非 split
+
+設 `pgp_num` 從 128 改成 256（要求 `pg_num_target >= 256`，否則拒絕）：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8654)
+
+```cpp
+if (n > (int)p.get_pg_num_target()) {
+  ss << "specified pgp_num " << n << " > pg_num " << p.get_pg_num_target();
+  return -EINVAL;
+}
+```
+
+通過後 `pgp_num_target = n`。下一次 mgr tick 進入 pgp_num 分支：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 2960)
+
+```cpp
+// adjust pgp_num?
+unsigned target = std::min(p.get_pg_num_pending(),
+                           p.get_pgp_num_target());
+if (target != p.get_pgp_num()) {
+  ...
+  if (target > p.get_pgp_num() &&
+      p.get_pgp_num() == p.get_pg_num()) {
+    dout(10) << "pool " << i.first
+             ...
+             << " - increase blocked by pg_num " << p.get_pg_num()
+             << dendl;
+  } else if (!aggro && (inactive_pgs_ratio > 0 ||
+                        degraded_ratio > 0 ||
+                        unknown_pgs_ratio > 0)) {
+    ...  // defer
+  } else if (!aggro && (misplaced_ratio > max_misplaced)) {
+    ...  // defer
+```
+
+pgp_num adjust 比 pg_num 多三道擋牆：
+
+| 擋牆 | 觸發條件 | 行為 |
+|---|---|---|
+| `pgp_num == pg_num` 而 target > pgp_num | 沒有 idle PG 容器可以「啟用」 | 等下一個 tick；要先讓 `pg_num` 跑在前面 |
+| 有 inactive / degraded / unknown PG | cluster 不健康 | 完全 defer |
+| `misplaced_ratio > target_max_misplaced_ratio`（預設 0.05 = 5%） | 正在搬太多 object | defer 直到 misplaced 降下來 |
+
+如果擋牆都過了，下一個 `pgp_num` 數字是個 capped 的步進：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 3006)
+
+```cpp
+} else {
+  double room =
+    std::min<double>(max_misplaced - misplaced_ratio,
+                     max_misplaced / 2.0);
+  unsigned estmax = std::max<unsigned>(
+    (double)p.get_pg_num() * room, 1u);
+  unsigned next_min = 0;
+  if (p.get_pgp_num() > estmax) {
+    next_min = p.get_pgp_num() - estmax;
+  }
+  next = std::clamp(target,
+                    next_min,
+                    p.get_pgp_num() + estmax);
+  ...
+```
+
+`estmax = pg_num × min(max_misplaced - current, max_misplaced/2)`。換成數字：`pg_num = 1024`、`target_max_misplaced_ratio = 0.05`、目前 `misplaced_ratio = 0`：
+
+```
+room = min(0.05 - 0, 0.05/2) = 0.025
+estmax = 1024 × 0.025 = 25.6 → 26
+```
+
+一次最多把 `pgp_num` 拉 26 個 PG。也就是說「**單次 tick 最多新引入 26 個 PG 接受 object**」。每次 tick 之後 misplaced 上升，room 縮小，步距會自動縮小，直到 client I/O 把舊資料慢慢搬完、misplaced 回到 0，再跑下一輪。
+
+值得注意第二段 outpace 保護：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 3022)
+
+```cpp
+if (p.get_pgp_num_target() == p.get_pg_num_target() &&
+    p.get_pgp_num_target() < p.get_pg_num()) {
+  // since pgp_num is tracking pg_num, ceph is handling
+  // pgp_num.  so, be responsible: don't let pgp_num get
+  // too far out ahead of merges (if we are merging).
+  ...
+  unsigned max_outpace_merges =
+    std::max<unsigned>(8, p.get_pg_num() * max_misplaced);
+  if (next + max_outpace_merges < p.get_pg_num()) {
+    next = p.get_pg_num() - max_outpace_merges;
+    ...
+```
+
+merge 過程中防止 `pgp_num` 領先 `pg_num` 太多，避免「pgp_num 已降但 pg_num 還沒 merge」造成大量 object 擠到太少的 OSD。
+
+## adjust_pgs() 的調度：每 2 秒一輪
+
+整個收斂引擎掛在 mgr 的 tick 上：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 411)
+
+```cpp
+void DaemonServer::tick()
+{
+  dout(10) << dendl;
+  send_report();
+  adjust_pgs();
+
+  schedule_tick_locked(
+    g_conf().get_val<std::chrono::seconds>("mgr_tick_period").count());
+}
+```
+
+`mgr_tick_period` 預設 **2 秒**。所以實際 schedule：
+
+| Option | 預設 | 影響 |
+|---|---|---|
+| `mgr_tick_period` | 2s | adjust_pgs() 的呼叫頻率 |
+| `mon_osd_max_creating_pgs` | 1024 | 整個 cluster 每輪能同時開始 split 出去的 PG 數量 |
+| `mgr_max_pg_num_change` | 128 | 單一 pool 在 single tick 內 pg_num 的最大跳幅（split 時被 `min(left, max_jump - pg_gap, target - current)` 限制） |
+| `target_max_misplaced_ratio` | 0.05 | misplaced 超過這比例就停 pgp_num 推進；單步 pgp_num 跳幅也以此為基數 |
+| `mgr_debug_aggressive_pg_num_changes` | false | dev knob：略過所有 throttle |
+
+split 那邊的步距：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 2944)
+
+```cpp
+unsigned add = std::min(
+  std::min(left, max_jump - pg_gap),
+  p.get_pg_num_target() - p.get_pg_num());
+unsigned target = p.get_pg_num() + add;
+left -= add;
+```
+
+`pg_gap = pg_num - pgp_num`。如果 gap 已經達到 `mgr_max_pg_num_change`，這輪不再 split 新 PG — 必須等 pgp_num 跟上來。所以一個典型的「pg_num=128 → 512」變化 timeline 大概像這樣：
+
+```
+t=0    : 命令送進去；pg_num_target=512、pgp_num_target=512、pg_num=128、pgp_num=128
+t=2s   : 第一輪 tick；pg_num += min(left, 128, 384) = 128 → pg_num=256, gap=128
+t=4s   : 第二輪 tick；pg_num gap 已達 max_jump → 不動 pg_num；先推 pgp_num += estmax
+... pgp_num 慢慢追上來、有資料搬移 → misplaced 增加 → 後續 tick defer 一些
+t=Ns   : pgp_num 推到 256，gap 歸 0 → 下一輪 tick 又可以推 pg_num
+... 反覆直到 pg_num=pgp_num=512
+```
+
+實務上「`pg_num 128 → 512`」對 100GB 級 pool 通常要 10~30 分鐘；對 50TB 級 pool 可能要小時級。
+
+## OSD 端：split 是本地 collection 改名 + bit 拆分
+
+mon 把 `pg_num` 改大後，OSD 收到新 osdmap，發現自己 host 的 PG 對應到的「split bits」變了：
+
+File: `ceph/src/osd/OSD.cc` (line 9156)
+
+```cpp
+void OSD::split_pgs(
+  PG *parent,
+  const set<spg_t> &childpgids, set<PGRef> *out_pgs,
+  OSDMapRef curmap,
+  OSDMapRef nextmap,
+  PeeringCtx &rctx)
+{
+  unsigned pg_num = nextmap->get_pg_num(parent->pg_id.pool());
+  parent->update_snap_mapper_bits(parent->get_pgid().get_split_bits(pg_num));
+  ...
+  unsigned split_bits = i->get_split_bits(pg_num);
+  ...
+  parent->split_colls(
+    *i,
+    split_bits,
+    i->ps(),
+    &child->get_pgpool().info,
+    rctx.transaction);
+```
+
+split 不涉及跨 OSD 的搬移 — 它是 **OSD 本機** 的 ObjectStore collection 拆分：父 PG 的 object，按更精細的 bit 範圍重新分到 child PG 的 collection。這就是為什麼 split 本身對 client I/O 衝擊小。**真正的搬移是 `pgp_num` 變大之後 CRUSH 把某些 PG 對應到不同 acting set 的 OSD 才開始的**。
+
+merge 反向更複雜 — 兩個 PG 在不同 OSD 上時，必須先讓它們 acting set 對齊（透過 upmap 或等 CRUSH 自然對齊），再做 source PG → target PG 的本地 merge。這就是 `adjust_pgs()` 裡那一大段 `source_acting == target_acting` 檢查的由來。
+
+## 邊界與除錯
+
+幾個會讓 operator 卡住的常見點：
+
+**為什麼 `pg_num` 一直卡在中間數字**：看 `ceph osd pool ls detail` 確認 `pg_num_target` 與 `pg_num` 是否一致。如果不一致：
+
+- `ceph -s` 有 inactive/degraded PG → adjust_pgs() defer pgp_num，間接卡住 pg_num（gap 達上限）
+- `mgr -- log` 會看到 "max_pg_num_change" 字樣，表示在等 pgp_num 追上
+- pool 上有 `FLAG_CREATING` → 初始 PG 還沒建完，adjust_pgs() 跳過這個 pool
+
+**為什麼降 pg_num 一直不動**：
+
+- `pgp_num` 仍 == `pg_num` 時 merge 直接 block — 必須先降 `pgp_num`
+- 任何 PG 不在 `active+clean`、merge target / source 在不同 OSD acting set、有 upmap → 全擋下，每 tick 都會列在 mgr log
+
+**為什麼 cache pool 拒絕 split**：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 8575)
+
+```cpp
+if (p.cache_mode != pg_pool_t::CACHEMODE_NONE && !force) {
+  ss << "splits in cache pools must be followed by scrubs and leave sufficient free space to avoid overfilling.  use --yes-i-really-mean-it to force.";
+  return -EPERM;
+}
+```
+
+cache pool 的 split 要附 `--yes-i-really-mean-it`。
+
+**用 `pg_num_actual` 直接改 `pg_num`**：理論上可以，但你會直接旁路 mgr 的 throttle、可能瞬間觸發大量 split。`mgr_debug_aggressive_pg_num_changes` 也是同樣的危險，命名就標明 dev only。
+
+<Callout type="warning" title="先動 pg_num 再讓 pgp_num 跟上 — 不是手動分兩步">
+  你不需要手動跑「先 set pg_num，等收斂後再 set pgp_num」。預設情境下 `pg_num_target == pgp_num_target` 時，set pg_num 已經同步把 pgp_num_target 也設好，mgr 會自己安排「先 split 容器、再讓 placement 跟上」的順序。**唯一需要手動分開的場景是你刻意要做 pre-split**（先把 PG 數量增加但暫時不引入 object placement 變化），這時先 `set pgp_num`（鎖在舊值），再 `set pg_num`。
+</Callout>
+
+<Callout type="tip" title="想加速 / 觀察當下狀態">
+  - `ceph osd pool ls detail` — 看每個 pool 的 5 個欄位（`pg_num`, `pgp_num`, `pg_num_target`, `pgp_num_target`, `pg_num_pending`）
+  - `ceph osd pool autoscale-status` — autoscaler 對每個 pool 的「理想 pg_num」估算
+  - 想暫時加速：`ceph config set global target_max_misplaced_ratio 0.10`（5% → 10%）；想看每步詳細決策：`ceph tell mgr config set debug_mgr 10/10` 看 adjust_pgs 的 dout
+  - 真的卡住：先用 `ceph osd pool ls detail` 找出哪個欄位卡住、再對照 `ceph -s` 看是不是有 inactive PG / health warning 把 adjust_pgs() defer 了
+</Callout>
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — CRUSH & PG](./crush-and-placement) — object → PG → OSD 的 hash 流程；`pgp_num` 改變為什麼會觸發 CRUSH 重算
+  - [Ceph — PG health states](./pg-health-states) — adjust_pgs() defer 的判斷依據：`PG_STATE_ACTIVE` / `PG_STATE_CLEAN` / misplaced
+  - [Ceph — osd ok-to-stop 在原始碼裡檢查了什麼](./osd-ok-to-stop) — 同樣是 mgr-driven 對 OSDMap / PGMap 的 background 收斂模式
+</Callout>
