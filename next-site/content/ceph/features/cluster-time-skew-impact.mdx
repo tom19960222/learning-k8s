@@ -1,0 +1,326 @@
+---
+layout: doc
+title: Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency
+description: 用 v19.2.3 原始碼拆 MON-MON、MON-OSD、OSD-OSD 在 10/50/100/500/1000/5000ms 差距下會觸發哪條 health check、哪條 lease/heartbeat path，以及哪些情況其實沒有固定毫秒門檻。
+---
+
+## 場景
+
+你在 3-node Ceph cluster 上看到 chrony 顯示某台 node 比其他 node 快 80ms，另一條監控又顯示 OSD heartbeat 偶爾 1.2s。這兩個數字都叫「時間差距」很容易混在一起，但 Ceph 原始碼不是用同一張表判斷所有 daemon pair。
+
+這頁先把問題拆成兩種：**clock offset** 是兩台 node 的時鐘相差多少；**heartbeat latency** 是訊息來回花多久。MON-MON 有 50ms clock skew health check；MON-OSD 沒有對 10ms 到 5s clock offset 的專用 health check；OSD-OSD 則同時有 latency 型 health check 與 read lease 的 clock-delta 補償。
+
+## 先看結論表
+
+假設使用 v19.2.3 預設值，且沒有手動調整 `mon_clock_drift_allowed`、`mon_warn_on_slow_ping_time`、`mon_warn_on_slow_ping_ratio`、`osd_heartbeat_grace`：
+
+| 差距 | MON-MON clock offset | MON-OSD clock offset | OSD-OSD heartbeat latency | OSD-OSD clock delta / read lease |
+|---|---|---|---|---|
+| 10ms | 不觸發 `MON_CLOCK_SKEW` | 沒有專用 health check | 不觸發 slow ping | 由 heartbeat stamp 估算 delta，沒有 health check |
+| 50ms | 臨界值；原始碼用 `>`，剛好 50ms 通常不觸發 | 沒有專用 health check | 不觸發 slow ping | 同上 |
+| 100ms | 下一輪 MON timecheck 後可能 `HEALTH_WARN`，但高 latency 會被扣掉 | 沒有專用 health check | 不觸發 slow ping | lease window 會扣掉 clock-delta bound，仍非固定 health check |
+| 500ms | 同 100ms：MON-MON 進 `MON_CLOCK_SKEW` bucket | 沒有專用 health check | 不觸發 slow ping | 仍走 read lease 補償；若 readable lease 過期，PG 會進 `laggy` path |
+| 1000ms | 同 100ms | 沒有專用 health check | 預設 slow-ping 臨界值；剛好 1000ms 不一定，超過才 `OSD_SLOW_PING_TIME_*` | 仍不是 1000ms clock health check |
+| 5000ms | 同 100ms；沒有升級成 `HEALTH_ERR` 的專門分級 | 沒有專用 health check | 會觸發 slow-ping `HEALTH_WARN`，但未回覆超過 20s 才是 mark-down path | read lease margin 會明顯變小；source 沒有 5s 固定門檻 |
+
+重點是：Ceph 沒有「所有 daemon 差 50ms 就壞掉」這種全域規則。50ms 是 **MON-MON timecheck** 的預設門檻；1s 是 **OSD-OSD heartbeat latency** 在預設 `20s * 0.05` 下得到的 slow-ping 門檻；MON-OSD 主要看 beacon / auth / message delivery，不看這張毫秒 clock offset 表。
+
+## MON-MON：50ms 是 health check 門檻
+
+MON-MON 的 clock skew 是最直接的一條。預設 `mon_clock_drift_allowed` 是 `0.05` 秒，且 timecheck 在正常狀態每 5 分鐘跑一次，已經偵測到 skew 時用 30 秒作為重新檢查基數。
+
+| option | 預設 | Source |
+|---|---:|---|
+| `mon_clock_drift_allowed` | `0.05` 秒 | `ceph/src/common/options/mon.yaml.in:609-616` |
+| `mon_timecheck_interval` | `5_min` | `ceph/src/common/options/mon.yaml.in:627-637` |
+| `mon_timecheck_skew_interval` | `30` 秒 | `ceph/src/common/options/mon.yaml.in:638-650` |
+
+這條 path 是 leader-driven：leader 對 quorum 內其他 MON 發 PING，peon 回 PONG，leader 用 PONG 的 timestamp 和自己收到時的時間算 `skew_bound`。
+
+```text
+leader mon
+  ├─ send PING to peon mon, record local send time
+  ├─ peon replies PONG with peon timestamp
+  ├─ leader computes latency and skew_bound
+  └─ HealthMonitor converts skew map to MON_CLOCK_SKEW
+```
+
+`skew_bound` 的非直覺點是它會扣掉 latency。也就是說，100ms 的 wall-clock offset 不一定等於 100ms 的 health-check skew；如果當下 PING/PONG latency 很高，部分 offset 會被視為網路延遲造成的外觀差距。
+
+File: ceph/src/mon/Monitor.cc (line 5164)
+
+```cpp
+double delta = ((double) m->timestamp) - ((double) curr_time);
+double abs_delta = (delta > 0 ? delta : -delta);
+double skew_bound = abs_delta - latency;
+if (skew_bound < 0)
+  skew_bound = 0;
+else if (delta < 0)
+  skew_bound = -skew_bound;
+```
+
+判定本身是嚴格大於 `mon_clock_drift_allowed`。因此「剛好 50ms」不是一個可靠的警告點；`skew_bound > 0.05` 才是。
+
+File: ceph/src/mon/Monitor.h (line 592)
+
+```cpp
+bool timecheck_has_skew(const double skew_bound, double *abs) const {
+  double abs_skew = std::fabs(skew_bound);
+  if (abs)
+    *abs = abs_skew;
+  return (abs_skew > g_conf()->mon_clock_drift_allowed);
+}
+```
+
+一旦有 MON 超過門檻，`HealthMonitor` 只產生 `HEALTH_WARN`，health check 名稱是 `MON_CLOCK_SKEW`。原始碼沒有再把 100ms、500ms、5s 分成不同 severity。
+
+File: ceph/src/mon/HealthMonitor.cc (line 862)
+
+```cpp
+auto& d = checks->add("MON_CLOCK_SKEW", HEALTH_WARN, ss.str(), details.size());
+d.detail.swap(details);
+```
+
+另一條容易混淆的是 Paxos log。Paxos 收到未來時間戳記超過同一個 `mon_clock_drift_allowed` 時會寫 cluster log，但這不是 `MON_CLOCK_SKEW` health check。
+
+File: ceph/src/mon/Paxos.cc (line 1025)
+
+```cpp
+void Paxos::warn_on_future_time(utime_t t, entity_name_t from)
+{
+  utime_t now = ceph_clock_now();
+  if (t > now) {
+    utime_t diff = t - now;
+    if (diff > g_conf()->mon_clock_drift_allowed) {
+      mon.clog->warn() << "message from " << from << " was stamped " << diff
+                       << "s in the future, clocks not synchronized";
+```
+
+## MON-OSD：沒有 50ms clock-skew health check
+
+MON-OSD 這段最容易誤判。OSD 會送 beacon 給 MON，但 beacon path 不拿 OSD 的 wall clock 去跟 MON wall clock 比較。OSD 端用 monotonic clock 決定多久送一次；MON 端收到後用 MON 自己的 `ceph_clock_now()` 記錄最後 report 時間。
+
+File: ceph/src/osd/OSD.cc (line 6444)
+
+```cpp
+bool need_send_beacon = false;
+const auto now = ceph::coarse_mono_clock::now();
+{
+  std::lock_guard l{min_last_epoch_clean_lock};
+  const auto elapsed = now - last_sent_beacon;
+  if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >
+    cct->_conf->osd_beacon_report_interval) {
+    need_send_beacon = true;
+  }
+}
+```
+
+File: ceph/src/mon/OSDMonitor.cc (line 4412)
+
+```cpp
+last_osd_report[from].first = ceph_clock_now();
+last_osd_report[from].second = beacon->osd_beacon_report_interval;
+ceph_assert(osdmap.is_up(from));
+osd_epochs[from] = beacon->version;
+```
+
+真正讓 MON 把 OSD mark down 的是「太久沒收到 beacon」，不是「MON 和 OSD 時鐘差 100ms」。預設 `mon_osd_report_timeout` 是 15 分鐘，`osd_beacon_report_interval` 是 5 分鐘，MON 用兩者較大者當 timeout，讓 OSD 可以漏掉一次 beacon。
+
+File: ceph/src/mon/OSDMonitor.cc (line 5320)
+
+```cpp
+utime_t diff = now - t->second.first;
+// we use the max(mon_osd_report_timeout, 2*osd_beacon_report_interval) as timeout
+// to allow for the osd to miss a beacon.
+int mon_osd_report_timeout = g_conf()->mon_osd_report_timeout;
+utime_t max_timeout(std::max(mon_osd_report_timeout,  2 * t->second.second), 0);
+if (diff > max_timeout) {
+```
+
+MON-OSD 確實還有 auth ticket / rotating key 路徑會提到 clock skew，但它不是 10ms、50ms、5s 的健康門檻。`auth_service_ticket_ttl` 預設是 1 小時；`MonClient::_check_auth_rotating()` 只有在 rotating secrets 看起來「比可接受下界還早過期」時印出 possible clock skew。OSD 啟動時如果一直拿不到 rotating service keys，才會在超過 `max_rotating_auth_attempts` 後退出。
+
+File: ceph/src/mon/MonClient.cc (line 1115)
+
+```cpp
+if (!rotating_secrets->need_new_secrets() &&
+    rotating_secrets->need_new_secrets(issued_at_lower_bound)) {
+  // the key has expired before it has been issued?
+  lderr(cct) << __func__ << " possible clock skew, rotating keys expired way too early"
+             << " (before " << issued_at_lower_bound << ")" << dendl;
+}
+```
+
+所以如果你只問「MON 和 OSD wall clock 差 10/50/100/500/1000/5000ms 會怎樣」，v19.2.3 的 source-backed 答案是：**沒有對應的固定 health check**。5s 仍遠小於 service ticket 預設 TTL，beacon timeout 也不是毫秒級。
+
+## OSD-OSD：latency 1s 會 WARN，clock delta 走 lease 補償
+
+OSD-OSD 有兩條不同 path：heartbeat latency 與 read lease clock delta。
+
+第一條是 heartbeat。OSD 每隔 `osd_heartbeat_interval` 對 peer 發 PING，預設 6 秒；每個 PING 都有 `deadline = now + osd_heartbeat_grace`，預設 grace 是 20 秒。超過 deadline 還沒收到 front/back reply 才進 failure report path。
+
+| option | 預設 | Source |
+|---|---:|---|
+| `osd_heartbeat_interval` | `6` 秒 | `ceph/src/common/options/global.yaml.in:2845-2853` |
+| `osd_heartbeat_grace` | `20` 秒 | `ceph/src/common/options/global.yaml.in:2854-2864` |
+
+File: ceph/src/osd/OSD.cc (line 6227)
+
+```cpp
+utime_t now = ceph_clock_now();
+auto mnow = service.get_mnow();
+utime_t deadline = now;
+deadline += cct->_conf->osd_heartbeat_grace;
+```
+
+File: ceph/src/osd/OSD.cc (line 6244)
+
+```cpp
+i->second.last_tx = now;
+if (i->second.first_tx == utime_t())
+  i->second.first_tx = now;
+i->second.ping_history[now] = make_pair(deadline,
+  HeartbeatInfo::HEARTBEAT_MAX_CONN);
+```
+
+如果 deadline 過了，OSD 先放進 `failure_queue`，之後送 `MOSDFailure` 給 MON。這是 mark-down path，不是 slow-ping health check。
+
+File: ceph/src/osd/OSD.cc (line 6173)
+
+```cpp
+if (p->second.is_unhealthy(now)) {
+  utime_t oldest_deadline = p->second.ping_history.begin()->second.first;
+```
+
+File: ceph/src/osd/OSD.cc (line 6193)
+
+```cpp
+// fail
+  failure_queue[p->first] = std::min(p->second.last_rx_back, p->second.last_rx_front);
+```
+
+第二條是 MON 看到的 slow-ping health check。OSD 回報 heartbeat ping time，MON 用 `mon_warn_on_slow_ping_time` 或 `mon_warn_on_slow_ping_ratio * osd_heartbeat_grace` 計算門檻。預設 `mon_warn_on_slow_ping_time = 0`，所以走 ratio：`0.05 * 20s = 1s`。
+
+| option | 預設 | Source |
+|---|---:|---|
+| `mon_warn_on_slow_ping_time` | `0` | `ceph/src/common/options/global.yaml.in:1679-1691` |
+| `mon_warn_on_slow_ping_ratio` | `0.05` | `ceph/src/common/options/global.yaml.in:1692-1704` |
+
+File: ceph/src/mon/PGMap.cc (line 2776)
+
+```cpp
+auto warn_slow_ping_time = cct->_conf.get_val<double>("mon_warn_on_slow_ping_time") * 1000;
+auto grace = cct->_conf.get_val<int64_t>("osd_heartbeat_grace");
+if (warn_slow_ping_time == 0) {
+  double ratio = cct->_conf.get_val<double>("mon_warn_on_slow_ping_ratio");
+  warn_slow_ping_time = grace;
+  warn_slow_ping_time *= 1000000 * ratio;
+}
+```
+
+判斷也是嚴格大於。預設下，1000ms 是臨界值；超過 1000ms 才會進 `OSD_SLOW_PING_TIME_BACK` 或 `OSD_SLOW_PING_TIME_FRONT`。
+
+File: ceph/src/mon/PGMap.cc (line 2822)
+
+```cpp
+if (back.pingtime > warn_slow_ping_time) {
+  back.improving = (j.second.back_pingtime[0] < j.second.back_pingtime[1]
+                    && j.second.back_pingtime[1] < j.second.back_pingtime[2]);
+  back_sorted.emplace(back);
+}
+```
+
+OSD-OSD 的 clock delta 是另一件事。從 Octopus 之後，OSD heartbeat message 帶 mono timestamp，`HeartbeatStamps` 維護「peer mono clock − local mono clock」的上下界，給 PG read lease 使用。這裡的目的不是發 health warning，而是把 primary 給 replica 的 `readable_until` 轉成 local time。
+
+File: ceph/src/osd/PeeringState.h (line 119)
+
+```cpp
+// we maintain an upper and lower bound on the delta between our local
+// mono_clock time (minus the startup_time) to the peer OSD's mono_clock
+// time (minus its startup_time).
+//
+// delta is (remote_clock_time - local_clock_time), so that
+// local_time + delta -> peer_time, and peer_time - delta -> local_time.
+```
+
+Replica 收到 lease 時，會用這些 bound 修正 `readable_until` 與 `readable_until_ub`。
+
+File: ceph/src/osd/PeeringState.cc (line 1161)
+
+```cpp
+ceph::signedspan ru = ceph::signedspan::zero();
+if (l.readable_until != ceph::signedspan::zero() &&
+    hb_stamps[0]->peer_clock_delta_ub) {
+  ru = l.readable_until - *hb_stamps[0]->peer_clock_delta_ub;
+}
+```
+
+File: ceph/src/osd/PeeringState.cc (line 1175)
+
+```cpp
+ceph::signedspan ruub;
+if (hb_stamps[0]->peer_clock_delta_lb) {
+ruub = l.readable_until_ub - *hb_stamps[0]->peer_clock_delta_lb;
+}
+```
+
+如果 local `mnow` 已經超過 readable lease，PG 會進 `laggy` path：primary 設 `PG_STATE_LAGGY` 並把 op 放進等待列；non-primary 回 `-EAGAIN`。
+
+File: ceph/src/osd/PrimaryLogPG.cc (line 821)
+
+```cpp
+bool PrimaryLogPG::check_laggy(OpRequestRef& op)
+{
+  assert(HAVE_FEATURE(recovery_state.get_min_upacting_features(),
+                      SERVER_OCTOPUS));
+  if (state_test(PG_STATE_WAIT)) {
+    dout(10) << __func__ << " PG is WAIT state" << dendl;
+  } else if (!state_test(PG_STATE_LAGGY)) {
+    auto mnow = osd->get_mnow();
+    auto ru = recovery_state.get_readable_until();
+    if (mnow <= ru) {
+      // not laggy
+      return true;
+    }
+```
+
+預設 read lease interval 不是 50ms，而是 `osd_heartbeat_grace * osd_pool_default_read_lease_ratio`，也就是 `20s * 0.8 = 16s`。Primary 每半個 lease interval renew 一次。
+
+File: ceph/src/osd/PeeringState.h (line 49)
+
+```cpp
+ceph::timespan get_readable_interval(ConfigProxy &conf) const {
+  double v = 0;
+  if (info.opts.get(pool_opts_t::READ_LEASE_INTERVAL, &v)) {
+    return ceph::make_timespan(v);
+  } else {
+    auto hbi = conf->osd_heartbeat_grace;
+    auto fac = conf->osd_pool_default_read_lease_ratio;
+    return ceph::make_timespan(hbi * fac);
+  }
+}
+```
+
+## 原始碼路徑
+
+| 問題 | 入口 | 真正效果 |
+|---|---|---|
+| MON-MON clock offset | `Monitor::timecheck_start_round()` / `handle_timecheck_leader()` | `skew_bound > mon_clock_drift_allowed` 產生 `MON_CLOCK_SKEW` `HEALTH_WARN` |
+| MON-MON future timestamp | `Paxos::warn_on_future_time()` | 寫 cluster log，不是 health check |
+| MON-OSD clock offset | `OSD::send_beacon()` / `OSDMonitor::prepare_beacon()` / `MonClient::_check_auth_rotating()` | beacon timeout 與 auth ticket TTL；沒有 10ms 到 5s clock-skew health threshold |
+| OSD-OSD heartbeat latency | `OSD::heartbeat()` / `OSD::handle_osd_ping()` / `PGMap::get_health_checks()` | 超過 1s 預設 slow-ping `HEALTH_WARN`；超過 20s 無回覆才進 failure report |
+| OSD-OSD clock delta | `HeartbeatStamps` / `PeeringState::proc_lease()` / `PrimaryLogPG::check_laggy()` | read lease 轉換與 `laggy` path；沒有固定 50ms health check |
+
+## 邊界與除錯
+
+如果看到 `MON_CLOCK_SKEW`，先把它當 MON quorum 內的 clock offset 問題，不要直接怪 OSD。`ceph time-sync-status` 與 MON log 比 `ceph osd perf` 更接近這條 path。
+
+如果看到 `OSD_SLOW_PING_TIME_BACK` 或 `OSD_SLOW_PING_TIME_FRONT`，那是 OSD-OSD heartbeat latency。預設門檻來自 `20s * 0.05 = 1s`；100ms 和 500ms 不會觸發，5s 會觸發 WARN，但還不到 mark-down 的 20s no-reply path。
+
+如果只有某台 OSD 的 system clock 偏 5s，但 MON-MON 沒有 skew、OSD-OSD heartbeat latency 正常，這份 source trace 找不到 v19.2.3 會立刻對這個 OSD 產生 health warning 的固定規則。真正要留意的是 auth rotating key 是否異常、read lease 是否一直進 `laggy`、以及 beacon 是否因為訊息送不出去而超過分鐘級 timeout。
+
+## 接下來 / 相關頁面
+
+- [Ceph — MON clock skew 超過 50ms 多久才會被抓到](./mon-clock-skew-detection) — 更完整拆 `timecheck` round、latency 扣除與 `MON_CLOCK_SKEW`
+- [Ceph — MON quorum loss 對線上 I/O 的實際影響](./mon-quorum-loss-impact) — 了解 quorum 消失時，Paxos lease 與 cephx ticket 哪個先影響 I/O
+- [Ceph — OSD flapping 的 mark-down / mark-out path](./osd-flapping) — 追 OSD heartbeat failure report 如何變成 OSDMap 狀態改變
+- [Ceph — PG/OSD/MON 危險狀態](./pg-health-states) — 對照 `laggy`、slow ops、OSD down 這些 health signal 對線上服務的影響
