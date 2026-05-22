@@ -1,0 +1,323 @@
+---
+layout: doc
+title: Ceph — CRUSH straw / straw2
+description: straw 與 straw2 是 CRUSH bucket 內部挑下一層 item 的 weighted random 演算法。這頁用抽籤直覺拆解它們差在哪、為什麼 straw2 是現在該理解的版本，以及 reweight 時為什麼只搬必要的 PG。
+---
+
+## 場景
+
+你看 `ceph osd tree` 或 decompile CRUSH map 時，常會看到 bucket 後面寫著 `alg straw2`。下一個直覺問題是：CRUSH 不是已經把 PG 算到 OSD 了嗎，為什麼還有 straw / straw2？
+
+關鍵是 CRUSH 不是一次把 PG 直接丟到某顆 OSD。它會沿著拓樸樹一層一層挑：root 挑 rack、rack 挑 host、host 再挑 osd。**straw / straw2 就是每一個 bucket 裡「怎麼從多個 child item 挑出一個」的演算法**。
+
+```
+PG id x + replica position r
+        |
+        v
+crush_do_rule(rule, x)
+        |
+        v
+rule step: take root -> chooseleaf firstn type host
+        |
+        v
+每層 bucket 都跑一次 bucket choose
+        |
+        v
+straw2：每個 child 抽一支依 weight 修正的籤，分數最高者勝出
+```
+
+這件事會直接影響兩個線上現象：第一，OSD weight 不同時資料大致按比例分散；第二，加 OSD、拔 OSD、reweight OSD 時，只有必要的 PG 需要重 placement，不會整個 cluster 洗牌。
+
+## CRUSH bucket 在哪裡被挑選
+
+`crush_do_rule()` 是 placement 的入口。傳入 rule、input `x`、weight vector 後，它會進到一般 rule 或 MSR rule；一般 replicated pool 走的是 `crush_do_rule_no_retry()`。在 rule step 遇到 `choose` / `chooseleaf` 時，才會呼叫 `crush_choose_firstn()` 或 `crush_choose_indep()`，再進一步進到每個 bucket 的 choose algorithm。
+
+File: ceph/src/crush/mapper.c (line 920)
+
+```c
+case CRUSH_RULE_CHOOSELEAF_FIRSTN:
+case CRUSH_RULE_CHOOSE_FIRSTN:
+	firstn = 1;
+	/* fall through */
+case CRUSH_RULE_CHOOSELEAF_INDEP:
+case CRUSH_RULE_CHOOSE_INDEP:
+	...
+	osize += crush_choose_firstn(
+		map, cw, map->buckets[bno],
+		weight, weight_max, x, numrep,
+		curstep->arg2, o+osize, j,
+		result_max-osize, choose_tries,
+		recurse_tries, choose_local_retries,
+		choose_local_fallback_retries,
+		recurse_to_leaf, vary_r, stable,
+		c+osize, 0, choose_args);
+```
+
+真正分派到 `straw` 或 `straw2` 的地方在 `crush_bucket_choose()`。同一個 CRUSH rule 不需要知道 bucket 用哪種 algorithm，因為 bucket 自己的 `h.alg` 決定要走哪段邏輯。
+
+File: ceph/src/crush/mapper.c (line 368)
+
+```c
+static int crush_bucket_choose(const struct crush_bucket *in,
+			       struct crush_work_bucket *work,
+			       int x, int r,
+			       const struct crush_choose_arg *arg,
+			       int position)
+{
+	switch (in->alg) {
+	case CRUSH_BUCKET_STRAW:
+		return bucket_straw_choose(
+			(const struct crush_bucket_straw *)in, x, r);
+	case CRUSH_BUCKET_STRAW2:
+		return bucket_straw2_choose(
+			(const struct crush_bucket_straw2 *)in,
+			x, r, arg, position);
+	}
+}
+```
+
+所以 straw / straw2 不是「另一套 CRUSH」，而是 CRUSH traversal 裡某一層 bucket 的局部選擇器。
+
+## straw：先算好每支籤的長度
+
+舊的 `straw` bucket 會在 CRUSH map 內同時保存兩組資料：每個 item 的 `item_weights`，以及預先算好的 `straws`。選擇時，每個 item 用同一個 input 算 hash，取低 16 bits，再乘上自己的 `straws[i]`；乘完後分數最高的 item 勝出。
+
+File: ceph/src/crush/crush.h (line 328)
+
+```c
+struct crush_bucket_straw {
+	struct crush_bucket h;
+	__u32 *item_weights;   /* 16-bit fixed point */
+	__u32 *straws;         /* 16-bit fixed point */
+};
+```
+
+File: ceph/src/crush/mapper.c (line 208)
+
+```c
+static int bucket_straw_choose(const struct crush_bucket_straw *bucket,
+			       int x, int r)
+{
+	for (i = 0; i < bucket->h.size; i++) {
+		draw = crush_hash32_3(bucket->h.hash, x, bucket->h.items[i], r);
+		draw &= 0xffff;
+		draw *= bucket->straws[i];
+		if (i == 0 || draw > high_draw) {
+			high = i;
+			high_draw = draw;
+		}
+	}
+	return bucket->h.items[high];
+}
+```
+
+這個做法的問題不是「抽籤」這個直覺錯，而是 `straws` 的預先計算很難在所有 weight 組合下都保持理想行為。`builder.c` 裡 `crush_calc_straw()` 的註解已經直接說明：這段舊邏輯是 fundamentally flawed，後面才用 `straw_calc_version` 修正部分 scaler 問題。
+
+File: ceph/src/crush/builder.c (line 430)
+
+```c
+int crush_calc_straw(struct crush_map *map, struct crush_bucket_straw *bucket)
+{
+	...
+	if (map->straw_calc_version == 0) {
+		...
+	} else if (map->straw_calc_version >= 1) {
+		...
+	}
+}
+```
+
+`straw_calc_version=1` 修的是舊 straw 的 scaler 計算，不是把 `straw` 變成 `straw2`。在 v19.2.3 的 `crush.h` 裡，這個 tunable 被標成 backward compatibility，註解也寫著 `straw2 replaces it`。
+
+## straw2：每次抽籤時才用 weight 算分數
+
+`straw2` 的 struct 少了一個關鍵欄位：它只保存 `item_weights`，不再保存預先算好的 `straws`。也就是說，weight 是持久狀態；每次 placement 的 draw 是用 `x`、item id、replica position `r` 和 weight 即時計算。
+
+File: ceph/src/crush/crush.h (line 341)
+
+```c
+struct crush_bucket_straw2 {
+	struct crush_bucket h; /*!< generic bucket information */
+	__u32 *item_weights;   /*!< 16.16 fixed point weight for each item */
+};
+```
+
+`straw2` 的 source 註解把直覺寫得很清楚：如果 osd.0 weight 是 8、osd.1 weight 是 4，抽樣結果會讓 PG 數量大致按 weight 比例分布。實作上，它用 hash 產生一個 uniform random 值，再透過 `crush_ln()` 轉成 exponential distribution 的 draw；因為 `ln` 值是負的，weight 越大，除完後越接近 0，也就越容易成為最高分。
+
+File: ceph/src/crush/mapper.c (line 315)
+
+```c
+static inline __s64 generate_exponential_distribution(int type, int x, int y,
+						      int z, int weight)
+{
+	unsigned int u = crush_hash32_3(type, x, y, z);
+	u &= 0xffff;
+
+	__s64 ln = crush_ln(u) - 0x1000000000000ll;
+
+	/*
+	 * divide by 16.16 fixed-point weight.  note
+	 * that the ln value is negative, so a larger
+	 * weight means a larger (less negative) value
+	 * for draw.
+	 */
+	return div64_s64(ln, weight);
+}
+```
+
+最後 `bucket_straw2_choose()` 對 bucket 內每個 item 算一次 draw，挑最大者。weight 為 0 的 item 直接給 `S64_MIN`，等於不可能勝出。
+
+File: ceph/src/crush/mapper.c (line 342)
+
+```c
+static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
+				int x, int r, const struct crush_choose_arg *arg,
+				int position)
+{
+	__u32 *weights = get_choose_arg_weights(bucket, arg, position);
+	__s32 *ids = get_choose_arg_ids(bucket, arg);
+	for (i = 0; i < bucket->h.size; i++) {
+		if (weights[i]) {
+			draw = generate_exponential_distribution(
+				bucket->h.hash, x, ids[i], r, weights[i]);
+		} else {
+			draw = S64_MIN;
+		}
+		if (i == 0 || draw > high_draw) {
+			high = i;
+			high_draw = draw;
+		}
+	}
+	return bucket->h.items[high];
+}
+```
+
+這也是 straw2 比 modular hashing 好懂的地方：不是 `hash(x) % N`。每個 item 都有一個自己的分數，新增 item 只是新增一個競爭者；舊 item 彼此之間的分數沒有被重新排序。
+
+## 為什麼 reweight 只搬必要的 PG
+
+把 `straw2` 想成每個 item 都有自己的 draw：
+
+```
+item A: draw = hash(x, A, r) / weight(A)
+item B: draw = hash(x, B, r) / weight(B)
+item C: draw = hash(x, C, r) / weight(C)
+
+最高分勝出
+```
+
+如果你只改 item B 的 weight，A 和 C 的 draw 沒變，A 與 C 之間誰高誰低也沒變。因此 mapping 只應該在「B 與其他 item」之間移動，不應該從 A 跑到 C。這就是 CRUSH 所謂 stable movement 在 bucket 內的核心。
+
+Ceph 的測試直接鎖住這個行為。`straw2_reweight` 先用舊 weight 算一次 `out0`，再改某個 item 的 weight 算 `out1`；如果新結果不是被改 weight 的 item，而且舊結果也不是它，測試要求新舊結果必須相同。
+
+File: ceph/src/test/crush/crush.cc (line 973)
+
+```cpp
+TEST_F(CRUSHTest, straw2_reweight) {
+  // when we adjust the weight of an item in a straw2 bucket,
+  // we should *only* see movement from or to that item, never
+  // between other items.
+```
+
+File: ceph/src/test/crush/crush.cc (line 1068)
+
+```cpp
+if (out1[0] == changed) {
+  ASSERT_EQ(changed, out0[0]);
+} else if (out0[0] != changed) {
+  ASSERT_EQ(out0[0], out1[0]);
+}
+```
+
+這段測試比口號更重要：它說明 straw2 的「少搬資料」不是平均情況的期望值，而是 source 裡明確要維持的行為契約。
+
+## 你會看到的操作面線索
+
+v19.2.3 的 `CrushWrapper` 預設 tunables 會把 `straw_calc_version` 設成 1，而且 default bucket algorithm 會優先回傳 `CRUSH_BUCKET_STRAW2`。所以新建 CRUSH map 或新 bucket 時，正常情況會走 straw2，而不是舊 straw。
+
+File: ceph/src/crush/CrushWrapper.h (line 187)
+
+```cpp
+void set_tunables_default() {
+  set_tunables_jewel();
+  crush->straw_calc_version = 1;
+}
+
+unsigned get_default_bucket_alg() const {
+  if (crush->allowed_bucket_algs & (1 << CRUSH_BUCKET_STRAW2))
+    return CRUSH_BUCKET_STRAW2;
+```
+
+如果舊 CRUSH map 還有 `alg straw`，MON 有一個明確命令可以把所有 straw bucket 轉成 straw2。這是會改 CRUSH map 的操作，線上執行前要先評估 data movement，不要把它當成純查詢命令。
+
+File: ceph/src/mon/MonCommands.h (line 670)
+
+```c
+COMMAND("osd crush set-all-straw-buckets-to-straw2",
+	"convert all CRUSH current straw buckets to use the straw2 algorithm",
+	"osd", "rw")
+```
+
+File: ceph/src/mon/OSDMonitor.cc (line 10358)
+
+```cpp
+} else if (prefix == "osd crush set-all-straw-buckets-to-straw2") {
+  CrushWrapper newcrush = _get_pending_crush();
+  for (int b = 0; b < newcrush.get_max_buckets(); ++b) {
+    int bid = -1 - b;
+    if (newcrush.bucket_exists(bid) &&
+	newcrush.get_bucket_alg(bid) == CRUSH_BUCKET_STRAW) {
+      newcrush.bucket_set_alg(bid, CRUSH_BUCKET_STRAW2);
+    }
+  }
+```
+
+還有一個常見 health 線索：如果 `mon_warn_on_crush_straw_calc_version_zero` 開著，而 CRUSH map 的 `straw_calc_version` 是 0，OSDMap 會產生 `OLD_CRUSH_STRAW_CALC_VERSION` health warning。
+
+File: ceph/src/osd/OSDMap.cc (line 7557)
+
+```cpp
+// OLD_CRUSH_STRAW_CALC_VERSION
+if (cct->_conf->mon_warn_on_crush_straw_calc_version_zero) {
+  if (crush->get_straw_calc_version() == 0) {
+    ostringstream ss;
+    ss << "crush map has straw_calc_version=0";
+    auto& d = checks->add("OLD_CRUSH_STRAW_CALC_VERSION",
+			  HEALTH_WARN, ss.str(), 0);
+```
+
+最後，某些較新的 CRUSH weight-set 功能也要求 bucket 都是 straw2。`OSDMonitor` 在 `osd crush weight-set create*` 路徑會先檢查 `has_non_straw2_buckets()`，如果還有非 straw2 bucket 就直接拒絕。
+
+File: ceph/src/mon/OSDMonitor.cc (line 10754)
+
+```cpp
+if (newcrush.has_non_straw2_buckets()) {
+  ss << "crush map contains one or more bucket(s) that are not straw2";
+  err = -EPERM;
+  goto reply_no_propose;
+}
+```
+
+## 邊界與除錯
+
+- `straw2` 解決的是 bucket 內 item add/remove/reweight 時的資料移動範圍；它不代表 OSD utilization 會完美相同。PG 數、weight、CRUSH rule、failure domain 都仍然會影響實際分布。
+- `straw_calc_version` 只影響舊 `straw` bucket 的 scaler 計算；看到 `straw_calc_version=1` 不等於所有 bucket 都是 `straw2`。
+- 把 bucket 從 `straw` 改成 `straw2` 是 CRUSH map 變更，會造成 placement 重新計算。即使 source 裡提供 `set-all-straw-buckets-to-straw2`，也應先在測試 map 上估算 movement，再套到 production cluster。
+- 如果你在讀 CRUSH map 時看到 `choose_args` 或 weight-set，記得它們只在 straw2 bucket 路徑被使用；`crush_bucket_choose()` 傳給 `bucket_straw2_choose()` 的 `arg` 不會進入舊 `bucket_straw_choose()`。
+
+## 原始碼路徑
+
+| 路徑 | 角色 |
+|---|---|
+| `ceph/src/crush/crush.h` | 定義 bucket algorithm、`crush_bucket_straw` / `crush_bucket_straw2` struct、預設推薦 straw2 的註解 |
+| `ceph/src/crush/mapper.c` | CRUSH rule traversal、`bucket_straw_choose()`、`bucket_straw2_choose()` 與 exponential draw |
+| `ceph/src/crush/builder.c` | 建立 bucket、add/remove/reweight item，以及舊 `crush_calc_straw()` scaler 計算 |
+| `ceph/src/crush/CrushWrapper.h` | C++ wrapper 的 default tunables、default bucket algorithm、`do_rule()` 包裝 |
+| `ceph/src/mon/OSDMonitor.cc` | MON 處理 `set-all-straw-buckets-to-straw2` 與 weight-set 建立前的 straw2 檢查 |
+| `ceph/src/test/crush/crush.cc` | `straw2_stddev` 與 `straw2_reweight` 測試，鎖定比例分布與 reweight movement 契約 |
+
+## 接下來 / 相關頁面
+
+- [CRUSH 與 Placement](/ceph/features/crush-and-placement) — 先看 object / PG / CRUSHMap rule 的整體 placement 流程。
+- [pg_num / pgp_num](/ceph/features/pool-pgnum-pgpnum) — PG 數量與 placement 推進如何影響 remap / split / merge。
+- [PG health states](/ceph/features/pg-health-states) — placement 變動後，哪些 PG state 會真正影響線上 I/O。

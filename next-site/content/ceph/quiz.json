@@ -82,5 +82,29 @@
     ],
     "answer": 0,
     "explanation": "`src/osd/scheduler/mClockScheduler.cc:623-659` 顯示：如果改到低階 QoS key，只有 `osd_mclock_profile == \"custom\"` 才會更新 `ClientRegistry`；built-in profile 會對 `osd` / `osd.<id>` 發 `config rm` 並移除 ephemeral value。`qa/standalone/misc/mclock-config.sh:304-378` 也驗證 built-in profile 下低階參數不能被修改。"
+  },
+  {
+    "id": 8,
+    "question": "CRUSH bucket 用 `straw2` 挑 child item 時，核心做法是什麼？",
+    "options": [
+      "每個 item 用 hash 產生隨機值，轉成 exponential draw 後用 item weight 修正，最後選 draw 最大者；weight 越大越容易勝出",
+      "把 PG id 對 bucket size 做 modulo，餘數是哪個 index 就選哪個 item",
+      "MON 維護一張 PG 到 OSD 的 mapping table，client 查表後照表寫入",
+      "固定從 weight 最大的 item 開始輪流選，直到所有 item 都被選過"
+    ],
+    "answer": 0,
+    "explanation": "`src/crush/mapper.c:315-339` 的 `generate_exponential_distribution()` 用 hash 產生 16-bit 隨機值，再透過 `crush_ln()` 與 weight 算 draw；`src/crush/mapper.c:342-365` 的 `bucket_straw2_choose()` 逐一比較每個 item 的 draw，選最大者。"
+  },
+  {
+    "id": 9,
+    "question": "調整 straw2 bucket 裡某一個 item 的 weight 時，source 測試期待哪些 mapping 會移動？",
+    "options": [
+      "只應該在被改 weight 的 item 與其他 item 之間移動；兩個未改 weight 的 item 之間不應該互相搬移",
+      "所有 PG 都會重新 hash，因為 bucket size 或 weight 一變就等於重建整張 mapping table",
+      "完全不會移動，straw2 只影響新寫入 object，舊 PG 保持原樣",
+      "只會移到目前 utilization 最低的 OSD，因為 straw2 會讀取即時容量"
+    ],
+    "answer": 0,
+    "explanation": "`src/test/crush/crush.cc:973-1072` 的 `straw2_reweight` 測試註解寫明：調整 straw2 bucket 中某 item 的 weight 時，只應看到 mapping 往返該 item，不應在其他 item 之間移動。測試也用 `ASSERT_EQ(out0[0], out1[0])` 鎖住未受影響 item 的 mapping。"
   }
 ]
