@@ -1,0 +1,314 @@
+---
+layout: doc
+title: Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響
+description: ceph 的 quorum 是 N/2+1，3 mon 容忍 1 死。掛 1 台仍 ok（10 秒左右 election 後恢復）；掛 2 台落到 0 個有效 mon，剩餘那台卡在 probing 永遠不寫 osdmap，現有 I/O 短期還能跑、但 cephx service ticket 1 小時後過期就斷；掛 3 台所有東西都依賴的源頭消失。
+---
+
+## 場景
+
+你的 cluster 是 3 個 monitor、20 顆 OSD、跑了一台 KubeVirt VM 用 RBD volume。某天機房維護把 mon node 一台一台抽掉，你想知道：
+
+- 抽 1 台：跑得好好的 VM 會抖嗎？多久恢復？
+- 抽 2 台：剩 1 台 mon 還能服務嗎？目前正在寫入的 fsync 會卡住嗎？
+- 抽 3 台：cluster 完全沒 mon，OSD 上的資料怎麼了？client 端的 librbd 會回什麼錯？
+
+直覺答案是「2/3 就好、低於就不行」。但這個直覺對 client I/O 的時間軸**不準** — 因為 client I/O 的 critical path 不直接走 mon。下面從 v19.2.3 原始碼追三個維度：quorum 數學、Paxos lease 時序、cephx ticket 過期、與哪些 I/O 真的依賴 mon 才能繼續。
+
+## quorum 是「N/2 + 1」，不是「過半」
+
+數字硬寫在 MonMap：
+
+File: `ceph/src/mon/MonMap.h` (line 193)
+
+```cpp
+unsigned min_quorum_size(unsigned total_mons=0) const {
+  if (total_mons == 0) {
+    total_mons = size();
+  }
+  return total_mons / 2 + 1;
+}
+```
+
+| total_mons | min_quorum_size | 可掉幾台 |
+|---|---|---|
+| 1 | 1 | 0 |
+| 3 | 2 | 1 |
+| 5 | 3 | 2 |
+| 7 | 4 | 3 |
+
+3 mon 就是「**最多 1 台**」，不是「過半 = 1.5 → 2 = 可以掉 2 台」。`/ 2 + 1` 對 2 mon 也是 2 — 部署 2 mon 沒有任何容錯，所以線上不要這樣配。
+
+## 兩個關鍵 predicate：is_writeable / is_readable
+
+ceph mon 上所有 osdmap / monmap / authmap 修改都會先過這兩個閘門。
+
+File: `ceph/src/mon/Paxos.cc` (line 1522)
+
+```cpp
+bool Paxos::is_writeable()
+{
+  return
+    mon.is_leader() &&
+    is_active() &&
+    is_lease_valid();
+}
+```
+
+三條 AND 全要過：
+
+| 條件 | 何時失效 |
+|---|---|
+| `mon.is_leader()` | 自己不是 leader、或現在 cluster 沒 leader（任何 election 進行中、或無法選出 leader） |
+| `is_active()` | Paxos state 不是 ACTIVE（正在 recover / collect / commit 中） |
+| `is_lease_valid()` | 沒收到 leader 的 lease（單 mon 自動 valid，多 mon 必須 lease 還沒過期） |
+
+`is_readable()` 略寬鬆，peon 也可以服務 read（但仍要有 lease）：
+
+File: `ceph/src/mon/Paxos.cc` (line 1481)
+
+```cpp
+bool Paxos::is_readable(version_t v)
+{
+  bool ret;
+  if (v > last_committed)
+    ret = false;
+  else
+    ret =
+      (mon.is_peon() || mon.is_leader()) &&
+      (is_active() || is_updating() || is_writing()) &&
+      last_committed > 0 && is_lease_valid();
+  ...
+```
+
+關鍵字：**沒有 quorum 就沒有 lease；沒有 lease 就 read/write 都不行**。後面三個情境都繞著這條打。
+
+## Paxos lease 時序：3 秒 renew、10 秒 timeout
+
+leader 每 `mon_lease * mon_lease_renew_interval_factor = 5 × 0.6 = 3 秒` 對所有 peon 發 lease。lease 本身 5 秒到期。peon 如果 10 秒（`mon_lease * mon_lease_ack_timeout_factor = 5 × 2`）沒收到新 lease，主動發起 election。
+
+File: `ceph/src/mon/Paxos.cc` (line 974)
+
+```cpp
+void Paxos::extend_lease()
+{
+  ceph_assert(mon.is_leader());
+  lease_expire = ceph::real_clock::now();
+  lease_expire += ceph::make_timespan(g_conf()->mon_lease);
+  acked_lease.clear();
+  acked_lease.insert(mon.rank);
+  ...
+  // set timeout event.
+  if (!lease_ack_timeout_event) {
+    lease_ack_timeout_event = mon.timer.add_event_after(
+      g_conf()->mon_lease_ack_timeout_factor * g_conf()->mon_lease,
+      new C_MonContext{&mon, [this](int r) {
+          if (r == -ECANCELED)
+            return;
+          lease_ack_timeout();
+        }});
+  }
+  ...
+```
+
+對應的兩個 timeout 都會直接呼 `mon.bootstrap()`，丟掉 quorum 並進入 PROBING：
+
+File: `ceph/src/mon/Paxos.cc` (line 1191)
+
+```cpp
+void Paxos::lease_ack_timeout()
+{
+  dout(1) << "lease_ack_timeout -- calling new election" << dendl;
+  ceph_assert(mon.is_leader());
+  ceph_assert(is_active());
+  logger->inc(l_paxos_lease_ack_timeout);
+  lease_ack_timeout_event = 0;
+  mon.bootstrap();
+}
+...
+void Paxos::lease_timeout()
+{
+  dout(1) << "lease_timeout -- calling new election" << dendl;
+  ceph_assert(mon.is_peon());
+  ...
+  mon.bootstrap();
+}
+```
+
+`bootstrap()` 把 state 重設成 PROBING、丟掉 quorum、等對方 probe 過來：
+
+File: `ceph/src/mon/Monitor.cc` (line 2147)
+
+```cpp
+unsigned need = monmap->min_quorum_size();
+dout(10) << " outside_quorum now " << outside_quorum << ", need " << need << dendl;
+if (outside_quorum.size() >= need) {
+  if (outside_quorum.count(name)) {
+    dout(10) << " that's enough to form a new quorum, calling election" << dendl;
+    start_election();
+  } else {
+    dout(10) << " that's enough to form a new quorum, but it does not include me; waiting" << dendl;
+  }
+} else {
+  dout(10) << " that's not yet enough for a new quorum, waiting" << dendl;
+}
+```
+
+收齊 ≥ `min_quorum_size` 個 mon 才會進 election，否則無限等待 — 這條決定了「掛 2 台」的所有後果。
+
+## 情境 A：掛 1 台（剩 2/3）
+
+剩 2 個 mon ≥ min_quorum_size(3) = 2，**quorum holds**。但需要分兩種子情境：
+
+**A1. 掛的是 peon（leader 還活著）**
+
+| t | 發生什麼 |
+|---|---|
+| 0 | peon 停掉 |
+| 0~3s | leader 在下次 lease renew 發出 lease，peon 沒回 ack |
+| ≤ 10s | `lease_ack_timeout` → `bootstrap` → election |
+| 10~15s | election：剩餘 2 mon 投票，仍能形成 quorum，回到 active |
+| 期間 | `is_writeable() = false`（leader 自己也丟掉 quorum），任何需要寫 osdmap 的命令（pool set / osd out / osd up...）會卡住或重試 |
+
+**A2. 掛的是 leader**
+
+| t | 發生什麼 |
+|---|---|
+| 0 | leader 停掉 |
+| ≤ 10s | 所有 peon 的 `lease_timeout` 同時觸發（沒收到 leader 的下一個 lease） |
+| 10~20s | 全員 `bootstrap()` → probing → 收齊 2 個 mon → election → 新 leader 上任 |
+| 期間 | 同樣：no writeable，read 也會回 `-EAGAIN`（is_readable 也檢查 lease） |
+
+對 **client I/O 的影響**：
+
+| I/O 類型 | 受影響嗎 |
+|---|---|
+| 已建好 connection 的 librbd read/write 直接打 OSD | 完全不受影響（不經 mon） |
+| OSD 之間 replication / heartbeat | 完全不受影響 |
+| `ceph -s` / `ceph osd dump` 等需要 mon read | 卡 10~20 秒 |
+| `kubectl create pvc` 觸發 ceph-csi 建 RBD image | 期間會 retry，超時就失敗 |
+| 新的 OSD 上線 / mark down | 暫停直到 election 完 |
+
+**結論：1 台 mon 死亡對 dataplane I/O 幾乎透明**，10~20 秒內可能看到 control plane 操作短暫卡住。對 KubeVirt VM 來說，guest OS 通常感知不到。
+
+## 情境 B：掛 2 台（剩 1/3）
+
+剩 1 mon < min_quorum_size(3) = 2，**quorum 無法形成**。
+
+剩下的那台 mon 進入 `bootstrap()`：state 變 `STATE_PROBING`，反覆向 monmap 裡的其他 mon 發 probe 訊息，永遠收不到回應，永遠 hang 在 PROBING。`outside_quorum` 集合永遠湊不到 2 個（自己 + ???），所以永遠不會呼 `start_election()`。
+
+對 mon 自己：
+
+- `is_writeable()` = false（不是 leader）
+- `is_readable(v)` = false（peon 但沒 active state、沒 lease）
+- 任何 client 命令打過來會被擱置（leader 不存在所以 forward 也無處可去）
+
+但 client I/O 的 timeline 比直覺長得多：
+
+| 時間 | client / OSD 視角 |
+|---|---|
+| t=0 | 2 mon 死 |
+| ≤ t=20s | 還活著的 mon 嘗試 bootstrap、failed；剩下 mon 進 PROBING 並 stay 在那 |
+| **OSD I/O 持續正常** | OSD 不需要 mon 才能服務既有的 PG read/write。client 端 librbd 用既有的 osdmap、既有的 cephx service ticket，read/write 通過 |
+| t=5min | OSD 嘗試送 `osd_beacon` 到 mon，mon 不在 quorum 不能寫 — beacon 累積、但無 mon 端被更新 |
+| t≈1hr | `auth_service_ticket_ttl = 1_hr` 到期，client 要 renew service ticket — 需要 mon 簽發。**這時 I/O 開始斷** |
+| 任意時間 | 如果一顆 OSD 故障（disk error、daemon crash），mon 沒辦法 mark it down，導致 client 一直把 op 送到死掉的 OSD，**讀寫掛起** |
+
+兩個關鍵 ttl：
+
+File: `ceph/src/common/options/global.yaml.in` (line 2205)
+
+```yaml
+- name: auth_mon_ticket_ttl
+  type: float
+  default: 72_hr
+- name: auth_service_ticket_ttl
+  type: float
+  default: 1_hr
+```
+
+| ticket | 預設 TTL | 沒了會怎樣 |
+|---|---|---|
+| mon ticket | 72 小時 | client 連 mon 都連不上（但 mon 本來就不在 quorum） |
+| service ticket | 1 小時 | client 與 OSD 之間的 cephx 認證失效，後續 I/O 拿 `EACCES` |
+
+**所以掛 2 台 mon 的時間軸是：**
+
+```
+t=0    ┌─ mon 掛 2 台
+       │
+       │  ▶ dataplane I/O 持續正常
+       │  ▶ control plane（任何 ceph 命令）卡住
+       │  ▶ OSD failure 偵測停擺
+       │
+t=1hr  └─ cephx service ticket 過期 → I/O 全面 EACCES / hang
+```
+
+實務上你有大約 **1 小時的搶救窗口**：在這段時間裡 client I/O 大致不會自己中斷（除非剛好 OSD 死掉），可以把 mon 救回來。超過 1 小時就是 cluster-wide 災難。
+
+## 情境 C：掛 3 台（剩 0/3）
+
+跟情境 B 邏輯相同，差別只在「沒有任何 mon 在 PROBING」— 沒有東西可以等。
+
+dataplane 的衰退路徑完全一樣：
+
+| 時間 | 狀態 |
+|---|---|
+| t < 1hr | librbd / KubeVirt VM 寫 RBD volume 持續 OK，因為 client 用 cached osdmap + 未過期的 service ticket |
+| t ≈ 1hr | service ticket 過期，I/O 全停 |
+| 任何 OSD 故障 | 該 OSD 的 PG 上 I/O 卡住，因為沒有 mon 能 mark 它 down、改 acting set |
+
+但 mon 完全消失多一個風險：**無人持有 monmap**。如果你還想救援，要靠 OSD store 裡 cached 的 osdmap、加上人工把 mon DB 從某個 OSD 上 rebuild 出來（`ceph-objectstore-tool` 的 `update-mon-db`），這是一條痛苦的 manual recovery 路徑、超出本頁範圍。
+
+## 為什麼 dataplane I/O 不直接依賴 mon
+
+關鍵設計：**mon 給 client 拿到 osdmap + service ticket 之後，後續 RADOS read/write 全部直接打 OSD**。
+
+OSD 端對 mon 的依賴是 outbound：
+
+File: `ceph/src/osd/OSD.cc` (line 1266 區段附近)
+
+OSD 會主動送這幾類訊息給 mon：
+
+- `MOSDFailure` — 透過 `monc->send_mon_message(m)` 告訴 mon 「我覺得 osd.X 死了」
+- `MOSDPGCreated` — pg 建好通知
+- `MOSDPGReadyToMerge` — pg merge 握手
+- `osd_beacon` — 定期心跳（每 5 分鐘）
+- `MPGStats` — 給 mgr，但走 mon route
+
+如果 mon 沒 quorum，這些訊息都不會被消化（mon 不會寫進 osdmap）。但**OSD 對 client 的 service 不會因此停止**，因為這條 path 不經過 mon：
+
+```
+client ─ RADOS op ──▶ OSD ─ replicate ─▶ OSD ─ ack ─▶ OSD ─ ack ─▶ client
+   │
+   └── (背景) ─ 定期向 mon subscribe osdmap、refresh cephx service ticket
+```
+
+OSD 自己不需要 mon 也能服務 read/write。只要 client 還有有效的 osdmap + service ticket，I/O 就會繼續。這就是為什麼「掛 2 台 mon」與「掛 3 台 mon」對 dataplane 的立即影響幾乎相同，差別在於救援路徑。
+
+## 邊界與除錯
+
+幾個容易踩的點：
+
+**「`ceph -s` hang，是不是 mon 壞了？」**：`ceph -s` 經 mon 路由、需要 `is_readable()`，所以 mon 沒 quorum 時它會 timeout。從 OSD node 上跑 `rados -p mypool get foo /tmp/foo` 如果還能跑，代表 dataplane 還活著。確認 mon 狀態的可靠方法是看 mon log（`/var/log/ceph/ceph-mon.<host>.log` 找 `PROBING` 或 `ELECTING` 字樣）。
+
+**「只剩 1 mon 想暫時讓它服務」**：唯一支援的方式是 `ceph mon remove <name>`（從 monmap 移除其他兩台），讓 monmap.size() 變 1、min_quorum_size 跟著變 1。但這需要 quorum 才能執行 — 已經沒 quorum 就鎖死，必須走 `ceph-mon --extract-monmap` + `--inject-monmap` 的離線編輯流程。
+
+**「election 來回打」**：lease_ack 與 lease timeout 都用 `mon_lease_ack_timeout_factor` × `mon_lease`（10 秒）。如果你的 mon node 跨 WAN 部署、平均 RTT > 1 秒，election 可能反覆觸發。先確認 timecheck 沒在報、再決定要不要調大 `mon_lease`。
+
+<Callout type="warning" title="3 mon 容錯 1 — 你的真實 SLA 是「最久 1 小時」">
+  掛 2 台 mon 後，dataplane 看起來「沒事」是假象 — 1 小時後 service ticket 過期，所有 client I/O 同時 EACCES。在這 1 小時內你必須把至少 1 台 mon 救回來，否則進入 cluster-wide outage。Production 線上 cluster 應該部署 5 mon（容錯 2）或在 mon node 故障時設置自動化 escalation。
+</Callout>
+
+<Callout type="tip" title="想觀察的場景">
+  - lab 環境用 `kill -STOP $(pidof ceph-mon)`（不是 kill -9）模擬 mon 掛起，10 秒後會看到 election；30 秒後別的 mon 開始抱怨 `MON_DOWN`
+  - 跑 `rados bench -p mypool 60 write -b 4M` 同時 stop 2 個 mon — 你會看到 throughput 大致維持 30~50 分鐘，然後突然全部卡住
+  - `ceph daemon mon.X mon_status` 在 mon node 上跑可以直接看到 `state: probing` / `state: electing` / `state: leader|peon`，不必經 quorum
+</Callout>
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — 整體架構](./architecture) — MON 在 cluster 裡扮演的角色：cluster map 的 source of truth
+  - [Ceph — MON clock skew 偵測](./mon-clock-skew-detection) — 同樣是 Paxos lease 衍生的健康檢查；election 太頻繁時通常是 clock 或網路問題
+  - [Ceph — osd ok-to-stop 在原始碼裡檢查了什麼](./osd-ok-to-stop) — OSD 端的 graceful stop 檢查，與 mon quorum 互補
+</Callout>
