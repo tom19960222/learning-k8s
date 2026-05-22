@@ -16,7 +16,8 @@
     {"id": "mon-quorum-loss-impact", "label": "MON quorum loss", "description": "3 mon 容錯 1：quorum = N/2+1、Paxos lease 10s timeout、cephx service ticket 1hr 過期是真正的 I/O 中斷時鐘", "featureSlug": "mon-quorum-loss-impact", "category": "controller", "position": {"x": 1000, "y": 50}},
     {"id": "osd-ok-to-stop", "label": "osd ok-to-stop", "description": "每 PG 跑一次 min_size 模擬：扣掉這幾顆後 acting 還夠不夠維持 active", "featureSlug": "osd-ok-to-stop", "category": "tooling", "position": {"x": 400, "y": 660}},
     {"id": "osd-safe-to-destroy", "label": "osd safe-to-destroy", "description": "三條規則：osdmap.exists / pg map 仍在此 OSD / 不健康 cluster 中仍持有 PG 資料", "featureSlug": "osd-safe-to-destroy", "category": "tooling", "position": {"x": 700, "y": 660}},
-    {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}}
+    {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}},
+    {"id": "prometheus-alert-design", "label": "Prometheus alert 四層設計", "description": "用 ceph_health_detail 與 OSD_FLAGS gate 維護期警報風暴：observe / ignorable / better-not-ignore / immediate 四層 + promtool dry-run", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}}
   ],
   "edges": [
     {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
@@ -47,6 +48,9 @@
     {"id": "e-pgnum-osd", "source": "pool-pgnum-pgpnum", "target": "osd-and-bluestore", "label": "splits / merges"},
     {"id": "e-pgnum-health", "source": "pool-pgnum-pgpnum", "target": "pg-health-states", "label": "defers on degraded"},
     {"id": "e-arch-quorum", "source": "architecture", "target": "mon-quorum-loss-impact", "label": "Paxos quorum"},
-    {"id": "e-quorum-clockskew", "source": "mon-quorum-loss-impact", "target": "mon-clock-skew-detection", "label": "shares lease path"}
+    {"id": "e-quorum-clockskew", "source": "mon-quorum-loss-impact", "target": "mon-clock-skew-detection", "label": "shares lease path"},
+    {"id": "e-pghealth-alerts", "source": "pg-health-states", "target": "prometheus-alert-design", "label": "drives alerts"},
+    {"id": "e-flapping-alerts", "source": "osd-flapping", "target": "prometheus-alert-design", "label": "alert noise source"},
+    {"id": "e-okstop-alerts", "source": "osd-ok-to-stop", "target": "prometheus-alert-design", "label": "maintenance gate"}
   ]
 }

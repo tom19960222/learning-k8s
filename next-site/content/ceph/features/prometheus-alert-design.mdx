@@ -1,0 +1,952 @@
+---
+layout: doc
+title: Ceph — Prometheus alert rule 四層設計：消除維護期警報風暴
+description: 從 ceph-mixin 的 prometheus_alerts.yml 出發，分析 OSDMAP_FLAGS / OSD_FLAGS / HOST_IN_MAINTENANCE 在 OSDMap.cc 與 cephadm/module.py 的觸發路徑，重新設計四層 (observe / ignorable / better-not-ignore / immediate) alert，並用 promtool dry-run 推演 + 給出可直接照做的實驗計畫。
+---
+
+## 場景
+
+凌晨三點：某 OSD 的硬碟 SMART 不可逆地壞了，oncall 進去要換碟。換碟流程是教科書答案：
+
+```
+ceph orch host maintenance enter cephnode-3   # 把整個 host 進維護
+# 換碟
+ceph orch host maintenance exit cephnode-3
+```
+
+可是 Prometheus 從 `ceph orch host maintenance enter` 那一刻起就開始炸：
+
+```
+[FIRING] CephHealthWarning   (HEALTH_WARN 持續 15 分鐘)
+[FIRING] CephOSDDown         (OSD 持續 down 5 分鐘)
+[FIRING] CephOSDHostDown     (整個 host 5 分鐘)
+[FIRING] CephPGsUnclean      (PGs unclean 15 分鐘)
+```
+
+每一條都是 stock `ceph-mixin/prometheus_alerts.yml` 預設規則。它們**完全正確**——cluster 真的是 HEALTH_WARN、OSD 真的 down、PG 真的 unclean——但這些都是「我自己叫它變這樣的」。Pagerduty 從凌晨三點響到五點，oncall 被吵醒、又得手動 silence。
+
+問題的本質：**stock 規則只看「現在是不是 WARN」，不看「我有沒有預期它是 WARN」。**
+
+這頁從原始碼層拆：
+
+1. ceph mgr/prometheus 模組到底丟了哪些 metric。
+2. `ceph orch host maintenance enter` 在原始碼裡實際做了什麼，留下哪個訊號可以拿來當 gate。
+3. 重新分四層的 alert rule set，用 `unless` 子句 gate 掉「預期會 WARN」的訊號，但保留「就算 maintenance 也不該發生」的訊號。
+4. 用 promtool 的 unit test 機制做出 dry-run 推演結果。
+
+## 從原始碼追：HEALTH_WARN 是怎麼被丟出來的
+
+### OSDMAP_FLAGS：你按下 `noout`，cluster 就 WARN
+
+`File: ceph/src/osd/OSDMap.cc (line 7471)`
+
+```cpp
+// OSDMAP_FLAGS
+{
+  // warn about flags
+  uint64_t warn_flags =
+    CEPH_OSDMAP_PAUSERD |
+    CEPH_OSDMAP_PAUSEWR |
+    CEPH_OSDMAP_PAUSEREC |
+    CEPH_OSDMAP_NOUP |
+    CEPH_OSDMAP_NODOWN |
+    CEPH_OSDMAP_NOIN |
+    CEPH_OSDMAP_NOOUT |
+    CEPH_OSDMAP_NOBACKFILL |
+    CEPH_OSDMAP_NORECOVER |
+    CEPH_OSDMAP_NOSCRUB |
+    CEPH_OSDMAP_NODEEP_SCRUB |
+    CEPH_OSDMAP_NOTIERAGENT |
+    CEPH_OSDMAP_NOSNAPTRIM |
+    CEPH_OSDMAP_NOREBALANCE;
+  if (test_flag(warn_flags)) {
+    ostringstream ss;
+    string s = get_flag_string(get_flags() & warn_flags);
+    ss << s << " flag(s) set";
+    checks->add("OSDMAP_FLAGS", HEALTH_WARN, ss.str(),
+                s.size() /* kludgey but sufficient */);
+  }
+}
+```
+
+重點是 `OSDMAP_FLAGS` 一旦觸發就是 **HEALTH_WARN**，沒有 INFO/NOTICE 這種中間層。下面這些都會踩到：
+
+- `ceph osd set noout`（整個 cluster）
+- `ceph osd set noscrub`
+- `ceph osd set norebalance`
+
+### OSD_FLAGS：你只把某幾顆 OSD 設 noout，照樣 WARN
+
+`File: ceph/src/osd/OSDMap.cc (line 7498)`
+
+```cpp
+// OSD_FLAGS
+{
+  list<string> detail;
+  const unsigned flags =
+    CEPH_OSD_NOUP |
+    CEPH_OSD_NOIN |
+    CEPH_OSD_NODOWN |
+    CEPH_OSD_NOOUT;
+  for (int i = 0; i < max_osd; ++i) {
+    if (osd_state[i] & flags) {
+      // ... 累積 detail
+    }
+  }
+  // 也檢查 crush_node_flags / device_class_flags
+  if (!detail.empty()) {
+    auto& d = checks->add("OSD_FLAGS", HEALTH_WARN, ss.str(), detail.size());
+  }
+}
+```
+
+`ceph osd add-noout osd.5` 或者 `ceph osd set-group noout cephnode-3` 走到這條。
+
+### HOST_IN_MAINTENANCE：cephadm 路線專屬
+
+`File: ceph/src/pybind/mgr/cephadm/module.py (line 2118)`
+
+```python
+def _set_maintenance_healthcheck(self) -> None:
+    """Raise/update or clear the maintenance health check as needed"""
+    in_maintenance = self.inventory.get_host_with_state("maintenance")
+    if not in_maintenance:
+        self.remove_health_warning('HOST_IN_MAINTENANCE')
+    else:
+        s = "host is" if len(in_maintenance) == 1 else "hosts are"
+        self.set_health_warning(
+            "HOST_IN_MAINTENANCE",
+            f"{len(in_maintenance)} {s} in maintenance mode", 1,
+            [f"{h} is in maintenance" for h in in_maintenance])
+```
+
+`ceph orch host maintenance enter <hostname>` 走 `enter_host_maintenance()`，最後呼叫 `_set_maintenance_healthcheck()` 丟 `HOST_IN_MAINTENANCE`。這條同時也會做：
+
+`File: ceph/src/pybind/mgr/cephadm/module.py (line 2180)`
+
+```python
+if "osd" in host_daemons:
+    crush_node = hostname if '.' not in hostname else hostname.split('.')[0]
+    rc, out, err = self.mon_command({
+        'prefix': 'osd set-group',
+        'flags': 'noout',
+        'who': [crush_node],
+        'format': 'json'
+    })
+```
+
+也就是 `ceph orch host maintenance enter` 同時會：
+
+1. 丟出 `HOST_IN_MAINTENANCE` health check（HEALTH_WARN）。
+2. 對該 host 的 crush bucket 下 `osd set-group noout`，連帶丟出 `OSD_FLAGS` health check（HEALTH_WARN）。
+3. systemd 停掉這台所有 ceph daemon，過 5 分鐘 OSD 會被 mon 標 down，丟出 `OSD_HOST_DOWN` 與 `OSD_DOWN`。
+4. PG 因為 OSD 不足而從 `active+clean` 變 `active+undersized+degraded`，丟出 `PG_DEGRADED`。
+
+**一個正當的維護動作，會同時讓五~六條 health check 都進 HEALTH_WARN**。stock alert rules 不知道這些是同一個原因引發的。
+
+### mgr/prometheus 的 metric 模型
+
+`File: ceph/src/pybind/mgr/prometheus/module.py (line 47)`
+
+```python
+def health_status_to_number(status: str) -> int:
+    if status == 'HEALTH_OK':
+        return 0
+    elif status == 'HEALTH_WARN':
+        return 1
+    elif status == 'HEALTH_ERR':
+        return 2
+```
+
+`File: ceph/src/pybind/mgr/prometheus/module.py (line 742)`
+
+```python
+metrics['health_detail'] = Metric(
+    'gauge',
+    'health_detail',
+    'healthcheck status by type (0=inactive, 1=active)',
+    HEALTHCHECK_DETAIL  # ('name', 'severity')
+)
+```
+
+`File: ceph/src/pybind/mgr/prometheus/module.py (line 932)`
+
+```python
+self.health_history.check(health)
+for name, info in self.health_history.healthcheck.items():
+    v = 1 if info.active else 0
+    self.metrics['health_detail'].set(
+        v, (
+            name,
+            str(info.severity))
+    )
+```
+
+`File: ceph/src/pybind/mgr/prometheus/module.py (line 69)`
+
+```python
+OSD_FLAGS = ('noup', 'nodown', 'noout', 'noin', 'nobackfill', 'norebalance',
+             'norecover', 'noscrub', 'nodeep-scrub')
+```
+
+`File: ceph/src/pybind/mgr/prometheus/module.py (line 1120)`
+
+```python
+def get_metadata_and_osd_status(self) -> None:
+    osd_map = self.get('osd_map')
+    osd_flags = osd_map['flags'].split(',')
+    for flag in OSD_FLAGS:
+        self.metrics['osd_flag_{}'.format(flag)].set(
+            int(flag in osd_flags)
+        )
+```
+
+把上面拼起來，cluster 在維護期我們會拿到這些 gauge：
+
+```
+ceph_health_status                                       == 1  # WARN
+ceph_health_detail{name="HOST_IN_MAINTENANCE"}           == 1
+ceph_health_detail{name="OSD_FLAGS"}                     == 1
+ceph_health_detail{name="OSD_HOST_DOWN"}                 == 1
+ceph_health_detail{name="OSD_DOWN"}                      == 1
+ceph_health_detail{name="PG_DEGRADED"}                   == 1
+ceph_osd_flag_noout                                      == 0  # 因為是 subtree/per-osd flag
+```
+
+注意最後一行：`ceph_osd_flag_noout` 只反映 cluster-wide 的 `osd_map['flags']`，不會反映 per-osd 或 crush-bucket 的 noout。所以**檢測「現在是不是在維護」要用 `ceph_health_detail{name=~"HOST_IN_MAINTENANCE|OSD_FLAGS|OSDMAP_FLAGS"}`，不能只看 `ceph_osd_flag_noout`**。
+
+## 為什麼 stock ceph-mixin 規則會吵
+
+回頭看 `monitoring/ceph-mixin/prometheus_alerts.yml`：
+
+`File: ceph/monitoring/ceph-mixin/prometheus_alerts.yml (line 4)`
+
+```yaml
+- alert: "CephHealthError"
+  expr: "ceph_health_status == 2"
+  for: "5m"
+  labels: { severity: "critical" }
+
+- alert: "CephHealthWarning"
+  expr: "ceph_health_status == 1"
+  for: "15m"
+  labels: { severity: "warning" }
+```
+
+`CephHealthWarning` 只看 `ceph_health_status == 1`，沒有 `unless` 子句去 gate 維護期。`for: 15m` 算是一個短時間的緩衝，但維護換碟動輒半小時起跳，照樣會 fire。
+
+`File: ceph/monitoring/ceph-mixin/prometheus_alerts.yml (line 95)`
+
+```yaml
+- alert: "CephOSDHostDown"
+  expr: "ceph_health_detail{name=\"OSD_HOST_DOWN\"} == 1"
+  for: "5m"
+
+- alert: "CephOSDDown"
+  expr: "ceph_health_detail{name=\"OSD_DOWN\"} == 1"
+  for: "5m"
+```
+
+也都沒有 gate。實務上一定會 fire。
+
+stock mixin 的設計哲學是「全部都丟出來，讓 oncall 自己判斷」，這在 stage cluster 還能接受，正式 prod 就是 alert fatigue 的元兇。
+
+## 四層 alert 設計
+
+把上面看過的 health check 重新分四層。**分層依據是「這個訊號背後的事實」對 client I/O 的影響**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Tier 3 — immediate (page everyone, 24/7)                        │
+│  client I/O 已經被擋 / 資料已經有風險不可逆                       │
+│   • HEALTH_ERR                                                  │
+│   • PG_AVAILABILITY (扣掉 OSD_DOWN 後仍 inactive)                │
+│   • PG_DAMAGED / OSD_SCRUB_ERRORS                               │
+│   • PG_RECOVERY_FULL / OSD_FULL                                 │
+│   • MON_DOWN_QUORUM_AT_RISK                                     │
+│   • MDS_DAMAGE / MDS_ALL_DOWN / MDS_HEALTH_READ_ONLY            │
+│   • CephOSDDownHigh (>= 10% OSD down)                           │
+├─────────────────────────────────────────────────────────────────┤
+│ Tier 2 — better-not-ignore (page during business hours)         │
+│  cluster 還能服務，但若不處理會升級成 Tier 3                      │
+│   • DEVICE_HEALTH (SMART 預測故障)                               │
+│   • OSD_TOO_MANY_REPAIRS (硬碟靜默壞)                            │
+│   • OSD_NEARFULL                                                │
+│   • CephOSDFlapping                                             │
+│   • MON_CLOCK_SKEW                                              │
+│   • MON_DISK_LOW                                                │
+│   • RECENT_MGR_MODULE_CRASH                                     │
+├─────────────────────────────────────────────────────────────────┤
+│ Tier 1 — ignorable during maintenance (gate by maintenance)     │
+│  訊號本身是合法的 (cluster 真的 WARN)，但我有預期                  │
+│   • CephHealthWarning (raw HEALTH_WARN)                         │
+│   • OSD_DOWN / OSD_HOST_DOWN                                    │
+│   • PG_DEGRADED / CephPGsUnclean                                │
+│   • OSDMAP_FLAGS / OSD_FLAGS                                    │
+│   • RECOVERY 相關 (CephSlowOps, recovery rate)                  │
+├─────────────────────────────────────────────────────────────────┤
+│ Tier 0 — observe (記錄到 alertmanager 但不 page)                 │
+│  純資訊，用來在事後回溯 timeline                                  │
+│   • HOST_IN_MAINTENANCE                                         │
+│   • cluster I/O throughput / latency 變動                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 設計核心：一個 `record` rule 當 gate
+
+定義一個 recording rule，凡是 cluster 處於「管理員自己叫它變 WARN」的狀態，就為 1。所有 Tier 1 規則用 `unless on() ceph:maintenance_active == 1` gate 掉。
+
+```yaml
+groups:
+  - name: ceph-maintenance-gate
+    interval: 30s
+    rules:
+      - record: ceph:maintenance_active
+        expr: |
+          max(
+            (ceph_health_detail{name="HOST_IN_MAINTENANCE"} == 1)
+            or (ceph_health_detail{name="OSDMAP_FLAGS"} == 1)
+            or (ceph_health_detail{name="OSD_FLAGS"} == 1)
+          )
+```
+
+- `max()` 把多個 series 收斂成單一 scalar-like value，方便後續 `unless on()` 配對。
+- 三條訊號任一個亮就視為 in-maintenance：cephadm 路線 (`HOST_IN_MAINTENANCE`)、`ceph osd set noout` 路線 (`OSDMAP_FLAGS`)、`ceph osd add-noout` / subtree 路線 (`OSD_FLAGS`) 都涵蓋。
+
+### Tier 3 — 馬上處理
+
+```yaml
+- name: ceph-tier3-immediate
+  rules:
+    - alert: CephHealthError
+      expr: ceph_health_status == 2
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+      annotations:
+        summary: "Ceph HEALTH_ERR ({{ $value }})"
+        runbook: "ceph health detail; ceph -s"
+
+    - alert: CephPGUnavailableBlockingIO
+      # 真的 inactive，扣掉「只是 OSD 還在 down」的情況
+      expr: |
+        (ceph_health_detail{name="PG_AVAILABILITY"} == 1)
+        - on() group_left() (ceph_health_detail{name="OSD_DOWN"} == 1)
+        == 1
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephPGDamaged
+      expr: ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1
+      for: 5m
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephOSDFull
+      expr: ceph_health_detail{name="OSD_FULL"} > 0
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephPGRecoveryAtRisk
+      expr: ceph_health_detail{name="PG_RECOVERY_FULL"} == 1
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephMonQuorumAtRisk
+      # 用 ceph-mixin 原版的計算法
+      expr: |
+        (ceph_health_detail{name="MON_DOWN"} == 1)
+        * on() (
+          count(ceph_mon_quorum_status == 1)
+          == bool (floor(count(ceph_mon_metadata) / 2) + 1)
+        )
+        == 1
+      for: 30s
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephOSDDownHigh
+      expr: count(ceph_osd_up == 0) / count(ceph_osd_up) * 100 >= 10
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+
+    - alert: CephFilesystemDamaged
+      expr: ceph_health_detail{name=~"MDS_DAMAGE|MDS_ALL_DOWN|MDS_HEALTH_READ_ONLY|FS_DEGRADED|FS_WITH_FAILED_MDS"} > 0
+      for: 1m
+      labels: { severity: critical, tier: t3 }
+```
+
+**這層為什麼不 gate 維護**：上面這些 health check 即使在 maintenance 也不該發生，因為它們的語意是「客戶寫入會被擋 / 已經掉資料」。例如 `PG_AVAILABILITY` 在我把單一 host 下線時不該觸發（其他 host 還能服務 PG），所以扣掉 `OSD_DOWN` 子訊號後若還是 1，就真的有問題。
+
+### Tier 2 — 不要忽略比較好
+
+```yaml
+- name: ceph-tier2-business-hours
+  rules:
+    - alert: CephDeviceFailurePredicted
+      expr: ceph_health_detail{name="DEVICE_HEALTH"} == 1
+      for: 1h            # 給 SMART 訊號穩定下來
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephOSDTooManyRepairs
+      # 硬碟靜默壞，read 都從副本走 — 換碟的訊號
+      expr: ceph_health_detail{name="OSD_TOO_MANY_REPAIRS"} == 1
+      for: 10m
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephOSDNearFull
+      expr: ceph_health_detail{name="OSD_NEARFULL"} == 1
+      for: 30m           # 維護期可能短暫 nearfull, 給時間吸收
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephOSDFlapping
+      expr: (rate(ceph_osd_up[5m]) * on(ceph_daemon) group_left(hostname) ceph_osd_metadata) * 60 > 1
+      for: 5m
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephMonClockSkew
+      expr: ceph_health_detail{name="MON_CLOCK_SKEW"} == 1
+      for: 5m
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephMonDiskspaceLow
+      expr: ceph_health_detail{name="MON_DISK_LOW"} == 1
+      for: 5m
+      labels: { severity: warning, tier: t2 }
+
+    - alert: CephMgrModuleCrash
+      expr: ceph_health_detail{name="RECENT_MGR_MODULE_CRASH"} == 1
+      for: 10m
+      labels: { severity: warning, tier: t2 }
+```
+
+**這層為什麼也不 gate 維護**：DEVICE_HEALTH / OSD_TOO_MANY_REPAIRS / OSD_NEARFULL 都跟「為什麼今天要進維護」有關——抑制掉這些訊號等於把進維護的根因也抑制掉了。我們**要它在維護期還是叫**，但 severity 標 warning + 較長 `for:`，所以即使誤觸也不會半夜 page，只會在白天 oncall 巡檢時看到。
+
+### Tier 1 — 維護期可忽略
+
+```yaml
+- name: ceph-tier1-gated
+  rules:
+    - alert: CephHealthWarning
+      expr: |
+        (ceph_health_status == 1)
+        unless on() (ceph:maintenance_active == 1)
+      for: 30m            # 比 stock 的 15m 寬鬆，給維護開始/結束的訊號漂移
+      labels: { severity: warning, tier: t1 }
+
+    - alert: CephOSDDown
+      expr: |
+        (ceph_health_detail{name="OSD_DOWN"} == 1)
+        unless on() (ceph:maintenance_active == 1)
+      for: 10m            # 比 stock 的 5m 寬鬆
+      labels: { severity: warning, tier: t1 }
+
+    - alert: CephOSDHostDown
+      expr: |
+        (ceph_health_detail{name="OSD_HOST_DOWN"} == 1)
+        unless on() (ceph:maintenance_active == 1)
+      for: 10m
+      labels: { severity: warning, tier: t1 }
+
+    - alert: CephPGsDegraded
+      expr: |
+        (ceph_health_detail{name="PG_DEGRADED"} == 1)
+        unless on() (ceph:maintenance_active == 1)
+      for: 30m
+      labels: { severity: warning, tier: t1 }
+
+    - alert: CephPGsUnclean
+      expr: |
+        (ceph_pool_metadata * on(pool_id,instance) group_left()
+          (ceph_pg_total - ceph_pg_clean) > 0)
+        unless on() (ceph:maintenance_active == 1)
+      for: 30m
+      labels: { severity: warning, tier: t1 }
+
+    - alert: CephOSDFlagsSet
+      # 不在維護卻有 flag — 表示忘記清除
+      expr: |
+        (ceph_health_detail{name=~"OSDMAP_FLAGS|OSD_FLAGS"} == 1)
+        unless on() (ceph_health_detail{name="HOST_IN_MAINTENANCE"} == 1)
+      for: 12h            # 12 小時都沒清就提醒一下
+      labels: { severity: warning, tier: t1 }
+      annotations:
+        summary: "Ceph 有 noout/noscrub 等 flag 已設超過 12h"
+        runbook: "ceph osd dump | grep -E 'flags|noout'"
+```
+
+**最後一條 `CephOSDFlagsSet` 是設計關鍵**：noout 永遠忘記清是 ceph cluster 的常見坑（換完碟、重啟完服務後 ops 沒 `unset noout`），結果未來真的有 OSD 壞掉時 cluster 不會自動 out，rebalance 不開始，資料越來越 degraded。這條的意思是「flag 還在但 maintenance health check 已經消失」就 fire。
+
+### Tier 0 — 觀察
+
+```yaml
+- name: ceph-tier0-observe
+  rules:
+    - alert: CephHostInMaintenance
+      expr: ceph_health_detail{name="HOST_IN_MAINTENANCE"} == 1
+      for: 0s
+      labels: { severity: info, tier: t0 }
+      annotations:
+        summary: "有 host 進入 maintenance mode"
+
+    - alert: CephClusterRecovering
+      # 用來觀察 backfill / recovery 進度 — 不 page，只記 timeline
+      expr: ceph_health_detail{name=~"PG_DEGRADED|PG_BACKFILL_FULL"} == 1
+      for: 0s
+      labels: { severity: info, tier: t0 }
+```
+
+Tier 0 在 alertmanager 設定 `repeat_interval: 30d` + 不送 Pagerduty，只送 Slack `#ceph-events` 頻道做時間線記錄。
+
+## 詳細解說：為什麼每一條這樣劃
+
+### 為什麼 `OSDMAP_FLAGS` 沒列在 Tier 3
+
+語意上 `pauserd|pausewr` 是 cluster IO 直接被停（很嚴重），但 mixin 把所有 14 個 flag 都合在同一個 health check name 裡。**沒辦法用 `name=` 區分 pause* 跟 noout/noscrub**。要區分得另外從 ceph_osd_flag_pauserd / ceph_osd_flag_pausewr 看：
+
+```yaml
+- alert: CephClusterPaused
+  expr: (ceph_osd_flag_pauserd == 1) or (ceph_osd_flag_pausewr == 1)
+  for: 30s
+  labels: { severity: critical, tier: t3 }
+```
+
+把這條補到 Tier 3，OSDMAP_FLAGS 的剩下 case 才放心丟到 Tier 1。
+
+### 為什麼 `PG_AVAILABILITY` 要扣掉 `OSD_DOWN`
+
+`File: ceph/monitoring/ceph-mixin/prometheus_alerts.yml (line 396)`
+
+```yaml
+- alert: "CephPGUnavailableBlockingIO"
+  expr: "((ceph_health_detail{name=\"PG_AVAILABILITY\"} == 1) - scalar(ceph_health_detail{name=\"OSD_DOWN\"})) == 1"
+```
+
+stock mixin 已經這樣做了，我們沿用。原因：
+
+```
+情境 A：單 host 下線維護
+  → OSD_DOWN 亮 + 可能 PG_AVAILABILITY 短暫亮（peering 中）
+  → 扣掉 OSD_DOWN：1 - 1 = 0，不 fire
+情境 B：cluster 多副本同時掉（網路腦裂 / RAID controller 燒掉）
+  → OSD_DOWN 亮 + PG 真的 inactive（沒有任何 up replica）
+  → 扣掉 OSD_DOWN：1 - 1 = 0，不 fire ❌
+```
+
+所以 stock 的這條規則在「多副本同時掉」時還是會 miss。我們在 Tier 3 多加一條補：
+
+```yaml
+- alert: CephPGActiveCountLow
+  # PG inactive 比例 >= 5%
+  expr: |
+    sum by (pool_id) (ceph_pg_total - ceph_pg_active)
+    / on(pool_id) group_left() sum by (pool_id) (ceph_pg_total)
+    * 100 >= 5
+  for: 2m
+  labels: { severity: critical, tier: t3 }
+```
+
+這條看 PG 實際狀態而不是 health check，繞過上面的減法盲點。
+
+### 為什麼 `DEVICE_HEALTH` 放 Tier 2 而不是 Tier 3
+
+DEVICE_HEALTH 是 SMART 預測，**不是真的壞**。`ceph device get-health-metrics` 把 SMART 指標餵給內建的線性模型，丟出「6 週內可能壞」這種預測。實務上：
+
+- 半夜 page 一個「6 週後可能壞」太誇張。
+- 白天 oncall 看到後，排到下一個維護視窗換掉即可。
+
+### 為什麼 `OSD_TOO_MANY_REPAIRS` 放 Tier 2 不是 Tier 1
+
+`File: ceph/monitoring/ceph-mixin/prometheus_alerts.yml (line 149)`
+
+```yaml
+- alert: "CephOSDTooManyRepairs"
+  annotations:
+    description: "Reads from an OSD have used a secondary PG to return data to the client, indicating a potential failing drive."
+```
+
+語意是「主副本 read 失敗，用 secondary 回應」——已經是硬碟靜默壞的訊號。我選擇**不 gate** 它的原因：
+
+- 維護期我們把整個 host 下線，但 too_many_repairs 是針對「up 的 OSD」做的判定。一個 host 在 maintenance 但其他 host 的 OSD 出現 too_many_repairs，就是「維護期間又踩到第二顆要壞的碟」，很可能是相關性故障（同批次 / 同 firmware），必須馬上知道。
+
+### 為什麼 `CephOSDFlagsSet` 用 12h 不是更短
+
+維護視窗 30 分鐘很正常，更長的滾動升級可能 2~4 小時。12h 給足夠 buffer 又能在「換完碟回家睡覺忘記 `unset noout`」隔天就提醒。
+
+## Dry-run 推演
+
+用 Prometheus 內建的 `promtool test rules` 機制做時間線推演。下面是兩個關鍵情境，從 t=0 到 t=2h 跑完。
+
+### 情境 1：正常維護換碟（30 分鐘）
+
+時間軸：
+
+```
+t=0       cluster HEALTH_OK，oncall 進去要換 cephnode-3 的 osd.5
+t=0:30    `ceph orch host maintenance enter cephnode-3` 下去
+t=0:30    mgr 立即丟 HOST_IN_MAINTENANCE health check，並對 cephnode-3 下 osd set-group noout
+t=0:30    OSD_FLAGS health check 也亮
+t=0:30    ceph:maintenance_active recording rule = 1
+t=5:30    cephnode-3 的 OSD 被標 down（heartbeat 失聯超過 mon_osd_down_out_subtree_limit_default 寬限）
+t=5:30    OSD_DOWN, OSD_HOST_DOWN health check 亮
+t=5:30    PGs 變 active+undersized — PG_DEGRADED 亮
+t=5:30    ceph_health_status 從 0 → 1
+t=30:00   oncall 換完碟、reboot 完，daemon 起回來
+t=30:30   OSD 自己 boot 起來、被 mon 標 in（noout 還在所以不會被 out，這也是 noout 的目的）
+t=33:00   PG 都 active+clean，health check 全清
+t=33:00   ceph orch host maintenance exit cephnode-3 → 自動 unset noout group
+t=33:00   ceph:maintenance_active = 0
+t=33:01   一切回歸 HEALTH_OK
+```
+
+每條 alert 的狀態：
+
+| Alert | t=0:30 | t=5:30 | t=20:00 | t=33:00 | t=33:01 | fire? |
+|---|---|---|---|---|---|---|
+| `CephHostInMaintenance` (T0) | active | active | active | clear | clear | info only |
+| `CephClusterRecovering` (T0) | pending | active | active | clear | clear | info only |
+| `CephHealthWarning` (T1) | gated | gated | gated | gated | clear | **不 fire** ✅ |
+| `CephOSDDown` (T1) | clear | gated | gated | gated | clear | **不 fire** ✅ |
+| `CephOSDHostDown` (T1) | clear | gated | gated | gated | clear | **不 fire** ✅ |
+| `CephPGsDegraded` (T1) | clear | gated | gated | gated | clear | **不 fire** ✅ |
+| `CephHealthError` (T3) | clear | clear | clear | clear | clear | 不 fire ✅ |
+| `CephOSDDownHigh` (T3) | clear | depends | depends | clear | clear | 取決於 host 上 OSD 數 |
+| `CephPGUnavailableBlockingIO` (T3) | clear | clear | clear | clear | clear | 不 fire ✅ |
+| `CephOSDFlagsSet` (T1) | clear | clear | clear | clear | clear | 不 fire ✅ |
+
+`CephOSDDownHigh` 是個特殊例：如果 cluster 只有 3 個 host 每台跑 8 顆 OSD，一台下線就是 33% 都 down，這條會 fire（嚴格上我們希望它 fire 提醒 cluster 容量縮減太多）。Tier 3 不 gate 是刻意的——但這條的 page-or-not 取決於 cluster 規模，5 個以上 host 的 cluster 才適合單獨 host 維護不被 page。
+
+### 情境 2：忘記 unset noout
+
+```
+t=0       cluster HEALTH_OK
+t=0:30    工程師急修：ceph osd set noout
+t=1:00    急修完成、cluster 恢復
+t=1:00    OSDMAP_FLAGS 一直亮（noout 沒清）
+t=1:00    HOST_IN_MAINTENANCE 沒亮（沒走 cephadm 路線）
+t=1:00    ceph:maintenance_active = 1（因為 OSDMAP_FLAGS）
+                — Tier 1 全部被 gate，沒人會被吵
+t=1:00 ~ 13:00   12 小時內什麼都沒有，Tier 1 看起來都 OK
+t=13:00   CephOSDFlagsSet 觸發 → page 白天 oncall
+                "Ceph 有 noout/noscrub 等 flag 已設超過 12h"
+t=13:00   工程師看到後 `ceph osd unset noout`
+t=13:01   全部回歸 HEALTH_OK
+```
+
+關鍵：**`CephOSDFlagsSet` 用 `unless ceph_health_detail{name="HOST_IN_MAINTENANCE"}`**，所以走 cephadm 路線的 noout 不會觸發這條（因為 HOST_IN_MAINTENANCE 同時也亮）。手動 `osd set noout` 的不會亮 HOST_IN_MAINTENANCE，就會被這條抓出來。
+
+### 情境 3：維護期間有第二顆碟掉
+
+最危險的場景。
+
+```
+t=0       cluster HEALTH_OK，3 副本，cephnode-3 進維護
+t=0:30    `ceph orch host maintenance enter cephnode-3`
+t=0:30    HOST_IN_MAINTENANCE / OSD_FLAGS 亮，ceph:maintenance_active = 1
+t=5:30    cephnode-3 上 OSD 全 down，PG 變 undersized (剩 2 副本)
+                — Tier 1 全部 gated，正確
+t=15:00   cephnode-1 的 osd.2 真的硬體壞掉 — 不是維護的
+t=15:05   PG 變成 active+undersized 但有些 PG 剩 1 副本（同 PG 兩個 OSD 都掛）
+t=20:00   PG_AVAILABILITY 開始亮（peering 中）
+                — Tier 3 `CephPGUnavailableBlockingIO` 用減法扣掉 OSD_DOWN，
+                  但因為 OSD_DOWN 一直是 1，PG_AVAILABILITY 也是 1，
+                  1 - 1 = 0，沒 fire ⚠️
+                — Tier 3 `CephPGActiveCountLow` 看 ceph_pg_active 比例，
+                  如果 inactive PG >= 5%，會 fire ✅
+t=20:00   Tier 2 `CephOSDTooManyRepairs` 可能亮（如果 osd.2 是先靜默壞）
+                — 沒 gate，page 出去 ✅
+t=20:00   Tier 3 `CephOSDDownHigh` 如果 >= 10% OSD down，fire ✅
+```
+
+設計通過的關鍵點：
+
+1. `CephOSDTooManyRepairs` 不 gate 維護期 → 抓得到第二顆碟訊號。
+2. `CephPGActiveCountLow` 直接看 PG state metric，不靠 health_detail 的減法 → 真的不可用時會 fire。
+3. `CephOSDDownHigh` 不 gate → 維護期掉太多碟還是會 page。
+
+### 用 promtool 跑 unit test
+
+把上面的時間線寫成 promtool test rules 的 YAML：
+
+```yaml
+# tests.yml
+rule_files:
+  - ./ceph-alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  - interval: 30s
+    name: "scenario 1: cephadm host maintenance"
+    input_series:
+      - series: 'ceph_health_status'
+        values: '0x60 1x60 0x10'   # 30min 0, 30min 1, 5min 0
+      - series: 'ceph_health_detail{name="HOST_IN_MAINTENANCE"}'
+        values: '0x60 1x66 0x4'
+      - series: 'ceph_health_detail{name="OSD_FLAGS"}'
+        values: '0x60 1x66 0x4'
+      - series: 'ceph_health_detail{name="OSD_DOWN"}'
+        values: '0x70 1x52 0x8'    # 5 分鐘後才 down
+      - series: 'ceph_health_detail{name="OSD_HOST_DOWN"}'
+        values: '0x70 1x52 0x8'
+      - series: 'ceph_health_detail{name="PG_DEGRADED"}'
+        values: '0x70 1x52 0x8'
+
+    alert_rule_test:
+      # 維護期間 (t=30min ~ t=63min) 所有 Tier 1 都應該沒 fire
+      - eval_time: 45m
+        alertname: CephHealthWarning
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CephOSDDown
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CephOSDHostDown
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CephPGsDegraded
+        exp_alerts: []
+      # 但 Tier 0 觀察 alert 應該 active
+      - eval_time: 45m
+        alertname: CephHostInMaintenance
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              tier: t0
+```
+
+跑：
+
+```bash
+promtool test rules tests.yml
+```
+
+預期輸出：
+
+```
+Unit Testing:  tests.yml
+  SUCCESS
+```
+
+## 實驗計畫
+
+### 環境準備
+
+我**自己環境**裡能跑 ceph 的方式有三條，由淺至深：
+
+| 方法 | 何時用 | 限制 |
+|---|---|---|
+| `promtool test rules` (純 unit test) | 驗 PromQL 邏輯 | 不會真的呼叫 ceph |
+| Rook in kind | 驗 metric 真的存在 | OSD 只能用 loopback device，不像真硬碟 |
+| Vagrant + cephadm (3 VM) | 完整驗 host maintenance 流程 | 慢、吃資源 |
+
+下面實驗計畫分階段。前 4 步可以在 kind / docker 完成，第 5 步才需要 3 VM。
+
+### Step 1 — promtool unit test
+
+```bash
+# 目錄結構
+ceph-alerts/
+  ceph-alerts.yml      # 我們上面寫的四層規則
+  tests.yml            # 三個情境的時間線
+
+cd ceph-alerts
+promtool check rules ceph-alerts.yml      # 先 lint
+promtool test rules tests.yml             # 跑時間線
+```
+
+驗證項：
+
+- [ ] 情境 1（30min 維護）：Tier 1 全部 0 fire
+- [ ] 情境 2（手動 noout 12h）：13h 時 `CephOSDFlagsSet` fire
+- [ ] 情境 3（維護期第二顆掉）：`CephOSDTooManyRepairs` + `CephPGActiveCountLow` fire
+
+### Step 2 — Rook in kind 拉一個迷你 cluster
+
+```bash
+kind create cluster --config kind-3node.yaml
+
+# 安裝 rook operator
+kubectl create -f https://raw.githubusercontent.com/rook/rook/v1.18.0/deploy/examples/crds.yaml
+kubectl create -f https://raw.githubusercontent.com/rook/rook/v1.18.0/deploy/examples/common.yaml
+kubectl create -f https://raw.githubusercontent.com/rook/rook/v1.18.0/deploy/examples/operator.yaml
+
+# 給每個 node 加 loopback device 當 OSD
+docker exec -it kind-worker fallocate -l 20G /var/lib/rook-osd.img
+docker exec -it kind-worker losetup /dev/loop0 /var/lib/rook-osd.img
+# worker2, worker3 同樣
+
+# 建 cluster
+kubectl create -f cluster-test.yaml
+
+# 確認 OSD 起來
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph -s
+```
+
+驗證項：
+
+- [ ] `ceph -s` 顯示 3 OSD up, in
+- [ ] `curl http://<mgr-pod>:9283/metrics | grep ceph_health_detail` 看得到 metric
+
+### Step 3 — 部署 Prometheus + 我們的 rules
+
+```bash
+# 用 kube-prometheus-stack
+helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+
+# 把我們的 rules 包成 PrometheusRule CR
+kubectl apply -f ceph-tier-alerts-prometheusrule.yaml
+```
+
+驗證項：
+
+- [ ] Prometheus UI > Status > Rules 看到我們四個 group
+- [ ] `ceph:maintenance_active` recording rule 在 ceph 正常時 = 0
+
+### Step 4 — 觸發情境 1：手動 noout
+
+```bash
+# 在 toolbox 裡
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph osd set noout
+
+# 等 30 秒讓 mgr/prometheus scrape
+sleep 30
+
+# 查 metric
+curl http://<prom-svc>/api/v1/query?query=ceph_health_detail{name=\"OSDMAP_FLAGS\"}
+# 應該 == 1
+
+curl http://<prom-svc>/api/v1/query?query=ceph:maintenance_active
+# 應該 == 1
+
+# 等 30 分鐘看 CephHealthWarning 有沒有 fire
+curl http://<prom-svc>/api/v1/alerts | jq '.data.alerts[] | select(.labels.alertname=="CephHealthWarning")'
+# 應該是空陣列
+
+# unset 並等 13h（或在 prom rules 把 12h 改成 5m 加快測）
+kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph osd unset noout
+```
+
+驗證項：
+
+- [ ] 設 noout 後 `ceph:maintenance_active` = 1
+- [ ] 30 分鐘內 Tier 1 沒有 alert fire
+- [ ] unset 後 `ceph:maintenance_active` = 0
+
+### Step 5 — 完整 cephadm host maintenance 流程（需要 VM）
+
+kind 沒有 cephadm，要真的驗 `ceph orch host maintenance enter` 行為需要：
+
+- 3 台 VM（Vagrant 或 Proxmox）跑 Ubuntu 22.04
+- 每台兩顆磁碟（一顆 OS、一顆 OSD）
+- 用 cephadm bootstrap
+
+```bash
+# bootstrap
+cephadm bootstrap --mon-ip 192.168.122.10
+
+# 加另外兩台
+ceph orch host add cephnode-2 192.168.122.11
+ceph orch host add cephnode-3 192.168.122.12
+
+# 拉 OSD daemon
+ceph orch apply osd --all-available-devices
+
+# 驗證 HEALTH_OK
+ceph -s
+
+# 真正觸發 host maintenance
+ceph orch host maintenance enter cephnode-3
+
+# 查 metric (從 Prometheus / curl mgr)
+curl http://192.168.122.10:9283/metrics | grep -E 'HOST_IN_MAINTENANCE|OSD_FLAGS|OSDMAP_FLAGS'
+```
+
+驗證項：
+
+- [ ] `ceph_health_detail{name="HOST_IN_MAINTENANCE"} == 1`
+- [ ] `ceph_health_detail{name="OSD_FLAGS"} == 1`（subtree noout）
+- [ ] `ceph_health_detail{name="OSDMAP_FLAGS"} == 0`（cluster-wide flag 沒設）
+- [ ] 等 6 分鐘後 `ceph_health_detail{name="OSD_DOWN"} == 1`
+- [ ] **整個過程 Tier 1 alert 都沒 fire**
+- [ ] `ceph orch host maintenance exit cephnode-3` 後所有 health check 30 秒內清零
+
+### Step 6 — Chaos test：維護期間掉第二顆
+
+最後一個壓力測試。**這步只在 step 5 環境完整跑通後才做**，會真的弄壞資料如果做錯了。
+
+```bash
+# 第一台進維護
+ceph orch host maintenance enter cephnode-3
+
+# 等 OSD 全 down
+sleep 360
+
+# 模擬 cephnode-1 上某顆 OSD 真的硬體壞 — 停掉 daemon (不要破壞檔案)
+systemctl stop ceph-osd@1
+
+# 觀察
+ceph health detail
+curl http://192.168.122.10:9283/metrics | grep PG_AVAILABILITY
+```
+
+驗證項：
+
+- [ ] `CephOSDDownHigh` fire（如果 >= 10% OSD down）
+- [ ] `CephOSDTooManyRepairs` 在 osd.1 開始走 read repair 時 fire
+- [ ] `CephPGActiveCountLow` 在有 PG 變 inactive 時 fire
+- [ ] Tier 1 仍然不 fire（被 maintenance gate）
+
+完成後：
+
+```bash
+systemctl start ceph-osd@1
+ceph orch host maintenance exit cephnode-3
+ceph -s   # 應該回到 HEALTH_OK
+```
+
+## 邊界與除錯
+
+### gate 失效的情況
+
+`ceph:maintenance_active` 依賴三個 health_detail series。如果 mgr/prometheus 模組掛掉，這三個 metric 都不會回 — Prometheus 看到的是「沒有 series」而不是「series == 0」。
+
+`unless on() (ceph:maintenance_active == 1)` 在 vector 不存在時的 semantics 是「不 unless 任何東西」，所以 Tier 1 會照樣 fire。**這在 mgr 掛掉時是對的**，因為這時候我們想被叫醒。
+
+但如果你想要更保險，可以加：
+
+```yaml
+- alert: CephMgrPrometheusModuleInactive
+  expr: up{job="ceph"} == 0
+  for: 1m
+  labels: { severity: critical, tier: t3 }
+```
+
+`CephMgrPrometheusModuleInactive` 跟 stock mixin 一樣（line 342），放 Tier 3。
+
+### `ceph osd add-noout osd.5`（單顆 OSD noout，不走 subtree）
+
+這個 case **不會** 觸發 `HOST_IN_MAINTENANCE`，但會觸發 `OSD_FLAGS`。我們的 gate 把 OSD_FLAGS 也算進去，所以單顆 OSD noout 也視為 maintenance，正確。
+
+但 `ceph osd add-noout` 是 per-OSD 操作，工程師很容易忘記 `rm-noout`。`CephOSDFlagsSet` 用 12h timeout 兜底。
+
+### 維護期遞迴/連續
+
+維護期裡又進另一個 host 維護（rolling reboot），`ceph:maintenance_active` 仍然 = 1，無問題。但要注意 `CephOSDDownHigh` 不 gate，rolling 期間如果 down 比例衝過 10% 還是會 fire — 這是刻意的，因為 rolling 滾太快本來就要小心。
+
+### alertmanager inhibit rules 配合
+
+光在 PromQL 端 gate 還不夠，建議在 alertmanager 也設 inhibit：
+
+```yaml
+inhibit_rules:
+  - source_match: { alertname: 'CephHostInMaintenance' }
+    target_match_re: { tier: 't1' }
+    equal: []   # 全 cluster level 抑制
+```
+
+這樣即使 PromQL 端有空窗（例如 mgr/prometheus 那 30s 沒抓到），alertmanager 端還能保兜底。
+
+## 接下來 / 相關頁面
+
+- [Ceph - Node flapping](./osd-flapping)：理解為什麼 maintenance 期間 OSD 會被 mark down/up 來回跳，以及 mon 的 laggy EMA 與 subtree_limit 怎麼擋
+- [Ceph - PG health states](./pg-health-states)：active/clean、degraded、undersized 等狀態跟 alert 名字的對應
+- [Ceph - osd ok-to-stop](./osd-ok-to-stop)：進維護前先用這個指令模擬，避免「進去才發現會掉資料」
+- [Ceph - MON clock skew](./mon-clock-skew-detection)：Tier 2 的 `CephMonClockSkew` 訊號從哪來
