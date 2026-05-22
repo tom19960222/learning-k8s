@@ -1,0 +1,433 @@
+---
+layout: doc
+title: Ceph — MON clock skew 超過 50ms 多久才會被抓到
+description: leader monitor 透過 timecheck round 對 quorum 內其他 mon 做 ping/pong，每次扣掉估計 latency 後算出 skew_bound；正常 5 分鐘一輪、進入 skew 狀態後縮短到 30 秒一輪；最壞情況下需要等到下一個 round 才會看到 MON_CLOCK_SKEW。
+---
+
+## 場景
+
+你的 3-node ceph cluster 跑在 3 台 bare-metal、各自一顆 SSD 跑 mon daemon。某天你不小心把其中一台的 chrony 指向錯誤的 NTP server，過幾分鐘那台 mon 的 system clock 慢慢漂出去 — 假設目前差了 70ms。
+
+問題：`ceph -s` 多久會冒出 `HEALTH_WARN clock skew detected on mon.X`？
+
+答案不是「立刻」也不是「等下次心跳」。ceph monitor 有一套自己的 timecheck 機制，跟 ntpd / Paxos lease 都不一樣。下面從 v19.2.3 原始碼追完整的偵測 path。
+
+## 三個 timer × 兩條警告路徑
+
+要回答「多久」必須先知道有幾個時鐘在跑：
+
+| Timer | 預設 | 觸發什麼 | 定義 |
+|---|---|---|---|
+| `mon_tick_interval` | 5s | `Monitor::tick()` → 各 PaxosService.tick()，包含 `HealthMonitor::tick()` | `mon.yaml.in:1314` |
+| `mon_timecheck_interval` | 300s (5 min) | leader 啟動一輪 timecheck（無 skew 時） | `mon.yaml.in:628` |
+| `mon_timecheck_skew_interval` | 30s | leader 啟動一輪 timecheck（已偵測到 skew 時，作為 backoff 基數） | `mon.yaml.in:639` |
+
+門檻只有一個：
+
+```yaml
+- name: mon_clock_drift_allowed
+  type: float
+  default: 0.05  # 50 milliseconds
+```
+
+File: `ceph/src/common/options/mon.yaml.in` (line 609)
+
+警告路徑有兩條，**完全獨立**：
+
+1. **timecheck round** — leader 主動 ping/pong，產生 `MON_CLOCK_SKEW` health check（這是 `ceph -s` 看到的那條）
+2. **Paxos `warn_on_future_time`** — 每收到一條未來時間的 lease 或 ack message 就可能寫一行 cluster log；只走 clog、不上 health check
+
+下面主要拆 timecheck round 這條，文末會帶到 Paxos 那條。
+
+## timecheck round：leader 是「the eye of the storm」
+
+機制本身是 leader-driven 的 ping/pong + Smoothed RTT。Header 的註解講得清楚：
+
+File: `ceph/src/mon/Monitor.h` (line 525)
+
+```cpp
+/**
+ * @defgroup Monitor_h_TimeCheck Monitor Clock Drift Early Warning System
+ * ...
+ * This mechanism works as follows:
+ *
+ *  - Leader sends out a 'PING' message to each other monitor in the quorum.
+ *    The message is timestamped with the leader's current time. The leader's
+ *    current time is recorded in a map, associated with each peon's
+ *    instance.
+ *  - The peon replies to the leader with a timestamped 'PONG' message.
+ *  - The leader calculates a delta between the peon's timestamp and its
+ *    current time and stashes it.
+ *  - The leader also calculates the time it took to receive the 'PONG'
+ *    since the 'PING' was sent, and stashes an approximate latency estimate.
+ *  - Once all the quorum members have pong'ed, the leader will share the
+ *    clock skew and latency maps with all the monitors in the quorum.
+ */
+```
+
+關鍵字：**leader 是參考點**。peon 的時間誤差是相對於 leader 算出來的，leader 自己的 skew 永遠是 0：
+
+File: `ceph/src/mon/Monitor.cc` (line 5042)
+
+```cpp
+// we are at the eye of the storm; the point of reference
+timecheck_skews[rank] = 0.0;
+timecheck_latencies[rank] = 0.0;
+```
+
+所以如果是 **leader 自己的 clock** 漂走，其他 peon 全部會被標 skew。如果是某顆 peon 漂走，只標那一顆。
+
+## 一輪 timecheck 的時序
+
+leader 進 quorum 後，`finish_election()` 之前會呼 `timecheck_start()`，這啟動了 timer：
+
+File: `ceph/src/mon/Monitor.cc` (line 2292)
+
+```cpp
+if (monmap->size() > 1 &&
+    monmap->get_epoch() > 0) {
+  timecheck_start();
+  health_tick_start();
+  ...
+```
+
+`timecheck_start()` → `timecheck_start_round()` 進入一輪，發出 PING：
+
+File: `ceph/src/mon/Monitor.cc` (line 5046)
+
+```cpp
+for (set<int>::iterator it = quorum.begin(); it != quorum.end(); ++it) {
+  if (monmap->get_name(*it) == name)
+    continue;
+
+  utime_t curr_time = ceph_clock_now();
+  timecheck_waiting[*it] = curr_time;
+  MTimeCheck2 *m = new MTimeCheck2(MTimeCheck2::OP_PING);
+  m->epoch = get_epoch();
+  m->round = timecheck_round;
+  ...
+  send_mon_message(m, *it);
+}
+```
+
+每個 peon 收到 PING → 回 PONG，PONG 裡帶自己的 `timestamp = ceph_clock_now()`。leader 收 PONG 進 `handle_timecheck_leader()`。
+
+## 偵測核心：skew_bound 的算法
+
+leader 收到 PONG 後做兩件事：算 latency、算 skew_bound。
+
+File: `ceph/src/mon/Monitor.cc` (line 5101)
+
+```cpp
+utime_t curr_time = ceph_clock_now();
+
+ceph_assert(timecheck_waiting.count(other) > 0);
+utime_t timecheck_sent = timecheck_waiting[other];
+timecheck_waiting.erase(other);
+if (curr_time < timecheck_sent) {
+  // our clock was readjusted -- drop everything until it all makes sense.
+  dout(1) << __func__ << " our clock was readjusted --"
+          << " bump round and drop current check"
+          << dendl;
+  timecheck_cancel_round();
+  return;
+}
+
+/* update peer latencies */
+double latency = (double)(curr_time - timecheck_sent);
+
+if (timecheck_latencies.count(other) == 0)
+  timecheck_latencies[other] = latency;
+else {
+  double avg_latency = ((timecheck_latencies[other]*0.8)+(latency*0.2));
+  timecheck_latencies[other] = avg_latency;
+}
+```
+
+latency 是 EWMA — 80% 舊值 + 20% 新值，所以網路抖動不會立刻翻轉判斷。
+
+接著算 skew_bound：
+
+File: `ceph/src/mon/Monitor.cc` (line 5164)
+
+```cpp
+double delta = ((double) m->timestamp) - ((double) curr_time);
+double abs_delta = (delta > 0 ? delta : -delta);
+double skew_bound = abs_delta - latency;
+if (skew_bound < 0)
+  skew_bound = 0;
+else if (delta < 0)
+  skew_bound = -skew_bound;
+```
+
+公式翻譯成白話：
+
+| 量 | 含義 |
+|---|---|
+| `delta` | peon 戳記時間 − leader 收到時的時間（正：peon 走得快；負：peon 走得慢） |
+| `latency` | leader 從 PING 發出到 PONG 收到的時間（用 EWMA 抹平） |
+| `abs_delta - latency` | 扣掉「能用 RTT 解釋」的部分後，剩下的「真實偏移下界」 |
+
+| 情況 | skew_bound |
+|---|---|
+| `abs_delta ≤ latency`（外觀的偏移可以完全用 RTT 解釋） | `0`（不算 skew） |
+| `abs_delta > latency` 且 peon 快 | `+ (abs_delta - latency)` |
+| `abs_delta > latency` 且 peon 慢 | `- (abs_delta - latency)` |
+
+注意：因為 latency 是被扣掉的，**RTT 越高、判定門檻越寬**。實務上 mon 跨 rack 部署、RTT 1~5ms 時，50ms 的真實偏移會被算成大約 45~49ms 的 skew_bound，仍可觸發 warn。但若 RTT 已經 > 50ms（例如跨城市），50ms 真實偏移會被「latency 吸收」、不報。
+
+判定就一行：
+
+File: `ceph/src/mon/Monitor.h` (line 592)
+
+```cpp
+bool timecheck_has_skew(const double skew_bound, double *abs) const {
+  double abs_skew = std::fabs(skew_bound);
+  if (abs)
+    *abs = abs_skew;
+  return (abs_skew > g_conf()->mon_clock_drift_allowed);
+}
+```
+
+`> 0.05`（嚴格大於）即視為 skew。
+
+## 一輪結束後的兩個動作：report + check_skews
+
+當所有 peon 都 ack 過，`timecheck_finish_round()` 呼 `timecheck_report()` 與 `timecheck_check_skews()`：
+
+File: `ceph/src/mon/Monitor.cc` (line 4885)
+
+```cpp
+if (success) {
+  ceph_assert(timecheck_waiting.empty());
+  ceph_assert(timecheck_acks == quorum.size());
+  timecheck_report();
+  timecheck_check_skews();
+  return;
+}
+```
+
+`timecheck_report()` 把這輪結果（skew + latency 兩個 map）廣播給所有 peon — 讓 peon 也知道自己被算成多偏（peon 上看到 `ceph time-sync-status` 才有資料）。
+
+`timecheck_check_skews()` 才是決定下一輪節奏：
+
+File: `ceph/src/mon/Monitor.cc` (line 4951)
+
+```cpp
+bool found_skew = false;
+for (auto& p : timecheck_skews) {
+  double abs_skew;
+  if (timecheck_has_skew(p.second, &abs_skew)) {
+    found_skew = true;
+  }
+}
+
+if (found_skew) {
+  ++timecheck_rounds_since_clean;
+  timecheck_reset_event();
+} else if (timecheck_rounds_since_clean > 0) {
+  // make sure the skews are really gone and not just a transient success
+  timecheck_rounds_since_clean = 1;
+  timecheck_reset_event();
+  timecheck_rounds_since_clean = 0;
+}
+```
+
+`timecheck_rounds_since_clean` 是這個系統的「警戒等級」：
+
+File: `ceph/src/mon/Monitor.cc` (line 4926)
+
+```cpp
+double delay =
+  cct->_conf->mon_timecheck_skew_interval * timecheck_rounds_since_clean;
+
+if (delay <= 0 || delay > cct->_conf->mon_timecheck_interval) {
+  delay = cct->_conf->mon_timecheck_interval;
+}
+```
+
+所以 backoff schedule 是：
+
+| 連續偵測到 skew 的第 N 輪 | 下一輪間隔 |
+|---|---|
+| 0（正常） | 300s = `mon_timecheck_interval` |
+| 1 | 30s = `mon_timecheck_skew_interval × 1` |
+| 2 | 60s |
+| 3 | 90s |
+| ... | `30 × N`，capped at 300s |
+| 10 起 | 300s（封頂） |
+
+當 skew 消失，`timecheck_rounds_since_clean` 重置回 0，下一輪間隔回到 300s。
+
+## 多久才偵測到？
+
+把上述拼起來，從「clock 漂出 50ms」到「`ceph -s` 顯示 `MON_CLOCK_SKEW`」的延遲：
+
+```
+                  漂超過 50ms 那一刻
+                          │
+                          │  ① 等下一輪 timecheck 觸發
+                          │     正常 cluster：0~300 秒 (avg 150s)
+                          │     已知 skew：0~30 秒
+                          ▼
+              leader 發 PING、收 PONG、算 skew_bound
+                          │
+                          │  ② round latency（≤ RTT × N peon），常小於 100ms
+                          ▼
+            timecheck_check_skews() 寫入 timecheck_skews[]
+                          │
+                          │  ③ 等 Monitor::tick() 跑 PaxosService.tick()
+                          │     mon_tick_interval = 5s（0~5s）
+                          ▼
+          HealthMonitor::tick() → check_leader_health()
+                          │
+                          │  check_for_clock_skew() 讀 timecheck_skews
+                          │  加入 MON_CLOCK_SKEW health check
+                          ▼
+                          propose_pending()
+                          │
+                          ▼
+                  ceph -s 顯示 HEALTH_WARN
+```
+
+幾個常見情境的數字（這裡的「等」假設你剛好錯過某輪、要等下一輪）：
+
+| 情境 | 上一輪剛跑完 | 上一輪是 30s 前 | 平均 |
+|---|---|---|---|
+| 健康 cluster 突然漂 70ms | 0~300s + 5s | 0~300s + 5s | 約 2.5 分鐘 |
+| 已在 skew 中又漂大一些 | 0~30s + 5s | 0~30s + 5s | 約 15 秒 |
+| 真實偏移 70ms 但跨 WAN RTT 100ms | **可能永遠不報**（latency 吸收 abs_delta） | — | — |
+
+最壞情況：cluster 健康、剛好在新一輪剛開始時漂掉、整個 RTT 抖動很小 → 接近 `mon_timecheck_interval` 上限 305 秒（5 分鐘 + tick）才看得到。
+
+## health check 怎麼變成 `ceph -s` 那行字
+
+leader 的 `HealthMonitor::tick()` 每 5 秒跑一次（由 `Monitor::tick()` iterate paxos_service 觸發）：
+
+File: `ceph/src/mon/HealthMonitor.cc` (line 378)
+
+```cpp
+void HealthMonitor::tick()
+{
+  if (!is_active()) {
+    return;
+  }
+  bool changed = false;
+  if (check_member_health()) {
+    changed = true;
+  }
+  if (!mon.is_leader()) {
+    return;
+  }
+  if (check_leader_health()) {
+    changed = true;
+  }
+  ...
+```
+
+只有 leader 會跑 `check_leader_health()`，裡面呼到 `check_for_clock_skew()`：
+
+File: `ceph/src/mon/HealthMonitor.cc` (line 834)
+
+```cpp
+void HealthMonitor::check_for_clock_skew(health_check_map_t *checks)
+{
+  if (!mon.timecheck_skews.empty()) {
+    list<string> warns;
+    list<string> details;
+    for (auto& i : mon.timecheck_skews) {
+      double skew = i.second;
+      double latency = mon.timecheck_latencies[i.first];
+      string name = mon.monmap->get_name(i.first);
+      ostringstream tcss;
+      health_status_t tcstatus = mon.timecheck_status(tcss, skew, latency);
+      if (tcstatus != HEALTH_OK) {
+        warns.push_back(name);
+        ...
+      }
+    }
+    if (!warns.empty()) {
+      ostringstream ss;
+      ss << "clock skew detected on";
+      ...
+      auto& d = checks->add("MON_CLOCK_SKEW", HEALTH_WARN, ss.str(), details.size());
+      d.detail.swap(details);
+    }
+  }
+}
+```
+
+`MON_CLOCK_SKEW` 是固定的 health check key，severity 永遠是 `HEALTH_WARN` — 不會升到 `HEALTH_ERR`。即使你的 mon 偏移 5 秒，這條也只是 WARN。
+
+## 第二條警告路徑：Paxos `warn_on_future_time`
+
+完全獨立於 timecheck — Paxos 每處理一條 lease 或 lease ack message 都會檢查 timestamp：
+
+File: `ceph/src/mon/Paxos.cc` (line 1025)
+
+```cpp
+void Paxos::warn_on_future_time(utime_t t, entity_name_t from)
+{
+  utime_t now = ceph_clock_now();
+  if (t > now) {
+    utime_t diff = t - now;
+    if (diff > g_conf()->mon_clock_drift_allowed) {
+      utime_t warn_diff = now - last_clock_drift_warn;
+      if (warn_diff >
+          pow(g_conf()->mon_clock_drift_warn_backoff, clock_drift_warned)) {
+        mon.clog->warn() << "message from " << from << " was stamped " << diff
+                         << "s in the future, clocks not synchronized";
+        last_clock_drift_warn = ceph_clock_now();
+        ++clock_drift_warned;
+      }
+    }
+  }
+}
+```
+
+呼叫點是 lease 與 lease ack 處理（同檔 line 1115 / 1188）。特色：
+
+- **單向偵測**：只看「對方戳了未來時間」（`t > now`），對方戳過去時間不報
+- **指數 backoff**：`warn_backoff^clock_drift_warned` 秒；`mon_clock_drift_warn_backoff` 預設 5，所以 1 秒、5 秒、25 秒、125 秒 …
+- **不上 health check**：只寫 cluster log（`mon.clog->warn()`）
+- **完全 reactive**：依賴 lease/ack 訊息流量，沒有獨立 timer
+
+這條的價值是 lease 在 ms 等級觸發，所以**它通常會比 timecheck round 先告警**（出現在 `ceph log last cluster | grep "future"`）；但因為不掛 health check，自動化監控系統如果只看 `ceph -s` JSON 不會抓到。
+
+## 邊界與除錯
+
+幾個會讓人困惑的點：
+
+**leader 自己漂走 → 全部 peon 都標 skew**：因為 `timecheck_skews[rank] = 0.0` 永遠以 leader 為基準。實務上 `ceph time-sync-status` 看不出來「誰才是真的錯」，需要對照外部 NTP source。
+
+**剛 election 完一段時間沒 warn**：`timecheck_start()` 是在每次 election 後啟動，第一輪要等到 `mon_timecheck_interval`（5 分鐘）才跑。剛重啟過的 cluster + 短時間內漂掉 → 偵測會慢。
+
+**單 mon cluster 不會跑 timecheck**：
+
+```cpp
+if (monmap->size() == 1) {
+  ceph_abort_msg("We are alone; this shouldn't have been scheduled!");
+  return;
+}
+```
+
+開發 / lab 用單 mon 環境不會看到這條 health check。
+
+**clock 被往回調**：leader 在 `handle_timecheck_leader` 開頭擋掉 `curr_time < timecheck_sent` 的 case，整輪 cancel 重新來。如果你在 mon 上手動 `date -s` 往回調，會看到 round counter 一直被 cancel、出現連續 skew detection。
+
+<Callout type="warning" title="NTP 不在 ceph 自己的責任範圍">
+  ceph 只**偵測** clock 偏移、不**修正**它。要避免警告，operator 必須在 mon node 上跑 ntpd / chrony / systemd-timesyncd，並保證每台 mon 都指向同一個 stratum source。kubernetes/rook 部署時若使用 host network 跑 mon、host clock 通常由 node 的 kubelet host 決定；KubeVirt VM 環境裡 VM clock 由 hypervisor 給，跨 hypervisor live migrate 後可能瞬間漂。
+</Callout>
+
+<Callout type="tip" title="想加快偵測？調這兩個 knob">
+  - `ceph config set mon mon_timecheck_interval 60` — 把正常輪降到 60 秒，最壞延遲變 ≈ 1 分鐘（但每分鐘 quorum 內就會多一輪 ping/pong，loaded cluster 上會增加 mon 上的 work）
+  - `ceph config set mon mon_clock_drift_allowed 0.02` — 門檻降到 20ms。RTT 通常 ~1ms 的內網 cluster 可接受；跨 WAN 不要這樣設，會 false positive
+</Callout>
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — 整體架構](./architecture) — MON Paxos quorum 是 timecheck 跑得起來的前提；leader / peon 角色定義
+  - [Ceph — osd ok-to-stop 在原始碼裡檢查了什麼](./osd-ok-to-stop) — 同樣是 mgr / mon 「不停的 background 檢查」模式，但目標不同
+  - [Ceph — Node flapping](./osd-flapping) — Monitor::tick 的另一條路徑：MON 的 failure_info 也是 tick-driven 的
+</Callout>
