@@ -1,0 +1,471 @@
+---
+layout: doc
+title: systemd-timesyncd — poll interval 怎麼從 2048s 變回 32s
+description: 從 src/timesync/timesyncd-manager.c 的 manager_adjust_poll 拆出 NTP query 間隔的四條決策路徑：poll_resync 直接回 min、偏移 > 0.2s 直接回 min、偏移 < 0.05s ×2 變慢、spike 或偏移 > 0.15s ÷2 變快、0.05~0.15s 死區。從預設 max 2048s 因為自然 ÷2 路徑要 6 輪、總計 64.5 分鐘才回到 min；如果外部跳鐘 (poll_resync = true) 一次回 min 32s。
+---
+
+## 場景
+
+跑著好好的 ceph cluster，平常 `timedatectl timesync-status` 顯示 `Poll interval: 34min 8s (max: 34min 8s)`，所有 mon 都在 max。某天網路一抖：
+
+```
+Poll interval: 32s (min: 32s)
+```
+
+突然變成 64 倍頻率。問題：
+
+1. **timesyncd 在什麼情況下會調整 poll interval？**
+2. 從預設 max **2048 秒**（≈ 34 分鐘）回到 32 秒，是一步到位還是逐步往下？經過幾輪？
+3. 我可以主動觸發「立刻變高頻」嗎？
+
+這頁從 v260.1 原始碼把 `manager_adjust_poll` 一支函式拆透。
+
+## 兩個常數先記住
+
+File: `systemd/src/timesync/timesyncd-manager.h` (line 14)
+
+```c
+#define NTP_POLL_INTERVAL_MIN_USEC      (32 * USEC_PER_SEC)
+#define NTP_POLL_INTERVAL_MAX_USEC      (2048 * USEC_PER_SEC)
+```
+
+預設下限 32 秒、上限 2048 秒（≈ 34 min 8s）。中間都是 2 的次方倍數：32, 64, 128, 256, 512, 1024, 2048 — 共 7 個 step。
+
+決策門檻：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 44)
+
+```c
+/* Expected accuracy of time synchronization; used to adjust the poll interval */
+#define NTP_ACCURACY_SEC                0.2
+```
+
+這個 0.2 秒不是「ceph 可容忍多少」，而是 **timesyncd 對 NTP server 的回應「期望精度」**。所有 poll interval 的調整都以這個數字當基準。
+
+## TL;DR — 四條決策路徑
+
+每收到一封 NTP 回應，timesyncd 都會跑一次 `manager_adjust_poll(m, offset, spike)`。內部按順序檢查四個條件，**先匹配的決定動作**：
+
+| 條件 | 動作 | 下一輪間隔 |
+|---|---|---|
+| `m->poll_resync == true`（外部 process 改了 wall clock） | 直接設成 min | 32s（一次到底） |
+| `!spike && |offset| > 0.2s` | 直接設成 min | 32s（一次到底） |
+| `|offset| < 0.05s`（= 0.2 × 0.25） | 間隔 ×2 | 慢慢變稀 |
+| `spike || |offset| > 0.15s`（= 0.2 × 0.75） | 間隔 ÷2 | 變快一倍 |
+| 都沒匹配（`0.05s ≤ |offset| ≤ 0.15s`、不是 spike） | **不動** | 維持 |
+
+注意 **中間有一段 0.05~0.15 秒的「死區」**：偏移落在這個範圍 timesyncd 認為「已經夠準了、不需要更頻繁、但也別變稀」。這個區段才是穩定 cluster 應該長期待著的地方。
+
+## manager_adjust_poll 整段拆解
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 364)
+
+```c
+static void manager_adjust_poll(Manager *m, double offset, bool spike) {
+        assert(m);
+
+        if (m->poll_resync) {
+                m->poll_interval_usec = m->poll_interval_min_usec;
+                m->poll_resync = false;
+                return;
+        }
+
+        /* set to minimal poll interval */
+        if (!spike && fabs(offset) > NTP_ACCURACY_SEC) {
+                m->poll_interval_usec = m->poll_interval_min_usec;
+                return;
+        }
+
+        /* increase polling interval */
+        if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) {
+                if (m->poll_interval_usec < m->poll_interval_max_usec)
+                        m->poll_interval_usec *= 2;
+                return;
+        }
+
+        /* decrease polling interval */
+        if (spike || fabs(offset) > NTP_ACCURACY_SEC * 0.75) {
+                if (m->poll_interval_usec > m->poll_interval_min_usec)
+                        m->poll_interval_usec /= 2;
+                return;
+        }
+}
+```
+
+四個 branch，每個 branch 都 `return` — 不會 fall-through。讀的時候照順序看就行。
+
+### Branch 1：`poll_resync == true` → 直接 min
+
+`poll_resync` 是個 flag，**只有一個地方會設成 true**：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 206)
+
+```c
+static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        /* rearm timer */
+        manager_clock_watch_setup(m);
+
+        /* skip our own jumps */
+        if (m->jumped) {
+                m->jumped = false;
+                return 0;
+        }
+
+        /* resync */
+        log_debug("System time changed. Resyncing.");
+        m->poll_resync = true;
+
+        return manager_send_request(m);
+}
+```
+
+也就是**外部 process 改了 `CLOCK_REALTIME`**：
+
+- 另一個 NTP daemon（chrony）也在跑、做了 jump
+- `date -s` 手動改時間
+- KubeVirt VM live migrate 到另一台 hypervisor、guest clock 被 host 重置
+- 任何 process 對 `CLOCK_REALTIME` 呼叫 `clock_settime` 或 `clock_adjtime(ADJ_SETOFFSET)`
+
+`m->jumped` 是 daemon 自己 jump 的標記（[參見 restart 那一頁](./timesyncd-restart-impact)），避免自己造成的跳鐘觸發 resync。其他人造成的跳鐘 → `poll_resync = true` → 立刻發 NTP request 重新同步、下一輪 adjust_poll 把 interval 設成 min。
+
+**這條是「最直接的 shrink」**：從 2048 秒直接掉到 32 秒，不分步。
+
+### Branch 2：偏移 > 0.2 秒（且非 spike）→ 直接 min
+
+```c
+if (!spike && fabs(offset) > NTP_ACCURACY_SEC) {
+        m->poll_interval_usec = m->poll_interval_min_usec;
+        return;
+}
+```
+
+NTP server 回了一個跟我們現在 clock 差超過 200ms 的時間，**而且 spike detection 認為這不是雜訊**。語意：我們的 clock 真的歪了，要密集 sync 才能拉回來。
+
+也是一次到底、min。
+
+注意 `!spike` 這個條件 — spike 走別的 branch（Branch 4）。
+
+### Branch 3：偏移 < 0.05 秒 → ×2 變稀
+
+```c
+if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) {
+        if (m->poll_interval_usec < m->poll_interval_max_usec)
+                m->poll_interval_usec *= 2;
+        return;
+}
+```
+
+`NTP_ACCURACY_SEC * 0.25 = 0.05 秒`。偏移小於 50ms → 我們很準了 → 把 poll 間隔翻倍（但不超過 max）。
+
+這是穩定 cluster 平常會走的路徑。每次 NTP 回應都偏移 < 50ms → 每次 ×2 → 7 輪後從 32 秒爬到 2048 秒。
+
+### Branch 4：spike 或偏移 > 0.15 秒 → ÷2 變快
+
+```c
+if (spike || fabs(offset) > NTP_ACCURACY_SEC * 0.75) {
+        if (m->poll_interval_usec > m->poll_interval_min_usec)
+                m->poll_interval_usec /= 2;
+        return;
+}
+```
+
+`NTP_ACCURACY_SEC * 0.75 = 0.15 秒`。兩種情況之一觸發：
+
+- 偏移在 0.15 ~ 0.2 秒之間（再大就走 Branch 2 一次到底）
+- 被 spike detection 判定為 spike
+
+把 interval ÷2（但不低於 min）。**這條是「逐步 shrink」**：從 2048 → 1024 → 512 → ... → 32 要 6 步。
+
+### 死區：0.05 ~ 0.15 秒
+
+四個 branch 都不匹配時、函式什麼都不做、`poll_interval_usec` 保持。發生條件：
+
+```
+not spike AND
+0.05s ≤ |offset| ≤ 0.15s
+```
+
+語意：「不夠準到值得放慢、也沒糟到值得加密」。穩態運作的 cluster 大部分時間在這裡。
+
+## 「從 2048 秒回到 32 秒」需要多久
+
+兩條路徑時間差很大：
+
+### 路徑 A：自然 ÷2（Branch 4 連鎖）
+
+每輪 poll 結束才能呼一次 adjust_poll，每輪間隔就是當下的 `poll_interval_usec`。所以 ÷2 連鎖的時間是：
+
+| 步 | 動作前 interval | 動作後 | 累積等待時間 |
+|---|---|---|---|
+| 第 1 步 | 2048s | 1024s | 2048s |
+| 第 2 步 | 1024s | 512s | 3072s |
+| 第 3 步 | 512s | 256s | 3584s |
+| 第 4 步 | 256s | 128s | 3840s |
+| 第 5 步 | 128s | 64s | 3968s |
+| 第 6 步 | 64s | 32s | 4032s |
+
+**總計 6 步、4032 秒 ≈ 67 分鐘**才從 2048s 一路降到 32s。
+
+而且這個降階是「條件持續滿足」的前提下。實務上偏移走著走著就會掉到死區甚至 < 0.05s 區、然後改走 Branch 3 ×2 反彈回去。
+
+### 路徑 B：偏移超過 0.2s（Branch 2）
+
+第一次 NTP 回應就把偏移帶回來、超過 0.2s → 直接 min。**1 步、最壞 2048 秒等下一個 poll**。
+
+如果還在 2048 秒週期裡、剛同步完還沒到下次 poll，要等到下次 poll 才生效（除非觸發 Branch 1 立刻 resync）。
+
+### 路徑 C：外部跳鐘（Branch 1）
+
+`poll_resync = true` 設定後 `manager_clock_watch` **立刻呼 `manager_send_request(m)`**（不等 timer）。這封新 NTP 回應一回來、`adjust_poll` 命中 Branch 1、設成 min。
+
+**1 步、毫秒到秒級**（網路 RTT 級）。
+
+## spike detection — Branch 4 的另一條觸發
+
+`spike` 不是時間「跳」的意思，是統計學「異常 sample」的意思。
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 311)
+
+```c
+static bool manager_sample_spike_detection(Manager *m, double offset, double delay) {
+        unsigned i, idx_cur, idx_new, idx_min;
+        double jitter;
+        double j;
+
+        m->packet_count++;
+
+        /* ignore initial sample */
+        if (m->packet_count == 1)
+                return false;
+
+        /* store the current data in our samples array */
+        idx_cur = m->samples_idx;
+        idx_new = (idx_cur + 1) % ELEMENTSOF(m->samples);
+        m->samples_idx = idx_new;
+        m->samples[idx_new].offset = offset;
+        m->samples[idx_new].delay = delay;
+
+        /* calculate new jitter value from the RMS differences relative to the lowest delay sample */
+        jitter = m->samples_jitter;
+        for (idx_min = idx_cur, i = 0; i < ELEMENTSOF(m->samples); i++)
+                if (m->samples[i].delay > 0 && m->samples[i].delay < m->samples[idx_min].delay)
+                        idx_min = i;
+
+        j = 0;
+        FOREACH_ELEMENT(sample, m->samples)
+                j += pow(sample->offset - m->samples[idx_min].offset, 2);
+
+        size_t n = ELEMENTSOF(m->samples);
+        m->samples_jitter = sqrt(j / (n - 1));
+
+        /* ignore samples when resyncing */
+        if (m->poll_resync)
+                return false;
+
+        /* always accept offset if we are farther off than the round-trip delay */
+        if (fabs(offset) > delay)
+                return false;
+
+        /* we need a few samples before looking at them */
+        if (m->packet_count < 4)
+                return false;
+
+        /* do not accept anything worse than the maximum possible error of the best sample */
+        if (fabs(offset) > m->samples[idx_min].delay)
+                return true;
+
+        /* compare the difference between the current offset to the previous offset and jitter */
+        return fabs(offset - m->samples[idx_cur].offset) > 3 * jitter;
+}
+```
+
+維護 8 筆 sample（`samples[8]`，`timesyncd-manager.h:75`），記錄 `offset` 跟 `delay`。每筆新進來算一次：
+
+1. **`packet_count < 4`** → 不算 spike（取樣不夠）。
+2. **`|offset| > delay`** → 不算 spike（偏移比 RTT 還大、很可能是真的歪了，不是 jitter）。
+3. **`|offset| > samples[idx_min].delay`** → 是 spike（這筆 offset 比最佳 sample 的 delay 還大，當異常）。
+4. **`|offset - prev_offset| > 3 × jitter`** → 是 spike（這筆跟上一筆差距超過 3σ）。
+
+被判 spike 的 sample：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 573)
+
+```c
+if (!spike) {
+        /* Fix up our idea of the time. */
+        dts.realtime = (usec_t) (dts.realtime + offset * USEC_PER_SEC);
+
+        r = manager_adjust_clock(m, offset, leap_sec);
+        ...
+}
+```
+
+被判 spike 就 **完全跳過 `manager_adjust_clock`** — 不會調 wall clock。但 **`manager_adjust_poll` 還是會被呼到**（line 535 在 spike detection 之後、condition check 之前），所以 spike → Branch 4 → 把 poll interval ÷2 縮小。語意：「這筆我不信、再來一封看看」。
+
+連續被 spike 的場景（網路 jitter 大），poll 會持續 ÷2 直到 min 32s。
+
+## TL;DR 二輪 — 整理所有「會 shrink」的條件
+
+| 觸發 | 哪個 branch | 結果 | 速度 |
+|---|---|---|---|
+| 別人改了 `CLOCK_REALTIME` (例如 chrony、`date -s`、VM live migrate) | 1 | 立即 min | 毫秒到秒級 |
+| NTP 回應偏移 > 0.2 秒 | 2 | 立即 min | 等到下個 poll |
+| NTP 回應 spike OR 偏移 0.15~0.2 秒 | 4 | ÷2 | 一輪一步、最壞 67 min 到 min |
+| daemon 啟動跳鐘 (`load_clock_timestamp`) | 不觸發 adjust_poll | 不變 | — |
+| timesyncd 自己 jump (offset ≥ 0.4 秒走 `ADJ_SETOFFSET`) | 不觸發 Branch 1（`m->jumped` 擋住） | 看當輪 offset → Branch 2 | 一輪到 min |
+| `systemctl reload systemd-timesyncd` | 不重置 | 維持當下 interval | — |
+| 切換 NTP server (`manager_set_server_name`) | 不重置 interval | 沿用當下 interval | — |
+| 連線 timeout、選下一台 server | 不重置 interval | 沿用 | — |
+| servers exhausted | 反而 ×2 增加 | 變慢 | — |
+
+最後一條值得特別注意：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 851)
+
+```c
+if (restart && !m->exhausted_servers && m->poll_interval_usec > 0) {
+        log_debug("Waiting after exhausting servers.");
+        r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME,
+                                       m->poll_interval_usec, 0, manager_retry_connect, m);
+        ...
+        m->exhausted_servers = true;
+
+        /* Increase the polling interval */
+        if (m->poll_interval_usec < m->poll_interval_max_usec)
+                m->poll_interval_usec *= 2;
+
+        return 0;
+}
+```
+
+**所有 NTP server 都連不上**時、timesyncd 反而會 ×2 拉長重試間隔。設計是 backoff、避免一直打不通的 server group 被打爆。但這也代表「網路斷了又回來」這個常見情境裡，poll interval 會偏高，可能要等真正收到回應後 Branch 1/2/4 才把它拉回來。
+
+## 怎麼觀察當下的 poll interval
+
+### 方法 A：`timedatectl timesync-status`
+
+```bash
+$ timedatectl timesync-status
+       Server: 169.254.169.123 (ntp.local)
+Poll interval: 34min 8s (min: 32s; max 34min 8s)
+       Packet count: 12345
+        Frequency: -1.234 ppm
+```
+
+這個顯示永遠 round 到秒。`Frequency` 是 PLL 學到的 ppm drift。
+
+### 方法 B：把 log level 拉到 debug
+
+[參見 log-anatomy 那一頁](./timesyncd-log-anatomy)。debug 開了以後，每次 poll 結束會印：
+
+```
+interval/delta/delay/jitter/drift 32s/+0.001s/0.005s/0.012s/-1.234ppm
+```
+
+（這條 log 在 `timesyncd-manager.c:595`）
+
+看 `interval` 那個欄位就是下次 poll 等多久。
+
+## 怎麼手動觸發「立刻變高頻」
+
+### 方法 A：踩 Branch 1 — 改 wall clock
+
+```bash
+sudo date -s "$(date)"   # 設成現在時間（等於沒改、但會觸發 settimeofday）
+```
+
+但 systemd 預設的 `clock-set` mechanism 不一定會走 `clock_settime` — 視 distro 而定。比較可靠的方式：
+
+```bash
+sudo bash -c 'date +%s | xargs -I{} echo "Setting to now()"; clock_settime CLOCK_REALTIME ...'
+```
+
+實務上不建議這樣搞 — 改了真實時間會踩到別的子系統。
+
+### 方法 B：重啟 daemon
+
+```bash
+sudo systemctl restart systemd-timesyncd
+```
+
+[參見 restart 那一頁](./timesyncd-restart-impact)：daemon 重啟後 `poll_interval_usec` 從 `Manager.poll_interval_min_usec`（32s）開始（`timesyncd-manager.c:686` 的初始化條件 `if (m->poll_interval_usec == 0)`）。重啟那一輪會用 32s 等待第一封 NTP 回應、然後 Branch 3 / Branch 4 / 死區開始作用。
+
+對 ceph cluster 來說這是最安全的方式 — 不會像改 wall clock 那樣污染其他 daemon。但會 trigger restart 本身的跳鐘風險（[那一頁](./timesyncd-restart-impact)）。
+
+### 方法 C：改 `PollIntervalMaxSec=` 設定值（半永久）
+
+`/etc/systemd/timesyncd.conf`：
+
+```ini
+[Time]
+PollIntervalMinSec=16
+PollIntervalMaxSec=512
+```
+
+File: `systemd/src/timesync/timesyncd-gperf.gperf`（gperf-generated parser）對應 `Manager.poll_interval_min_usec` / `Manager.poll_interval_max_usec`。
+
+改完 `systemctl restart systemd-timesyncd`。從此 max 是 512s。**注意**：這是改上限、不是強制現在就 32s。
+
+### 方法 D：spike + ÷2 連鎖（不會手動觸發）
+
+實務上不會主動觸發 spike — 它是網路狀況觸發的。但對運維有意義：**有 packet loss / jitter 的網路會自動往 min 收斂**，反過來也表示 `timedatectl` 看到 poll = 32s 是個訊號，代表這段時間網路或時鐘有持續抖動。
+
+## 對 ceph mon 的具體意涵
+
+對應 [ceph clock skew 那一頁](/ceph/mon-clock-skew-detection)：
+
+- mon 上 timesyncd 從 2048s 變成 32s 是個 **網路或時鐘異常的早期訊號**，比 ceph 自己的 timecheck round（5 分鐘）反應更快。
+- 反過來如果一台 mon 持續維持 max 2048s、另一台一直在 32s，差異本身就是個 host-level 問題訊號（後者那台網路或時鐘有問題）。
+- Prometheus 想抓這個訊號要走 `org.freedesktop.timesync1` D-Bus（或解析 `timedatectl` 輸出）— mgr/prometheus 沒有現成 exporter。
+
+## 邊界與容易踩坑
+
+### `Manager.poll_interval_usec` 在重啟時不會持久化
+
+File: `systemd/src/timesync/timesyncd-manager.h` (line 66)
+
+```c
+usec_t poll_interval_usec;
+```
+
+是 `Manager` struct 的欄位，daemon 重啟就重置。不像 `TIMESYNCD_CLOCK_FILE` 跨 restart 保留。所以 `systemctl restart` 後永遠從 min 開始。
+
+### Branch 順序很重要、不是「找最匹配」
+
+例如 `|offset| = 0.18s` 同時滿足：
+
+- Branch 2：`!spike && |offset| > 0.2` — 不滿足（0.18 < 0.2）
+- Branch 4：`|offset| > 0.15` — 滿足
+
+直接走 Branch 4 ÷2。
+
+但若 `|offset| = 0.21s`：
+
+- Branch 2：滿足 → 直接 min、return。Branch 4 永遠不會被檢查。
+
+也就是說 Branch 2 跟 Branch 4 不是 0.15s 與 0.2s 兩段「灰色到嚴重」的漸層 — 一旦過 0.2s 就跳到 min。
+
+### Spike 同時擋兩個 branch
+
+`spike == true` 時：
+
+- Branch 2 不會匹配（被 `!spike` 擋住）。
+- Branch 4 立刻匹配（`spike || ...`）。
+
+所以連續 spike → 一路 ÷2、不會跳 min。語意是「我不確定這個 sample 是不是真的偏移、再多採幾次比較快」。
+
+### NTP server 偷偷加 leap second 會發生什麼
+
+`offset` 是 ((receive - origin) + (trans - dest)) / 2（line 530）。leap second 那一秒 server 戳出來的 `trans` 會多 1 秒、`offset` 看起來突然差 1s → 走 Branch 2 → min。然後 timesyncd 走 `manager_adjust_clock` jump 1 秒。
+
+leap_sec 是 NTP packet 裡的 `leap_indicator` 欄位、由 NTP server 標。timesyncd 自己不算 leap、只接受 NTP 通知。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — `poll_interval_usec` 重啟後從 min 開始的初始化邏輯；`NTP_MAX_ADJUST = 0.4s` 走 slew/jump 的分界
+  - [systemd-timesyncd — 跟系統時間有關的 log 印不印](./timesyncd-log-anatomy) — `interval/delta/delay/jitter/drift` 那行 DEBUG log 就是觀察 poll 動態的窗口
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — timesyncd poll 變高頻是 ceph timecheck 的提前訊號
+</Callout>
