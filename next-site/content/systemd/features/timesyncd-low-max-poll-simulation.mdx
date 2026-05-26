@@ -438,5 +438,5 @@ Poll interval: 32s (min: 32s; max 32s)
   - [systemd-timesyncd — poll interval 怎麼從 2048s 變回 32s](./timesyncd-poll-interval-adaptation) — `manager_adjust_poll` 四條決策路徑的完整拆解，是這頁的基礎
   - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — 改了 conf 之後必須 restart，restart 本身的副作用
   - [systemd-timesyncd — 跟系統時間有關的 log 印不印](./timesyncd-log-anatomy) — 觀察短 poll 期 PLL 行為要把 log 拉到 debug
-  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — ceph 端的 timecheck 5 分鐘節奏跟 timesyncd 短 poll 沒辦法配合得更好
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection) — ceph 端的 timecheck 5 分鐘節奏跟 timesyncd 短 poll 沒辦法配合得更好
 </Callout>
