@@ -1,0 +1,536 @@
+---
+layout: doc
+title: systemd-timesyncd — 跟系統時間有關的 log 印不印
+description: 從 src/timesync 的每一個 log_* 呼叫點拆，分類成 INFO / WARNING / ERR / DEBUG。重點：實際做 slew/jump 的兩行 log 都是 LOG_DEBUG，而 systemd 預設 log_max_level = LOG_INFO，所以 journalctl -u systemd-timesyncd 平常看到的只有「Contacted」「Initial clock synchronization」這兩條 INFO，slew/jump 的真實偏移完全被吃掉。
+---
+
+## 場景
+
+ceph 那邊發了 `MON_CLOCK_SKEW`，oncall 跑去 mon node 查 `journalctl -u systemd-timesyncd`：
+
+```
+May 26 09:00:01 cephnode-3 systemd-timesyncd[412]: Initial clock synchronization to ...
+May 26 09:00:01 cephnode-3 systemd-timesyncd[412]: Contacted time server 169.254.169.123:123 (ntp.local).
+```
+
+就這兩行。可是 cluster log 顯示某個時間點 `mon.2` 的 clock 被偵測到漂了 180ms。
+
+問題：**那 180ms 修正的瞬間，timesyncd 到底寫不寫 log？寫了什麼 level？為什麼 journalctl 看不到？**
+
+答案藏在 `src/timesync/timesyncd-manager.c:255` 那兩行 `log_debug` — 而 systemd 預設 log level 只到 INFO，DEBUG 直接被丟掉。
+
+下面從 v260.1 原始碼把跟系統時間有關的所有 log 呼叫點全部列出來，附 level、附觸發條件、附在 journal 裡長什麼樣子。
+
+## TL;DR：每個事件對應一行 log
+
+按時序排列。第三欄是 **預設可不可見**（systemd 預設 `log_max_level = LOG_INFO`）：
+
+| 事件 | level | 預設可見 | source 位置 |
+|---|---|---|---|
+| daemon 啟動跳鐘（往前跳到 epoch + 1μs） | INFO + MESSAGE_ID | ✅ | `timesyncd.c:130` |
+| daemon 啟動跳鐘失敗（`clock_settime` 回錯） | WARNING | ✅ | `timesyncd.c:126` |
+| `advance_tstamp` 改 mtime 失敗 | WARNING | ✅ | `timesyncd.c:56` |
+| 第一次成功 contact 某 server | INFO | ✅ | `timesyncd-manager.c:614` |
+| 第一次同步成功（Initial clock synchronization） | INFO + MESSAGE_ID | ✅ | `timesyncd-manager.c:621` |
+| Server root distance 太大、disconnect | INFO | ✅ | `timesyncd-manager.c:495` |
+| 等回應 timeout | INFO | ✅ | `timesyncd-manager.c:91` |
+| Server 連線返回錯誤 | WARNING | ✅ | `timesyncd-manager.c:424` |
+| Invalid response，disconnect | WARNING | ✅ | `timesyncd-manager.c:441` |
+| 設定檔解析錯（PollInterval、ConnectionRetrySec…） | WARNING | ✅ | `timesyncd-conf.c:122..132` |
+| `clock_adjtime` 系統呼叫失敗 | ERR | ✅ | `timesyncd-manager.c:579` |
+| Listen socket setup 失敗 | WARNING | ✅ | `timesyncd-manager.c:119` |
+| **NTP 同步 → slew adjust（`|offset| < 0.4s`）** | **DEBUG** | ❌ | `timesyncd-manager.c:255` |
+| **NTP 同步 → jump adjust（`|offset| ≥ 0.4s`）** | **DEBUG** | ❌ | `timesyncd-manager.c:272` |
+| adjust 後的 PLL status 詳細 dump | DEBUG | ❌ | `timesyncd-manager.c:297` |
+| 完整 NTP packet dump | DEBUG | ❌ | `timesyncd-manager.c:537` |
+| 每次 poll 後 interval/delta/delay/jitter/drift | DEBUG | ❌ | `timesyncd-manager.c:595` |
+| **外部 process 改了 wall clock（time-change event）** | **DEBUG** | ❌ | `timesyncd-manager.c:219` |
+| Sent NTP request to X | DEBUG | ❌ | `timesyncd-manager.c:143` |
+| Resolving X / Resolved address | DEBUG | ❌ | `timesyncd-manager.c:768, 878` |
+| Selected server / address | DEBUG | ❌ | `timesyncd-manager.c:711, 731` |
+| Response from unknown server / Unexpected reply / Invalid reply | DEBUG | ❌ | `timesyncd-manager.c:448..489` |
+| Network connectivity 變化（後面說明） | INFO 或 DEBUG | 視 m->talking | `timesyncd-manager.c:1059..1064` |
+
+**結論**：實際做 clock adjustment 的兩條訊息（slew + jump）都是 DEBUG，所以正常情況下 journal 只會看到「Initial clock synchronization」與「Contacted」兩條 INFO，後續所有的微調都看不到。
+
+## systemd 的 log level 規則
+
+`log_*` 巨集走的是經典 syslog 優先級（值越小、優先級越高）：
+
+```
+LOG_EMERG    = 0
+LOG_ALERT    = 1
+LOG_CRIT     = 2
+LOG_ERR      = 3
+LOG_WARNING  = 4
+LOG_NOTICE   = 5
+LOG_INFO     = 6
+LOG_DEBUG    = 7
+```
+
+決定要不要丟掉的條件就一行：
+
+File: `systemd/src/basic/log.c` (line 843)
+
+```c
+if (_likely_(LOG_PRI(level) > log_max_level))
+        return -ERRNO_VALUE(error);   /* 直接丟掉 */
+```
+
+預設值：
+
+File: `systemd/src/basic/log.c` (line 46)
+
+```c
+static int log_max_level = LOG_INFO;
+```
+
+也就是 `log_debug()` (`LOG_DEBUG = 7`) > `LOG_INFO = 6` → 條件成立 → 丟掉。
+
+`log_setup()` 在 `timesyncd.c:149` 跑：
+
+File: `systemd/src/basic/log.c` (line 1712)
+
+```c
+void log_setup(void) {
+        log_set_target(LOG_TARGET_AUTO);
+        log_parse_environment();
+        (void) log_open();
+        if (log_on_console() && show_color < 0)
+                log_show_color(true);
+}
+```
+
+`log_parse_environment()` 會讀環境變數：
+
+File: `systemd/src/basic/log.c` (line 1327)
+
+```c
+e = getenv("SYSTEMD_LOG_LEVEL");
+if (e) {
+        r = log_set_max_level_from_string(e);
+        if (r < 0)
+                log_warning_errno(r, "Failed to parse log level '%s', ignoring: %m", e);
+} else {
+        /* If no explicit log level is specified then let's see if this is a debug invocation, and if
+         * so raise the log level to debug too. Note that this is not symmetric: just because
+         * DEBUG_INVOCATION is explicitly set to 0 we won't lower the log level below debug. This
+         * follows the logic that debug logging is an opt-in thing anyway, and if there's any reason
+         * to enable it we should not disable it here automatically. */
+        r = getenv_bool("DEBUG_INVOCATION");
+        ...
+        else if (r > 0)
+                log_set_max_level(LOG_DEBUG);
+}
+```
+
+也就是兩個 knob 可以把預設拉到 DEBUG：
+
+1. `SYSTEMD_LOG_LEVEL=debug` 環境變數
+2. `DEBUG_INVOCATION=1` 環境變數（systemctl `service-log-level X debug` 就走這條）
+
+而 unit file `systemd-timesyncd.service.in` 完全沒設 `Environment=SYSTEMD_LOG_LEVEL=...` 也沒 `LogLevelMax=`：
+
+File: `systemd/units/systemd-timesyncd.service.in`
+
+```
+[Service]
+AmbientCapabilities=CAP_SYS_TIME
+BusName=org.freedesktop.timesync1
+CapabilityBoundingSet=CAP_SYS_TIME
+Environment=SYSTEMD_NSS_RESOLVE_VALIDATE=0     ← 唯一的 Environment 條目
+ExecStart={{LIBEXECDIR}}/systemd-timesyncd
+...
+```
+
+所以 timesyncd 永遠走預設 INFO。
+
+## 平常看得到的那兩條 INFO 長什麼樣
+
+### `Contacted time server X (Y).`
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 607)
+
+```c
+if (!m->talking) {
+        _cleanup_free_ char *pretty = NULL;
+
+        m->talking = true;
+
+        (void) server_address_pretty(m->current_server_address, &pretty);
+
+        log_info("Contacted time server %s (%s).", strna(pretty), m->current_server_name->string);
+        (void) sd_notifyf(false, "STATUS=Contacted time server %s (%s).",
+                          strna(pretty), m->current_server_name->string);
+}
+```
+
+`m->talking` 是 per-server flag，**第一次拿到回應才印**。之後同一個 server 重複回應、再快、再準，都不會再印第二次 INFO。換到另一個 server 才會再印一次。
+
+journal 範例：
+
+```
+May 26 09:00:01 cephnode-3 systemd-timesyncd[412]: Contacted time server 169.254.169.123:123 (ntp.local).
+```
+
+### `Initial clock synchronization to ...`
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 618)
+
+```c
+if (!spike && !m->synchronized) {
+        m->synchronized = true;
+
+        log_struct(LOG_INFO,
+                   LOG_MESSAGE("Initial clock synchronization to %s.",
+                               FORMAT_TIMESTAMP_STYLE(dts.realtime, TIMESTAMP_US)),
+                   LOG_MESSAGE_ID(SD_MESSAGE_TIME_SYNC_STR),
+                   LOG_ITEM("MONOTONIC_USEC=" USEC_FMT, dts.monotonic),
+                   LOG_ITEM("REALTIME_USEC=" USEC_FMT, dts.realtime),
+                   LOG_ITEM("BOOTTIME_USEC=" USEC_FMT, dts.boottime));
+}
+```
+
+也是 **per-daemon-lifetime 只印一次**（`m->synchronized` 設為 true 後就不再走進來）。`spike` 是 jitter 偵測 — 那一輪如果被視為 spike、不會被當成有效 sync，所以也不印。
+
+`SD_MESSAGE_TIME_SYNC_STR = 7c8a41f3-7b76-4941-a0e1-780b1be2f037`。
+
+journal 範例：
+
+```
+May 26 09:00:01 cephnode-3 systemd-timesyncd[412]: Initial clock synchronization to Mon 2026-05-26 09:00:01.123456 UTC.
+```
+
+帶結構化欄位的話可以用 `journalctl -o verbose`：
+
+```
+MESSAGE_ID=7c8a41f37b764941a0e1780b1be2f037
+MESSAGE=Initial clock synchronization to Mon 2026-05-26 09:00:01.123456 UTC.
+MONOTONIC_USEC=15234890
+REALTIME_USEC=1748246401123456
+BOOTTIME_USEC=987654321
+```
+
+## 平常看不到、但很重要的那幾條 DEBUG
+
+### `adjust (slew): +X.XXX sec`
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 240)
+
+```c
+static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
+        struct timex tmx;
+
+        /* For small deltas, tell the kernel to gradually adjust the system clock to the NTP time, larger
+         * deltas are just directly set. */
+        if (fabs(offset) < NTP_MAX_ADJUST) {
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR,
+                        .status = STA_PLL,
+                        .offset = offset * NSEC_PER_SEC,
+                        .constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4,
+                };
+
+                log_debug("  adjust (slew): %+.3f sec", offset);
+        } else {
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET | ADJ_MAXERROR | ADJ_ESTERROR,
+                        ...
+                };
+                ...
+                m->jumped = true;
+                log_debug("  adjust (jump): %+.3f sec", offset);
+        }
+```
+
+兩條都是 `log_debug`。**這代表預設 install 的 systemd-timesyncd 不會在 journal 留下「我剛剛把 clock 調了 N 毫秒」的紀錄**。要看到必須先打開 debug log。
+
+### `status` block — 看 PLL 狀態
+
+接在 `adjust` 後面：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 297)
+
+```c
+log_debug("  status       : %04i %s\n"
+          "  time now     : %"PRI_TIME".%03"PRI_USEC"\n"
+          "  constant     : %"PRI_TIMEX"\n"
+          "  offset       : %+.3f sec\n"
+          "  freq offset  : %+"PRI_TIMEX" (%+"PRI_TIMEX" ppm)\n",
+          tmx.status, tmx.status & STA_UNSYNC ? "unsync" : "sync",
+          tmx.time.tv_sec, tmx.time.tv_usec / NSEC_PER_MSEC,
+          tmx.constant,
+          (double)tmx.offset / NSEC_PER_SEC,
+          tmx.freq, tmx.freq / 65536);
+```
+
+這條印 PLL 的內部狀態（kernel 回的 `struct timex`）。debug 模式下開出來會看到 RTC 漂移 ppm、PLL constant 等資料，跟 `chronyc tracking` 在 chrony 那邊看到的內容相當。
+
+### `System time changed. Resyncing.`
+
+外部 process 改 wall clock 觸發的事件：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 206)
+
+```c
+static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        /* rearm timer */
+        manager_clock_watch_setup(m);
+
+        /* skip our own jumps */
+        if (m->jumped) {
+                m->jumped = false;
+                return 0;
+        }
+
+        /* resync */
+        log_debug("System time changed. Resyncing.");
+        m->poll_resync = true;
+
+        return manager_send_request(m);
+}
+```
+
+也是 DEBUG。如果別的 process（例如 ops 在 mon 上手敲 `date -s`、或 chrony 也在跑）改了 `CLOCK_REALTIME`，timesyncd 會被 `TFD_TIMER_CANCEL_ON_SET` 喚醒、寫這條 log、立刻發 NTP request 重新確認。
+
+但因為是 DEBUG，**手動 `date -s` 改了系統時間，看 journal 找不到 timesyncd 的反應紀錄**。
+
+### `NTP response:` 完整 dump
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 537)
+
+```c
+log_debug("NTP response:\n"
+          "  leap         : %u\n"
+          "  version      : %u\n"
+          "  mode         : %u\n"
+          "  stratum      : %u\n"
+          "  precision    : %.6f sec (%i)\n"
+          "  root distance: %.6f sec\n"
+          "  reference    : %.4s\n"
+          "  origin       : %.3f\n"
+          "  receive      : %.3f\n"
+          "  transmit     : %.3f\n"
+          "  dest         : %.3f\n"
+          "  offset       : %+.3f sec\n"
+          "  delay        : %.3f sec\n"
+          "  packet count : %"PRIu64"\n"
+          "  jitter       : %.3f%s\n"
+          "  poll interval: " USEC_FMT "\n",
+          ...
+);
+```
+
+每收到一封 NTP packet 就 dump 一次完整內容。debug 開出來會非常吵，但能看到每次 sync 的 stratum、root distance、jitter、offset 等。
+
+### `interval/delta/delay/jitter/drift` 一行摘要
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 595)
+
+```c
+log_debug("interval/delta/delay/jitter/drift " USEC_FMT "s/%+.3fs/%.3fs/%.3fs/%+"PRIi64"ppm%s",
+          m->poll_interval_usec / USEC_PER_SEC, offset, delay,
+          m->samples_jitter, m->drift_freq / 65536,
+          spike ? " spike" : "");
+```
+
+每次處理完一封 packet 都會印。比上面那個完整 dump 緊湊，適合一次看好幾筆。
+
+## 啟動跳鐘的 INFO（重要！）
+
+唯一 **預設可見且伴隨系統時間真的被動到** 的訊息：
+
+File: `systemd/src/timesync/timesyncd.c` (line 125)
+
+```c
+if (clock_settime(CLOCK_REALTIME, TIMESPEC_STORE(epoch + 1)) < 0) {
+        log_warning_errno(errno, "Failed to advance system clock, ignoring: %m");
+        return 0;
+}
+
+log_struct(LOG_INFO,
+           LOG_MESSAGE_ID(SD_MESSAGE_TIME_BUMP_STR),
+           LOG_ITEM("REALTIME_USEC=" USEC_FMT, epoch + 1),
+           LOG_ITEM("DIRECTION=forwards"),
+           LOG_MESSAGE("System clock time advanced to %s: %s",
+                       epoch > TIME_EPOCH * USEC_PER_SEC ? "recorded timestamp" : "built-in epoch",
+                       FORMAT_TIMESTAMP(epoch + 1)));
+```
+
+`SD_MESSAGE_TIME_BUMP_STR = 7db73c8a-f0d9-4eeb-822a-e04323fe6ab6`。
+
+journal 範例（成功跳）：
+
+```
+May 26 09:00:00 cephnode-3 systemd-timesyncd[412]: System clock time advanced to recorded timestamp: Mon 2026-05-26 08:59:30 UTC
+```
+
+journal 範例（失敗）：
+
+```
+May 26 09:00:00 cephnode-3 systemd-timesyncd[412]: Failed to advance system clock, ignoring: Operation not permitted
+```
+
+`MESSAGE_ID` 是固定的 → 可以靠它撈所有跳鐘事件，不論訊息文字怎麼演進。詳見 [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) 那一頁，這個 MESSAGE_ID 同時被 PID 1 的 `clock_apply_epoch` 也用到。
+
+## 「對某 server 連不上」會印 INFO 還是 DEBUG？
+
+`m->talking` 這個 flag 主導了「靜悄悄」與「明顯失敗」的切換：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 1056)
+
+```c
+if (connected && !online) {
+        /* When m->talking is false, we have not received any responses from the server,
+         * and it is not necessary to log about disconnection. */
+        log_full(m->talking ? LOG_INFO : LOG_DEBUG,
+                 "No network connectivity, watching for changes.");
+        manager_disconnect(m);
+
+} else if ((!connected || changed) && online) {
+        log_full(connected ? LOG_DEBUG : LOG_INFO,
+                 "Network configuration changed, trying to establish connection.");
+        ...
+}
+```
+
+兩條都用 `log_full(level, ...)` — runtime 決定 level：
+
+- 「網路掉了」：曾經跟 server 講過話 (`m->talking` 為 true) → 印 INFO（看得到）；從來沒 sync 過 → 印 DEBUG（看不到）。設計理由就在註解：從沒同步過、本來就也沒在 sync，掉線 user 不需要被通知。
+- 「網路回來了」：先前已經 connected → DEBUG（次要事件）；先前 disconnected → INFO（這是個 recovery 訊號）。
+
+這個 pattern 在 systemd 程式碼裡很常見：**事件本身語意上重不重要 → 對應 level**，而不是按 function 寫死。
+
+## 為什麼把 slew/jump 都設成 DEBUG
+
+這個設計選擇有兩個理由：
+
+1. **slew 是高頻常態事件**。預設 poll interval 32 ~ 2048 秒，每次同步幾乎都會做一次小幅 slew（甚至每次 sync 觸發 PLL 微調）。如果每次都印 INFO，一台 mon 跑一天 journal 會多上百行。
+2. **真正重要的「不應該發生的調整」會在 ceph / kubernetes 等上層系統暴露**。例如 ceph 的 `MON_CLOCK_SKEW` health check (HEALTH_WARN)、kubernetes 的 `kubelet` 對 `time-set.target` 的依賴 — 這些上層系統有自己的告警機制。timesyncd 把細節留給 debug 場景。
+
+但代價是：**事後追「是不是某瞬間時間被動了」很難**。只有：
+
+- `SD_MESSAGE_TIME_BUMP_STR`（啟動時的大跳）
+- `SD_MESSAGE_TIME_SYNC_STR`（第一次 sync）
+
+這兩個事件預設可見。其他所有調整都得自己事先把 log level 拉到 DEBUG 才會留下證據。
+
+## 怎麼把 log 拉到 DEBUG
+
+### 方法 A：暫時改（drop-in）
+
+```bash
+sudo systemctl edit systemd-timesyncd
+```
+
+加入：
+
+```ini
+[Service]
+Environment=SYSTEMD_LOG_LEVEL=debug
+```
+
+存檔後 `systemctl restart systemd-timesyncd`。要還原把該 file 砍掉再 restart。
+
+### 方法 B：runtime 即時切換、不重啟
+
+```bash
+sudo systemctl service-log-level systemd-timesyncd debug
+```
+
+走 D-Bus 動態調整 `log_max_level`、daemon 不用重啟（所以不會踩到 [restart 跳鐘](./timesyncd-restart-impact)）。要查現在的 level：
+
+```bash
+sudo systemctl service-log-level systemd-timesyncd
+```
+
+恢復成 info：
+
+```bash
+sudo systemctl service-log-level systemd-timesyncd info
+```
+
+### 方法 C：手動跑（lab 用）
+
+```bash
+sudo systemctl stop systemd-timesyncd
+sudo -u systemd-timesync SYSTEMD_LOG_LEVEL=debug /usr/lib/systemd/systemd-timesyncd
+```
+
+注意這樣跑沒有 CAP_SYS_TIME（除非用 `sudo`），會無法跳鐘但其他邏輯能看。
+
+## 用 MESSAGE_ID 撈事件
+
+兩個固定 MESSAGE_ID：
+
+```bash
+# 啟動跳鐘事件（SD_MESSAGE_TIME_BUMP）
+journalctl MESSAGE_ID=7db73c8af0d94eeb822ae04323fe6ab6
+
+# 第一次同步事件（SD_MESSAGE_TIME_SYNC）
+journalctl MESSAGE_ID=7c8a41f37b764941a0e1780b1be2f037
+```
+
+注意 `journalctl MESSAGE_ID=...` 走的是結構化 field 比對、不是 grep，**沒有 grep regex 那種誤判風險**，distro / 版本升級後文字訊息變了也照樣抓得到。
+
+對 mon node 來說最有用的查詢：
+
+```bash
+# 看這台機器近 24 小時所有跳鐘事件
+journalctl --since "24h ago" \
+  MESSAGE_ID=7db73c8af0d94eeb822ae04323fe6ab6 \
+  + MESSAGE_ID=7c8a41f37b764941a0e1780b1be2f037
+```
+
+（`+` 是 journalctl 的 OR）
+
+## 跟 chrony 對比
+
+chrony 預設 verbose 多很多 — 把 `chronyd` 啟動 log 印一下：
+
+```
+chronyd version 4.3 starting (+CMDMON +NTP +REFCLOCK +RTC +PRIVDROP +SCFILTER +SIGND ...)
+Frequency 0.123 +/- 0.456 ppm read from /var/lib/chrony/drift
+Loaded seccomp filter (level 1)
+System clock wrong by -1.234567 seconds (step)
+```
+
+`System clock wrong by ... (step)` 跟 systemd-timesyncd 的 `adjust (jump)` 對應，但 chrony 預設印出來，timesyncd 不印。原因是 chrony 走自己的 logger 不走 systemd journal，沒有相同的 level 機制。
+
+**做維運 audit 時，若 mon 用的是 timesyncd 而不是 chrony，務必先把 log level 拉到 debug**，否則「systemd-timesyncd 到底動了多大」是個黑盒。
+
+## 邊界與小細節
+
+### service unit `LogLevelMax=` 跟 `Environment=SYSTEMD_LOG_LEVEL=` 的差別
+
+- `LogLevelMax=` 是 systemd executor 在送 message 進 journal 時做的 **per-message filter**，daemon 自己仍然會跑完 format。
+- `Environment=SYSTEMD_LOG_LEVEL=` 是 daemon 自己看到的環境變數，`log_parse_environment_variables()` 直接設 `log_max_level`，連 format 都不會跑。
+
+要省 CPU + 不污染 journal 用 `Environment=`；要過濾既有 daemon 的訊息流但保留內部完整 trace 用 `LogLevelMax=`。
+
+### `LogLevelMax=info` 跟預設一樣嗎
+
+不一樣。預設沒設代表 daemon 內部 `log_max_level = LOG_INFO`，DEBUG 訊息根本沒生出來。`LogLevelMax=info` 是 daemon 該寫的還是會寫進 journal write socket，executor 在收訊那一端 drop。
+
+對 timesyncd 來說設不設效果一樣，因為 daemon 本身就不會發 DEBUG。但對其他 daemon、特別是 unit file 內已經有 `Environment=SYSTEMD_LOG_LEVEL=debug` 的，可以再加 `LogLevelMax=info` 把 journal 噪音壓回去（不過為什麼這麼做、不直接降 daemon log level，是別的問題）。
+
+### journal 不存怎麼辦
+
+`/etc/systemd/journald.conf` 預設 `Storage=auto` — 有 `/var/log/journal` 目錄就持久化、沒有就只放 `/run/log/journal`（tmpfs，重開機沒）。檢查：
+
+```bash
+sudo journalctl --disk-usage
+ls -la /var/log/journal/
+```
+
+若沒持久化、debug log 拉到 INFO 後一旦重開機就消失。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — 跳鐘事件本身的 source path；MESSAGE_ID 的兩條 INFO log 跟系統時間操作的對應關係
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — 上層告警系統怎麼補 timesyncd debug log 缺失
+  - [Ceph — Prometheus alert 四層設計](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 屬於 Tier 2，搭配 timesyncd 跳鐘事件查 root cause
+</Callout>
