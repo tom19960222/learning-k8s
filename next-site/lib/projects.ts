@@ -412,6 +412,43 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'systemd': {
+    id: 'systemd',
+    displayName: 'systemd',
+    shortName: 'systemd',
+    description: 'Linux init + service manager。從 timesyncd 入手看 systemd 怎麼處理 clock、daemon lifecycle、event loop',
+    githubUrl: 'https://github.com/systemd/systemd',
+    submodulePath: path.join(REPO_ROOT, 'systemd'),
+    color: 'sky',
+    accentClass: 'border-sky-500 text-sky-400',
+    features: ['timesyncd-restart-impact'],
+    featureGroups: [
+      { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact'] },
+    ],
+    usecases: [],
+    difficulty: '🟡 中階',
+    difficultyColor: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+    problemStatement: 'ceph mon clock skew 那一頁追到「ceph 只偵測、不修正」。修正是誰做的？Linux 上預設是 systemd-timesyncd。timesyncd 程式碼很小 (1.7k 行)，但行為對 ceph、KubeVirt 都會直接影響：service 重啟那一刻系統時間會不會跳？跳到哪？多久才同步回去？這頁從 src/timesync 把整條路徑追完。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: 'ceph mon 寫過 clock skew 那一頁，現在反過來想：node 上的 chrony / timesyncd 重啟，到底會不會讓 ceph 看到 50ms 以上的偏移？需要從 systemd 程式碼確認 timesyncd 在 daemon 啟動瞬間做了哪些 clock 操作。',
+      scenes: [
+        { step: 1, icon: '🕒', actor: '你', action: '讀 timesyncd-restart-impact：daemon 啟動的五個階段', detail: 'load_clock_timestamp 在 event loop 開始前就跑：讀 /var/lib/systemd/timesync/clock 的 mtime、取 max(TIME_EPOCH, mtime)、若 now < epoch 直接 clock_settime 跳到 epoch+1μs。系統時間可能瞬間向前跳秒級。' },
+      ],
+      outcome: '你知道 timesyncd 重啟那一刻 wall clock 可能瞬間前跳（不會後退），跳幅 = max(stale clock-file mtime, built-in TIME_EPOCH) − 現在 RTC。對 ceph 偵測來說：若 mon node 的 timesyncd 重啟導致前跳超過 50ms，會被 timecheck round 抓到一次 HEALTH_WARN。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'timesyncd-restart-impact', note: '從一個具體問題切入：service restart 對系統時間的影響' },
+      ],
+      intermediate: [
+        { slug: 'timesyncd-restart-impact', note: '深入 load_clock_timestamp + clock_apply_epoch 兩條路徑' },
+      ],
+      advanced: [
+        { slug: 'timesyncd-restart-impact', note: 'NTP_MAX_ADJUST + clock_adjtime ADJ_OFFSET vs ADJ_SETOFFSET 的決策邊界' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)

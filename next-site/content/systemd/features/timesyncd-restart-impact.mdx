@@ -1,0 +1,682 @@
+---
+layout: doc
+title: systemd-timesyncd — service 重啟對系統時間的影響
+description: 從 src/timesync/timesyncd.c 的 load_clock_timestamp() 入手，拆解 systemd-timesyncd daemon 重啟時對 CLOCK_REALTIME 的三條影響路徑：開機時 PID 1 的 clock_apply_epoch 可能往前/往後跳；daemon 啟動的 load_clock_timestamp 只往前跳到 timestamp 檔 mtime 或 built-in TIME_EPOCH；首次 NTP 同步後的 clock_adjtime 視偏移大小決定 slew (< 0.4s) 或 jump。每 60 秒寫一次 timestamp 檔。
+---
+
+## 場景
+
+ceph 那邊查過 [MON clock skew 多久會被偵測](/ceph/mon-clock-skew-detection)：50ms 以上的偏移、最壞約 5 分鐘 health 會變 WARN。下個問題就是：
+
+> mon node 上的 `systemctl restart systemd-timesyncd` 那一刻，**系統時間會不會瞬間跳？跳多少？**
+
+如果重啟讓 wall clock 一瞬間前跳超過 50ms，ceph mon 的下一輪 timecheck 就會把這台標 skew。如果 KubeVirt VM 在這台 host 上跑、guest clock 又跟 host clock 綁定，VM 內的應用也會看到 timestamp 不單調。
+
+這頁從 v260.1 原始碼追完整路徑：daemon 啟動到 event loop 開始之間，timesyncd 對 `CLOCK_REALTIME` 做了哪些事，每一步在什麼情況下會跳、跳多少。
+
+## TL;DR
+
+| 情境 | 系統時間會發生什麼 | 跳幅範圍 |
+|---|---|---|
+| **單純 `systemctl restart systemd-timesyncd`**（RTC 正常、檔案存在） | 通常**不跳**（now > mtime） | 0 |
+| 同上但 RTC 比 timestamp 檔慢（電池壞、虛擬機 RTC 漂） | **前跳** 到 `max(timestamp file mtime, TIME_EPOCH) + 1μs` | mtime − RTC，可能秒~分鐘 |
+| 同上、檔案不存在 | **前跳** 到 `TIME_EPOCH + 1μs`（build-time epoch） | TIME_EPOCH − RTC |
+| 重啟後 NTP 回應且偏移 < 0.4s | 慢慢 slew（`ADJ_OFFSET`），不跳 | 漸進 |
+| 重啟後 NTP 回應且偏移 ≥ 0.4s | **瞬跳**（`ADJ_SETOFFSET`），可正可負 | 完整 offset |
+| timesyncd 在執行中閒置 → 重啟 | timestamp 檔最多落後 70 秒（60s save + 10s slack） | 影響 fallback 跳幅 |
+
+最重要的一點：**`load_clock_timestamp` 只能讓系統時間往前跳，永遠不會往後**。這個性質是設計刻意的，後面會看程式碼怎麼擋的。
+
+## 完整路徑一張圖
+
+```
+systemctl restart systemd-timesyncd
+        │
+        ▼
+exec /usr/lib/systemd/systemd-timesyncd
+        │
+        ▼
+[A] timesyncd.c::run()
+   │
+   ├── ① load_clock_timestamp(uid, gid)           ← drop privs 前跑
+   │     開檔 /var/lib/systemd/timesync/clock
+   │     epoch = MAX(TIME_EPOCH, file_mtime)
+   │     advance_tstamp(fd, epoch)
+   │       → bump mtime 到下一個可區分的值
+   │     IF now(CLOCK_REALTIME) <= epoch:
+   │         clock_settime(CLOCK_REALTIME, epoch + 1μs)  ← 直接跳！
+   │         log SD_MESSAGE_TIME_BUMP_STR
+   │
+   ├── ② drop_privileges(systemd-timesync uid, keep CAP_SYS_TIME)
+   │
+   ├── ③ manager_new()  / manager_connect_bus() / manager_parse_config_file()
+   │
+   ├── ④ manager_setup_save_time_event()
+   │     每 60 秒（CLOCK_BOOTTIME timer + 10s 精度）touch_file 一次 clock 檔
+   │
+   ├── ⑤ if network_is_online(): manager_connect()
+   │       開始 NTP query；首封 packet 在毫秒級送出
+   │
+   └── ⑥ sd_event_loop()
+         │
+         └── (有 NTP 回應)
+             ↓
+             manager_handle_response()
+             ↓
+             manager_adjust_clock(offset, leap_sec)
+                 IF |offset| < 0.4s:
+                     clock_adjtime(ADJ_OFFSET | ADJ_TIMECONST)   ← slew
+                 ELSE:
+                     clock_adjtime(ADJ_SETOFFSET)                ← jump
+                     m->jumped = true
+
+關機路徑：
+   sd_event_loop 結束
+   ↓
+   touch(TIMESYNCD_CLOCK_FILE)  ← 最後一次 save
+   ↓
+   exit
+```
+
+下面把每一段的程式碼拆開。
+
+## 兩個常數先記住
+
+File: `systemd/src/shared/clock-util.h` (line 7)
+
+```c
+#define EPOCH_CLOCK_FILE          "/usr/lib/clock-epoch"
+#define TIMESYNCD_CLOCK_FILE_DIR  "/var/lib/systemd/timesync/"
+#define TIMESYNCD_CLOCK_FILE      TIMESYNCD_CLOCK_FILE_DIR "clock"
+```
+
+`TIME_EPOCH` 是 build 時決定的（從 git tag 或 NEWS 檔的 mtime）：
+
+File: `systemd/meson.build` (line 739)
+
+```meson
+time_epoch = get_option('time-epoch')
+if time_epoch <= 0
+    time_epoch = run_command(sh, '-c', 'echo "$SOURCE_DATE_EPOCH"', check : true).stdout().strip()
+    if time_epoch == '' and git.found() and fs.is_dir('.git')
+        # If we're in a git repository, use the creation time of the latest git tag.
+        latest_tag = run_command(git, 'describe', '--abbrev=0', '--tags', check : false)
+        if latest_tag.returncode() == 0
+            time_epoch = run_command(
+                git, 'log', '--no-show-signature', '-1', '--format=%at',
+                     latest_tag.stdout().strip(),
+                check : false).stdout()
+        endif
+    endif
+    # ... 略，fallback 到 NEWS 檔 mtime
+endif
+conf.set('TIME_EPOCH', time_epoch)
+```
+
+也就是說，distro 套件 maintainer 編 systemd 那台 builder 的 git tag 時間決定了這個下限。Ubuntu 24.04 ship 的 systemd v255 → `TIME_EPOCH ≈ 2023-12-12`。
+
+這個下限保護的是 **完全沒有 RTC 的嵌入式裝置 / 第一次開機的 VM**：如果 RTC 顯示 1970-01-01，至少能跳到「systemd build 那一刻」。
+
+## ① load_clock_timestamp：daemon 啟動的核心
+
+這是整篇主菜。File: `systemd/src/timesync/timesyncd.c` (line 75)
+
+```c
+static int load_clock_timestamp(uid_t uid, gid_t gid) {
+        usec_t epoch = TIME_EPOCH * USEC_PER_SEC, ct;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        /* Let's try to make sure that the clock is always monotonically increasing, by saving the clock
+         * whenever we have a new NTP time, or when we shut down, and restoring it when we start again. This
+         * is particularly helpful on systems lacking a battery backed RTC. We also will adjust the time to
+         * at least the build time of systemd. */
+```
+
+開檔：
+
+```c
+        fd = open(TIMESYNCD_CLOCK_FILE, O_RDWR|O_CLOEXEC, 0644);
+        if (fd < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Unable to open timestamp file ..., ignoring: %m");
+
+                r = mkdir_safe_label(TIMESYNCD_CLOCK_FILE_DIR, 0755, uid, gid,
+                                     MKDIR_FOLLOW_SYMLINK | MKDIR_WARN_MODE);
+
+                /* Create stamp file with the compiled-in date */
+                r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents= */ false, epoch, uid, gid, 0644);
+```
+
+如果檔案不存在，建一個、mtime 設成 `TIME_EPOCH`（build 時間）。
+
+如果檔案存在：
+
+```c
+        } else {
+                struct stat st;
+
+                /* Check if the recorded time is later than the compiled-in one */
+                if (fstat(fd, &st) < 0)
+                        return log_error_errno(errno, "Unable to stat timestamp file ...: %m");
+
+                /* Try to fix the access mode, so that we can still touch the file after dropping privileges */
+                r = fchmod_and_chown(fd, 0644, uid, gid);
+
+                epoch = MAX(epoch, timespec_load(&st.st_mtim));
+
+                (void) advance_tstamp(fd, epoch);
+        }
+```
+
+這幾行決定 `epoch` 是什麼：取 `MAX(TIME_EPOCH, 檔案 mtime)`。然後 `advance_tstamp` 把 mtime 往前推一個可分辨的單位（後面拆）。
+
+關鍵的跳鐘決策：
+
+```c
+        ct = now(CLOCK_REALTIME);
+        if (ct > epoch)
+                return 0;
+
+        /* Not that it matters much, but we actually restore the clock to n+1 here rather than n, simply
+         * because we read n as time previously already and we want to progress here, i.e. not report the
+         * same time again. */
+        if (clock_settime(CLOCK_REALTIME, TIMESPEC_STORE(epoch + 1)) < 0) {
+                log_warning_errno(errno, "Failed to advance system clock, ignoring: %m");
+                return 0;
+        }
+
+        log_struct(LOG_INFO,
+                   LOG_MESSAGE_ID(SD_MESSAGE_TIME_BUMP_STR),
+                   LOG_ITEM("REALTIME_USEC=" USEC_FMT, epoch + 1),
+                   LOG_ITEM("DIRECTION=forwards"),
+                   LOG_MESSAGE("System clock time advanced to %s: %s",
+                               epoch > TIME_EPOCH * USEC_PER_SEC ? "recorded timestamp" : "built-in epoch",
+                               FORMAT_TIMESTAMP(epoch + 1)));
+        return 0;
+}
+```
+
+兩個重點：
+
+1. **`if (ct > epoch) return 0`**：當前 wall clock 已經比 epoch 新 → 什麼都不做。也就是說，**重啟期間若 RTC 一直走得好好的，timesyncd 不會碰系統時間**。
+2. **`clock_settime(CLOCK_REALTIME, epoch + 1)`**：只發生在 `now <= epoch` 的情況。`clock_settime` 是 **瞬跳**（不是 slew）。
+
+所以 daemon restart 那一刻系統時間「會不會跳」完全取決於這個 `if`：
+
+```
+跳    ⇐⇒    now(CLOCK_REALTIME) ≤ max(TIME_EPOCH, /var/lib/systemd/timesync/clock 的 mtime)
+不跳  ⇐⇒    now(CLOCK_REALTIME)  > max(TIME_EPOCH, /var/lib/systemd/timesync/clock 的 mtime)
+```
+
+跳的話、永遠是**往前**：clock_settime 設的目標是「比現在更後面的時間」。
+
+`SD_MESSAGE_TIME_BUMP_STR` 是個固定的 journal MESSAGE_ID，可以靠它撈到所有 bump 事件：
+
+```bash
+journalctl --no-pager MESSAGE_ID=$(cat /etc/systemd/system/systemd-timesyncd.service 2>/dev/null; \
+                                   awk '/SD_MESSAGE_TIME_BUMP_STR/{print}' /usr/include/systemd/sd-messages.h)
+# 或直接用記得住的 ID（搜尋 sd-messages.h 對應的 hex）
+```
+
+### `advance_tstamp` 在做什麼
+
+File: `systemd/src/timesync/timesyncd.c` (line 29)
+
+```c
+static int advance_tstamp(int fd, usec_t epoch) {
+        /* So here's the problem: whenever we read the timestamp we'd like to ensure the next time we won't
+         * restore the exact same time again, but one at least one step further (so that comparing mtimes of
+         * the timestamp file is a reliable check that timesync did its thing). But file systems have
+         * different timestamp accuracy: traditional fat has 2s granularity, and even ext2 and friends expose
+         * different granularity depending on selected inode size during formatting! ...
+         * Hence, to ensure the timestamp definitely is increased, here's what we'll do: we'll first try to
+         * increase the timestamp by 1μs, write that and read it back. If it was updated, great. But if it was
+         * not, we'll instead increase the timestamp by 10μs, and do the same, then 100μs, then 1ms, and so on,
+         * until it works, or we reach 10s. */
+
+        usec_t target = MAX(epoch, now(CLOCK_REALTIME));
+
+        for (usec_t a = 1; a <= 10 * USEC_PER_SEC; a *= 10) {
+                struct timespec ts[2];
+                struct stat new_st;
+
+                usec_t c = usec_add(target, a);
+                timespec_store(&ts[0], c);
+                ts[1] = ts[0];
+
+                if (futimens(fd, ts) < 0) {
+                        log_warning_errno(errno, "Unable to update mtime of timestamp file, ignoring: %m");
+                        return 0;
+                }
+
+                if (fstat(fd, &new_st) < 0)
+                        return log_error_errno(errno, "Failed to stat timestamp file: %m");
+
+                if (timespec_load(&new_st.st_mtim) > target) {
+                        log_debug("Successfully touched timestamp file.");
+                        return 1;
+                }
+        }
+```
+
+這支函式不影響系統時間，**只影響 timestamp 檔的 mtime**。目的是：下次重啟讀回來時，`epoch` 一定比這次更新，避免 `now <= epoch` 的判斷誤判。
+
+ext4 通常 nanosecond 精度，第一次 +1μs 就成功。FAT 是 2 秒精度，需要 +1, +10, +100, +1ms, +10ms, +100ms, +1s, +10s 一路試到能寫成功為止。`target` 取 `MAX(epoch, now)`：如果 wall clock 已經比 epoch 新，新 mtime 直接從 wall clock 起跳。
+
+## ② drop privileges：保留 CAP_SYS_TIME
+
+File: `systemd/src/timesync/timesyncd.c` (line 177)
+
+```c
+        /* Drop privileges, but only if we have been started as root. ... */
+        if (uid_current == 0) {
+                r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to drop privileges: %m");
+        }
+```
+
+systemd-timesyncd 啟動是 root（為了 `clock_settime`），跑完 `load_clock_timestamp` 後立刻 `setuid` 到 `systemd-timesync` user，但保留 `CAP_SYS_TIME` 給後面的 `clock_adjtime`。
+
+也就是說 **唯一可能 `clock_settime` 的時機點就是步驟 ①**。之後所有 clock 操作都走 `clock_adjtime`。
+
+## ③④ event loop 之前的 setup
+
+manager_new、connect_bus、parse_config 這些都不碰系統時間。
+
+`manager_setup_save_time_event` 是排定一個 60 秒一次的計時器，用 `CLOCK_BOOTTIME`（系統時間跳了不會影響它）：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 1185)
+
+```c
+int manager_setup_save_time_event(Manager *m) {
+        if (m->save_time_interval_usec == USEC_INFINITY)
+                return 0;
+
+        /* NB: we'll accumulate scheduling latencies here, but this doesn't matter */
+        r = event_reset_time_relative(
+                        m->event,
+                        &m->event_save_time,
+                        CLOCK_BOOTTIME,
+                        m->save_time_interval_usec,       /* 60 秒 */
+                        10 * USEC_PER_SEC,                /* 10 秒 slack */
+                        manager_save_time_handler,
+                        m,
+                        SD_EVENT_PRIORITY_NORMAL,
+                        "save-time",
+                        /* force_reset= */ false);
+}
+```
+
+精度 10 秒是讓 sd-event 把這個 timer 跟其他附近的 timer 一起 wake-up 省電。實際 callback：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 1211)
+
+```c
+static int manager_save_time_and_rearm(Manager *m, usec_t t) {
+        /* Updates the timestamp file to the specified time. If 't' is USEC_INFINITY uses the current system
+         * clock, but otherwise uses the specified timestamp. Note that whenever we acquire an NTP sync the
+         * specified timestamp value might be more accurate than the system clock, since the latter is
+         * subject to slow adjustments. */
+        r = touch_file(TIMESYNCD_CLOCK_FILE, /* parents= */ false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
+
+        return manager_setup_save_time_event(m);
+}
+```
+
+預設 `DEFAULT_SAVE_TIME_INTERVAL_USEC = 60 * USEC_PER_SEC`（`timesyncd-manager.h:22`）。所以**正常 daemon 跑著時，timestamp 檔最多落後 60 + 10 = 70 秒**。重啟若卡 70 秒以上，下次啟動的 `epoch` 也會落後 70 秒。
+
+## ⑤ NTP 同步：slew 或 jump 由 0.4 秒分界
+
+如果重啟後網路可用，daemon 開始問 NTP server：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 96)
+
+```c
+static int manager_send_request(Manager *m) {
+        /* ... 略 ...
+         * Record the transmit timestamp. This should be as close as possible to
+         * the send-to to ensure the timestamp is reasonably accurate */
+        assert_se(clock_gettime(CLOCK_BOOTTIME, &m->trans_time_mon) >= 0);
+        assert_se(clock_gettime(CLOCK_REALTIME, &m->trans_time) >= 0);
+
+        len = sendto(m->server_socket, &ntpmsg, sizeof(ntpmsg), MSG_DONTWAIT, ...);
+```
+
+第一封 UDP packet 在 daemon ready 後毫秒內送出（前提：`network_is_online()` 為 true，否則等 `NetworkManager`/`systemd-networkd` 通知 online）。
+
+收到 NTP 回應後計算 offset，呼 `manager_adjust_clock()`：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 47)
+
+```c
+/*
+ * Maximum delta in seconds which the system clock is gradually adjusted
+ * (slewed) to approach the network time. Deltas larger that this are set by
+ * letting the system time jump. The kernel's limit for adjtime is 0.5s.
+ */
+#define NTP_MAX_ADJUST                  0.4
+```
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 240)
+
+```c
+static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
+        struct timex tmx;
+
+        /* For small deltas, tell the kernel to gradually adjust the system clock to the NTP time, larger
+         * deltas are just directly set. */
+        if (fabs(offset) < NTP_MAX_ADJUST) {
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR,
+                        .status = STA_PLL,
+                        .offset = offset * NSEC_PER_SEC,
+                        .constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4,
+                };
+
+                log_debug("  adjust (slew): %+.3f sec", offset);
+        } else {
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET | ADJ_MAXERROR | ADJ_ESTERROR,
+
+                        /* ADJ_NANO uses nanoseconds in the microseconds field */
+                        .time.tv_sec = (long)offset,
+                        .time.tv_usec = (offset - (double) (long) offset) * NSEC_PER_SEC,
+                };
+
+                if (tmx.time.tv_usec < 0) {
+                        tmx.time.tv_sec  -= 1;
+                        tmx.time.tv_usec += NSEC_PER_SEC;
+                }
+
+                m->jumped = true;
+                log_debug("  adjust (jump): %+.3f sec", offset);
+        }
+
+        /* ... 略 ... */
+
+        if (clock_adjtime(CLOCK_REALTIME, &tmx) < 0)
+                return -errno;
+```
+
+兩種模式的差別：
+
+| offset 大小 | kernel API | 對 wall clock 的影響 | ceph 看不看得到 |
+|---|---|---|---|
+| `|offset| < 0.4s` | `clock_adjtime(ADJ_OFFSET)` | 慢慢 slew：kernel 把 tick rate 微調，幾秒到幾分鐘內走完 | 不會跳，timecheck 看到 latency 抖動但 skew_bound 通常不過門檻 |
+| `|offset| ≥ 0.4s` | `clock_adjtime(ADJ_SETOFFSET)` | 一次加上 `offset`（含負）到 wall clock：**瞬跳，可正可負** | 會跳，下一輪 timecheck 看得到 |
+
+`m->jumped = true` 是內部 flag。下面會看到，daemon 自己 jump 時要避免把自己當外部時間變化處理：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 206)
+
+```c
+static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        /* rearm timer */
+        manager_clock_watch_setup(m);
+
+        /* skip our own jumps */
+        if (m->jumped) {
+                m->jumped = false;
+                return 0;
+        }
+
+        /* resync */
+        log_debug("System time changed. Resyncing.");
+        m->poll_resync = true;
+
+        return manager_send_request(m);
+}
+```
+
+`event_add_time_change` 走 Linux 的 `TFD_TIMER_CANCEL_ON_SET` 機制：任何人對 `CLOCK_REALTIME` 做 `clock_settime` 或 `clock_adjtime(ADJ_SETOFFSET)`，kernel 會 cancel 這個 timer，event loop 拿到 `EPOLL...EXP` 通知。也就是說 **若另一個 process（例如 ops 手動 `date -s`）改了時間，timesyncd 會立刻重新發 NTP query 確認**。
+
+## ⑥ shutdown：最後一次 save
+
+`systemctl stop` 送 SIGTERM 給 daemon → `sd_event_set_signal_exit(true)`（`timesyncd-manager.c:1137`）讓 event loop 退出 → `run()` 走到結尾：
+
+File: `systemd/src/timesync/timesyncd.c` (line 227)
+
+```c
+        r = sd_event_loop(m->event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run event loop: %m");
+
+        /* Save the current time in the file system on exit. */
+        r = touch(TIMESYNCD_CLOCK_FILE);
+        if (r < 0)
+                log_debug_errno(r, "Failed to touch "TIMESYNCD_CLOCK_FILE", ignoring: %m");
+
+        return 0;
+}
+```
+
+`touch()` 直接用當前 wall clock 更新 mtime。也就是：**乾淨關機 → timestamp 檔是停機那一刻的時間 → 下次重啟 `now > epoch` → 不跳**。
+
+**髒關機（kill -9 / 主機掉電）才會留下 70 秒以內的 stale mtime**，下次重啟可能踩 `now <= epoch` 那條路徑（如果這 70 秒內 RTC 又因為任何原因走慢了）。
+
+## clock_apply_epoch：另一條獨立路徑（PID 1 開機時跑）
+
+很容易跟 timesyncd 的 `load_clock_timestamp` 搞混。它是 **PID 1 systemd 本身**在 bootstrap 階段跑的，跟 daemon 重啟無關：
+
+File: `systemd/src/core/clock-warp.c` (line 25)
+
+```c
+void clock_apply_epoch(bool allow_backwards) {
+        usec_t epoch_usec = 0, timesyncd_usec = 0;
+        struct stat st;
+        int r;
+
+        r = RET_NERRNO(stat(TIMESYNCD_CLOCK_FILE, &st));
+        if (r >= 0)
+                timesyncd_usec = timespec_load(&st.st_mtim);
+        else if (r != -ENOENT)
+                log_warning_errno(r, "Could not stat %s, ignoring: %m", TIMESYNCD_CLOCK_FILE);
+
+        r = RET_NERRNO(stat(EPOCH_CLOCK_FILE, &st));   /* /usr/lib/clock-epoch */
+        if (r >= 0)
+                epoch_usec = timespec_load(&st.st_mtim);
+
+        epoch_usec = MAX3(epoch_usec,
+                          timesyncd_usec,
+                          (usec_t) TIME_EPOCH * USEC_PER_SEC);
+
+        if (epoch_usec == 0)
+                return log_debug("Clock epoch is 0, skipping clock adjustment.");
+
+        usec_t now_usec = now(CLOCK_REALTIME);
+        bool advance;
+
+        if (now_usec < epoch_usec)
+                advance = true;
+        else if (CLOCK_VALID_RANGE_USEC_MAX > 0 &&
+                 now_usec > usec_add(epoch_usec, CLOCK_VALID_RANGE_USEC_MAX) &&
+                 allow_backwards)
+                advance = false;
+        else
+                return;  /* Nothing to do. */
+
+        r = RET_NERRNO(clock_settime(CLOCK_REALTIME, TIMESPEC_STORE(epoch_usec)));
+```
+
+兩個重要差別跟 daemon-side `load_clock_timestamp` 比：
+
+1. 多看一個檔案 `/usr/lib/clock-epoch`（distro 可以放、預設沒有）。
+2. **允許「往後跳」**：如果 wall clock 比 `epoch + CLOCK_VALID_RANGE_USEC_MAX` 還新且 `allow_backwards = true`，就被拉回 `epoch`。這擋的是「VM 從 future snapshot 復原、RTC 顯示 2099 年」這種狀況。
+
+呼叫點：
+
+File: `systemd/src/core/main.c` (line 3186)
+
+```c
+                        if (!skip_setup)
+                                initialize_clock_timewarp();
+
+                        clock_apply_epoch(/* allow_backwards= */ !skip_setup);
+```
+
+`skip_setup = true` 表示 PID 1 是 re-exec（`systemctl daemon-reexec`）— 這時不該再 warp 時鐘，所以 `allow_backwards = false`（其實 `!skip_setup = false`），保險起見也不做 backwards 跳鐘。
+
+**回到主問題**：`systemctl restart systemd-timesyncd` **不會** 觸發 `clock_apply_epoch`，因為 PID 1 沒被 re-exec、boot 也沒重來。所以 daemon restart 的 clock impact 完全由 `load_clock_timestamp` 一支函式決定。
+
+## 把所有跳鐘可能性列出來
+
+整理一張表，給 `systemctl restart systemd-timesyncd` 之後**可能**對系統時間有影響的事件：
+
+| 事件 | 何時發生 | 對 CLOCK_REALTIME 的效果 | 大小 |
+|---|---|---|---|
+| ① `load_clock_timestamp` 跳鐘 | drop priv 前、event loop 開始前 | `clock_settime` 前跳到 `max(file_mtime, TIME_EPOCH) + 1μs` | mtime − now（前跳） |
+| ② 首次 NTP 回應 (slew) | event loop 開始、首封 packet 回應後（毫秒到秒級） | `clock_adjtime(ADJ_OFFSET)` 漸進 slew | < 0.4s |
+| ③ 首次 NTP 回應 (jump) | 同 ② | `clock_adjtime(ADJ_SETOFFSET)` 瞬跳 | ≥ 0.4s，可正可負 |
+| ④ 後續 NTP poll 同步 | 32s ~ 2048s 一次 | 同 ②③，正常情況 slew | < 0.4s |
+| ⑤ 60 秒 save tick | 持續跑時 | **不碰系統時間**，只更新 timestamp 檔 mtime | 0 |
+| ⑥ shutdown touch | 收到 SIGTERM 退出 event loop 後 | **不碰系統時間**，只更新 timestamp 檔 mtime | 0 |
+
+`systemctl restart` 走的就是「SIGTERM 舊 process → fork 新 process」，所以順序是：
+
+```
+舊 process: ... ⑤(每 60s) ... → SIGTERM → event loop exit → ⑥
+                                                      ↓
+                                                exit(0)
+                                                      ↓
+                                              systemd 重新 fork
+                                                      ↓
+新 process:  ①  →  drop priv  →  manager_new  →  …  →  sd_event_loop
+                                                              ↓
+                                                       (網路 ok 才會) ②/③
+```
+
+中間 systemd PID 1 fork 新 process 的 latency 通常 100ms 級。整個 restart 對系統時間影響最大的就是步驟 ①。
+
+## 真實情境推演
+
+### 情境 A：dev box 上 `systemctl restart systemd-timesyncd`
+
+- t-1s: 系統正常運作、wall clock 約 `2026-05-26 10:00:00`
+- t=0:  `systemctl restart` 下去
+- t≈0:01s: 舊 process 收 SIGTERM、event loop 退出、`touch(TIMESYNCD_CLOCK_FILE)` mtime ≈ `10:00:00.01`
+- t≈0:05s: systemd 啟動新 process
+- t≈0:05s: `load_clock_timestamp` 讀 mtime = `10:00:00.01`、`now = 10:00:00.06`、`now > epoch` → **不跳**
+- t≈0:1s: 新 process 進 event loop
+- t≈0:5s: NTP 回應、offset 可能幾 ms → slew
+
+**結果**：wall clock 連續，外界完全感覺不到。
+
+### 情境 B：VM 從 5 分鐘前的 snapshot 復原 + restart timesyncd
+
+- t-300s: snapshot 拍下，mtime = `09:55:00`
+- t=0:  VM 復原
+- t=0:  guest wall clock 因為 RTC = `10:00:00`、但 timestamp 檔 mtime = `09:55:00`
+- t=0:  `systemctl restart systemd-timesyncd`
+- t≈0:  `load_clock_timestamp`：`epoch = max(09:55:00, TIME_EPOCH) = 09:55:00`、`now = 10:00:00`、`now > epoch` → **不跳**
+- t≈0:5s: NTP 同步：offset 可能 -300s（因為 host 時間已經到 `10:00:00` 但 snapshot 的 clock domain 不一樣），絕對值 ≥ 0.4 → **瞬跳 -300s**（**往後！**）
+
+**結果**：systemctl restart **本身** 不跳；但隨後的首次 NTP sync 會大幅後跳。timesyncd 自己的 `m->jumped` 會擋住 `manager_clock_watch` 的重複處理，但 ceph mon 或其他依賴 wall clock 的 daemon 會看到時間倒流，可能造成 problem。
+
+### 情境 C：bare-metal RTC 電池壞，重啟後 RTC 顯示 epoch（1970）
+
+- t=0: 開機，PID 1 系統初始化
+- `clock_apply_epoch`：讀 `/var/lib/systemd/timesync/clock` mtime ≈ 上次乾淨關機那一刻；TIME_EPOCH = 2024 某天；`max` 取 2024 那個 mtime；`now = 1970`、`now < epoch` → `clock_settime` **前跳到 2024 某天**
+- 之後 systemd-timesyncd 啟動跑 `load_clock_timestamp`：`now` 已經是 2024 → `now > epoch` → **不跳**
+- 首次 NTP sync：offset 可能秒級 → jump 修正到精確時間
+
+**結果**：PID 1 的 `clock_apply_epoch` 處理了大跳，timesyncd daemon 只負責 fine-tuning。
+
+### 情境 D：systemd-timesyncd 從沒跑過、第一次啟動
+
+- daemon `load_clock_timestamp`：`open()` 回 `ENOENT` → 建立檔案、mtime = `TIME_EPOCH`
+- `now = whatever RTC says`
+- 若 RTC < TIME_EPOCH（嵌入式裝置）：**前跳到 TIME_EPOCH + 1μs**
+- 若 RTC ≥ TIME_EPOCH：**不跳**
+
+## 對 ceph mon 的具體影響
+
+回到一開始的問題：mon node 上 `systemctl restart systemd-timesyncd` 會不會讓 ceph 看到 skew？
+
+| timesyncd 路徑 | mon 那邊看到什麼 |
+|---|---|
+| restart 但 RTC 正常 + 上次乾淨關機 → 不跳 | timecheck 看到偏移 ≈ 0，無 skew |
+| restart 但 timestamp 檔老 + RTC 也老 → 前跳秒級 | 下一輪 timecheck（最壞 5 分鐘）看到 ≥ 50ms，**HEALTH_WARN** |
+| 首次 NTP slew（< 0.4s）| 偏移漸進收斂，每輪 timecheck 看到的 abs_delta 逐次縮小，可能短暫 WARN 後自動 CLEAR |
+| 首次 NTP jump（≥ 0.4s）| 一輪 timecheck 看到 ≥ 400ms，**HEALTH_WARN**；下一輪可能就清掉 |
+
+實務操作建議：
+
+- **批次 rolling restart mon 上的 timesyncd 前**，先確認 `/var/lib/systemd/timesync/clock` mtime 跟系統時間差 < 50ms：
+
+  ```bash
+  date -u
+  stat -c '%y' /var/lib/systemd/timesync/clock
+  ```
+
+- 如果 RTC 不可靠（VM），先做一次手動同步：
+
+  ```bash
+  chronyc -a 'burst 4/4'   # 若用 chrony
+  # 或
+  systemctl restart systemd-timesyncd  # 先讓 timesyncd 跑著
+  timedatectl timesync-status
+  ```
+
+- 升級 systemd（distro package update）會同時 restart daemon — 上面所有情境都適用。Trigger 來自 `dpkg`/`rpm` 的 post-install hook。
+
+## 邊界與除錯
+
+### 沒有網路怎麼辦
+
+`run()` line 217：
+
+```c
+if (network_is_online()) {
+    r = manager_connect(m);
+    if (r < 0)
+        return r;
+}
+```
+
+沒 online 的話 NTP 完全不問。事件來源 `event_add_io` 監聽 `/run/systemd/netif/state`（systemd-networkd）或對 `NetworkManager` D-Bus signal 訂閱，net 上來就會 `manager_connect`。
+
+但 `load_clock_timestamp` 已經跑過了 — **timestamp file 跳鐘那一段不靠網路**。
+
+### 從 `journalctl` 找 bump 事件
+
+```bash
+journalctl -u systemd-timesyncd | grep -E "System clock time advanced|adjust"
+```
+
+日誌字串：
+
+- `System clock time advanced to recorded timestamp: ...` — `load_clock_timestamp` 從 timestamp 檔跳
+- `System clock time advanced to built-in epoch: ...` — `load_clock_timestamp` 從 TIME_EPOCH 跳
+- `adjust (slew): +0.xxx sec` — NTP slew
+- `adjust (jump): +X.xxx sec` — NTP jump
+
+PID 1 的跳則是：
+
+- `System time advanced to ...` — `clock_apply_epoch` 前跳
+- `System time was further ahead than ...` — `clock_apply_epoch` 後拉
+
+journal MESSAGE_ID 都是 `SD_MESSAGE_TIME_BUMP_STR`（同一個），用 ID 過濾比較精確。
+
+### 為什麼 `load_clock_timestamp` 不檢查網路就跳
+
+設計理由就在 line 80 註解：「particularly helpful on systems lacking a battery backed RTC」。如果是嵌入式設備、開機 RTC 永遠 1970 — 等網路上來再修就太慢了（許多 TLS 認證會在這之前就失敗）。先用 timestamp 檔（或 build epoch）粗略 bootstrap，網路上來後 NTP 再精修。
+
+### timestamp 檔被刪掉
+
+`open()` 回 `ENOENT` → 建一個新的、mtime = `TIME_EPOCH`。下次 daemon 重啟若 `now > TIME_EPOCH` 就不會跳，否則跳到 TIME_EPOCH。
+
+### chrony / ntpd 跑著、timesyncd 沒跑
+
+`load_clock_timestamp` 完全不會被觸發，因為這段邏輯只在 timesyncd 進程裡。chrony 有自己的 driftfile（`/var/lib/chrony/drift`）但不會做這種 build-epoch fallback；chrony 預設用 `makestep 1.0 3` rule（前三次 sync 偏移 > 1s 直接 jump，之後一律 slew）。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — timesyncd 跳鐘後，ceph 多久才會看到並抓出來
+  - [Ceph — Clock skew matrix](/ceph/cluster-time-skew-impact) — 不同程度的時間偏移對 MON-MON / MON-OSD / OSD-OSD 各條 channel 的影響
+  - [Ceph — Prometheus alert 四層設計](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 在 Tier 2，timesyncd restart 偶發的暫態 skew 不該 page
+</Callout>

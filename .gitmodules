@@ -36,3 +36,6 @@
 	url = https://github.com/qemu/qemu.git
 	branch = v11.0.0
 	shallow = true
+[submodule "systemd"]
+	path = systemd
+	url = https://github.com/systemd/systemd
