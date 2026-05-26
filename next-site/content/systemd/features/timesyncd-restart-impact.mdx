@@ -400,14 +400,17 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
                 return -errno;
 ```
 
-兩種模式的差別：
+兩種模式的差別 — 分界就是 `NTP_MAX_ADJUST = 0.4` 秒（取自上面那段 source 開頭的常數）。把偏移取絕對值，跟 0.4 比，決定走哪條：
 
-| offset 大小 | kernel API | 對 wall clock 的影響 | ceph 看不看得到 |
+| 偏移絕對值 | kernel API | 對 wall clock 的影響 | ceph 那邊看到什麼 |
 |---|---|---|---|
-| `|offset| < 0.4s` | `clock_adjtime(ADJ_OFFSET)` | 慢慢 slew：kernel 把 tick rate 微調，幾秒到幾分鐘內走完 | 不會跳，timecheck 看到 latency 抖動但 skew_bound 通常不過門檻 |
-| `|offset| ≥ 0.4s` | `clock_adjtime(ADJ_SETOFFSET)` | 一次加上 `offset`（含負）到 wall clock：**瞬跳，可正可負** | 會跳，下一輪 timecheck 看得到 |
+| 小於 0.4 秒 | `clock_adjtime(ADJ_OFFSET)` + `STA_PLL` | 走 kernel PLL：微調 tick frequency，offset 在幾秒到幾分鐘內被慢慢吸收 — **不跳** | 沒跳鐘事件，下幾輪 timecheck 看到的 `abs_delta` 逐步縮小，通常不過 50ms 門檻 |
+| 大於等於 0.4 秒 | `clock_adjtime(ADJ_SETOFFSET)` | 一次把整個 offset（可正可負）加到 wall clock — **瞬跳** | 下一輪 timecheck 就看到完整偏移；若 ≥ 50ms 會觸發 `MON_CLOCK_SKEW` |
 
-`m->jumped = true` 是內部 flag。下面會看到，daemon 自己 jump 時要避免把自己當外部時間變化處理：
+兩條路的差別不只是 API：**對其他程式可不可見** 也不一樣。
+
+- **slew**：`CLOCK_REALTIME` 沒有任何「跳事件」可被觀察，外部程式只會看到時間略偏一點點，沒有 kernel 級通知。
+- **jump**：kernel 發 `TFD_TIMER_CANCEL_ON_SET`，所有訂閱 `CLOCK_REALTIME` 的 timerfd 會被一次性取消。timesyncd 自己也有訂一個（下面那段就是），所以 `m->jumped = true` 就是設給自己看 — 用來辨識「這個跳鐘訊號是不是我剛自己造成的」：
 
 File: `systemd/src/timesync/timesyncd-manager.c` (line 206)
 
