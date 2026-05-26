@@ -471,9 +471,9 @@ for (idx_min = idx_cur, i = 0; i < ELEMENTSOF(m->samples); i++)
 
 | Case | offset 量級 | 對 ceph 影響 | 激進 max=64 恢復 | 平衡 max=256 恢復 | 保守 max=1024 恢復 |
 | --- | --- | --- | --- | --- | --- |
-| A 暫態 5ms | 無 | 1.5min | 5min | 17.5min |
-| B 50-150ms | HEALTH_WARN | 4min | 10min | 36min |
-| C >200ms 異常 | HEALTH_WARN 連續 | 4min | 9min | 36min |
+| A | 5ms | 無 | 1.5min | 5min | 17.5min |
+| B | 50-150ms | HEALTH_WARN | 4min | 10min | 36min |
+| C | >200ms | HEALTH_WARN 連續 | 4min | 9min | 36min |
 
 ## 我的推薦
 
