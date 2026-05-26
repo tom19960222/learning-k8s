@@ -421,9 +421,9 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'systemd'),
     color: 'sky',
     accentClass: 'border-sky-500 text-sky-400',
-    features: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation'],
+    features: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation'],
     featureGroups: [
-      { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation'] },
+      { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation'] },
     ],
     usecases: [],
     difficulty: '🟡 中階',
