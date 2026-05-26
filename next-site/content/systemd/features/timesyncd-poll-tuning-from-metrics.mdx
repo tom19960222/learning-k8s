@@ -1,0 +1,524 @@
+---
+layout: doc
+title: systemd-timesyncd — 從一週實測數據反推最佳 PollIntervalMaxSec
+description: 根據 3 台 ceph node 一週監控（offset ±1ms、jitter 980us、root distance < 4ms、freq -12.475 ~ -0.936ppm），推算 PollIntervalMin/Max 的合理範圍。從源碼的 NTP_ACCURACY_SEC=0.2、PLL constant=log2i(poll)-4、spike detection 三條檢查反推：實測 offset 永遠落在 Branch 3 的 ×2 區間，所以 poll 永遠爬到 max — 「max 設多少」是唯一真正的決策。給出激進 max=64、平衡 max=256、保守 max=1024 三組設定，並分析 RTC 突發 50-200ms 偏移時各設定的恢復時間。
+---
+
+## 場景
+
+過去一週監控我家三台 ceph node 上的 systemd-timesyncd，每分鐘抓一次 `timedatectl timesync-status` 的數值，取一週統計：
+
+| 指標 | 觀察值 |
+| --- | --- |
+| offset 範圍 | -898us 到 +974us |
+| jitter 最大 | 980us |
+| root distance | 1.876ms 到 3.944ms |
+| frequency 範圍 | -12.475ppm 到 -0.936ppm |
+
+問題：`PollIntervalMaxSec` / `PollIntervalMinSec` 該設多少？從激進到保守，並且考慮兩種狀況：
+
+1. **一般情況** — RTC 行為穩定（如上面的數據）。
+2. **RTC 突然抽一下** — 想盡快偵測並恢復。
+
+這頁從源碼把「每個指標代表什麼」與「設定值會怎麼影響行為」串起來，最後給三組推薦設定 + 取捨分析。
+
+前置閱讀：[poll interval adaptation](./timesyncd-poll-interval-adaptation) 講演算法、[low max poll simulation](./timesyncd-low-max-poll-simulation) 講過度激進的副作用。這頁是「實測驅動」的對應篇。
+
+## 每個指標來自哪裡
+
+### offset
+
+每筆 NTP 回應算出的 system clock 與 server time 的差距：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 530)
+
+```c
+offset = ((receive - origin) + (trans - dest)) / 2;
+```
+
+這是 RFC5905 的標準對稱式：`((T2−T1) + (T3−T4)) / 2`。`timedatectl timesync-status` 印出來的 `Offset` 就是最後一次量到的值。
+
+實測 ±1ms 的意義：**`fabs(offset) < NTP_ACCURACY_SEC × 0.25 = 50ms` 永遠成立**。對 `manager_adjust_poll` 來說，這代表 Branch 3（增加 poll interval）會一路觸發。
+
+### jitter
+
+8 筆 sample 的 offset 對「delay 最短那筆」的 RMS 差：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 337)
+
+```c
+j = 0;
+FOREACH_ELEMENT(sample, m->samples)
+        j += pow(sample->offset - m->samples[idx_min].offset, 2);
+
+size_t n = ELEMENTSOF(m->samples);
+m->samples_jitter = sqrt(j / (n - 1));
+```
+
+jitter 980us ⇒ spike 判定門檻 `3 × jitter = 2.94ms`。
+
+實際上 spike detection 有兩條：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 357)
+
+```c
+/* do not accept anything worse than the maximum possible error of the best sample */
+if (fabs(offset) > m->samples[idx_min].delay)
+        return true;
+
+/* compare the difference between the current offset to the previous offset and jitter */
+return fabs(offset - m->samples[idx_cur].offset) > 3 * jitter;
+```
+
+第一條：「offset 超過 8 筆 sample 裡最小 delay」也算 spike。實測 root distance 最小 1.876ms ⇒ 最小 delay 至少 ~2ms（delay 通常與 root distance 同數量級）⇒ 第一條的閾值 ~2ms。
+
+合在一起：實測環境的 spike 門檻 ≈ 2~3ms。
+
+### root distance
+
+NTP server 自己回報的「我跟我的上游 server 距離有多遠」：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 493)
+
+```c
+root_distance = ntp_ts_short_to_d(&ntpmsg.root_delay) / 2 + ntp_ts_short_to_d(&ntpmsg.root_dispersion);
+if (root_distance > (double) m->root_distance_max_usec / (double) USEC_PER_SEC) {
+        log_info("Server has too large root distance. Disconnecting.");
+        return manager_connect(m);
+}
+```
+
+預設 `NTP_ROOT_DISTANCE_MAX_USEC = 5s`：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 55)
+
+```c
+/* Default of maximum acceptable root distance in microseconds. */
+#define NTP_ROOT_DISTANCE_MAX_USEC      (5 * USEC_PER_SEC)
+```
+
+實測 1.876 ~ 3.944ms，遠低於 5s 上限。連用 LAN NTP 都不必擔心換 server 的問題。
+
+### frequency
+
+kernel 上次 `adjtimex` 回報的 PLL 校頻量：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 295)
+
+```c
+m->drift_freq = tmx.freq;
+```
+
+`timedatectl` 印的 `Frequency` 是 `drift_freq / 0x10000`：
+
+File: `systemd/src/timedate/timedatectl.c` (line 534)
+
+```c
+r = table_add_cell_stringf(table, NULL, "%+.3fppm", (double) i->freq / 0x10000);
+```
+
+實測 -12.475 ~ -0.936ppm 的意義：
+
+- **方向永遠是負的** — 本地 oscillator 比 server 慢，PLL 持續往「加快」方向校。RTC quartz 的 ppm 偏移在常溫下穩定為負屬於正常製程偏差。
+- **變動範圍 11.5ppm** — 室溫變化、CPU thermal 等慢變因素造成的「真實 drift rate 變動」。每秒會累積 12.5us，在 2048s（預設 max poll）期間理論最大累積 = 25.6ms。
+- **但實測 offset 仍 < 1ms** — 因為 PLL 在 11 分鐘模式持續修正 rate，所以 drift 不會累積到下次 NTP 才被發現。
+
+## 這些數字告訴你 timesyncd 現在的行為
+
+把實測數據套進 `manager_adjust_poll`：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 364)
+
+```c
+static void manager_adjust_poll(Manager *m, double offset, bool spike) {
+        if (m->poll_resync) {
+                m->poll_interval_usec = m->poll_interval_min_usec;
+                ...
+        }
+        if (!spike && fabs(offset) > NTP_ACCURACY_SEC) {                  /* > 200ms */
+                m->poll_interval_usec = m->poll_interval_min_usec;
+                return;
+        }
+        if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) {                     /* < 50ms */
+                if (m->poll_interval_usec < m->poll_interval_max_usec)
+                        m->poll_interval_usec *= 2;
+                return;
+        }
+        if (spike || fabs(offset) > NTP_ACCURACY_SEC * 0.75) {            /* > 150ms */
+                if (m->poll_interval_usec > m->poll_interval_min_usec)
+                        m->poll_interval_usec /= 2;
+                return;
+        }
+}
+```
+
+實測 offset 一直在 1ms 量級，永遠落在 Branch 3 的「< 50ms」區間。所以行為是：
+
+- 重啟後 poll 從 `min_usec` 開始
+- 連續 ×2 直到 max（六輪：32→64→128→256→512→1024→2048，累積 4032s）
+- 之後一直待在 max
+
+**結論：在我家這種穩定環境，poll interval 99.9% 的時間都等於 `PollIntervalMaxSec`。`min` 只在前 6 輪有意義。**
+
+所以真正要決策的是 max。
+
+### offset 永遠不會觸發 ÷2 嗎？
+
+對。實測最大 |offset| = 974us，遠低於 Branch 4 的 0.15s 門檻。也低於 spike 判定的 2~3ms 門檻。所以正常運作期間，poll 永遠只會 ×2 或不動。
+
+只有當 **RTC 突然抽一下** 把 offset 推到 ≥150ms 或觸發 spike 判定，才會 ÷2。
+
+## 三組推薦設定
+
+下面以「重啟後在第 N 輪達到穩態」、「PLL constant」、「每天 NTP packet 數量」、「spike 視窗時長」四個維度比較。穩態 poll 計算前提是 offset 持續 < 50ms（依實測就是這種情況）。
+
+| 設定 | min | max | 達穩態輪數 | 穩態 poll | PLL constant | packet/day | spike 視窗 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 預設 | 32 | 2048 | 6 | 2048s | 7 | ~42 | 4.5 小時 |
+| 保守 | 32 | 1024 | 5 | 1024s | 6 | ~84 | 2.3 小時 |
+| 平衡 | 32 | 256 | 3 | 256s | 4 | ~337 | 34 分鐘 |
+| 激進 | 32 | 64 | 1 | 64s | 2 | ~1350 | 8.5 分鐘 |
+
+PLL constant 算法（[adjust_clock 那一段](./timesyncd-poll-interval-adaptation)）：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 252)
+
+```c
+.constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4,
+```
+
+- 64s → log2i(64) − 4 = 6 − 4 = 2
+- 256s → log2i(256) − 4 = 8 − 4 = 4
+- 1024s → log2i(1024) − 4 = 10 − 4 = 6
+- 2048s → log2i(2048) − 4 = 11 − 4 = 7
+
+constant 越小、PLL 對 sample 越敏感。對 offset 持續 < 1ms 的環境，constant=2 跟 constant=7 在 steady-state 沒有實際差別 — sample noise 本身就比 PLL 反應的雜訊還小。
+
+### 激進設定 (min=32, max=64)
+
+```ini
+[Time]
+PollIntervalMinSec=32
+PollIntervalMaxSec=64
+```
+
+特性：
+
+- 每 64 秒一輪 NTP query。對任何 RTC 異常的 **偵測上限 64 秒**。
+- PLL constant=2，反應快但對 jitter 敏感。實測 jitter 980us 對 PLL 噪音貢獻：constant=2 vs constant=7 大約 7-10 倍。但因為 offset 本身就 < 1ms，噪音放大 10 倍仍然 < 10ms。
+- 每天 ~1350 packet 對 self-hosted NTP server 沒問題；用 `pool.ntp.org` 邊界（建議 ≥64s）。
+- spike 視窗 8.5 分鐘，只能 filter 偶發 jitter。
+
+適合場景：
+
+- 自己跑 NTP server，packet 量無壓力。
+- ceph mon clock skew 警報是高優先級監控對象，希望 ≤ 1 分鐘內偵測到。
+
+### 平衡設定 (min=32, max=256)
+
+```ini
+[Time]
+PollIntervalMinSec=32
+PollIntervalMaxSec=256
+```
+
+特性：
+
+- 每 256 秒（~4.3 分鐘）一輪 query。**比 ceph timecheck 5 分鐘略快 — 兩個 timer 對 RTC 異常的偵測敏感度相當**。
+- PLL constant=4，仍然偏敏感但比激進設定多一級 noise filter。
+- 每天 ~337 packet，對 pool.ntp.org 完全友善。
+- spike 視窗 34 分鐘，足夠 filter 大部分網路 jitter。
+
+適合場景：
+
+- 標準 production 設定。
+- 不確定該選哪個就選這組。
+
+### 保守設定 (min=32, max=1024)
+
+```ini
+[Time]
+PollIntervalMinSec=32
+PollIntervalMaxSec=1024
+```
+
+特性：
+
+- 每 1024 秒（~17 分鐘）一輪 query。比預設 2048 略快但不會多很多 NTP traffic。
+- PLL constant=6，noise immunity 接近預設。
+- 每天 ~84 packet。
+- spike 視窗 2.3 小時，filter 噪音能力強。
+
+適合場景：
+
+- ceph clock skew 不是首要監控對象、用 NTP 服務商（如 pool.ntp.org）要省 packet。
+- 想比預設快一點但不想顯著增加 NTP server 壓力。
+
+## RTC 突然抽一下的恢復路徑
+
+「RTC 抽一下」可以拆成幾種具體情境，每個觸發 timesyncd 不同分支：
+
+### Case A：offset 累積到 5~50ms（最常見）
+
+例如 RTC drift rate 從 -10ppm 突然變成 -200ppm 30 秒後恢復：累積 offset = 190ppm × 30s = 5.7ms。
+
+下一輪 NTP query：
+- 5.7ms < 50ms → 仍走 Branch 3（×2 或維持 max）
+- 不會觸發 spike（5.7ms < jitter×3 ~3ms？不對，5.7ms > 3ms，會觸發！）
+
+實際走向取決於 spike 判定：5.7ms > 2.94ms ⇒ 視為 spike ⇒ Branch 4 觸發 ÷2。但 spike 那筆 sample **不會** 進 PLL：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 573)
+
+```c
+if (!spike) {
+        /* Fix up our idea of the time. */
+        dts.realtime = (usec_t) (dts.realtime + offset * USEC_PER_SEC);
+
+        r = manager_adjust_clock(m, offset, leap_sec);
+        ...
+}
+```
+
+spike 被擋住、不修 clock。下一輪 poll interval 已經是 max/2，再下一輪如果 offset 還在 5ms 級會再被當 spike ÷2，直到 poll 降到讓 PLL 跟得上。
+
+**這就是「越穩定的環境、jitter 越小、突發 5ms 越容易被誤判為 spike」的副作用。** 但這也是設計意圖：jitter 980us 的環境裡 5ms 偏差確實「不像真實」。
+
+恢復路徑：
+- 偵測延遲 = 第一次 query 看到偏差 = 最壞情況 = max poll interval
+- 連續幾輪 spike → poll ÷2 → 直到偏差不再被視為 spike
+- 修 clock 採 PLL slew，offset 5ms 大約 30s 內收斂
+
+| 設定 | 從 RTC 抽起到 NTP 偵測 | 從偵測到 ceph 不再 HEALTH_WARN |
+| --- | --- | --- |
+| 激進 max=64 | ≤ 64s | ≤ 64s + 30s = 1.5min |
+| 平衡 max=256 | ≤ 256s | ≤ 4.3min + 30s = 5min |
+| 保守 max=1024 | ≤ 1024s | ≤ 17min + 30s = 17.5min |
+| 預設 max=2048 | ≤ 2048s | ≤ 34min + 30s = 35min |
+
+但要注意 ceph 本身有 50ms 門檻 — 5ms 偏差不會觸發 ceph HEALTH_WARN。Case A 對 ceph 監控其實沒影響。
+
+### Case B：offset 累積到 50~150ms（ceph 50ms 門檻會觸發）
+
+例如 RTC 暫時跑到 -1000ppm 60 秒：累積 = 988ppm × 60s = 59ms。
+
+- 59ms < 200ms ⇒ 不走 Branch 2 reset
+- 59ms > 50ms ⇒ 不走 Branch 3 ×2
+- 59ms < 150ms ⇒ 不走 Branch 4 ÷2
+- 但 59ms > 2.94ms ⇒ spike
+
+落在 50~150ms 死區、但會被當 spike：行為跟 Case A 一樣（spike 不入 PLL、poll ÷2）。
+
+ceph 端：59ms 偏差 > 50ms 門檻 ⇒ 下一輪 timecheck（≤ 5min）會看到 HEALTH_WARN。
+
+| 設定 | NTP 何時開始修 | ceph HEALTH_WARN 持續 |
+| --- | --- | --- |
+| 激進 max=64 | ≤ 64s（spike-擋一次）+ 64s（再來一輪、可能仍 spike）⇒ 連續 spike 直到 poll 降到 16s。實務 2~3 輪 ≈ 3min | 3-8min |
+| 平衡 max=256 | spike 連續被擋。從 256→128→64→32→16(min) ⇒ 4 輪 ≈ 12min | 12-17min |
+| 保守 max=1024 | 1024→512→256→128→64→32 ⇒ 6 輪 ≈ 32min | 32-37min |
+| 預設 max=2048 | 6-7 輪 ≈ 60min+ | 60-65min |
+
+**這裡才看出 max poll 對 ceph 監控的明顯差別。**
+
+但有個 nuance：spike 一直被擋的話，clock 一直沒被修，offset 會繼續累積。如果 RTC 已經回到 -12ppm 正常範圍，offset 就停在 59ms；下一筆 NTP query 看到的 still 59ms 跟前一輪比變化小（只變 0.7ms），**spike 第二條判定（|Δoffset| > 3 × jitter）會變 false**，這筆就被當正常值收下、進 PLL。
+
+所以實際恢復路徑：
+1. 第一筆異常 sample 被當 spike 擋住
+2. 第二筆 sample offset 仍 ~59ms，但 |Δ| 很小 ⇒ 不再 spike ⇒ 進 PLL ⇒ 修
+3. PLL slew 59ms 大約 120-300s
+
+修正後的真實時序：
+
+| 設定 | NTP 偵測到 → 開始修 | 修正完成 | 總計（最壞） |
+| --- | --- | --- | --- |
+| 激進 max=64 | ≤ 128s | + 120s | ~ 4 min |
+| 平衡 max=256 | ≤ 512s | + 120s | ~ 10 min |
+| 保守 max=1024 | ≤ 2048s | + 120s | ~ 36 min |
+| 預設 max=2048 | ≤ 4096s | + 120s | ~ 70 min |
+
+### Case C：offset > 200ms（嚴重 RTC abnormality）
+
+例如 RTC 卡住 5 秒、累積 60ppm × 5s + 之後正常運作 1 分鐘把 offset 推到 ~250ms。或更糟的情況。
+
+- 250ms > 200ms ⇒ Branch 2 直接 `poll_interval_usec = poll_interval_min_usec`
+- 一定不是 spike（spike 判定走 `samples[idx_min].delay`，假設 delay < 5ms ⇒ 250 > 5ms ⇒ spike 第一條返回 true... wait）
+
+實際 spike 判定第一條 `fabs(offset) > m->samples[idx_min].delay`：250ms > best delay（~2ms）⇒ true ⇒ spike。
+
+但 Branch 2 的條件是 `!spike && fabs(offset) > NTP_ACCURACY_SEC`，因為 spike，**不走 Branch 2 reset**。
+
+走 Branch 4: `spike || fabs(offset) > 0.15s` 觸發 ÷2。一樣是 spike 擋住、不修 clock。
+
+下一筆 sample：offset 仍 ~250ms（沒被修）但 |Δ| 小 → spike 第二條 false → 但 spike 第一條（offset > best_delay）**仍然 true**！⇒ 仍然 spike。
+
+問題：spike 第一條會一直把 250ms 擋著，clock 永遠不修？
+
+仔細看：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 332)
+
+```c
+jitter = m->samples_jitter;
+for (idx_min = idx_cur, i = 0; i < ELEMENTSOF(m->samples); i++)
+        if (m->samples[i].delay > 0 && m->samples[i].delay < m->samples[idx_min].delay)
+                idx_min = i;
+```
+
+`idx_min` 是 sample 裡 delay 最小的那筆。delay 跟 offset 是分開存的。即使 offset 全部 250ms，delay 仍然是網路 RTT（~2ms）。
+
+所以 250ms > 2ms 一直成立 ⇒ 一直 spike ⇒ 一直不修。**這似乎是 timesyncd 的盲點**：累積異常 offset 又沒有大幅波動的話，spike detection 會把它擋死。
+
+實務上會解套的條件：
+- offset 繼續變大（>>250ms）讓 |Δ| 突破 3×jitter ⇒ Branch 2 reset to min（但需要 `!spike` 條件，spike 就不走）
+- 連續 spike 累積到 `NTP_MAX_MISSED_REPLIES = 2` 切 server？不對，這是 missed reply 不是 spike
+- 重啟 timesyncd / `systemctl restart`
+
+實際的逃脫機制：**spike 仍然會 ÷2 poll**，所以 poll 會持續減半到 min（最快 6 輪後到 16s）。當 poll 降到 min 時，連續密集 sample，jitter 估計會被異常 offset 拉高、spike 門檻變寬鬆、最終一筆 sample 被接受。
+
+但這個機制是 **「靠加大 jitter 估計把 spike 門檻拉高」**，不是直接修正 — 過程可能需要 8 個 sample 才能讓 jitter 統計穩定。max=2048 ⇒ 6 輪 ÷2 到 min ⇒ 1024+512+256+128+64+32 = 2016s = 34min；之後 8 個 sample × 32s = 256s = 4min 才完整刷新 jitter；總計 ~38min。
+
+| 設定 | 從 RTC 抽起到完成修正（Case C） |
+| --- | --- |
+| 激進 max=64 | poll 已經是 64，÷2 1 輪到 32，再 ÷2 到 16 ⇒ 2 輪 ~96s，加 8 sample × 16s ~128s ⇒ ~ 4min |
+| 平衡 max=256 | 3 輪 ÷2 到 32 ~7min，加 jitter 刷新 ~ 9min |
+| 保守 max=1024 | 5 輪 ÷2 ~ 32min，加刷新 ~ 36min |
+| 預設 max=2048 | 6 輪 ÷2 ~ 64min，加刷新 ~ 68min |
+
+對嚴重異常恢復來說，激進設定是真的差別很大。
+
+### 三種 Case 整理
+
+| Case | offset 量級 | 對 ceph 影響 | 激進 max=64 恢復 | 平衡 max=256 恢復 | 保守 max=1024 恢復 |
+| --- | --- | --- | --- | --- | --- |
+| A 暫態 5ms | 無 | 1.5min | 5min | 17.5min |
+| B 50-150ms | HEALTH_WARN | 4min | 10min | 36min |
+| C >200ms 異常 | HEALTH_WARN 連續 | 4min | 9min | 36min |
+
+## 我的推薦
+
+**選平衡設定 (min=32, max=256)。**
+
+理由：
+
+1. **配合 ceph timecheck 5 分鐘節奏** — 偵測敏感度 ≈ ceph 偵測敏感度。timesyncd 256s + ceph 300s = 一個 ceph round 內必偵測到。
+2. **Case A 的 5ms 偏差在 5 分鐘內恢復** — 還不到 ceph 50ms 門檻，不會 false alert。
+3. **Case B 的 50-150ms 偏差在 10 分鐘內恢復** — 跟 ceph HEALTH_WARN 持續時間相近，alert 不會卡很久。
+4. **每天 337 packet** — 對 pool.ntp.org 友善，自己跑 NTP 也無壓力。
+5. **重啟後 3 輪達穩態 = 4.3 分鐘** — 比預設 6 輪 67 分鐘快很多。
+
+```ini
+[Time]
+NTP=pool.ntp.org
+PollIntervalMinSec=32
+PollIntervalMaxSec=256
+RootDistanceMaxSec=1
+```
+
+`RootDistanceMaxSec=1` 比預設 5 嚴格，但根據實測 root distance 上限 3.944ms，1 秒已經非常寬鬆 — 主要是把那種「明顯不健康」的 server 直接擋掉。
+
+## 怎麼套用 + 怎麼確認生效
+
+```bash
+sudo install -m 644 /dev/stdin /etc/systemd/timesyncd.conf <<'EOF'
+[Time]
+PollIntervalMinSec=32
+PollIntervalMaxSec=256
+EOF
+
+# 注意：reload 不會套用新值（沒有 reload handler）
+sudo systemctl restart systemd-timesyncd
+
+# 確認生效
+timedatectl timesync-status
+```
+
+預期輸出：
+
+```
+       Server: 162.159.200.123 (time.cloudflare.com)
+Poll interval: 32s (min: 32s; max 4min 16s)
+```
+
+`max 4min 16s` 就是 256s。
+
+如果 reload 沒生效會顯示舊值（[restart 本身可能跳鐘](./timesyncd-restart-impact)，需要評估時機）。
+
+## 我什麼時候會考慮改成激進
+
+實測一週的數據完全沒看到 Case B / C 級別的異常，所以平衡設定夠用。但下面情況我會切回激進 (max=64)：
+
+1. **發現 ceph 偶爾出現秒等級 HEALTH_WARN 且自動恢復** — 表示有 Case B 級的偏移。要縮短偵測延遲。
+2. **VM live migration 後** — KVM 的 KVM Clock 偶爾不穩。短期把 max 拉低觀察。
+3. **debug 模式** — 想看每 64s 一輪的 PLL 行為。改完記得拉回。
+
+## 邊界與容易踩坑
+
+### freq 永遠負的 — 是壞掉嗎？
+
+不是。`-12.475ppm ~ -0.936ppm` 表示 oscillator 比參考 server 慢 12 ppm 左右，這是常溫下 quartz 製程偏差的正常範圍（典型工業級 RTC ±20ppm）。
+
+**警訊**是：
+- freq 接近 ±500ppm — 已經是 Linux PLL 校頻能力的邊界
+- freq 不穩、來回擺動超過 50ppm — 可能 thermal 異常
+
+實測 11.5ppm 變動範圍很穩定，不用擔心。
+
+### offset peak-to-peak 1.87ms 是好還是壞？
+
+中等偏好。對照值：
+
+| 環境 | typical offset peak-to-peak |
+| --- | --- |
+| 同機房 LAN NTP server | 50us 量級 |
+| WAN NTP (RTT 5~10ms) | 1ms 量級 |
+| 跨大陸 NTP (RTT 50+ms) | 5-10ms 量級 |
+
+實測 1.87ms ⇒ 用的是 WAN NTP，RTT 大約 5-10ms。如果想壓到 50us 量級，要架本地 NTP server。
+
+### 為什麼沒有真的把 max 拉到 32（min=max）？
+
+[Low max poll simulation 那一頁](./timesyncd-low-max-poll-simulation) 拆過 — `min=max=32` 會讓 `manager_adjust_poll` 整支變 no-op，spike 視窗只剩 4.3 分鐘，PLL constant=1 把 jitter 直接餵 kernel。對穩定環境是把優勢做掉。
+
+`max=64` 仍保留 32↔64 兩個檔位，並且配合 spike detection 自動 ÷2 機制有逃脫路徑。
+
+### `PollIntervalMinSec=16` 看起來能用
+
+```ini
+PollIntervalMinSec=16
+```
+
+`timesyncd-conf.c:121` 的 check 是嚴格小於 16：
+
+File: `systemd/src/timesync/timesyncd-conf.c` (line 121)
+
+```c
+if (m->poll_interval_min_usec < 16 * USEC_PER_SEC) {
+        log_warning("Invalid PollIntervalMinSec=. Using default value.");
+        m->poll_interval_min_usec = NTP_POLL_INTERVAL_MIN_USEC;
+}
+```
+
+所以 `=16` 通過、`=15` 被打回 32。但這已經低於 NTPv4 RFC5905 建議的 `min poll 16s（2^4）`下限 — 不要這樣設。
+
+### restart 後恢復穩態的時間
+
+每個設定的「重啟到穩態」輪數 × 各輪累計時間：
+
+| 設定 | 路徑 | 累計時間 |
+| --- | --- | --- |
+| 預設 max=2048 | 32→64→128→256→512→1024→2048 | 6 輪 67 分鐘 |
+| 保守 max=1024 | 32→64→128→256→512→1024 | 5 輪 33 分鐘 |
+| 平衡 max=256 | 32→64→128→256 | 3 輪 7.5 分鐘 |
+| 激進 max=64 | 32→64 | 1 輪 1.5 分鐘 |
+
+平衡設定 7.5 分鐘是另一個它的好處 — 重啟後快速進入穩態。
+
+## 相關頁面
+
+<Callout type="info" title="延伸閱讀">
+  - [systemd-timesyncd — poll interval 怎麼從 2048s 變回 32s](./timesyncd-poll-interval-adaptation) — `manager_adjust_poll` 四條決策路徑的完整拆解
+  - [systemd-timesyncd — PollIntervalMaxSec 調成 64s 或 32s 會發生什麼](./timesyncd-low-max-poll-simulation) — 過度激進的副作用分析
+  - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — restart 的跳鐘機制
+  - [systemd-timesyncd — 跟系統時間有關的 log 印不印](./timesyncd-log-anatomy) — 把 PLL 行為轉成可觀察的 log
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection) — ceph 端 50ms 門檻 + 5 分鐘 timecheck，跟這頁推薦的 max=256 配合
+</Callout>
