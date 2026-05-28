@@ -1,0 +1,206 @@
+---
+layout: doc
+title: systemd — 只用 timesyncd + Prometheus，怎麼監控 ceph nodes 時間差 < 50ms
+description: timesyncd 本身不吐 Prometheus metric，但它把 clock 狀態寫進 kernel timex（STA_PLL、清掉 STA_UNSYNC），node_exporter 的 timex collector（預設開）就能用 node_timex_sync_status + node_timex_offset_seconds 看出 timesyncd 有沒有在做事。三層監控：node_exporter timex 看每台 node 的 offset（早期警告）、systemd_exporter 看 timesyncd 還活著、ceph-mgr prometheus 的 ceph_health_detail{name="MON_CLOCK_SKEW"} 是跨 node 50ms 的權威判決。time_exporter 已停更（2021）別用。
+---
+
+## 場景
+
+3-node bare-metal ceph cluster，每台跑一個 mon。你的時間同步**只有 systemd-timesyncd**（沒有 chrony、沒有 ntpd），監控**只有 Prometheus**。你要回答一個很具體的問題：
+
+> **怎麼用 Prometheus 確認「這三台 node 的時間彼此一致、誤差小於 50ms」？而且最好在 ceph 自己抱怨之前就先知道。**
+
+50ms 不是隨便挑的 — 它就是 ceph mon 的預設門檻。File: `ceph/src/common/options/mon.yaml.in` (line 609)
+
+```yaml
+- name: mon_clock_drift_allowed
+  type: float
+  desc: allowed clock drift (in seconds) between mons before issuing a health warning
+  default: 0.05
+```
+
+第一個障礙：**systemd-timesyncd 本身沒有 metrics endpoint**，不像 chrony 有 `chrony_exporter`。那要監控什麼？答案分三層，而且第一層比大多數人以為的好用。
+
+## 三層監控策略
+
+```
+        ┌─────────────────────────────────────────────────────────────┐
+        │  第一層：node_exporter (timex collector，預設開)             │
+        │    node_timex_sync_status   ← timesyncd 有沒有在 discipline  │
+        │    node_timex_offset_seconds ← 這台 node 現在偏多少（早期）  │
+        │    node_timex_maxerror_seconds ← 距離上次 sync 多久（新鮮度）│
+        └─────────────────────────────────────────────────────────────┘
+                              │ 但這是「對 NTP source 的偏移」，非跨 node
+                              ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  第二層：systemd_exporter                                    │
+        │    systemd_unit_state{name="systemd-timesyncd.service",      │
+        │                       state="active"}  ← daemon 還活著嗎     │
+        └─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  第三層：ceph-mgr prometheus module                          │
+        │    ceph_health_detail{name="MON_CLOCK_SKEW"} == 1            │
+        │      ← ceph 自己量「跨 mon 的 50ms 判決」，權威但只有 0/1    │
+        └─────────────────────────────────────────────────────────────┘
+```
+
+直覺上的分工：**第三層是權威判決**（ceph 自己跨 mon 量），但它只給你 0/1、而且要等 timecheck round（平均 ~2.5 分鐘，見下方相關頁面）。**第一層是早期警告**（每台 node 的 offset），能在還沒到 50ms 前就抓到某台在漂。**第二層是保命**（disciplining daemon 死了，前兩層的數字會慢慢變成謊言）。
+
+## 第一層：node_exporter timex — timesyncd 有沒有在做事
+
+很多人以為 timex collector 只對 chrony / ntpd 有用，對 timesyncd 沒用。**錯。** 關鍵在 timesyncd 收到一個有效 NTP sample、要校正 clock 時，到底對 kernel 做了什麼。
+
+timesyncd 把校正分成兩種：偏移 < 0.4 秒用 slew（漸進）、≥ 0.4 秒直接 jump。重點是 slew 這條設了 `status = STA_PLL`。File: `systemd/src/timesync/timesyncd-manager.c` (line 247)
+
+```c
+if (fabs(offset) < NTP_MAX_ADJUST) {       // NTP_MAX_ADJUST = 0.4
+        tmx = (struct timex) {
+                .modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR,
+                .status = STA_PLL,
+                .offset = offset * NSEC_PER_SEC,
+                .constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4,
+        };
+```
+
+注意它**沒有**設 `STA_UNSYNC`。STA_UNSYNC 只在一種情況下被設：RTC 跑 local time。File: `systemd/src/timesync/timesyncd-manager.c` (line 275)
+
+```c
+/* An unset STA_UNSYNC will enable the kernel's 11-minute mode, which syncs the system time
+ * periodically to the RTC. */
+if (m->rtc_local_time)
+        tmx.status |= STA_UNSYNC;
+```
+
+也就是說，正常情況（RTC 跑 UTC）timesyncd 每次成功校正都**清掉 STA_UNSYNC**，把 clock 標成「已同步」。而且 `modes` 裡帶了 `ADJ_MAXERROR | ADJ_ESTERROR`，但 struct 沒給值 → maxerror / esterror 被歸零。之後 kernel 會讓 maxerror 隨時間長大，timesyncd 下次校正再歸零。這兩個行為正好對應 node_exporter 的兩個 metric。
+
+node_exporter 的 timex collector 是**預設開啟**的（`registerCollector("timex", defaultEnabled, ...)`，node_exporter v1.11.1 `collector/timex.go`）。它呼叫 `adjtimex(2)` 讀回 kernel 的同步狀態，`sync_status` 的判定是：
+
+```text
+# node_exporter v1.11.1 collector/timex.go（Collect 邏輯）
+status, _ := unix.Adjtimex(timex)
+if status == timeError { syncStatus = 0 } else { syncStatus = 1 }
+node_timex_offset_seconds   = timex.Offset   / divisor
+node_timex_maxerror_seconds = timex.Maxerror / 1e6
+```
+
+`adjtimex` 只有在 clock 是 unsynchronised（STA_UNSYNC 被設）時才回傳 `TIME_ERROR`。把兩邊串起來：
+
+- timesyncd 正常運作 → 清掉 STA_UNSYNC → `adjtimex` 不回 TIME_ERROR → **`node_timex_sync_status = 1`**。
+- timesyncd 死掉或長時間連不到 NTP → maxerror 一路長大、kernel 最終自己設回 STA_UNSYNC → `adjtimex` 回 TIME_ERROR → **`node_timex_sync_status = 0`**。
+- `node_timex_offset_seconds` = kernel 目前還在修的偏移量（timesyncd 上次餵進去、隨 slew 衰減），是「這台 node 現在偏多少」的合理近似。
+
+這不是我推論的，是 node_exporter 官方文件 `docs/TIME.md` 直接寫的結論：
+
+> the combination of `sync_status` and `offset` exported by `timex` module is the way to monitor if systemd-timesyncd does its job.
+
+<Callout type="warning" title="chrony 的雷 timesyncd 沒有">
+  同一份 `docs/TIME.md` 提醒：某些舊 daemon 會在啟動時清掉 STA_UNSYNC 卻不維護它（例如 Debian jessie 的 chrony-1.30），導致 `sync_status` 不可信；chrony 要靠 `rtcsync` 選項才會維護這個 flag。timesyncd 沒這問題 —— 上面的原始碼顯示它每次成功校正都正確管理 STA_PLL / STA_UNSYNC，這正是 timex collector 對 timesyncd 可靠的原因。
+</Callout>
+
+## 第二層：systemd_exporter — disciplining daemon 還活著嗎
+
+第一層有個盲點：如果 timesyncd 整個死掉，kernel 要等到 maxerror 長到上限才把 `sync_status` 翻成 0，中間有空窗。直接盯著 service 狀態更即時。
+
+`prometheus-community/systemd_exporter`（v0.7.0）暴露每個 unit 的狀態。systemd_exporter v0.7.0 `systemd/systemd.go`：
+
+```go
+unitState := prometheus.NewDesc(
+    prometheus.BuildFQName(namespace, "", "unit_state"),
+    "Systemd unit", []string{"name", "type", "state"}, nil, ...)
+// state 取自：{"active", "activating", "deactivating", "inactive", "failed"}
+```
+
+每個 (unit, state) 組合各一行、值 0 或 1。所以盯 timesyncd 是否 active：
+
+```promql
+# 在你環境跑後對照：daemon 不在 active 就告警
+systemd_unit_state{name="systemd-timesyncd.service", state="active"} != 1
+```
+
+## 第三層：ceph-mgr prometheus — 跨 node 的權威判決
+
+前兩層量的都是「單台 node 對它的 NTP source 偏多少」，**不是** node 跟 node 之間的差。真正跨 mon 量時間差的是 ceph 自己的 timecheck，門檻就是上面那個 50ms。當它超標，會冒出 `MON_CLOCK_SKEW` health check。
+
+ceph-mgr 的 prometheus module 把每個 active 的 health check 變成一個 gauge。File: `ceph/src/pybind/mgr/prometheus/module.py` (line 742)
+
+```python
+metrics['health_detail'] = Metric(
+    'gauge',
+    'health_detail',
+    'healthcheck status by type (0=inactive, 1=active)',
+    HEALTHCHECK_DETAIL    # ('name', 'severity')
+)
+```
+
+它逐一把 health history 裡的 check 設成 1（active）或 0。File: `ceph/src/pybind/mgr/prometheus/module.py` (line 932)
+
+```python
+for name, info in self.health_history.healthcheck.items():
+    v = 1 if info.active else 0
+    self.metrics['health_detail'].set(v, (name, str(info.severity)))
+```
+
+所以跨 node 的權威告警是：
+
+```promql
+# ceph 自己判定跨 mon 時間差已超過 50ms
+ceph_health_detail{name="MON_CLOCK_SKEW"} == 1
+```
+
+<Callout type="warning" title="ceph 只給 0/1，不給 ms 數值">
+  `ceph_health_detail` 是 0/1 的 gauge —— 它告訴你「有沒有超過 50ms」，**不告訴你實際偏多少 ms**。實際數值在 `ceph time-sync-status` / `ceph health detail` 的文字輸出裡，預設不進 Prometheus。要看量級，要嘛去解析那個指令，要嘛靠第一層每台 node 的 `node_timex_offset_seconds` 三角推算。
+</Callout>
+
+## per-node offset 為什麼能當跨 node 的早期警告
+
+第三層要等 timecheck round（平均約 2.5 分鐘），而且只在已經破 50ms 後才響。能不能更早？可以，用第一層做數學：
+
+設 node A 對真實時間偏 `X`、node B 偏 `Y`，則 A、B 之間的差 = `|X − Y| ≤ |X| + |Y|`。所以**只要每台 node 都維持 `|node_timex_offset_seconds| < 25ms`，任兩台之間就保證 < 50ms**。
+
+於是一條比 ceph 更早的早期警告：
+
+```promql
+# 任一台 node 偏移超過 25ms 就預警（離 ceph 的 50ms 還有安全邊際）
+abs(node_timex_offset_seconds) > 0.025
+
+# timesyncd 沒在 discipline（持續 5 分鐘）
+min_over_time(node_timex_sync_status[5m]) == 0
+```
+
+這套組合的好處：第一層在「單台開始漂」時就先響（還沒影響到 ceph），第三層在「真的跨 node 破表」時給權威確認。兩者互補，不是二選一。
+
+## 哪些 exporter 是 active 的（哪個別用）
+
+| Exporter | 角色 | 維護狀態（查證於 2026-05） | 建議 |
+|----------|------|------------------------------|------|
+| `prometheus/node_exporter`（timex collector） | 每台 node 的 kernel 同步狀態與 offset | pushed 2026-05-26、release v1.11.1（2026-04）、13k★ | **主力**，預設就開 |
+| `prometheus-community/systemd_exporter` | timesyncd service 存活 | pushed 2026-05-23、release v0.7.0（2025-03） | 補 daemon 存活，建議 |
+| `dmitry-ee/time_exporter` | 專門 timesync 的 exporter | 最後 push 2021-11、6★ | **停更，別用** |
+
+結論：timesyncd 沒有專屬的、還在維護的 exporter；社群唯一一個專屬的 `time_exporter` 自 2021 就沒動。正解是用**通用且活躍**的 node_exporter timex collector（官方文件也是這樣建議）。要直接看 timesyncd 自己量到的 offset / jitter，可以手動 `timedatectl timesync-status` 對照 —— 那些數字來自 timesyncd 的 D-Bus 介面 `org.freedesktop.timesync1` 的 `NTPMessage` property。File: `systemd/src/timesync/timesyncd-bus.c` (line 221)
+
+```c
+SD_BUS_PROPERTY("NTPMessage", "(uuuuittayttttbtt)", property_get_ntp_message, 0, ...),
+```
+
+`NTPMessage` 直接吐 jitter、spike、四個 timestamp（offset / delay 由 client 從這四個算），但**目前沒有 active 維護的 exporter 在 scrape 這個 D-Bus property**，所以 Prometheus 路線還是回到 timex collector。
+
+## 邊界與除錯
+
+第一條：三層量的東西不同，**不要互相替代**。第一/二層是「每台 node 對它的 NTP server 偏多少 + daemon 活不活」；第三層才是「node 跟 node 之間差多少」。只裝 node_exporter 不裝 ceph metrics，你會漏掉「三台 node 一起偏同方向、各自對 NTP 都很準、但其實 ceph 早就跨 node 破表」這種少見但存在的情況 —— 不過若三台指向同一組 NTP server，這種情況很罕見。
+
+第二條：`node_timex_offset_seconds` 是 kernel 目前還在修的殘餘偏移、會隨 slew 衰減，**不是每次 scrape 重新量的新鮮值**。它適合抓趨勢（持續偏大），不適合當精密時間差量測。精密的跨 node 差，權威來源是 ceph 的 timecheck。
+
+第三條：若 `node_timex_sync_status` 長期是 0，先別急著怪 timesyncd。先用第二層確認 daemon 是否 active；若 active 但 sync_status 還是 0，再查是不是 RTC 跑 local time（上面原始碼顯示這會讓 timesyncd 主動設 STA_UNSYNC），或根本連不到 NTP server。
+
+建議的最小 alert 組合：`node_timex_sync_status == 0`（timesyncd 沒做事）、`abs(node_timex_offset_seconds) > 0.025`（早期漂移）、`systemd_unit_state{name="systemd-timesyncd.service",state="active"} != 1`（daemon 死）、`ceph_health_detail{name="MON_CLOCK_SKEW"} == 1`（跨 node 權威判決）。前三條的時間閾值請在你環境跑過、依 poll interval 調整。
+
+## 接下來 / 相關頁面
+
+- [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection)：第三層 `MON_CLOCK_SKEW` 從超標到 health 變 WARN 的完整延遲拆解（平均 ~2.5 分鐘）。
+- [Ceph — Clock skew matrix](/ceph/features/cluster-time-skew-impact)：不同程度的時間偏移對 MON-MON / MON-OSD / OSD-OSD 各條 channel 的實際影響。
+- [Ceph — Prometheus alert rule 四層設計](/ceph/features/prometheus-alert-design)：MON_CLOCK_SKEW 該放哪一層告警、怎麼避免維護期誤報。
+- [systemd — timesyncd 重啟對系統時間的影響](/systemd/features/timesyncd-restart-impact)：timesyncd 校正 clock（slew vs jump、STA_PLL）的完整原始碼路徑。
+- [systemd — 從一週實測反推 max poll](/systemd/features/timesyncd-poll-tuning-from-metrics)：poll interval 怎麼影響 offset 取樣頻率，跟這頁的 alert 時間閾值有關。

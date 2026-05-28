@@ -1,1 +1,67 @@
-[]
+[
+  {
+    "id": 1,
+    "section": "📈 timesyncd + Prometheus 監控",
+    "question": "為什麼 node_exporter 的 timex collector 對 systemd-timesyncd 是可靠的同步狀態來源？",
+    "options": [
+      "timesyncd 每次成功校正都把 status 設成 STA_PLL 並清掉 STA_UNSYNC（RTC 非 local time 時），kernel 因此回報已同步，node_timex_sync_status=1",
+      "timesyncd 內建一個 /metrics endpoint，timex collector 直接抓它",
+      "timex collector 會主動發 NTP 封包去量 offset，不依賴 timesyncd",
+      "因為 timesyncd 會把 offset 寫進 /proc/timesync 讓 collector 讀"
+    ],
+    "answer": 0,
+    "explanation": "manager_adjust_clock（timesyncd-manager.c:247）slew 路徑設 status=STA_PLL，且 STA_UNSYNC 只在 RTC 跑 local time 時才被設（line 275）。正常情況 timesyncd 清掉 STA_UNSYNC，kernel 標記為已同步，adjtimex 不回 TIME_ERROR，所以 node_timex_sync_status=1。timesyncd 本身沒有 metrics endpoint；timex collector 是讀 kernel 的 adjtimex 狀態，不自己發 NTP 封包。"
+  },
+  {
+    "id": 2,
+    "section": "📈 timesyncd + Prometheus 監控",
+    "question": "node_exporter 官方文件建議用哪一組 metric 判斷 systemd-timesyncd 有沒有在做事？",
+    "options": [
+      "timex collector 的 sync_status 與 offset 的組合",
+      "ntp collector 的 node_ntp_stratum",
+      "systemd_exporter 的 unit_state",
+      "process collector 的 CPU 使用率"
+    ],
+    "answer": 0,
+    "explanation": "node_exporter docs/TIME.md 明寫：『the combination of sync_status and offset exported by timex module is the way to monitor if systemd-timesyncd does its job.』ntp collector 已被標記 deprecated 且針對本地 NTP daemon；systemd_exporter 的 unit_state 只能看 daemon 是否存活，無法看時間偏移。"
+  },
+  {
+    "id": 3,
+    "section": "📈 timesyncd + Prometheus 監控",
+    "question": "3-node ceph cluster 跨 node 時間差超過 50ms 時，Prometheus 從 ceph-mgr prometheus module 會看到什麼？",
+    "options": [
+      "ceph_health_detail{name=\"MON_CLOCK_SKEW\"} 變 1，但只有 0/1、不含實際 ms 數值",
+      "一個 ceph_clock_skew_seconds gauge，精確到每對 mon 的毫秒差",
+      "什麼都看不到，ceph 不把 clock skew 暴露給 Prometheus",
+      "node_timex_offset_seconds 會自動同步成跨 node 的差值"
+    ],
+    "answer": 0,
+    "explanation": "prometheus module 把每個 active health check 設成 health_detail gauge（module.py:742、932），所以 MON_CLOCK_SKEW 會以 ceph_health_detail{name=\"MON_CLOCK_SKEW\"}=1 出現。它是 0/1 的判決（門檻 mon_clock_drift_allowed 預設 0.05s=50ms），實際偏移量級在 ceph time-sync-status 文字輸出、預設不進 Prometheus。"
+  },
+  {
+    "id": 4,
+    "section": "📈 timesyncd + Prometheus 監控",
+    "question": "為什麼「每台 node 維持 |node_timex_offset_seconds| < 25ms」就能保證任兩台 node 之間 < 50ms？",
+    "options": [
+      "因為兩台對真實時間的偏移 X、Y 滿足 |X−Y| ≤ |X|+|Y|，各自 < 25ms 則差必 < 50ms",
+      "因為 node_exporter 會自動把所有 node 的 offset 平均掉",
+      "因為 timesyncd 保證所有 node 的 offset 一定同號",
+      "因為 25ms 是 ceph 的硬性下限，低於它 ceph 不會比較"
+    ],
+    "answer": 0,
+    "explanation": "三角不等式 |X−Y| ≤ |X|+|Y|：若每台對真實時間偏移的絕對值都 < 25ms，任兩台之差必 < 50ms。這讓 per-node 的 offset 告警（門檻設 25ms）成為比 ceph 50ms 判決更早的早期警告，且兩者互補。"
+  },
+  {
+    "id": 5,
+    "section": "📈 timesyncd + Prometheus 監控",
+    "question": "只用 timesyncd + Prometheus 時，下列哪個 exporter 不建議採用？",
+    "options": [
+      "dmitry-ee/time_exporter — 最後更新停在 2021，已停更",
+      "prometheus/node_exporter — timex collector 預設開、持續維護",
+      "prometheus-community/systemd_exporter — 用來看 timesyncd service 是否 active",
+      "以上都該用，沒有不建議的"
+    ],
+    "answer": 0,
+    "explanation": "time_exporter 最後 push 在 2021-11、僅 6 star，屬停更專案，不建議用於生產。主力是活躍維護的 node_exporter（timex collector），輔以 systemd_exporter 看 daemon 存活。timesyncd 沒有還在維護的專屬 exporter，官方也建議走 node_exporter timex collector。"
+  }
+]

@@ -421,9 +421,10 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'systemd'),
     color: 'sky',
     accentClass: 'border-sky-500 text-sky-400',
-    features: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics'],
+    features: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics', 'timesyncd-prometheus-monitoring'],
     featureGroups: [
       { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics'] },
+      { label: 'Prometheus 監控', icon: '📈', slugs: ['timesyncd-prometheus-monitoring'] },
     ],
     usecases: [],
     difficulty: '🟡 中階',
@@ -443,9 +444,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
       intermediate: [
         { slug: 'timesyncd-restart-impact', note: '深入 load_clock_timestamp + clock_apply_epoch 兩條路徑' },
+        { slug: 'timesyncd-prometheus-monitoring', note: '用 node_exporter timex collector 監控 timesyncd 有沒有在校正 clock' },
       ],
       advanced: [
         { slug: 'timesyncd-restart-impact', note: 'NTP_MAX_ADJUST + clock_adjtime ADJ_OFFSET vs ADJ_SETOFFSET 的決策邊界' },
+        { slug: 'timesyncd-prometheus-monitoring', note: '三層監控設計 + per-node offset 當跨 node 50ms 早期警告的數學依據' },
       ],
     },
   },
