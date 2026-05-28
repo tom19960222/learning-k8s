@@ -1,6 +1,8 @@
-# AGENTS.md — learning-k8s
+# learning-k8s — AI 指引（CLAUDE.md = AGENTS.md）
 
 > 給未來 AI session 的指引。讀完這份再動手。
+>
+> 此檔為單一來源；`CLAUDE.md` 是指向本檔的 symlink。要改規則改這份就好，兩邊同步。
 
 ## 專案性質
 
@@ -46,6 +48,20 @@ make validate
 - quiz.json 格式（id 整數、answer 0-indexed）
 - `projects.ts` 裡所有 slug 都有對應 MDX 檔
 - Next.js build 必須 exit 0
+
+### Commit & push 方式（本機環境特例）
+
+這台機器的 ssh-agent 連線會失敗（agent 內那把標 `Windows` 的 key 取不到），而 `~/.ssh/id_ed25519` 沒有註冊到 GitHub。能用的 key 是 **repo 內的 `.ssh/id_ed25519`**（已被 `.gitignore` 擋掉，不會被 commit）。gpg signing 也走同一個壞掉的 agent，所以一併關掉。
+
+```bash
+# 1. commit：關閉 gpg signing
+git commit --no-gpg-sign -m "..."
+
+# 2. push：指定 repo 內的 key、繞過壞掉的 agent
+GIT_SSH_COMMAND='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none' git push
+```
+
+`origin` 是 SSH remote（`git@github.com:tom19960222/learning-k8s.git`）。push 前一樣要先 `make validate` exit 0。
 
 ### 加新專案的 5 步驟
 
