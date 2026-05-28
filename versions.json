@@ -23,5 +23,10 @@
     "commit": "705a59eaf96c86e1e977a2fe7b4f5cb19c96c4e6",
     "tag": "v4.2.4",
     "analyzed_at": "2026-04-30"
+  },
+  "rook": {
+    "commit": "7a84015d5d81890f82a4f9d01a30fb2c59e05ef2",
+    "tag": "v1.19.6",
+    "analyzed_at": "2026-05-28"
   }
 }

@@ -39,3 +39,8 @@
 [submodule "systemd"]
 	path = systemd
 	url = https://github.com/systemd/systemd
+[submodule "rook"]
+	path = rook
+	url = https://github.com/rook/rook.git
+	branch = v1.19.6
+	shallow = true

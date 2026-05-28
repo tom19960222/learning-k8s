@@ -449,6 +449,47 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'rook': {
+    id: 'rook',
+    displayName: 'Rook',
+    shortName: 'Rook',
+    description: '把 ceph 包成 Kubernetes operator。從 external cluster 模式入手，看 rook 怎麼把一個 cephadm-managed ceph cluster 接進 k8s，並持續追蹤它的 mon 變化',
+    githubUrl: 'https://github.com/rook/rook',
+    submodulePath: path.join(REPO_ROOT, 'rook'),
+    color: 'cyan',
+    accentClass: 'border-cyan-500 text-cyan-400',
+    features: ['external-cluster-mon-tracking'],
+    featureGroups: [
+      { label: 'External Cluster', icon: '🔗', slugs: ['external-cluster-mon-tracking'] },
+    ],
+    usecases: [],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: '你已經有一座用 cephadm 管理的 ceph cluster，想讓 k8s 的 Pod 直接拿它的 RBD / CephFS。rook 的 external cluster 模式不接管 ceph，只當 k8s 這側的連線管理者：建 CSI 設定、追 mon endpoint。但 ceph 那邊的 mon 不是固定的 — cephadm 隨時可能 ceph orch apply mon 改變 mon 數量。這頁從原始碼拆：rook 到底會不會自動跟上 mon 變化、多久跟上、mon 變多跟變少分別怎麼處理。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: '公司既有的 ceph cluster 是 cephadm 管的，你用 rook external 模式把它接進 k8s 給 KubeVirt VM 當 storage。某天 ceph 那邊維運加了兩台 mon、又退役了一台舊的，你開始擔心：k8s 這側的 CSI 還連得到嗎？要不要手動去改 ConfigMap？於是你打開 rook 原始碼，從 mon health checker 一路追到 rook-ceph-mon-endpoints ConfigMap。',
+      scenes: [
+        { step: 1, icon: '🔗', actor: '你', action: '讀初始連線：mon 清單從哪來', detail: 'import-external-cluster 腳本先建好 rook-ceph-mon-endpoints ConfigMap 與 rook-ceph-mon Secret。configureExternalCephCluster 用 PopulateExternalClusterInfo 把這份清單讀進 ClusterInfo，這是 mon 追蹤的起點。' },
+        { step: 2, icon: '🔁', actor: '你', action: '找到那條 45 秒的迴圈', detail: 'external 模式下 rook 一樣會啟動 mon health checker goroutine。每 45 秒（HealthCheckInterval）跑一次 checkHealth，external 分支會打 ceph quorum_status。' },
+        { step: 3, icon: '➕', actor: '你', action: '看 mon 變多怎麼被吸收', detail: 'addOrRemoveExternalMonitor 比對 quorum_status 的 MonMap 與 ClusterInfo：新出現且在 quorum 內的 mon 直接加進來，changed=true。' },
+        { step: 4, icon: '➖', actor: '你', action: '看 mon 變少怎麼被剔除', detail: '已經不在 MonMap 的 mon 自然不會被重新加回；還在 MonMap 但掉出 quorum 的 mon 會被移除。長度一變就 changed=true。' },
+        { step: 5, icon: '💾', actor: '你', action: '確認更新會落到哪', detail: 'changed=true 時 saveMonConfig 重寫 rook-ceph-mon-endpoints ConfigMap、CSI cluster config、ceph.conf。CSI 端就靠這份設定找 mon。' },
+      ],
+      outcome: '你確認 rook external 模式會自己追 mon 變化，週期約 45 秒，不需要手動改 ConfigMap。你也知道唯一的危險：千萬不要一次把 rook 當前認得的 mon 全部移除 — 那會讓 quorum_status 連不上，追蹤就卡住。逐台輪替、保留重疊，rook 就會無痛跟上。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'external-cluster-mon-tracking', note: '從一個具體問題切入：mon 數量變動 rook 會不會自動跟上' },
+      ],
+      intermediate: [
+        { slug: 'external-cluster-mon-tracking', note: '深入 mon health checker 的 45 秒迴圈與 addOrRemoveExternalMonitor 比對邏輯' },
+      ],
+      advanced: [
+        { slug: 'external-cluster-mon-tracking', note: '從 quorum_status 連線來源反推「一次移除全部已知 mon」為何會讓追蹤卡死' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)

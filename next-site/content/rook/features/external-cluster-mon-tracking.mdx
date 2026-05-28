@@ -1,0 +1,339 @@
+---
+layout: doc
+title: Rook — external cluster 模式下 mon 數量變動會自動更新嗎
+description: rook external 模式接 cephadm-managed ceph cluster 時，mon health checker 每 45 秒打一次 ceph quorum_status，把新增/移除的 mon 同步進 rook-ceph-mon-endpoints ConfigMap 與 CSI 設定。mon 變多時新 mon 進 quorum 後一個週期內被吸收；mon 變少時掉出 MonMap/quorum 的 mon 被剔除。唯一致命陷阱：一次移除 rook 當前認得的全部 mon 會讓 quorum_status 連不上、追蹤卡死。
+---
+
+## 場景
+
+你已經有一座用 **cephadm** 管理的 ceph cluster，想讓 k8s 的 Pod 直接拿它的 RBD / CephFS。於是你用 rook 的 **external cluster** 模式（`spec.external.enable: true`）把它接進來 — rook 不接管這座 ceph，只負責 k8s 這側：建 CSI 設定、寫連線資訊、追蹤 mon。
+
+問題來了：cephadm 那邊的 mon 不是固定的。維運可能 `ceph orch apply mon --placement="3 hostA hostB hostC"` 把 mon 從 3 台擴到 5 台，或退役一台舊機器。**k8s 這側的 rook 會自動跟上嗎？多久跟上？mon 變多跟變少處理方式一樣嗎？**
+
+結論先講：**會自動跟上，週期預設約 45 秒，不需要手動改 ConfigMap**。但「mon 變少」有一個會讓追蹤卡死的陷阱，最後一節會說。
+
+## 機制：mon 不是讀一次就算了
+
+很多人以為 external 模式只是「接的時候讀一次 mon 清單」。實際上 rook 在 external 模式下**一樣會啟動 mon health checker goroutine**，只是它做的事跟 internal 模式不同：internal 模式會幫你重啟掛掉的 mon Pod，external 模式則是反過來 — 把 ceph 那邊真實的 mon 狀態「拉」回來覆寫自己的紀錄。
+
+整條追蹤迴圈長這樣：
+
+```
+                          每 45 秒 (HealthCheckInterval)
+                                   │
+                                   ▼
+        ┌──────────────────────────────────────────────┐
+        │ checkHealth()  ── external 分支               │
+        │   1. ceph quorum_status  ◄── 用目前已知的     │
+        │      （拿 MonMap + Quorum）   mon 連過去       │
+        │   2. addOrRemoveExternalMonitor()             │
+        │        比對 MonMap vs ClusterInfo             │
+        │        ├─ 新 mon 且在 quorum → 加入  changed=1 │
+        │        └─ 舊 mon 不在 MonMap/quorum → 剔除 c=1 │
+        │   3. changed? → saveMonConfig()               │
+        └──────────────────────────────────────────────┘
+                                   │ changed 才寫
+                                   ▼
+        rook-ceph-mon-endpoints ConfigMap  +  CSI cluster config  +  ceph.conf
+                                   │
+                                   ▼
+                    ceph-csi provisioner / nodeplugin 讀它找 mon
+```
+
+關鍵是第 1 步用「目前已知的 mon」連過去打 `quorum_status`，第 3 步又把更新後的 mon 寫回連線設定 — 這個「拿舊的去問、把新的存起來」的循環，正是後面那個陷阱的根源。
+
+## 原始碼路徑
+
+### 起點：初始 mon 清單從匯入腳本來
+
+接 external cluster 前，你會在 ceph 端跑 `create-external-cluster-resources.py`，再在 k8s 端跑 `import-external-cluster.sh`，後者會建好 `rook-ceph-mon-endpoints` ConfigMap 與 `rook-ceph-mon` Secret。rook 的 external 設定流程第一件事就是把這份清單讀進 `ClusterInfo`：
+
+File: rook/pkg/operator/ceph/cluster/cluster_external.go (line 52)
+
+```go
+// loop until we find the secret necessary to connect to the external cluster
+// then populate clusterInfo
+cluster.ClusterInfo, err = opcontroller.PopulateExternalClusterInfo(cluster.Spec, c.context, c.OpManagerCtx, cluster.namespacedName.Namespace, cluster.ownerInfo)
+```
+
+`PopulateExternalClusterInfo` 是一個會卡住等到資訊就緒的迴圈，每次失敗等 60 秒重試（`externalConnectionRetry = 60 * time.Second`）。它讀的就是 `rook-ceph-mon-endpoints` ConfigMap：
+
+File: rook/pkg/operator/ceph/controller/cluster_info.go (line 459)
+
+```go
+func PopulateExternalClusterInfo(...) (*cephclient.ClusterInfo, error) {
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		clusterInfo, _, _, err := CreateOrLoadClusterInfo(context, ctx, namespace, nil, cephClusterSpec)
+		if err != nil {
+			log.NamespacedWarning(namespace, logger, "waiting for connection info of the external cluster. retrying in %s.", externalConnectionRetry.String())
+			time.Sleep(externalConnectionRetry)
+			continue
+		}
+		return clusterInfo, nil
+	}
+}
+```
+
+到這裡為止只是「接上線」。真正的持續追蹤在下一步。
+
+### 啟動：external 模式也會跑 monitoring goroutine
+
+`initializeCluster` 在 external 分支跑完 `configureExternalCephCluster` 之後，**無條件**呼叫 `configureCephMonitoring`：
+
+File: rook/pkg/operator/ceph/cluster/cluster.go (line 196)
+
+```go
+if cluster.Spec.External.Enable {
+	err := c.configureExternalCephCluster(cluster)
+	...
+}
+...
+// Start the monitoring if not already started
+c.configureCephMonitoring(cluster, cluster.ClusterInfo)
+```
+
+`configureCephMonitoring` 會對 `mon` / `osd` / `status` 三種 daemon 各起一個 goroutine。注意 `osd` checker 在 external 模式會被跳過，但 **`mon` checker 永遠會起**：
+
+File: rook/pkg/operator/ceph/cluster/monitoring.go (line 80)
+
+```go
+switch daemon {
+case "mon":
+	healthChecker := mon.NewHealthChecker(cluster.mons)
+	go healthChecker.Check(&cluster.monitoringRoutines, daemon)
+
+case "osd":
+	if !cluster.Spec.External.Enable {   // external 模式不追 osd
+		osdChecker := osd.NewOSDHealthMonitor(...)
+		go osdChecker.Start(&cluster.monitoringRoutines, daemon)
+	}
+```
+
+### 迴圈：每 45 秒一次
+
+mon checker 的週期是 `HealthCheckInterval`，預設 45 秒：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 40)
+
+```go
+var (
+	// HealthCheckInterval is the interval to check if the mons are in quorum
+	HealthCheckInterval = 45 * time.Second
+	// MonOutTimeout is the duration to wait before removing/failover to a new mon pod
+	MonOutTimeout = 10 * time.Minute
+)
+```
+
+這個值可以被 operator 的環境變數 `ROOK_MON_HEALTHCHECK_INTERVAL` 或 CephCluster CR 的 `spec.healthCheck.daemonHealth.mon.interval` 覆寫（`updateMonInterval`）。每個週期觸發一次 `checkHealth`：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 145)
+
+```go
+case <-time.After(hc.interval):
+	log.NamespacedDebug(namespace, logger, "checking health of mons")
+	err := hc.monCluster.checkHealth(health.InternalCtx)
+```
+
+### external 分支：打 quorum_status 然後比對
+
+`checkHealth` 一進來就分流。external 模式走一條獨立的短路徑：拿 mon quorum 狀態 → 交給 `handleExternalMonStatus`，**不會**去碰 mon Pod 的 failover 邏輯：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 180)
+
+```go
+// For an external connection we use a special function to get the status
+if c.spec.External.Enable {
+	quorumStatus, err := cephclient.GetMonQuorumStatus(c.context, c.ClusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to get external mon quorum status")
+	}
+
+	err = c.handleExternalMonStatus(quorumStatus)
+	...
+	return nil
+}
+```
+
+`GetMonQuorumStatus` 就是去跑 `ceph quorum_status`：
+
+File: rook/pkg/daemon/ceph/client/mon.go (line 76)
+
+```go
+// GetMonQuorumStatus calls quorum_status mon_command
+func GetMonQuorumStatus(context *clusterd.Context, clusterInfo *ClusterInfo) (MonStatusResponse, error) {
+	args := []string{"quorum_status"}
+	cmd := NewCephCommand(context, clusterInfo, args)
+	...
+}
+```
+
+### 核心比對：addOrRemoveExternalMonitor
+
+`handleExternalMonStatus` 只做兩件事：呼叫 `addOrRemoveExternalMonitor` 比對差異，**有變動才** `saveMonConfig`：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 947)
+
+```go
+func (c *Cluster) handleExternalMonStatus(status cephclient.MonStatusResponse) error {
+	...
+	changed, err := c.addOrRemoveExternalMonitor(status)
+	if err != nil {
+		return errors.Wrap(err, "failed to add or remove external mon")
+	}
+	// let's save the monitor's config if anything happened
+	if changed {
+		if err := c.saveMonConfig(); err != nil {
+			return errors.Wrap(err, "failed to save mon config after adding/removing external mon")
+		}
+	}
+	return nil
+}
+```
+
+`addOrRemoveExternalMonitor` 的做法是：先把 `ClusterInfo` 的 mon 全清空、暫存成 `oldClusterInfoMonitors`，再**只**從 `quorum_status` 回來的 `MonMap.Mons` 重新填回去。這個「清空再重填」的設計，讓「mon 變多」和「mon 變少」用同一段邏輯就處理掉了。
+
+## monitor 變多
+
+cephadm 加了一台 mon、它 join quorum 之後，下一個 45 秒週期 `quorum_status` 的 `MonMap.Mons` 就會多出這台。比對時它不在 `oldClusterInfoMonitors`、而且 `inQuorum` 為真，於是直接加進 `ClusterInfo`、標記 `changed`：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 989)
+
+```go
+for _, mon := range status.MonMap.Mons {
+	inQuorum := monInQuorum(mon, status.Quorum)
+	// if the mon was not in clusterInfo
+	if _, ok := oldClusterInfoMonitors[mon.Name]; !ok {
+		// If the mon is part of the quorum
+		if inQuorum {
+			info := c.monStatusToInfo(mon)
+			log.NamespacedInfo(c.Namespace, logger, "new external mon %q found: %s, adding it", mon.Name, info.Endpoint)
+			c.ClusterInfo.InternalMonitors[mon.Name] = info
+		}
+		changed = true
+	}
+```
+
+注意條件是「在 quorum 內」。cephadm 剛部署、還沒 join quorum 的新 mon **不會**被提早加入 — rook 會等它真的進 quorum 的那個週期才吸收。所以「mon 變多」的時序是：
+
+1. cephadm 部署新 mon 並 join quorum（這段時間取決於 ceph，不是 rook）。
+2. 下一次 rook mon health check（最多 45 秒後）看到它在 `quorum_status` 裡。
+3. 同一個週期內寫回 ConfigMap 與 CSI 設定。
+
+## monitor 變少
+
+「變少」有兩種情形，`addOrRemoveExternalMonitor` 用兩條路徑分別處理：
+
+**情形 A — mon 從 MonMap 整個消失**（cephadm 把它從 monmap 移除）。因為重填只迭代「現在的」`MonMap.Mons`，這台不會被加回去。最後用長度比對抓到差異，標記 `changed`：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 1021)
+
+```go
+// compare old clusterInfo with new ClusterInfo
+// if length differ -> the are different
+if len(oldClusterInfoMonitors) != len(c.ClusterInfo.InternalMonitors) {
+	changed = true
+}
+```
+
+**情形 B — mon 還在 MonMap、但掉出 quorum**（例如機器掛了但還沒從 monmap 移除）。它在 `oldClusterInfoMonitors` 裡，但 `inQuorum` 為假，於是不重新加回 `ClusterInfo`，並標記 `changed`：
+
+File: rook/pkg/operator/ceph/cluster/mon/health.go (line 1005)
+
+```go
+if !inQuorum {
+	// this mon was in clusterInfo but is not part of the quorum anymore
+	// thus don't add it again to ClusterInfo
+	log.NamespacedInfo(c.Namespace, logger, "monitor %q is not part of the external cluster monitor quorum, removing it", mon.Name)
+	changed = true
+}
+```
+
+兩種情形最後都走 `saveMonConfig`，把縮短後的 mon 清單寫回。另外當 mon 只剩 1 台時會印一行 warning 提醒你補 mon。
+
+## 更新會落到哪：rook-ceph-mon-endpoints ConfigMap 與 CSI 設定
+
+`saveMonConfig` 是「對外公布」這一步。它一次更新好幾個地方，CSI 端真正消費的是其中的 ConfigMap 與 CSI cluster config：
+
+File: rook/pkg/operator/ceph/cluster/mon/mon.go (line 1177)
+
+```go
+func (c *Cluster) saveMonConfig() error {
+	if err := c.persistExpectedMonDaemons(); err != nil {   // 寫 ConfigMap + EndpointSlice
+		return errors.Wrap(err, "failed to persist expected mon daemons")
+	}
+	// 更新 global config（讓重啟的 daemon 拿到最新 mon）
+	if err := config.GetStore(c.context, c.Namespace, c.ownerInfo).CreateOrUpdate(c.ClusterInfo); err != nil {
+		return errors.Wrap(err, "failed to update the global config")
+	}
+	// 寫 ceph.conf 到 config dir
+	if err := WriteConnectionConfig(c.context, c.ClusterInfo); err != nil {
+		return errors.Wrap(err, "failed to write connection config for new mons")
+	}
+	monEndpoints := csi.MonEndpoints(c.ClusterInfo.AllMonitors(), c.spec.RequireMsgr2())
+	...
+	// 更新 CSI cluster config
+	if err := csi.SaveClusterConfig(c.context.Clientset, clusterId, c.Namespace, c.ClusterInfo, csiConfigEntry); err != nil {
+		return errors.Wrap(err, "failed to update csi cluster config")
+	}
+	return nil
+}
+```
+
+`rook-ceph-mon-endpoints` ConfigMap 的 `data` 欄位就是把所有 mon 攤平成一串 endpoint：
+
+File: rook/pkg/operator/ceph/cluster/mon/mon.go (line 1388)
+
+```go
+configMap.Data = map[string]string{
+	EndpointDataKey:         flattenMonEndpoints(c.ClusterInfo.AllMonitors()),
+	EndpointExternalMonsKey: strings.Join(extMonIDs, ","),
+	...
+	csi.ConfigKey:             csiConfigValue,
+}
+```
+
+所以你想驗證 rook 有沒有跟上，直接看這個 ConfigMap 就好：
+
+```bash
+# 在你環境跑後對照：data.data 應反映 ceph 端目前的 mon endpoints
+kubectl -n rook-ceph get configmap rook-ceph-mon-endpoints -o jsonpath='{.data.data}'
+```
+
+## 時間：多久會更新
+
+把上面拼起來，從「ceph 端 mon 變動」到「rook 端 ConfigMap 更新」的延遲是：
+
+| 階段 | 耗時 | 由誰決定 |
+|------|------|----------|
+| 新 mon join quorum / 舊 mon 退出 monmap | 數秒～數十秒 | ceph + cephadm，不是 rook |
+| rook 下一次 mon health check 看到變化 | 最多 1 個週期（預設 **45 秒**） | `HealthCheckInterval` |
+| `saveMonConfig` 寫 ConfigMap / CSI config | 近乎即時 | rook |
+| ceph-csi Pod 內掛載的 config 重新整理 | k8s ConfigMap 傳播延遲（約 1 分鐘量級） | kubelet，不是 rook |
+
+也就是說，**rook 自己這側通常在 45 秒內就更新完**；端到端再加上 ceph 達成 quorum 的時間，以及 CSI Pod 拿到新 config 的 k8s 傳播延遲。
+
+## 邊界與除錯
+
+第一條是觀念：external 模式的 mon 追蹤是 **rook 主動去 `quorum_status` 拉**，不是 ceph 來通知，也不是你改 Secret 才生效。所以更新一定有「最多一個 health check 週期」的延遲，這是正常的，不是 bug。
+
+第二條，也是最危險的一條，跟前面那張圖標的「用目前已知的 mon 連過去」直接相關 — **不要一次把 rook 當前認得的 mon 全部移除**。
+
+rook 打 `quorum_status` 時，是用 `ClusterInfo` 裡現有的 mon endpoint 連過去的（每個週期更新完才把新 mon 寫進連線設定）。如果你在 rook 還沒觀察到替換的新 mon 之前，就把它目前認得的 mon 一次全換掉，那麼 `GetMonQuorumStatus` 會連不上而回傳錯誤，`checkHealth` 直接 return、`handleExternalMonStatus` 根本不會被呼叫 — 追蹤就卡在舊清單，直到某台舊 mon 回來、或你重新匯入連線資訊。
+
+| 操作方式 | 結果 |
+|----------|------|
+| 一台一台輪替 mon，保留與舊清單的重疊 | rook 每個週期都連得上，自動逐步跟上，無痛 |
+| 一次移除 rook 當前認得的全部 mon | `quorum_status` 連不上，追蹤卡死，需手動 re-import |
+
+實務建議：在 ceph 端調整 mon 時，**逐台進行，每次至少保留一台 rook 已知且在 quorum 內的 mon**，並給 rook 至少一個 health check 週期（預設 45 秒）去吸收，再動下一台。
+
+最後，除錯時看 operator log 的這幾行就知道 rook 有沒有在追：`new external mon %q found ... adding it`（吸收新 mon）、`monitor %q is not part of the external cluster monitor quorum, removing it`（剔除舊 mon）、`saved mon endpoints to config map`（已寫回）。
+
+## 接下來 / 相關頁面
+
+- [Ceph — 系統架構（MON quorum 與 Paxos）](/ceph/features/architecture)：rook 追的 `quorum_status`，背後就是 ceph MON 的 Paxos quorum。
+- [Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響](/ceph/features/mon-quorum-loss-impact)：理解「mon 掉出 quorum」對 ceph 本身的影響，跟這頁 rook 怎麼反應對照看。
+- [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi)：rook 更新的 CSI cluster config，最後是 ceph-csi 拿去找 mon 掛 RBD。
