@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: systemd-timesyncd — service 重啟對系統時間的影響
-description: 從 src/timesync/timesyncd.c 的 load_clock_timestamp() 入手，拆解 systemd-timesyncd daemon 重啟時對 CLOCK_REALTIME 的三條影響路徑：開機時 PID 1 的 clock_apply_epoch 可能往前/往後跳；daemon 啟動的 load_clock_timestamp 只往前跳到 timestamp 檔 mtime 或 built-in TIME_EPOCH；首次 NTP 同步後的 clock_adjtime 視偏移大小決定 slew (< 0.4s) 或 jump。每 60 秒寫一次 timestamp 檔。
+description: 從 src/timesync/timesyncd.c 的 load_clock_timestamp() 入手，拆解 systemd-timesyncd daemon 重啟時對 CLOCK_REALTIME 的三條影響路徑：開機時 PID 1 的 clock_apply_epoch 可能往前/往後跳；daemon 啟動的 load_clock_timestamp 只往前跳到 timestamp 檔 mtime 或 built-in TIME_EPOCH；首次 NTP 同步後的 clock_adjtime 視偏移大小決定 slew (< 0.4s) 或 jump。每 60 秒寫一次 timestamp 檔。另解答重啟後是否馬上發 NTP query（取決於 network_is_online）、poll interval 為何一定從 32s min 重爬，以及如何安全地手動觸發一次對時（timesyncd 無 makestep，只能 restart）。
 ---
 
 ## 場景
@@ -437,6 +437,103 @@ static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents
 
 `event_add_time_change` 走 Linux 的 `TFD_TIMER_CANCEL_ON_SET` 機制：任何人對 `CLOCK_REALTIME` 做 `clock_settime` 或 `clock_adjtime(ADJ_SETOFFSET)`，kernel 會 cancel 這個 timer，event loop 拿到 `EPOLL...EXP` 通知。也就是說 **若另一個 process（例如 ops 手動 `date -s`）改了時間，timesyncd 會立刻重新發 NTP query 確認**。
 
+## 重啟後會馬上對時嗎？poll interval 會回到 min 嗎？
+
+兩個問題機制不同，分開回答。
+
+### 會馬上發 NTP query — 但前提是「網路已經 online」
+
+新 process 跑完 `load_clock_timestamp` → drop priv → setup 之後，**只有在 `network_is_online()` 為真時**才會立刻 `manager_connect()`（`run()` line 217，前面引過）。`manager_connect()` 進來第一件事是 connection ratelimit：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 797)
+
+```c
+if (!ratelimit_below(&m->ratelimit)) {
+        log_debug("Delaying attempts to contact servers.");
+        r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME,
+                                       m->connection_retry_usec, 0, manager_retry_connect, m);
+        return 0;   /* 30 秒後再試 */
+}
+```
+
+ratelimit 是 10 秒最多 10 次（`RATELIMIT_INTERVAL_USEC=10s`、`RATELIMIT_BURST=10`，manager.c:60-61）。關鍵是這個 `RateLimit` state 放在 `Manager` struct 裡、**每個 process 獨立**：剛 fork 的新 process ratelimit 是乾淨的，所以重啟後第一次 connect 永遠不會被它擋。接著 `manager_begin()` → `manager_send_request()` 把第一封 UDP packet 送出，距 daemon ready 是毫秒級。
+
+所以：
+
+- **網路 online**：重啟後毫秒內就發第一封 NTP query。
+- **網路還沒 online**：`run()` 那個 `if` 不成立，完全不問；要等 systemd-networkd 的 `/run/systemd/netif/state` 或 NetworkManager D-Bus 通知 online 才 `manager_connect`。VM / server 剛開機網路慢時，「重啟 timesyncd」不等於「馬上對到時」。
+
+### poll interval 一定從 min（32 秒）重新爬
+
+關鍵：**timesyncd 從不把學到的 poll interval 寫檔**，它只活在 `Manager` 記憶體裡，process 一死就沒了。新 process 的 `poll_interval_usec` 是 `new0` 出來的 0：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 685)
+
+```c
+if (m->poll_interval_usec == 0)
+        m->poll_interval_usec = m->poll_interval_min_usec;   /* 32s */
+```
+
+`poll_interval_min_usec` = `NTP_POLL_INTERVAL_MIN_USEC` = 32 秒（manager.h:14、初始化於 manager.c:1118）。所以**第一次 query 一定用 32 秒**，不管重啟前已經爬到多大。之後每收到一次回應，`manager_adjust_poll` 依 offset 調整：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 364)
+
+```c
+static void manager_adjust_poll(Manager *m, double offset, bool spike) {
+        if (m->poll_resync) {                              /* 外部改了系統時間才會 true */
+                m->poll_interval_usec = m->poll_interval_min_usec;
+                m->poll_resync = false;
+                return;
+        }
+        if (!spike && fabs(offset) > NTP_ACCURACY_SEC)     /* > 0.2s → 拉回 min */
+                m->poll_interval_usec = m->poll_interval_min_usec;
+        else if (fabs(offset) < NTP_ACCURACY_SEC * 0.25) { /* < 0.05s → 加倍 */
+                if (m->poll_interval_usec < m->poll_interval_max_usec)
+                        m->poll_interval_usec *= 2;        /* 上限 2048s */
+        }
+        ...
+}
+```
+
+`NTP_ACCURACY_SEC = 0.2`（manager.c:45）。對得準（offset < 50ms）就 `*2`，一路 32 → 64 → 128 → … → 2048 秒（`NTP_POLL_INTERVAL_MAX_USEC`，manager.h:15）封頂。要從 32s 爬回 2048s 上限，需要連續 6 次成功且 offset 一直 < 50ms 的 sync（2⁶ × 32 = 2048）。
+
+所以重啟的副作用是：**poll 密度暫時被拉到最高（32s 一次），再慢慢爬回去**。對 ceph 反而是好事 — 重啟後那段最需要盯的時候剛好問得最勤。
+
+> 註：`poll_resync` 只有在 `manager_clock_watch` 偵測到「別人改了 `CLOCK_REALTIME`」時才被設 true（manager.c:220）。單純 restart 不走那條路；重啟回到 min poll 純粹來自上面 `poll_interval_usec == 0` 被 floor 成 min，不是 `poll_resync`。這頁把 poll 演進完整拆在 [poll interval 自適應](/systemd/timesyncd-poll-interval-adaptation)。
+
+### 想安全地「馬上觸發一次對時」怎麼做
+
+先講結論：**timesyncd 沒有 chrony `chronyc makestep` / `burst` 那種「立刻對時」指令**。整支 daemon 對外只暴露一個 D-Bus method `SetRuntimeNTPServers`（timesyncd-bus.c:224），沒有 force-sync。所以唯一可靠的觸發就是重啟：
+
+```bash
+systemctl restart systemd-timesyncd
+```
+
+重啟「本身」是安全的 — 前面整篇證明過 `load_clock_timestamp` 只會在 RTC 落後時**往前** bump，永遠不往後跳。**真正會動 wall clock 的是重啟後那次 NTP 校正**：offset < 0.4s 走 slew（漸進、不跳），≥ 0.4s 才瞬跳（`NTP_MAX_ADJUST`，manager.c:47）。
+
+要安全（不讓 ceph 看到突跳），照這個順序：
+
+```bash
+# 1. 先看現在偏多少
+timedatectl timesync-status        # 看 Offset 那行
+
+# 2a. |Offset| < 0.4s（尤其 < 50ms）→ 重啟後會 slew，安全，直接做
+systemctl restart systemd-timesyncd
+
+# 2b. |Offset| ≥ 0.4s 或 RTC 不可靠（VM / 電池壞）→ 重啟後會「瞬跳」
+#     先 silence ceph clock skew 告警再做，或挑維護窗
+amtool silence add alertname="CephClientRisk" 'name="MON_CLOCK_SKEW"' --duration=30m
+systemctl restart systemd-timesyncd
+
+# 3. 確認有對到（Packet count +1、Offset 變小）
+timedatectl timesync-status
+```
+
+兩種「偽觸發」不要用：
+
+- **`date -s "$(date)"`**（把時間設成自己）：確實會經由 `TFD_TIMER_CANCEL_ON_SET` 觸發 `manager_clock_watch` → `poll_resync=true` → 立刻重發 query（manager.c:218-222），但它本身就動了一次 wall clock，違反「安全」前提。
+- **`timedatectl set-ntp true`**：service 已經 active 時，start 一個 active service 是 no-op，不會逼出新 query。只有在 timesyncd 原本沒在跑時才有意義。
+
 ## ⑥ shutdown：最後一次 save
 
 `systemctl stop` 送 SIGTERM 給 daemon → `sd_event_set_signal_exit(true)`（`timesyncd-manager.c:1137`）讓 event loop 退出 → `run()` 走到結尾：
@@ -681,5 +778,5 @@ journal MESSAGE_ID 都是 `SD_MESSAGE_TIME_BUMP_STR`（同一個），用 ID 過
 <Callout type="info" title="延伸閱讀">
   - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — timesyncd 跳鐘後，ceph 多久才會看到並抓出來
   - [Ceph — Clock skew matrix](/ceph/cluster-time-skew-impact) — 不同程度的時間偏移對 MON-MON / MON-OSD / OSD-OSD 各條 channel 的影響
-  - [Ceph — Prometheus alert 四層設計](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 在 Tier 2，timesyncd restart 偶發的暫態 skew 不該 page
+  - [Ceph — Prometheus alert 重新設計（穩定性第一的 6 條 rule）](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 落在 `CephClientRisk` 的 `name!~` catch-all，`for: 5m` 後才 page；短於 5 分鐘的暫態 skew 不會觸發，要長時間維護則手動 silence
 </Callout>
