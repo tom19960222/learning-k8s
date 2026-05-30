@@ -723,6 +723,71 @@ File: `systemd/src/core/main.c` (line 3186)
 
 - 升級 systemd（distro package update）會同時 restart daemon — 上面所有情境都適用。Trigger 來自 `dpkg`/`rpm` 的 post-install hook。
 
+## 重啟後 journal 會印什麼（和為什麼看不到 slew/jump 的數字）
+
+把上面的時序換成「`journalctl -u systemd-timesyncd` 實際會看到什麼」。先講最反直覺的一點：**這次到底改了多少時間（slew / jump 的偏移數字）預設看不到** — 印那個數字的是 `LOG_DEBUG`，而 systemd 預設 `log_max_level = LOG_INFO`，DEBUG 直接被丟掉。
+
+一次「乾淨關機過、RTC 正常、offset 很小」的 restart，journal 通常只有這兩行 INFO：
+
+```
+systemd-timesyncd[412]: Initial clock synchronization to 2026-05-26 10:00:00.123456.
+systemd-timesyncd[412]: Contacted time server 169.254.169.123:123 (ntp.local).
+```
+
+對應 source（都是 `LOG_INFO`、預設可見）：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 614)
+
+```c
+log_info("Contacted time server %s (%s).", strna(pretty), m->current_server_name->string);
+```
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 621)
+
+```c
+log_struct(LOG_INFO,
+           LOG_MESSAGE("Initial clock synchronization to %s.",
+                       FORMAT_TIMESTAMP_STYLE(dts.realtime, TIMESTAMP_US)),
+           LOG_MESSAGE_ID(SD_MESSAGE_TIME_SYNC_STR),
+           LOG_ITEM("MONOTONIC_USEC=" USEC_FMT, dts.monotonic),
+           LOG_ITEM("REALTIME_USEC=" USEC_FMT, dts.realtime),
+           LOG_ITEM("BOOTTIME_USEC=" USEC_FMT, dts.boottime));
+```
+
+而「這次到底 slew 還是 jump、修了幾毫秒」，藏在這兩行 `LOG_DEBUG`，預設看不到：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 255 與 line 272)
+
+```c
+log_debug("  adjust (slew): %+.3f sec", offset);   // |offset| < 0.4s
+...
+log_debug("  adjust (jump): %+.3f sec", offset);   // |offset| ≥ 0.4s
+```
+
+只有在 **① `load_clock_timestamp` 真的 bump 了系統時間**（`now ≤ epoch`）時，才會多一行 INFO，而且帶固定的 `MESSAGE_ID`（DIRECTION=forwards）：
+
+File: `systemd/src/timesync/timesyncd.c` (line 130)
+
+```c
+log_struct(LOG_INFO,
+           LOG_MESSAGE_ID(SD_MESSAGE_TIME_BUMP_STR),
+           LOG_ITEM("REALTIME_USEC=" USEC_FMT, epoch + 1),
+           LOG_ITEM("DIRECTION=forwards"),
+           LOG_MESSAGE("System clock time advanced to %s: %s",
+                       epoch > TIME_EPOCH * USEC_PER_SEC ? "recorded timestamp" : "built-in epoch",
+                       FORMAT_TIMESTAMP(epoch + 1)));
+```
+
+整理成「三種 restart 在 journal 的指紋」：
+
+| restart 類型 | 預設（INFO）看得到的行 | 真實偏移數字在哪 |
+|---|---|---|
+| 乾淨 restart、RTC 正常、offset 小 | `Initial clock synchronization` + `Contacted time server` | `adjust (slew)`（DEBUG，預設吃掉） |
+| restart 撞到 `now ≤ epoch`（① bump） | 多一行 `System clock time advanced to recorded timestamp / built-in epoch` | 該行的 `REALTIME_USEC` |
+| restart 後首次 NTP offset ≥ 0.4s（瞬跳） | 同第一列那兩行 | `adjust (jump)`（DEBUG，預設吃掉） |
+
+所以「`systemctl restart` 後 mon 被 ceph 標 skew、但 journal 只有兩行 INFO、看不出修了多少」是正常現象 — 要看到真實偏移得把 timesyncd log level 拉到 debug。完整的 log 分類、`SD_MESSAGE_TIME_BUMP_STR` 的 hex 與用法、以及怎麼用 D-Bus 動態調 debug 等級（不用重啟、所以不會再踩一次跳鐘），見 [log 印不印那一頁](./timesyncd-log-anatomy)。
+
 ## 邊界與除錯
 
 ### 沒有網路怎麼辦
