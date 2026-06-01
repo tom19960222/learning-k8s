@@ -1,0 +1,271 @@
+---
+layout: doc
+title: systemd-timesyncd — 斷網 / 關機 / 長時間維護對對時的影響
+description: 從 v260.1 src/timesync 證明 timesyncd 在沒有 NTP 回應時「完全不碰系統時鐘」——offline 等於純 free-run，漂移量由硬體 TCXO ppm 決定不是 timesyncd。並拆三件關鍵事實：timesyncd 沒有 chrony 那種 driftfile（drift_freq 只在記憶體）、synchronized 旗標在 /run（reboot 即失憶）、timedatectl 的「synchronized」其實讀 kernel maxerror < 16s 跟 timesyncd 自己的狀態脫鉤。用單機/複數 node/rack/NTP server down 四組維護情境，把斷網 2h~1month、15s~1d 對應到 ceph 的 50ms WARN 與 5s lease 崩兩條線。
+---
+
+## 場景
+
+機房要做維護。你關掉一台（或一整 rack）ceph node 的對外網路，或 NTP server 自己要重開。問題很實際：
+
+> 斷網 **2 小時 / 1 天 / 1 週 / 1 個月**，這台 node 的時鐘會漂多遠？回來之後會發生什麼？會不會一回來就被 ceph 抓 `MON_CLOCK_SKEW`、甚至弄垮 mon lease？
+
+先講最重要的一句，它決定了後面所有情境：**timesyncd 在收不到 NTP 回應時，完全不碰系統時鐘**。系統時間只在「收到一個合法 NTP reply」的那一刻被 `clock_adjtime` 調整一次；沒有 reply，就沒有任何 adjustment。所以「斷網期間」對 timesyncd 來說不是一個它會去補償的狀態——它就只是**停手，讓時鐘自由漂（free-run）**。
+
+漂多遠，由**硬體晶振的頻率誤差（ppm）決定，跟 timesyncd 無關**。下面先把這個機制從 source 證出來，再套到你問的每一組維護情境。
+
+## 一個前提數字：ppm → 漂移
+
+timesyncd 不決定漂移速率，但要回答「2 小時漂多少」必須有個 ppm 假設。典型伺服器主機板的 TCXO 在溫度穩定時約 **±10 ppm**（1 ppm = 每秒 1 微秒 = 每天 86.4ms）。下面所有漂移數字都用這個**明確假設**換算，不是 source 給的值，請以你自己環境的實測 ppm 為準（`timedatectl show-timesync` 的 `Frequency` 欄位、或 `chronyc tracking` 的 residual freq 可以反推）：
+
+| 斷網時長 | @1 ppm | @10 ppm | @50 ppm（差的 RTC / 高溫） |
+|---|---|---|---|
+| 2 小時 | 7.2 ms | 72 ms | 360 ms |
+| 1 天 | 86 ms | **864 ms** | 4.3 s |
+| 1 週 | 605 ms | **6 s** | 30 s |
+| 1 個月 | 2.6 s | **26 s** | 130 s |
+
+粗體標出**跨過 ceph 門檻**的格子：50ms（`MON_CLOCK_SKEW` WARN）與 5s（`mon_lease`，超過會弄垮 Paxos lease）。這兩條線怎麼來的，拆在 [skew 量級階梯那一頁](/ceph/clock-skew-magnitude-ladder)。重點先記住：**漂移是線性累積的，維護越久、回來那一刻的偏移越大**。
+
+## 機制一：沒有 reply 就不調鐘
+
+系統時鐘的唯一寫入點，是收到合法 NTP 回應後的 `manager_receive_response` → `manager_adjust_clock`。整段 adjustment 包在 `if (!spike)` 裡，而且只在真的收到、解析、通過所有合法性檢查的 packet 之後才跑：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 571)
+
+```c
+/* Get current monotonic/realtime clocks immediately before adjusting the latter */
+triple_timestamp_now(&dts);
+
+if (!spike) {
+        /* Fix up our idea of the time. */
+        dts.realtime = (usec_t) (dts.realtime + offset * USEC_PER_SEC);
+
+        r = manager_adjust_clock(m, offset, leap_sec);
+```
+
+沒有這個 reply，這段就不會被呼叫——**沒有任何路徑會在「等不到 server」時去動 `CLOCK_REALTIME`**。斷網時 timesyncd 頂多是不斷重試（下一節），時鐘則繼續以硬體速率自己走。
+
+斷網被偵測到時，timesyncd 反而是**收手**：network monitor 看到 offline 就 `manager_disconnect`，停掉所有 listening / timer。
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 1056)
+
+```c
+if (connected && !online) {
+        /* When m->talking is false, we have not received any responses from the server,
+         * and it is not necessary to log about disconnection. */
+        log_full(m->talking ? LOG_INFO : LOG_DEBUG,
+                 "No network connectivity, watching for changes.");
+        manager_disconnect(m);
+```
+
+## 機制二：斷網時 timesyncd 在做什麼——三層 backoff
+
+「不調鐘」不代表閒著。依「斷網是怎麼表現的」分三種，各有自己的退避節奏。它們只影響**回來後多快重新對上**，不影響漂移本身。
+
+**(a) 送得出去、但對方不回（server 沉默 / 封包被丟）**：每送一次 request 就把 retry timer ×4/3 加長，從 15 秒爬到 6 分鐘封頂。
+
+File: `systemd/src/timesync/timesyncd-manager.h` (line 17)
+
+```c
+#define NTP_RETRY_INTERVAL_MIN_USEC     (15 * USEC_PER_SEC)
+#define NTP_RETRY_INTERVAL_MAX_USEC     (6 * 60 * USEC_PER_SEC) /* 6 minutes */
+```
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 150)
+
+```c
+if (m->retry_interval == 0)
+        m->retry_interval = NTP_RETRY_INTERVAL_MIN_USEC;
+else
+        m->retry_interval = MIN(m->retry_interval * 4/3, NTP_RETRY_INTERVAL_MAX_USEC);
+```
+
+連續漏 `NTP_MAX_MISSED_REPLIES = 2` 次（manager.c:58）就掛一個 10 秒 timeout，逾時換下一台 server。
+
+**(b) 多台 server 全試完還是不行**：進 exhausted-servers backoff，等一個 poll interval 再來，同時把 poll interval ×2（一路到 max 2048s）。
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 851)
+
+```c
+if (restart && !m->exhausted_servers && m->poll_interval_usec > 0) {
+        log_debug("Waiting after exhausting servers.");
+        r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME, m->poll_interval_usec, 0, manager_retry_connect, m);
+        // ...
+        m->exhausted_servers = true;
+        /* Increase the polling interval */
+        if (m->poll_interval_usec < m->poll_interval_max_usec)
+                m->poll_interval_usec *= 2;
+        return 0;
+}
+```
+
+**(c) 整個 link offline（拔線 / rack 斷外網）**：根本不送 request，純粹等 network monitor 通知 online（上一節的 `manager_disconnect`）。網路一回來，`manager_network_event_handler` 立刻 `manager_begin` / `manager_connect`，毫秒級就發第一封 request。
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 1063)
+
+```c
+} else if ((!connected || changed) && online) {
+        log_full(connected ? LOG_DEBUG : LOG_INFO,
+                 "Network configuration changed, trying to establish connection.");
+        if (m->current_server_address)
+                r = manager_begin(m);
+        else
+                r = manager_connect(m);
+```
+
+所以**斷越久不會「越難回來」**——(c) 一通網就立刻重連。真正的代價全在「漂移累積」，不在重連速度。
+
+## 機制三：timesyncd 沒有 driftfile，狀態全在記憶體
+
+這是跟 chrony 最大的差別，也是長維護要小心的點。chrony 會把學到的頻率誤差寫進 `/var/lib/chrony/drift`，斷網甚至重開機後還能靠它繼續校正晶振漂移。**timesyncd 沒有這個東西**。
+
+它學到的頻率補償 `drift_freq` 只存在 `Manager` struct 的記憶體裡：
+
+File: `systemd/src/timesync/timesyncd-manager.h` (line 82)
+
+```c
+        /* last change */
+        bool jumped;
+        int64_t drift_freq;
+```
+
+`drift_freq` 只在收到 reply、`clock_adjtime` 之後被更新，從不落地：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 295)
+
+```c
+        m->drift_freq = tmx.freq;
+```
+
+> 注意：kernel 自己會記住 PLL 餵進去的 frequency（`adjtimex` 的 `freq`），這個在 process 重啟後仍由 kernel 保留——所以「`systemctl restart timesyncd`」不會丟掉 kernel 端的頻率校正。但**整機 reboot 會**：開機 kernel freq 歸零，timesyncd 也沒有 driftfile 可以餵回去，要重新從 NTP 學。
+
+連「是否同步過」這個旗標都放在 **tmpfs 的 `/run`**，reboot 即蒸發：
+
+File: `systemd/src/timesync/timesyncd-manager.c` (line 582)
+
+```c
+r = touch("/run/systemd/timesync/synchronized");
+```
+
+啟動時靠 `access()` 這個檔判斷初始 `synchronized` 狀態（manager.c:1154）。`/run` 是 tmpfs，所以**每次 reboot 都從「沒同步過」開始**。
+
+結論：**「斷網維護」期間若順手 reboot 了 node，比單純斷網更糟**——除了漂移，還丟掉 kernel freq 校正和 poll interval 的爬升，回來要從 32s min poll 重新爬（[poll 重置那一頁](/systemd/timesyncd-poll-interval-adaptation)、[重啟影響那一頁](/systemd/timesyncd-restart-impact)）。
+
+## 機制四：timedatectl 的「synchronized」跟 timesyncd 脫鉤
+
+長維護時你會去看 `timedatectl`，但它的 `System clock synchronized: yes/no` **不是讀 timesyncd 的狀態**，而是問 kernel：`adjtimex` 回報的 `maxerror` 有沒有小於 16 秒。
+
+File: `systemd/src/timedate/timedated.c` (line 570)
+
+```c
+static bool ntp_synced(void) {
+        struct timex txc = {};
+
+        if (adjtimex(&txc) < 0)
+                return false;
+
+        /* Consider the system clock synchronized if the reported maximum error is smaller than the maximum
+         * value (16 seconds). Ignore the STA_UNSYNC flag as it may have been set to prevent the kernel from
+         * touching the RTC. */
+        return txc.maxerror < 16000000;
+}
+```
+
+kernel 的 `maxerror` 在沒有新 sync 時會**自己隨時間長大**（每秒加上一個 dispersion）。所以一台斷網很久的 node，即使 timesyncd 自己的 `synchronized` bool 還是 true，`timedatectl` 也會在 maxerror 漲過 16 秒後翻成 `not synchronized`。**這兩個狀態是不同來源、會不一致**——排查長維護時別把它們當同一回事。
+
+另外 timesyncd 自己的 `synchronized` 只會 false→true（manager.c:618-619），**從不主動翻回 false**。它不是「現在準不準」的指標，是「這個 process 活著的期間有沒有對成功過一次」。
+
+## 套到你的維護情境
+
+把上面四個機制套到實際維護。所有漂移數字延用前面 @10 ppm 的假設，**請以實測 ppm 修正**。
+
+### 單機斷網維護
+
+單台 node 斷外網，cluster 其他 node 時間正常。
+
+| 時長 | @10ppm 漂移 | 回來時發生什麼 |
+|---|---|---|
+| 2h | ~72 ms | 略過 50ms：回來首次 sync offset ~72ms。`< 0.4s` → **slew**（漸進、不跳）。ceph 那輪 timecheck 可能瞬間看到 ~72ms → 短暫 `MON_CLOCK_SKEW` WARN，收斂後自動 CLEAR |
+| 1d | ~864 ms | `< 5s`，lease 安全。但 `> 0.4s` → 回來首次 sync 是 **jump（瞬跳）**。ceph 下一輪 timecheck 看到 ~0.86s WARN，jump 修正後下輪清掉 |
+| 1week | ~6 s | **跨過 5s**：這台單機若是 mon，回來那一瞬間在它自己被 NTP 修正前，wall clock 領先/落後 quorum 約 6s。但這是**單機**——回來會被 timesyncd jump 修掉；風險窗只有「回到網路」到「首次 sync 完成」之間的數十秒 |
+| 1month | ~26 s | 同 1week，偏移更大、jump 幅度更大。對 ceph 是一次 jump 事件；對 node 上其他依賴單調時鐘的程式，瞬跳 26s 可能更有感 |
+
+單機情境的關鍵：**偏移再大，回來都是 timesyncd 一次（slew 或 jump）修掉**。slew/jump 的 0.4s 分界、jump 對 ceph 的瞬間衝擊，拆在 [重啟影響那一頁](/systemd/timesyncd-restart-impact)。
+
+### OSD / monitor nodes 複數斷網維護
+
+**這裡才是真正危險的情境**，因為 ceph 的時間門檻是**相對**的——比的是 node 之間的差，不是對 UTC 的絕對誤差。
+
+- **複數 OSD 斷網**：OSD 之間走 `mono_clock` + heartbeat delta 補償，**wall-clock skew 不觸發 OSD 健康門檻**（[skew 階梯那頁](/ceph/clock-skew-magnitude-ladder)證過）。所以複數 OSD 一起漂、一起回來，對 OSD-OSD 路徑相對無害；真正要擔心的是這些 OSD 跟**mon** 的關係，以及 client。
+- **複數 mon 斷網**：致命。mon 的 Paxos lease 用 **wall clock** 算。若維護讓 ≥2 台 mon（3-mon cluster）一起漂且漂的量**不同**，回來時彼此 wall clock 差超過 `mon_lease`(5s)，會弄垮 lease → election churn。
+
+| 時長 | 複數 mon 回來時 |
+|---|---|
+| 2h / 1d | 各自漂 `< 5s`（@10ppm 72ms / 864ms），**彼此差更小**（同型號 node ppm 接近、同時段同溫度）。回來各自被 NTP 修掉，風險低 |
+| 1week | @10ppm 各漂 ~6s。**若各 node ppm 相近、漂移方向一致，彼此差可能仍 `< 5s`**；但只要有一台 ppm 偏大（如 50ppm 漂 30s），回來瞬間 mon 之間差就可能 `> 5s` → lease 崩 |
+| 1month | @10ppm 各 ~26s，ppm 差異被時間放大，**mon 之間差很可能 >5s**。回來那段「未全部 sync 完」的窗口內，election 可能反覆 |
+
+實務建議：**維護複數 mon 時，最危險的不是維護當下（沒網誰也對不了時），而是「陸續回網、但還沒全部 sync 完」那段窗口**。要嘛同時恢復網路讓它們幾乎同步對時，要嘛一台一台恢復、確認 `timedatectl` 同步後再放下一台。
+
+### Rack 對外網路中斷
+
+整 rack 斷外網，但 **rack 內部網路還通**。這裡有個架構槓桿：
+
+- 如果 NTP server 在 **rack 外**：rack 內所有 node 一起 free-run。但因為它們**之前都對同一個 source**、且**彼此沒斷**，rack 內 node 之間的相對 skew 增長得比對 UTC 的絕對誤差慢得多（大家往同方向漂）。對「rack 內的 ceph daemon 互相比」相對安全。
+- 如果有 NTP server 在 **rack 內**（或設了 rack 內 peer）：rack 內根本不受影響。
+
+| 時長 | rack 內相對 skew（外部 NTP） |
+|---|---|
+| 15s / 1m | 可忽略（@10ppm 1m 才漂 0.6ms，node 間差更小） |
+| 1h | 各 node 對 UTC 漂 ~36ms，但 node 間差遠小於此 → 通常不破 50ms |
+| 1d | 對 UTC 漂 ~864ms；node 間差取決於 ppm 離散度，**可能破 50ms WARN，通常不破 5s** |
+
+rack 情境的教訓：**ceph 怕的是 node 間差，不是對 UTC 的絕對誤差**。整 rack 一起斷、一起漂，比單機落單斷網溫和得多。最該避免的是「rack 內一部分 node 用 rack 內 NTP、一部分用 rack 外」的混搭——斷外網時這兩群會分裂。
+
+### NTP server down（node 都在線，只是 server 掛了）
+
+node 網路正常，只是上游 NTP server 重開 / 維護。這對應前面**機制二 (a)/(b)**：node 送得出 request，只是沒人回。
+
+| server down 時長 | timesyncd 行為 | 時鐘影響 |
+|---|---|---|
+| 15s / 1m | retry 15s→×4/3 爬；poll interval 內可能還沒輪到下次 query | 幾乎無（free-run 1 分鐘 @10ppm 漂 0.6ms） |
+| 15m / 30m | 多台 server 試完進 exhausted backoff、poll ×2 拉長 | free-run，30m @10ppm 漂 ~18ms，不破 50ms |
+| 1h | 持續 backoff（poll 最多爬到 2048s）；retry 封頂 6min | ~36ms，臨界 50ms |
+| 6h / 1d | 同上持續重試 | 6h ~216ms（破 50ms）、1d ~864ms（破 50ms，近 1s）。但 server 一回來**毫秒級就重連**、一次 slew/jump 修掉 |
+
+NTP server down 的關鍵：**只要 node 自己還在線、彼此沒斷，所有 node 是「一起對不到上游、一起 free-run」**——node 間的相對 skew 增長慢，比單機斷網安全。配**多個** NTP server（system + fallback）能讓單一 server 維護完全無感，因為 timesyncd 會自動輪替到下一台（manager.c 的 server 輪替鏈）。
+
+## 原始碼路徑
+
+| 問題 | 入口 | 真正效果 |
+|---|---|---|
+| 斷網期間時鐘怎麼動 | （無）—— `manager_adjust_clock` 只在收到 reply 後被呼叫 | free-run，漂移 = 硬體 ppm × 時長 |
+| 斷網被偵測到 | `manager_network_event_handler` → `manager_disconnect` | 停止 listen/timer，等 online 通知 |
+| server 沉默重試 | `manager_send_request` retry_interval ×4/3 (15s→6min) | 只影響重連節奏，不碰時鐘 |
+| 全 server 試完 | `manager_connect` exhausted_servers backoff，poll ×2 | 拉長重試間隔 |
+| 網路恢復 | `manager_network_event_handler` → `manager_begin` | 毫秒級重連、首次 sync slew/jump 修偏移 |
+| 維護中 reboot | `/run/.../synchronized`(tmpfs) + in-memory `drift_freq` | 失去同步旗標與 kernel freq，從 min poll 重爬 |
+| `timedatectl` 同步狀態 | `timedated.c::ntp_synced()` `maxerror < 16s` | 跟 timesyncd 自身 `synchronized` 脫鉤 |
+
+## 邊界與除錯
+
+### timesyncd 不適合「長時間離線後仍要準」的場景
+
+如果你的 node 會長期離線（air-gapped、邊緣裝置、長維護），又要求離線期間時鐘仍準，**timesyncd 不是對的工具**——它沒有 driftfile，離線就是純 free-run，沒有頻率補償。這種需求要用 **chrony**（有 driftfile，離線靠學到的 ppm 繼續校正）或硬體 **PTP / GPS**。timesyncd 的設計定位是「持續有網的一般主機」。
+
+### 回來那一刻的 jump，是真正會打到 ceph 的事件
+
+維護越久、回來首次 sync 的偏移越大；偏移 ≥0.4s 就是**瞬跳**而非 slew。對 mon 而言這個 jump 若 >5s 會瞬間弄垮 lease；對所有依賴單調 wall clock 的程式，瞬跳本身就可能出問題。**rolling 維護回網前，先確認偏移**（`timedatectl timesync-status` 的 Offset），偏移大的話挑維護窗、或先 silence ceph 的 clock skew 告警再放回網——這條操作流程拆在 [重啟影響那一頁](/systemd/timesyncd-restart-impact)。
+
+### 怎麼估自己 node 的 ppm
+
+本頁所有漂移數字都建立在 ppm 假設上。要量你自己的：`timedatectl show-timesync --property=Frequency`（kernel freq，÷65536 ≈ ppm × ...），或斷網一段已知時間後比對 NTP 看實際漂了多少。**不要直接套本頁的 @10ppm**——VM、雲主機、老舊主機板的有效 ppm 可能差一個量級。
+
+## 接下來 / 相關頁面
+
+- [systemd-timesyncd — service 重啟對系統時間的影響](/systemd/timesyncd-restart-impact) — 回網後首次 sync 的 slew vs jump（0.4s 分界）、reboot 為何從 min poll 重爬
+- [systemd-timesyncd — poll interval 怎麼從 2048s 變回 32s](/systemd/timesyncd-poll-interval-adaptation) — 重連後 poll 為何一定從 32s 重新爬、什麼情況會被拉回 min
+- [systemd-timesyncd — 跟系統時間有關的 log 印不印](/systemd/timesyncd-log-anatomy) — 斷網重連時 journal 看得到什麼、slew/jump 偏移為何預設被吃掉
+- [Ceph — node 間時間差各量級壞掉什麼](/ceph/clock-skew-magnitude-ladder) — 50ms WARN 與 5s lease 崩兩條線；為什麼複數 mon 一起漂最危險
+- [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](/ceph/cluster-time-skew-impact) — MON-MON / MON-OSD / OSD-OSD 各走哪條時鐘路徑
