@@ -15,7 +15,7 @@
   {
     "id": 2,
     "section": "📈 timesyncd + Prometheus 監控",
-    "question": "node_exporter 官方文件建議用哪一組 metric 判斷 systemd-timesyncd 有沒有在做事？",
+    "question": "node_exporter 官方 docs 建議用哪一組 metric 判斷 systemd-timesyncd 有沒有在做事？",
     "options": [
       "timex collector 的 sync_status 與 offset 的組合",
       "ntp collector 的 node_ntp_stratum",
@@ -41,15 +41,15 @@
   {
     "id": 4,
     "section": "📈 timesyncd + Prometheus 監控",
-    "question": "為什麼「每台 node 維持 |node_timex_offset_seconds| < 25ms」就能保證任兩台 node 之間 < 50ms？",
+    "question": "為什麼「每台 node 維持 |node_timex_offset_seconds| < 25ms」只能當 ceph 50ms 門檻的早期 proxy，而不是權威判決？",
     "options": [
-      "因為兩台對真實時間的偏移 X、Y 滿足 |X−Y| ≤ |X|+|Y|，各自 < 25ms 則差必 < 50ms",
+      "因為三角不等式需要同一時間參考與新鮮 residual offset 前提；node_timex_offset_seconds 不是跨 node 即時量測，權威判決仍是 ceph timecheck",
       "因為 node_exporter 會自動把所有 node 的 offset 平均掉",
       "因為 timesyncd 保證所有 node 的 offset 一定同號",
       "因為 25ms 是 ceph 的硬性下限，低於它 ceph 不會比較"
     ],
     "answer": 0,
-    "explanation": "三角不等式 |X−Y| ≤ |X|+|Y|：若每台對真實時間偏移的絕對值都 < 25ms，任兩台之差必 < 50ms。這讓 per-node 的 offset 告警（門檻設 25ms）成為比 ceph 50ms 判決更早的早期警告，且兩者互補。"
+    "explanation": "三角不等式 |X−Y| ≤ |X|+|Y| 只有在 X/Y 可比較且足夠新鮮時才成立。node_timex_offset_seconds 是 kernel residual offset，不是每次 scrape 主動量測跨 node 差；它適合當早期 proxy，ceph_health_detail{name=\"MON_CLOCK_SKEW\"} 才是跨 mon 50ms 的權威判決。"
   },
   {
     "id": 5,
@@ -63,5 +63,83 @@
     ],
     "answer": 0,
     "explanation": "time_exporter 最後 push 在 2021-11、僅 6 star，屬停更專案，不建議用於生產。主力是活躍維護的 node_exporter（timex collector），輔以 systemd_exporter 看 daemon 存活。timesyncd 沒有還在維護的專屬 exporter，官方也建議走 node_exporter timex collector。"
+  },
+  {
+    "id": 6,
+    "section": "🕒 timesyncd restart impact",
+    "question": "systemd-timesyncd 啟動時 `load_clock_timestamp()` 對 `CLOCK_REALTIME` 的核心限制是什麼？",
+    "options": [
+      "只會在 now 不大於 timestamp file / TIME_EPOCH 時往前 bump 到 epoch+1us，不會往後調",
+      "每次 restart 都會強制往後校正到 NTP server time",
+      "只要 timestamp file 存在就一定會跳 60 秒",
+      "它不碰 CLOCK_REALTIME，只更新 /run/systemd/timesync/synchronized"
+    ],
+    "answer": 0,
+    "explanation": "timesyncd.c:118-130 先取 current realtime；若 ct > epoch 就 return。只有 current time 不大於 epoch 時才 clock_settime 到 epoch+1us，並記錄 DIRECTION=forwards。往後跳是 PID 1 clock_apply_epoch 或後續 NTP jump 的其他路徑，不是 daemon-side load_clock_timestamp。"
+  },
+  {
+    "id": 7,
+    "section": "🌐 outage / server failure",
+    "question": "NTP server 有回應但 root distance 超過 `RootDistanceMaxSec=` 時，timesyncd 會怎麼做？",
+    "options": [
+      "記錄 server root distance 太大，disconnect 並透過 manager_connect() 換下一個 server/address",
+      "照樣接受 sample，因為 root distance 只影響 log 顯示",
+      "立刻把系統時間往前跳到 root distance 對應的秒數",
+      "把 PollIntervalMaxSec 永久改成 32 秒"
+    ],
+    "answer": 0,
+    "explanation": "manager_receive_response 在 timesyncd-manager.c:493-497 用 root_delay/2 + root_dispersion 算 root distance，超過 m->root_distance_max_usec 就 log_info 並 return manager_connect(m)。這是 server selection 問題，不是 clock adjustment。"
+  },
+  {
+    "id": 8,
+    "section": "🧾 timesyncd log anatomy",
+    "question": "為什麼平常 `journalctl -u systemd-timesyncd` 常看不到實際 slew/jump 的 offset 數字？",
+    "options": [
+      "因為 `adjust (slew)` / `adjust (jump)` 與 NTP response dump 都是 LOG_DEBUG，預設 log level 只看到 INFO 以上",
+      "因為 timesyncd 根本不記錄任何 NTP response",
+      "因為 offset 只寫進 /proc/timesync，journalctl 不能讀",
+      "因為只有 chrony 才會在 log 裡寫 offset"
+    ],
+    "answer": 0,
+    "explanation": "timesyncd-manager.c:255/272 的 adjust log 是 log_debug，完整 NTP response dump 也是 log_debug。預設可見的是 Contacted time server、Initial clock synchronization、root distance 太大等 INFO。要看 offset 細節要開 DEBUG。"
+  },
+  {
+    "id": 9,
+    "section": "📉 poll interval adaptation",
+    "question": "`manager_sample_spike_detection()` 裡 `if (fabs(offset) > delay) return false;` 的意思是什麼？",
+    "options": [
+      "offset 比本輪 round-trip delay 還大時，timesyncd 認為比較像真偏移，所以不當 spike、接受 sample",
+      "offset 比 delay 大時，timesyncd 永遠把 sample 當 spike 並丟掉",
+      "delay 只用來顯示，不參與 spike detection",
+      "這行代表 timesyncd 會立刻切換 NTP server"
+    ],
+    "answer": 0,
+    "explanation": "timesyncd-manager.c:348-350 的註解寫明 always accept offset if we are farther off than the round-trip delay，return false 代表不是 spike。這修正了把 50ms/250ms 真偏移誤判成永遠 spike 的錯誤讀法。"
+  },
+  {
+    "id": 10,
+    "section": "📉 poll tuning from metrics",
+    "question": "用一週穩定數據選 `PollIntervalMaxSec=256` 的主要理由是什麼？",
+    "options": [
+      "穩態下最晚 256 秒拿到下一筆 NTP sample，跟 ceph 5 分鐘 timecheck 同量級，同時保留比 max=64 更好的 noise filter",
+      "source 保證 max=256 時所有 50ms 偏移都會在 10 分鐘內完全收斂",
+      "max=256 會讓 timesyncd 改用 chrony driftfile",
+      "max=256 會停用 spike detection，避免 sample 被忽略"
+    ],
+    "answer": 0,
+    "explanation": "source 能保證的是下一筆 sample 的最壞等待與 poll/PLL 決策，不保證 kernel slew 固定幾分鐘收斂。max=256 讓 sample 新鮮度接近 ceph timecheck，packet/day 仍合理，PLL constant=4 也比 max=64 的 constant=2 更不容易放大 jitter。"
+  },
+  {
+    "id": 11,
+    "section": "⏱️ time-set vs time-sync",
+    "question": "對需要準確時間的 workload，為什麼只寫 `After=time-set.target` 不夠？",
+    "options": [
+      "`time-set.target` 只代表本機時間已被 timestamp file / epoch 等 local source 推到粗略單調；要等遠端同步需用 `time-sync.target` 搭配 systemd-time-wait-sync 或等價機制",
+      "`time-set.target` 永遠不會被 systemd-timesyncd pull in",
+      "`time-set.target` 只跟 timezone 設定有關，與 CLOCK_REALTIME 無關",
+      "`time-sync.target` 是給 container 用的，bare-metal 不支援"
+    ],
+    "answer": 0,
+    "explanation": "systemd-timesyncd.service.xml:59-68 說明 timesyncd 只會 delay time-set.target 到 local clock 從 /var/lib/systemd/timesync/clock 更新，並不等準確遠端同步。systemd.special.xml:1269-1294 則說需要準確遠端時間要看 time-sync.target，並啟用 systemd-time-wait-sync.service 或等價服務。"
   }
 ]

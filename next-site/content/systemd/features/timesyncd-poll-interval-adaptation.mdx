@@ -421,7 +421,7 @@ PollIntervalMaxSec=512
 
 ## 對 ceph mon 的具體意涵
 
-對應 [ceph clock skew 那一頁](/ceph/mon-clock-skew-detection)：
+對應 [ceph clock skew 那一頁](/ceph/features/mon-clock-skew-detection)：
 
 - mon 上 timesyncd 從 2048s 變成 32s 是個 **網路或時鐘異常的早期訊號**，比 ceph 自己的 timecheck round（5 分鐘）反應更快。
 - 反過來如果一台 mon 持續維持 max 2048s、另一台一直在 32s，差異本身就是個 host-level 問題訊號（後者那台網路或時鐘有問題）。
@@ -474,5 +474,5 @@ leap_sec 是 NTP packet 裡的 `leap_indicator` 欄位、由 NTP server 標。ti
 <Callout type="info" title="延伸閱讀">
   - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — `poll_interval_usec` 重啟後從 min 開始的初始化邏輯；`NTP_MAX_ADJUST = 0.4s` 走 slew/jump 的分界
   - [systemd-timesyncd — 跟系統時間有關的 log 印不印](./timesyncd-log-anatomy) — `interval/delta/delay/jitter/drift` 那行 DEBUG log 就是觀察 poll 動態的窗口
-  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — timesyncd poll 變高頻是 ceph timecheck 的提前訊號
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection) — timesyncd poll 變高頻是 ceph timecheck 的提前訊號
 </Callout>
