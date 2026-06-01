@@ -1,12 +1,12 @@
 ---
 layout: doc
 title: systemd-timesyncd — service 重啟對系統時間的影響
-description: 從 src/timesync/timesyncd.c 的 load_clock_timestamp() 入手，拆解 systemd-timesyncd daemon 重啟時對 CLOCK_REALTIME 的三條影響路徑：開機時 PID 1 的 clock_apply_epoch 可能往前/往後跳；daemon 啟動的 load_clock_timestamp 只往前跳到 timestamp 檔 mtime 或 built-in TIME_EPOCH；首次 NTP 同步後的 clock_adjtime 視偏移大小決定 slew (< 0.4s) 或 jump。每 60 秒寫一次 timestamp 檔。另解答重啟後是否馬上發 NTP query（取決於 network_is_online）、poll interval 為何一定從 32s min 重爬，以及如何安全地手動觸發一次對時（timesyncd 無 makestep，只能 restart）。
+description: 從 src/timesync/timesyncd.c 的 load_clock_timestamp() 入手，拆解 systemd-timesyncd daemon 重啟時對 CLOCK_REALTIME 的三條影響路徑：開機時 PID 1 的 clock_apply_epoch 可能往前/往後跳；daemon 啟動的 load_clock_timestamp 只往前跳到 timestamp 檔 mtime 或 built-in TIME_EPOCH；首次 NTP 同步後的 clock_adjtime 視偏移大小決定 slew (< 0.4s) 或 jump。每 60 秒寫一次 timestamp 檔。另解答重啟後是否馬上發 NTP query、poll interval 為何一定從 32s min 重爬、time-set.target 為何不等於已同步，以及如何安全地手動觸發一次對時（timesyncd 無 makestep，只能 restart）。
 ---
 
 ## 場景
 
-ceph 那邊查過 [MON clock skew 多久會被偵測](/ceph/mon-clock-skew-detection)：50ms 以上的偏移、最壞約 5 分鐘 health 會變 WARN。下個問題就是：
+ceph 那邊查過 [MON clock skew 多久會被偵測](/ceph/features/mon-clock-skew-detection)：50ms 以上的偏移、最壞約 5 分鐘 health 會變 WARN。下個問題就是：
 
 > mon node 上的 `systemctl restart systemd-timesyncd` 那一刻，**系統時間會不會瞬間跳？跳多少？**
 
@@ -23,7 +23,7 @@ ceph 那邊查過 [MON clock skew 多久會被偵測](/ceph/mon-clock-skew-detec
 | 同上、檔案不存在 | **前跳** 到 `TIME_EPOCH + 1μs`（build-time epoch） | TIME_EPOCH − RTC |
 | 重啟後 NTP 回應且偏移 < 0.4s | 慢慢 slew（`ADJ_OFFSET`），不跳 | 漸進 |
 | 重啟後 NTP 回應且偏移 ≥ 0.4s | **瞬跳**（`ADJ_SETOFFSET`），可正可負 | 完整 offset |
-| timesyncd 在執行中閒置 → 重啟 | timestamp 檔最多落後 70 秒（60s save + 10s slack） | 影響 fallback 跳幅 |
+| timesyncd 在執行中閒置 → 重啟 | timestamp 檔通常每 60 秒左右更新一次，timer 有 10 秒精度 slack | 影響 fallback 前跳幅度；不是硬上限 |
 
 最重要的一點：**`load_clock_timestamp` 只能讓系統時間往前跳，永遠不會往後**。這個性質是設計刻意的，後面會看程式碼怎麼擋的。
 
@@ -55,7 +55,7 @@ exec /usr/lib/systemd/systemd-timesyncd
    │     每 60 秒（CLOCK_BOOTTIME timer + 10s 精度）touch_file 一次 clock 檔
    │
    ├── ⑤ if network_is_online(): manager_connect()
-   │       開始 NTP query；首封 packet 在毫秒級送出
+   │       開始選 server / address；已有 address 時可很快送出 NTP query
    │
    └── ⑥ sd_event_loop()
          │
@@ -325,7 +325,7 @@ static int manager_save_time_and_rearm(Manager *m, usec_t t) {
 }
 ```
 
-預設 `DEFAULT_SAVE_TIME_INTERVAL_USEC = 60 * USEC_PER_SEC`（`timesyncd-manager.h:22`）。所以**正常 daemon 跑著時，timestamp 檔最多落後 60 + 10 = 70 秒**。重啟若卡 70 秒以上，下次啟動的 `epoch` 也會落後 70 秒。
+預設 `DEFAULT_SAVE_TIME_INTERVAL_USEC = 60 * USEC_PER_SEC`（`timesyncd-manager.h:22`）。所以**正常 daemon 跑著時，timestamp 檔通常每 60 秒左右更新一次，timer 允許 10 秒精度 slack**。這不是「最多落後 70 秒」的硬上限：event loop 延遲、系統負載、suspend、髒關機時間點都可能讓 mtime 更舊。重啟時的 `epoch` 只能代表「上次成功寫入 timestamp 檔或 `TIME_EPOCH` 的較大者」。
 
 ## ⑤ NTP 同步：slew 或 jump 由 0.4 秒分界
 
@@ -344,7 +344,7 @@ static int manager_send_request(Manager *m) {
         len = sendto(m->server_socket, &ntpmsg, sizeof(ntpmsg), MSG_DONTWAIT, ...);
 ```
 
-第一封 UDP packet 在 daemon ready 後毫秒內送出（前提：`network_is_online()` 為 true，否則等 `NetworkManager`/`systemd-networkd` 通知 online）。
+若 `network_is_online()` 為 true，timesyncd 會進入 `manager_connect()`。已有可用 server address 時，第一封 UDP packet 可在 daemon ready 後很快送出；如果還沒有 address，仍要先走 server selection / DNS resolution。若網路還沒 online，則等 `NetworkManager`/`systemd-networkd` 通知 online。
 
 收到 NTP 回應後計算 offset，呼 `manager_adjust_clock()`：
 
@@ -456,11 +456,12 @@ if (!ratelimit_below(&m->ratelimit)) {
 }
 ```
 
-ratelimit 是 10 秒最多 10 次（`RATELIMIT_INTERVAL_USEC=10s`、`RATELIMIT_BURST=10`，manager.c:60-61）。關鍵是這個 `RateLimit` state 放在 `Manager` struct 裡、**每個 process 獨立**：剛 fork 的新 process ratelimit 是乾淨的，所以重啟後第一次 connect 永遠不會被它擋。接著 `manager_begin()` → `manager_send_request()` 把第一封 UDP packet 送出，距 daemon ready 是毫秒級。
+ratelimit 是 10 秒最多 10 次（`RATELIMIT_INTERVAL_USEC=10s`、`RATELIMIT_BURST=10`，manager.c:60-61）。關鍵是這個 `RateLimit` state 放在 `Manager` struct 裡、**每個 process 獨立**：剛 fork 的新 process ratelimit 是乾淨的，所以重啟後第一次 connect 不會被舊 process 的 ratelimit 擋住。若已經有可用的 server address，`manager_begin()` → `manager_send_request()` 可以很快送出第一封 UDP packet；若還沒有 address，仍要先走 server selection / DNS resolution。
 
 所以：
 
-- **網路 online**：重啟後毫秒內就發第一封 NTP query。
+- **網路 online 且已有 address**：重啟後可很快發第一封 NTP query。
+- **網路 online 但尚未選到 address**：先走 server selection / DNS resolution，不能保證毫秒級送出。
 - **網路還沒 online**：`run()` 那個 `if` 不成立，完全不問；要等 systemd-networkd 的 `/run/systemd/netif/state` 或 NetworkManager D-Bus 通知 online 才 `manager_connect`。VM / server 剛開機網路慢時，「重啟 timesyncd」不等於「馬上對到時」。
 
 ### poll interval 一定從 min（32 秒）重新爬
@@ -499,7 +500,7 @@ static void manager_adjust_poll(Manager *m, double offset, bool spike) {
 
 所以重啟的副作用是：**poll 密度暫時被拉到最高（32s 一次），再慢慢爬回去**。對 ceph 反而是好事 — 重啟後那段最需要盯的時候剛好問得最勤。
 
-> 註：`poll_resync` 只有在 `manager_clock_watch` 偵測到「別人改了 `CLOCK_REALTIME`」時才被設 true（manager.c:220）。單純 restart 不走那條路；重啟回到 min poll 純粹來自上面 `poll_interval_usec == 0` 被 floor 成 min，不是 `poll_resync`。這頁把 poll 演進完整拆在 [poll interval 自適應](/systemd/timesyncd-poll-interval-adaptation)。
+> 註：`poll_resync` 只有在 `manager_clock_watch` 偵測到「別人改了 `CLOCK_REALTIME`」時才被設 true（manager.c:220）。單純 restart 不走那條路；重啟回到 min poll 純粹來自上面 `poll_interval_usec == 0` 被 floor 成 min，不是 `poll_resync`。這頁把 poll 演進完整拆在 [poll interval 自適應](/systemd/features/timesyncd-poll-interval-adaptation)。
 
 ### 想安全地「馬上觸發一次對時」怎麼做
 
@@ -509,7 +510,7 @@ static void manager_adjust_poll(Manager *m, double offset, bool spike) {
 systemctl restart systemd-timesyncd
 ```
 
-重啟「本身」是安全的 — 前面整篇證明過 `load_clock_timestamp` 只會在 RTC 落後時**往前** bump，永遠不往後跳。**真正會動 wall clock 的是重啟後那次 NTP 校正**：offset < 0.4s 走 slew（漸進、不跳），≥ 0.4s 才瞬跳（`NTP_MAX_ADJUST`，manager.c:47）。
+重啟「本身」的精確說法是：`load_clock_timestamp` **不會往後跳**，但在 RTC / timestamp file / `TIME_EPOCH` 條件命中時仍可能**往前** bump。對 ceph 來說，前跳超過 50ms 一樣可能造成下一輪 timecheck 看到 skew；安全性取決於 timestamp/RTC 的相對位置，以及後續那次 NTP 校正的 offset。後續 NTP offset < 0.4s 走 slew（漸進、不跳），≥ 0.4s 才瞬跳（`NTP_MAX_ADJUST`，manager.c:47）。
 
 要安全（不讓 ceph 看到突跳），照這個順序：
 
@@ -556,7 +557,7 @@ File: `systemd/src/timesync/timesyncd.c` (line 227)
 
 `touch()` 直接用當前 wall clock 更新 mtime。也就是：**乾淨關機 → timestamp 檔是停機那一刻的時間 → 下次重啟 `now > epoch` → 不跳**。
 
-**髒關機（kill -9 / 主機掉電）才會留下 70 秒以內的 stale mtime**，下次重啟可能踩 `now <= epoch` 那條路徑（如果這 70 秒內 RTC 又因為任何原因走慢了）。
+**髒關機（kill -9 / 主機掉電）可能留下 stale mtime**，常見情況會接近上一輪 60 秒週期加 timer slack，但 source 沒有保證硬上限。下次重啟可能踩 `now <= epoch` 那條路徑（如果 timestamp 檔比當下 RTC 還新）。
 
 ## clock_apply_epoch：另一條獨立路徑（PID 1 開機時跑）
 
@@ -622,6 +623,52 @@ File: `systemd/src/core/main.c` (line 3186)
 
 **回到主問題**：`systemctl restart systemd-timesyncd` **不會** 觸發 `clock_apply_epoch`，因為 PID 1 沒被 re-exec、boot 也沒重來。所以 daemon restart 的 clock impact 完全由 `load_clock_timestamp` 一支函式決定。
 
+## time-set.target 不是 time-sync.target
+
+很多「開機後 service 已經起來，但時間還沒真的同步」的經驗，不是 timesyncd bug，而是 systemd target 的 contract。`systemd-timesyncd.service` 會把系統時間至少推到 timestamp file / epoch，然後讓 `time-set.target` 往前走；但這只保證**粗略單調**，不保證已經接到遠端 NTP server。
+
+File: `systemd/man/systemd-timesyncd.service.xml` (line 59)
+
+```xml
+<para>Initialization of <filename>systemd-timesyncd.service</filename> delays the start of units that are
+ordered after <filename>time-set.target</filename> ... until the local time has been updated from
+<filename>/var/lib/systemd/timesync/clock</filename> ... in order to make it roughly monotonic.
+It does not delay other units until synchronization with an accurate reference time sources has been reached.
+```
+
+`time-set.target` 自己的定義也講得很直：它適合需要「大概正確、不要倒退」的 service，而且不該被網路問題拖住。
+
+File: `systemd/man/systemd.special.xml` (line 1233)
+
+```xml
+<term><filename>time-set.target</filename></term>
+<listitem>
+  <para>Services responsible for setting the system clock (<constant>CLOCK_REALTIME</constant>)
+  from a local source ... should pull in this target and order themselves before it.
+```
+
+需要準確遠端同步時，要看 `time-sync.target`，而且在 timesyncd 情境下還要啟用 `systemd-time-wait-sync.service` 或等價機制，否則 ordering after `time-sync.target` 也可能太早通過：
+
+File: `systemd/man/systemd.special.xml` (line 1269)
+
+```xml
+<term><filename>time-sync.target</filename></term>
+<listitem>
+  <para>Services indicating completed synchronization of the system clock
+  (<constant>CLOCK_REALTIME</constant>) to a remote source should pull in this target and order
+  themselves before it.
+```
+
+對 SRE 來說，差異是：
+
+| 你看到的狀態 | 真正意思 | 不代表 |
+|---|---|---|
+| `time-set.target` reached | 本機時間已被 timestamp file / epoch / local source 推到粗略單調 | 已經連上 NTP、offset 很小 |
+| `/run/systemd/timesync/synchronized` 存在 | timesyncd 成功接受過至少一筆非 spike NTP sample | 之後每一秒都仍然準 |
+| `time-sync.target` reached（且 wait-sync 有啟用） | 有服務宣告遠端同步完成 | ceph 看到的跨 node skew 一定 < 50ms |
+
+所以如果某個 workload 真的怕 TLS certificate、Kerberos、ceph lease 這類「準確時間」問題，不要只寫 `After=time-set.target`。那只會等 `load_clock_timestamp` 的粗略 bootstrap，不會等第一筆有效 NTP reply。
+
 ## 把所有跳鐘可能性列出來
 
 整理一張表，給 `systemctl restart systemd-timesyncd` 之後**可能**對系統時間有影響的事件：
@@ -629,7 +676,7 @@ File: `systemd/src/core/main.c` (line 3186)
 | 事件 | 何時發生 | 對 CLOCK_REALTIME 的效果 | 大小 |
 |---|---|---|---|
 | ① `load_clock_timestamp` 跳鐘 | drop priv 前、event loop 開始前 | `clock_settime` 前跳到 `max(file_mtime, TIME_EPOCH) + 1μs` | mtime − now（前跳） |
-| ② 首次 NTP 回應 (slew) | event loop 開始、首封 packet 回應後（毫秒到秒級） | `clock_adjtime(ADJ_OFFSET)` 漸進 slew | < 0.4s |
+| ② 首次 NTP 回應 (slew) | event loop 開始、server selection / DNS / request / valid reply 完成後 | `clock_adjtime(ADJ_OFFSET)` 漸進 slew | < 0.4s |
 | ③ 首次 NTP 回應 (jump) | 同 ② | `clock_adjtime(ADJ_SETOFFSET)` 瞬跳 | ≥ 0.4s，可正可負 |
 | ④ 後續 NTP poll 同步 | 32s ~ 2048s 一次 | 同 ②③，正常情況 slew | < 0.4s |
 | ⑤ 60 秒 save tick | 持續跑時 | **不碰系統時間**，只更新 timestamp 檔 mtime | 0 |
@@ -841,7 +888,7 @@ journal MESSAGE_ID 都是 `SD_MESSAGE_TIME_BUMP_STR`（同一個），用 ID 過
 ## 相關頁面
 
 <Callout type="info" title="延伸閱讀">
-  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — timesyncd 跳鐘後，ceph 多久才會看到並抓出來
-  - [Ceph — Clock skew matrix](/ceph/cluster-time-skew-impact) — 不同程度的時間偏移對 MON-MON / MON-OSD / OSD-OSD 各條 channel 的影響
-  - [Ceph — Prometheus alert 重新設計（穩定性第一的 6 條 rule）](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 落在 `CephClientRisk` 的 `name!~` catch-all，`for: 5m` 後才 page；短於 5 分鐘的暫態 skew 不會觸發，要長時間維護則手動 silence
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection) — timesyncd 跳鐘後，ceph 多久才會看到並抓出來
+  - [Ceph — Clock skew matrix](/ceph/features/cluster-time-skew-impact) — 不同程度的時間偏移對 MON-MON / MON-OSD / OSD-OSD 各條 channel 的影響
+  - [Ceph — Prometheus alert 重新設計（穩定性第一的 6 條 rule）](/ceph/features/prometheus-alert-design) — MON_CLOCK_SKEW 落在 `CephClientRisk` 的 `name!~` catch-all，`for: 5m` 後才 page；短於 5 分鐘的暫態 skew 不會觸發，要長時間維護則手動 silence
 </Callout>

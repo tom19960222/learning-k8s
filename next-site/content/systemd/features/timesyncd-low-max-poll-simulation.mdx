@@ -294,7 +294,7 @@ else
 r = manager_arm_timer(m, m->retry_interval);
 ```
 
-`NTP_RETRY_INTERVAL_MIN_USEC = 15s`（`timesyncd-manager.h:17`）。NTP 送出後若沒回應、15s 後重試。連三次失敗（`NTP_MAX_MISSED_REPLIES = 2`）→ 切換 server。
+`NTP_RETRY_INTERVAL_MIN_USEC = 15s`（`timesyncd-manager.h:17`）。NTP 送出後若沒回應、15s 後重試；一般路徑累積到 `missed_replies > NTP_MAX_MISSED_REPLIES` 後才進 timeout / server 切換。初次連線因為 `manager_begin()` 預先把 `missed_replies` 設成 2，第一封沒回就會更快進 timeout。
 
 但這跟 poll interval 是分開的兩條 timer：retry timer 只在發送 → 沒收回應的階段運作。Poll interval 是收到回應 → 下一次發送之間的等待。
 
@@ -365,18 +365,20 @@ r = manager_arm_timer(m, m->retry_interval);
 
 **不該調**：
 
-1. **「為了讓 ceph 看到時間問題更早」** — ceph 自己的 timecheck 5 分鐘一輪，跟 timesyncd 的 32s 比已經慢很多，沒額外好處。反而高頻 poll 增加的 jitter 會讓 ceph 看到更多假警報。
+1. **「直接把 max 壓到 32，讓 ceph 更安全」** — ceph 自己的 timecheck 5 分鐘一輪，timesyncd 的 32s 並不會讓 ceph 判決更準。你得到的是更高 packet 量、更小 PLL constant、更多 jitter 進 clock。若目標是讓 timesyncd 的早期 sample 跟 ceph timecheck 同量級，先看 [metrics tuning 那一頁](./timesyncd-poll-tuning-from-metrics) 的 max=256 / 512 取捨，不要直接 min=max。
 2. **「PollIntervalMaxSec=32」一勞永逸** — 演算法整支變 no-op、丟掉 adaptive 設計的所有 benefit。等於 disable polling adaptation。
 3. **client 數量多時** — 對 NTP 基礎建設不友善。
 
 ## 折衷推薦
 
-如果非調不可、**推薦 `PollIntervalMaxSec=512`**（一輪 ~8.5 分鐘）：
+如果你沒有實測資料、只是想比預設快一些，**推薦先從 `PollIntervalMaxSec=512`**（一輪 ~8.5 分鐘）開始：
 
 - PLL constant = 5，比 default 略敏感但不會放大 noise 太多。
 - Spike 視窗 ≈ 68 分鐘，足夠 filter 偶發 jitter。
 - 每天 ~170 packet，對 NTP server 友好。
-- ceph 那邊 timecheck 5 分鐘一輪 → timesyncd 8.5 分鐘 → 兩個 timer 接近，敏感度匹配。
+- ceph 那邊 timecheck 5 分鐘一輪 → timesyncd 8.5 分鐘 → 兩個 timer 接近，但仍保守。
+
+如果像 [metrics tuning 那一頁](./timesyncd-poll-tuning-from-metrics) 一樣，已經有一週資料證明 offset / jitter / root distance 都很穩，且你希望 timesyncd sample 比 ceph timecheck 略早，`max=256` 也合理。這兩個建議不衝突：`512` 是沒有實測資料時的保守起點，`256` 是已有穩定數據後的平衡設定。
 
 ```ini
 [Time]

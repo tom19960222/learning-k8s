@@ -531,6 +531,6 @@ ls -la /var/log/journal/
 
 <Callout type="info" title="延伸閱讀">
   - [systemd-timesyncd — service 重啟對系統時間的影響](./timesyncd-restart-impact) — 跳鐘事件本身的 source path；MESSAGE_ID 的兩條 INFO log 跟系統時間操作的對應關係
-  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/mon-clock-skew-detection) — 上層告警系統怎麼補 timesyncd debug log 缺失
-  - [Ceph — Prometheus alert 四層設計](/ceph/prometheus-alert-design) — MON_CLOCK_SKEW 屬於 Tier 2，搭配 timesyncd 跳鐘事件查 root cause
+  - [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](/ceph/features/mon-clock-skew-detection) — 上層告警系統怎麼補 timesyncd debug log 缺失
+  - [Ceph — Prometheus alert 四層設計](/ceph/features/prometheus-alert-design) — MON_CLOCK_SKEW 屬於 Tier 2，搭配 timesyncd 跳鐘事件查 root cause
 </Callout>
