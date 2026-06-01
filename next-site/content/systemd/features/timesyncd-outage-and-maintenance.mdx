@@ -197,7 +197,7 @@ kernel 的 `maxerror` 在沒有新 sync 時會**自己隨時間長大**（每秒
 
 **這裡才是真正危險的情境**，因為 ceph 的時間門檻是**相對**的——比的是 node 之間的差，不是對 UTC 的絕對誤差。
 
-- **複數 OSD 斷網**：OSD 之間走 `mono_clock` + heartbeat delta 補償，**wall-clock skew 不觸發 OSD 健康門檻**（[skew 階梯那頁](/ceph/clock-skew-magnitude-ladder)證過）。所以複數 OSD 一起漂、一起回來，對 OSD-OSD 路徑相對無害；真正要擔心的是這些 OSD 跟**mon** 的關係，以及 client。
+- **複數 OSD 斷網**：OSD *之間*走 `mono_clock` + heartbeat delta 補償，**OSD-OSD 的 wall-clock skew 不觸發健康門檻**。但 **OSD 跟 mon 的關係會**：若維護讓 OSD 的 wall clock 領先 mon 超過約 1 小時（`auth_service_ticket_ttl`），mon 發的 cephx rotating service key 在 OSD 看來「一發即過期」，OSD rotate 不到可用 key、重試到上限就 `exit(1)`——**大量 OSD 起不來 / 被踢下線**。所以複數 OSD 長維護（week/month）回來時，最該確認的是「這些 OSD 對 mon 的偏差」有沒有到小時級，而不只是 OSD 彼此之間。這條 rotating key 路徑拆在 [skew 階梯那頁](/ceph/clock-skew-magnitude-ladder)。
 - **複數 mon 斷網**：致命。mon 的 Paxos lease 用 **wall clock** 算。若維護讓 ≥2 台 mon（3-mon cluster）一起漂且漂的量**不同**，回來時彼此 wall clock 差超過 `mon_lease`(5s)，會弄垮 lease → election churn。
 
 | 時長 | 複數 mon 回來時 |
