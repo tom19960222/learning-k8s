@@ -1,0 +1,306 @@
+---
+layout: doc
+title: Ceph — node 間時間差 51ms / 401ms / 1s / 1min / 1hr / 1day 分別壞掉什麼
+description: 用 v19.2.3 原始碼回答「node 時鐘差 N 會發生什麼」這題。結論只有兩個門檻在動：50ms 是 MON-MON 的 MON_CLOCK_SKEW 偵測線，5s（mon_lease）是 Paxos lease 用 wall clock 算的崩潰線——超過 5s 的 mon 守不住 lease、開始 election churn。MON-OSD 與 OSD-OSD 在 51ms 到 1 天的任何刻度都沒有 clock-skew 門檻，因為 OSD 之間走 mono_clock + delta 補償。順帶拆掉「skew 1 小時會讓 cephx ticket 提早過期」這個常見誤解。
+---
+
+## 場景
+
+[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把 MON-MON / MON-OSD / OSD-OSD 在毫秒級的差距攤開過了，結論是「沒有全域的 50ms 規則」。這頁問的是相鄰但不同的問題：
+
+> 把刻度往上拉——**51ms、401ms、1000ms、1 分鐘、1 小時、1 天**——每跨過一個量級，到底*多*壞掉一件什麼新的事？
+
+答案出乎意料地乾淨：**整條 ladder 上只有兩個門檻真的會改變行為**，而且兩個都只作用在 MON-MON 這條 pair 上：
+
+- **50ms**（`mon_clock_drift_allowed`）：超過就報 `MON_CLOCK_SKEW` `HEALTH_WARN`。
+- **5s**（`mon_lease`）：超過這個，Paxos lease 因為**用 wall clock 計算**而開始崩——skew 的 mon 守不住 lease，進入 election churn。
+
+MON-OSD 和 OSD-OSD 在 51ms 到 1 天的**任何**刻度都沒有對應的 clock-skew 門檻。下面從 v19.2.3 source 把這個結論一格一格證出來，並在最後拆掉「skew 久了 cephx ticket 會提早過期」這個直覺錯誤。
+
+## 先看結論表
+
+預設值、3-mon cluster、沒手動改 `mon_clock_drift_allowed` / `mon_lease`：
+
+| 差距 | MON ↔ MON | MON ↔ OSD | OSD ↔ OSD |
+|---|---|---|---|
+| **51ms** | `MON_CLOCK_SKEW` WARN（剛過 50ms，下一輪 timecheck 後） | 無門檻 | 無門檻（走 mono_clock） |
+| **401ms** | 同上 WARN，lease 仍正常 | 無門檻 | 無門檻 |
+| **1000ms** | 同上 WARN，lease 仍正常（1s < 5s） | 無門檻 | 無門檻 |
+| **1 min** | WARN **＋ lease 崩**：領先 leader >5s 的 mon 守不住 lease → bootstrap → **election churn**；每個訊息被戳「60s in the future」洗 cluster log | 無門檻 | 無門檻 |
+| **1 hr** | 同 1 min（lease 完全失效，skew mon 待不住 quorum）；**注意：這不是 cephx ticket 問題**（見最後一節） | 無門檻 | 無門檻 |
+| **1 day** | 同 1 min/1 hr，只是數字更大 | 無門檻 | 無門檻 |
+
+讀法：**從 51ms 到 1 天，只有 MON-MON 那一欄在變**，而且只在兩個點上變（50ms 開始 WARN、5s 開始 lease 崩）。MON-OSD、OSD-OSD 整欄是空的——這不是偷懶，是 source 裡真的沒有對應路徑，後面證給你看。
+
+## 兩個門檻一張圖
+
+```
+node 間 wall-clock 差距 (對 MON-MON pair)
+│
+0 ───────── 50ms ───────── 5s ─────────────────────▶  ∞
+            │              │
+            │              └─ mon_lease：Paxos lease 用 real_clock 算
+            │                 skew > 5s 的 mon 收到的 lease「已經過期」
+            │                 → is_lease_valid()=false → lease_timeout
+            │                 → bootstrap → election churn
+            │
+            └─ mon_clock_drift_allowed：timecheck skew_bound > 50ms
+               → MON_CLOCK_SKEW HEALTH_WARN（只有 WARN，永遠不升 ERR）
+
+51ms ─┐  401ms ─┐  1000ms ─┐     1min ─┐   1hr ─┐   1day ─┐
+      └─ WARN   └─ WARN     └─ WARN     └─ WARN+lease崩 ───┴── 都一樣
+                            (lease 都還在 5s 內)   (全部超過 5s)
+
+MON-OSD / OSD-OSD：整條線上沒有任何 clock-skew 門檻
+```
+
+下面分三條 pair 拆。
+
+## MON ↔ MON：50ms 偵測、5s lease 崩
+
+### 50ms：唯一的偵測門檻
+
+leader 對 quorum 內每個 peon 跑 timecheck（ping/pong），算出 `skew_bound = |delta| − latency`，再跟 `mon_clock_drift_allowed` 比。判定是**嚴格大於**：
+
+File: `ceph/src/mon/Monitor.h` (line 592)
+
+```cpp
+bool timecheck_has_skew(const double skew_bound, double *abs) const {
+  double abs_skew = std::fabs(skew_bound);
+  if (abs)
+    *abs = abs_skew;
+  return (abs_skew > g_conf()->mon_clock_drift_allowed);
+}
+```
+
+`mon_clock_drift_allowed` 預設 `0.05`（50ms）：
+
+File: `ceph/src/common/options/mon.yaml.in` (line 609)
+
+所以 **51ms** 是剛好踩過門檻（同 DC latency 通常 < 1ms，`skew_bound` 還是 > 50ms）→ 下一輪 timecheck 後產生 health check。`401ms` / `1000ms` / `1min` / `1hr` / `1day` 全都遠在門檻之上，**報的是同一條 WARN，沒有分級**：
+
+File: `ceph/src/mon/HealthMonitor.cc` (line 862)
+
+```cpp
+auto& d = checks->add("MON_CLOCK_SKEW", HEALTH_WARN, ss.str(), details.size());
+d.detail.swap(details);
+```
+
+整份 source 裡 `MON_CLOCK_SKEW` 只 add 過這一次，severity 寫死 `HEALTH_WARN`。**clock skew 永遠不會自己升成 `HEALTH_ERR`**——1 天的 skew 跟 51ms 在 `ceph -s` 的顏色上是一樣的。從 51ms 到 1 天，這條 WARN 線本身沒有再多做任何事。`ceph -s` 多久才看到這條 WARN，拆在 [MON clock skew 偵測那一頁](./mon-clock-skew-detection)。
+
+### 5s：lease 用 wall clock，這才是真正崩的地方
+
+關鍵非直覺點：**Paxos lease 的到期時間是 `ceph::real_clock`（wall clock），不是 monotonic**。
+
+File: `ceph/src/mon/Paxos.h` (line 405)
+
+```cpp
+ceph::real_clock::time_point lease_expire;
+```
+
+leader 每次 renew lease，把「**自己 wall clock 的** now + `mon_lease`」當作到期點，塞進 lease 訊息送出去：
+
+File: `ceph/src/mon/Paxos.cc` (line 979)
+
+```cpp
+lease_expire = ceph::real_clock::now();
+lease_expire += ceph::make_timespan(g_conf()->mon_lease);
+```
+
+`mon_lease` 預設 `5` 秒（`mon.yaml.in:379`）。peon 收到後，直接拿 leader 送來的到期時間，跟**自己的** wall clock 比：
+
+File: `ceph/src/mon/Paxos.cc` (line 1118)
+
+```cpp
+if (auto new_expire = lease->lease_timestamp.to_real_time();
+    lease_expire < new_expire) {
+  lease_expire = new_expire;
+  auto now = ceph::real_clock::now();
+  if (lease_expire < now) {
+    auto diff = now - lease_expire;
+    derr << "lease_expire from " << lease->get_source_inst() << " is " << diff
+         << " seconds in the past; mons are probably laggy (or possibly clocks are too skewed)" << dendl;
+  }
+}
+```
+
+這幾行就是分界：lease 訊息帶的是 leader 時間軸上的「now + 5s」。如果**這個 peon 的 wall clock 比 leader 快超過 5 秒**，那麼 `lease_expire`（leader 時間的 now+5s）在 peon 自己的時間軸上**已經是過去式**了——`lease_expire < now` 成立，印出那行 `clocks are too skewed`，而且 lease 一拿到就等於過期。
+
+之後所有讀寫都過不了這個閘：
+
+File: `ceph/src/mon/Paxos.cc` (line 1514)
+
+```cpp
+bool Paxos::is_lease_valid()
+{
+  return ((mon.get_quorum().size() == 1)
+	  || (ceph::real_clock::now() < lease_expire));
+}
+```
+
+`is_lease_valid()` 一旦回 false，`is_writeable()` 與 `is_readable()` 跟著垮，peon 收不到「未來的」有效 lease → `lease_timeout` 觸發 → `mon.bootstrap()` → 退出 quorum 重選。這條 timeout → bootstrap → election 的鏈，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。
+
+所以 **1 min / 1 hr / 1 day 的 MON-MON skew 做的是同一件事**：那台快超過 5s 的 mon 守不住 lease，反覆 bootstrap、反覆 election。3-mon cluster 裡若只有 1 台這樣，另外 2 台同步的 mon 仍能組 quorum=2 撐住（cluster 帶著 `MON_CLOCK_SKEW` WARN + 一台 mon 一直 flap）；若 2 台以上都 skew，就掉進 quorum loss。
+
+### bonus：每個訊息被戳「在未來」洗 log
+
+只要 skew > 50ms，skew mon 送出的每個 Paxos 訊息都會被收方判定「戳在未來」，寫一行 cluster log（用同一個 `mon_clock_drift_allowed` 當門檻，再套指數 backoff）：
+
+File: `ceph/src/mon/Paxos.cc` (line 1024)
+
+```cpp
+void Paxos::warn_on_future_time(utime_t t, entity_name_t from)
+{
+  utime_t now = ceph_clock_now();
+  if (t > now) {
+    utime_t diff = t - now;
+    if (diff > g_conf()->mon_clock_drift_allowed) {
+      // ... backoff 後 ...
+      mon.clog->warn() << "message from " << from << " was stamped " << diff
+                       << "s in the future, clocks not synchronized";
+```
+
+1 天的 skew 在這裡會印 `stamped 86400s in the future`。這只是 cluster log，不是 health check。
+
+## MON ↔ OSD：整條 ladder 上沒有 clock-skew 門檻
+
+這條 pair 最容易被誤會。直覺會想「MON 和 OSD 差太多會不會 OSD 被踢」，但 source 裡**沒有**拿 OSD wall clock 跟 MON wall clock 相減去判健康的地方。
+
+OSD 決定多久送一次 beacon，用的是 **monotonic clock**（`coarse_mono_clock`），跟 wall clock 無關：
+
+File: `ceph/src/osd/OSD.cc` (line 6444)
+
+```cpp
+const auto now = ceph::coarse_mono_clock::now();
+{
+  std::lock_guard l{min_last_epoch_clean_lock};
+  const auto elapsed = now - last_sent_beacon;
+  if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >
+    cct->_conf->osd_beacon_report_interval) {
+    need_send_beacon = true;
+  }
+}
+```
+
+MON 端唯一會把 OSD mark down 的時間判斷，是「太久沒收到 beacon」——用 MON 自己連續收件的時間差算，門檻 `max(mon_osd_report_timeout, 2 × osd_beacon_report_interval) = max(15min, 10min) = 15 分鐘`：
+
+File: `ceph/src/mon/OSDMonitor.cc` (line 5320)
+
+```cpp
+utime_t diff = now - t->second.first;
+// we use the max(mon_osd_report_timeout, 2*osd_beacon_report_interval) as timeout
+int mon_osd_report_timeout = g_conf()->mon_osd_report_timeout;
+utime_t max_timeout(std::max(mon_osd_report_timeout,  2 * t->second.second), 0);
+if (diff > max_timeout) {
+```
+
+這是個「分鐘級的沉默偵測」，量的是 MON 收到兩次 beacon 的間隔，**不是 MON 跟 OSD 的 wall clock 差**。一台 OSD 的時鐘就算偏 1 天，只要它每 5 分鐘還有送 beacon 出來，MON 這條路徑就不會踢它。
+
+所以 MON-OSD 在 51ms → 1 天**整條都沒有 clock-skew health check**。(`mon_osd_report_timeout` 預設 `15_min`：`global.yaml.in:1635`；`osd_beacon_report_interval` 預設 `5_min`：`global.yaml.in:2940`。)
+
+## OSD ↔ OSD：mono_clock + delta 補償，skew 免疫
+
+OSD 之間有兩條跟時間有關的路徑，但**兩條都不看 wall clock**。
+
+第一條，OSD service 的「現在」用 monotonic clock：
+
+File: `ceph/src/osd/OSD.cc` (line 331)
+
+```cpp
+ceph::signedspan OSDService::get_mnow() const
+{
+  return ceph::mono_clock::now() - osd->startup_time;
+}
+```
+
+heartbeat deadline、read lease 的 `readable_until` 判斷全建在 `get_mnow()` 上。monotonic clock 不受 NTP 校正、不受 wall-clock skew 影響，所以兩台 OSD 的 wall clock 差多少，對 heartbeat 的存活判斷沒有直接作用。
+
+第二條，跨 OSD 的 read lease 確實要把對方時間軸換算成自己的，但用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
+
+File: `ceph/src/osd/PeeringState.h` (line 119)
+
+```cpp
+// we maintain an upper and lower bound on the delta between our local
+// mono_clock time (minus the startup_time) to the peer OSD's mono_clock
+// time (minus its startup_time).
+//
+// delta is (remote_clock_time - local_clock_time), so that
+// local_time + delta -> peer_time, and peer_time - delta -> local_time.
+```
+
+primary 把 lease 換算給 replica 時就是減掉這個 delta bound。**這個 delta 是兩台 OSD mono_clock 起跑點的差，跟 wall-clock skew 是兩回事**——你把某台 OSD 的 `date` 調快一天，這個 mono delta 不會跟著變。
+
+結論：OSD-OSD 在 51ms → 1 天的任何刻度，**wall-clock skew 都不會觸發任何健康或 lease 問題**。(OSD-OSD 真正會 WARN 的是 heartbeat *latency* 超過 ~1s，那是「訊息來回多久」不是「時鐘差多少」，拆在 [10ms 到 5s 那一頁](./cluster-time-skew-impact)。)
+
+## 原始碼路徑
+
+| pair | 入口 | 門檻 / 效果 | 對 51ms→1day 的反應 |
+|---|---|---|---|
+| MON-MON 偵測 | `Monitor::timecheck_has_skew()` → `HealthMonitor` | `skew_bound > 50ms` → `MON_CLOCK_SKEW` WARN | 51ms 起一路都只是同一條 WARN，不升 ERR |
+| MON-MON lease | `Paxos::extend_lease()` / `handle_lease()` / `is_lease_valid()`（`real_clock`） | skew > `mon_lease`(5s) → lease 過期 → election churn | 1000ms 仍正常；1min/1hr/1day 全崩 |
+| MON-MON log | `Paxos::warn_on_future_time()` | `> 50ms` 寫 cluster log（非 health check） | 數字越大，log 裡的 "N s in the future" 越大 |
+| MON-OSD | `OSD::send_beacon()`（mono）/ `OSDMonitor` 15min 沉默偵測 | 無 clock-skew 門檻 | 整條 ladder 無反應 |
+| OSD-OSD | `OSDService::get_mnow()`（mono）/ `HeartbeatStamps` delta | 無 clock-skew 門檻 | 整條 ladder 無反應 |
+
+## 邊界與除錯
+
+### 「skew 1 小時 → cephx ticket 提早過期」是錯的
+
+最常見的誤解：既然 `auth_service_ticket_ttl` 是 1 小時，那 node 差 1 小時是不是 ticket 就立刻過期、I/O 斷掉？**source 說不會**，原因有兩層。
+
+第一層：client 端的 ticket 到期，是用**自己一台機器上的 wall clock 量的 duration**。收到 ticket 時記下 `expires = 自己的 now + validity`：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 199)
+
+```cpp
+expires = ceph_clock_now();
+expires += msg_a.validity;
+renew_after = expires;
+renew_after -= ((double)msg_a.validity.sec() / 4);
+```
+
+之後檢查到期，也是用同一台 client 的 wall clock：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 215)
+
+```cpp
+bool CephXTicketHandler::have_key()
+{
+  if (have_key_flag) {
+    have_key_flag = ceph_clock_now() < expires;
+  }
+  return have_key_flag;
+}
+```
+
+`expires` 和檢查它的 `ceph_clock_now()` 都在**同一台機器、同一個時鐘**上。一個固定的 skew offset 在減法裡直接抵消掉——client 跟 mon 差多少，對「這張 ticket 從我拿到算起活了多久」沒有任何影響。
+
+第二層：負責驗 ticket 的 daemon（例如 OSD），`cephx_verify_authorizer()` 裡**根本沒有 wall-clock 到期檢查**——它靠的是 rotating `secret_id`，解不開就 false，沒有比對 timestamp：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 422)
+
+```cpp
+bool cephx_verify_authorizer(CephContext *cct, const KeyStore& keys,
+			     bufferlist::const_iterator& indata,
+			     // ...
+{
+  // decode → get_service_secret(secret_id) → decrypt
+  // 全程不呼叫 ceph_clock_now()、不比 expires
+```
+
+所以那個 1 小時的數字，真正的意義在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)：是「mon **掛掉**後，client 多久會因為 renew 不到 ticket 而斷」，跟「node 之間時鐘**差**多少」是兩個獨立的故事。把 skew 和 mon downtime 混在一起，是排查時最容易走錯的一步。
+
+### 真的要擔心的是 5s lease 線，不是毫秒
+
+`MON_CLOCK_SKEW` WARN 很顯眼，但 51ms 的 WARN 其實人畜無害——quorum 穩、I/O 正常。**真正改變 cluster 行為的是 skew 跨過 `mon_lease`（5s）**：那之後 mon 開始 flap、election 反覆、control plane 卡頓。排查順序應該是：先看 `ceph -s` 有沒有 `MON_CLOCK_SKEW`，再看 mon log 有沒有 `clocks are too skewed` / 反覆 `calling new election`——後者才代表 skew 已經大到弄垮 lease。
+
+### MON-OSD/OSD-OSD 看起來「沒事」是真的沒事
+
+如果只有某台 OSD 的 system clock 偏掉（哪怕 1 天），但 MON-MON 之間同步良好，這份 trace 找不到 v19.2.3 會因此對該 OSD 直接產生 health warning 的固定規則。OSD 之間走 mono_clock，beacon 走 mono cadence + 分鐘級沉默偵測。要留意的反而是別的訊號：read lease 是否一直進 `laggy`、beacon 是否因為訊息送不出去而超過 15 分鐘 timeout——這些都不是「差幾毫秒」的問題。
+
+## 接下來 / 相關頁面
+
+- [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](./cluster-time-skew-impact) — 毫秒級的 pair-by-pair 矩陣、以及 heartbeat *latency* 跟 clock *offset* 的差別
+- [Ceph — MON clock 漂移多久後 ceph -s 才會變 HEALTH_WARN](./mon-clock-skew-detection) — 50ms WARN 那條線的偵測延遲（平均 ~2.5 分、最壞 ~5 分）
+- [Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響](./mon-quorum-loss-impact) — lease timeout → election 鏈，以及 1hr cephx ticket TTL 在「mon 掛掉」（非 skew）情境下的真正角色
+- [systemd-timesyncd — service 重啟對系統時間的影響](/systemd/features/timesyncd-restart-impact) — 是誰在修這些 skew：timesyncd 的 slew / jump 邊界與重啟行為

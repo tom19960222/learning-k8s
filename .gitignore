@@ -2,3 +2,4 @@ node_modules/
 next-site/.next/
 next-site/out/
 .ssh/
+.claude/scheduled_tasks.lock
