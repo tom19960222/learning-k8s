@@ -44,3 +44,8 @@
 	url = https://github.com/rook/rook.git
 	branch = v1.19.6
 	shallow = true
+[submodule "ceph-csi"]
+	path = ceph-csi
+	url = https://github.com/ceph/ceph-csi.git
+	branch = v3.14.0
+	shallow = true
