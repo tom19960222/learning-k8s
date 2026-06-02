@@ -94,14 +94,72 @@ erasure-coded pool 用 `ECBackend`（`src/osd/ECBackend.h`）。本 SP 不展開
    │   ├─ 帶 PG log entry + object diff
    │   └─ secondary 也走 ObjectStore 寫 BlueStore
    │
-   ▼ 5. 等所有 secondary 回 commit ack
+   ▼ 5. primary 同時追蹤本機 commit 與 peer commit
    │
-   ▼ 6. primary 自己 commit
+   ▼ 6. acting/recovery/backfill shard 的 commit 都清掉
    │
    ▼ 7. 回 ack client (write applied + committed)
 ```
 
-關鍵：**RADOS 是 strongly consistent**。primary 不會在 secondary commit 完成之前回 ack。萬一 secondary 失聯，primary 會把那個 op 標進 PG log 等 recovery。
+關鍵：**RADOS 是 strongly consistent**。primary 不會在必要 replica 的 commit 完成之前回 ack；但 source 裡不是「先等所有 secondary，再 primary 自己 commit」的串列模型，而是 `ReplicatedBackend::submit_transaction()` 先把 local shard 加進 `waiting_for_commit`，再把這筆 transaction fan-out 給 peer。local commit 與 peer commit 都會從同一個 set 裡移除，直到 set 空了才完成。
+
+```cpp
+// File: ceph/src/osd/ReplicatedBackend.cc (line 510)
+op->waiting_for_commit.insert(
+  parent->get_acting_recovery_backfill_shards().begin(),
+  parent->get_acting_recovery_backfill_shards().end());
+op->waiting_for_commit.insert(get_parent()->whoami_shard());
+```
+
+```cpp
+// File: ceph/src/osd/ReplicatedBackend.cc (line 568)
+op->waiting_for_commit.erase(get_parent()->whoami_shard());
+if (op->waiting_for_commit.empty()) {
+  op->op->on_commit->complete(0);
+}
+```
+
+萬一 peer 失聯，PG 會進 peering/recovery 路徑，primary 透過 PG log 與 missing set 補回需要的 object，而不是把已 ack 的 op 當成「只有 primary 有」的狀態放著不管。
+
+## 容量閘門：full / backfillfull 會比 scheduler 更早擋住工作
+
+OSD 的 write / recovery 不只受 mClock 與 recovery throttle 影響。容量狀態會在更前面擋住工作：
+
+| 狀態 | source path | 實際效果 |
+|---|---|---|
+| `nearfull` | `OSDService::recalc_full_state()` 回 `NEARFULL` | health warning；提高刪除優先權，但不代表 write 已停 |
+| `backfillfull` | OSDMap 設 `CEPH_OSD_BACKFILLFULL`，PG reservation / scan path set `backfill_toofull` | backfill 目的端太滿，placement movement 可能停住 |
+| `full` / pool `FLAG_FULL` | `PrimaryLogPG` 在執行 write 前檢查 pool full flag | 對普通 write 回 `ENOSPC` / `EDQUOT` 或讓舊 client retry |
+| failsafe full | OSD local ratio 超過 `osd_failsafe_full_ratio` | OSD 為了自保 drop update / abort push，屬於立即處理等級 |
+
+```cpp
+// File: ceph/src/osd/PrimaryLogPG.cc (line 8904)
+if ((ctx->delta_stats.num_bytes > 0 ||
+     ctx->delta_stats.num_objects > 0) &&
+    pool.info.has_flag(pg_pool_t::FLAG_FULL)) {
+  ...
+  return pool.info.has_flag(pg_pool_t::FLAG_FULL_QUOTA) ? -EDQUOT : -ENOSPC;
+}
+```
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 5660)
+if (!ps->cct->_conf->osd_debug_skip_full_check_in_recovery &&
+    ps->get_osdmap()->check_full(ps->acting_recovery_backfill)) {
+  post_event(RecoveryTooFull());
+  return;
+}
+```
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 5683)
+PeeringState::WaitLocalRecoveryReserved::react(const RecoveryTooFull &evt)
+{
+  ps->state_set(PG_STATE_RECOVERY_TOOFULL);
+}
+```
+
+所以現場看到 `slow ops` 或 recovery 不動時，不要只調 `osd_mclock_profile`。如果 `ceph health detail` 同時有 `OSD_BACKFILLFULL`、`PG_BACKFILL_FULL`、`PG_RECOVERY_FULL`、`POOL_FULL`，scheduler 即使把 work item dequeue 出來，PG / OSD 的容量閘門仍可能讓它無法真正前進。
 
 ## ObjectStore：抽象的 storage backend
 
@@ -239,6 +297,9 @@ v19 Crimson 還是 experimental，預設不啟用。不在本 SP 範圍。
 - [src/osd/OSD.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/OSD.cc) — `OSD::tick` (line 6337)
 - [src/osd/PG.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PG.h) — `class PG` (line 166)
 - [src/osd/PrimaryLogPG.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/PrimaryLogPG.h) — `class PrimaryLogPG` (line 60)
+- `src/osd/ReplicatedBackend.cc:510-572,609-627` — replicated write 的 local/peer commit tracking
+- `src/osd/PrimaryLogPG.cc:8904-8921` — pool full write rejection
+- `src/osd/PG.cc:2091-2147` — recovery/backfill too-full reservation gate
 - [src/osd/ECBackend.h](https://github.com/ceph/ceph/blob/v19.2.3/src/osd/ECBackend.h) — erasure-coded backend
 - [src/os/bluestore/BlueStore.h](https://github.com/ceph/ceph/blob/v19.2.3/src/os/bluestore/BlueStore.h) — `class BlueStore` (line 236)
 - [src/os/bluestore/BlueFS.h](https://github.com/ceph/ceph/blob/v19.2.3/src/os/bluestore/BlueFS.h) — `class BlueFS` (line 249)

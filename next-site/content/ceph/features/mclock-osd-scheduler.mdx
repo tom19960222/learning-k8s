@@ -359,6 +359,22 @@ bool OSD::maybe_override_options_for_qos(const std::set<std::string> *changed)
 
 所以如果你看到某篇舊測試文章說 mClock profile 會把 `osd_max_backfills` / `osd_recovery_max_active` 放大到 1000，不要直接套到 Squid。以本頁的 pinned source 為準，v19.2.3 的 rollback defaults 是 `1`、`0`、`3`、`10`。
 
+另外一個邊界更重要：mClock **不是** recovery/backfill 的最終允許者。它把 `background_recovery` item 從 queue 裡拿出來後，後面還會遇到 `_recover_now()` 的 active/reserved gate、local/remote backfill reserver、PG peering state、OSDMap flag、以及 full/backfillfull 檢查。若目的端 OSD 已經 `backfillfull`，或 pool/OSD 已經 full，mClock 再怎麼提高 recovery reservation，也不能繞過容量保護。
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 9499)
+bool OSDService::_recover_now(uint64_t *available_pushes)
+{
+  uint64_t max = osd->get_recovery_max_active();
+  if (max <= recovery_ops_active + recovery_ops_reserved) {
+    return false;
+  }
+  return true;
+}
+```
+
+所以 slow recovery 的除錯順序應該是：先確認 mClock 變更有沒有被 rollback，再看 recovery/backfill reservation，再看 `backfill_toofull` / `recovery_toofull` / `OSD_BACKFILLFULL`。只盯 `osd_mclock_profile` 會錯過很多「scheduler 之外」的硬 gate。
+
 ## 怎麼查與怎麼調
 
 下面指令需要真實 Ceph cluster。本頁只用 v19.2.3 source 與 repo 內 doc 驗證語意；在你環境跑後再對照實際回傳值。
@@ -456,5 +472,7 @@ ceph daemon osd.0 perf dump
 - `src/osd/scheduler/mClockScheduler.cc:558-660` — mClock config observer 與 built-in profile 低階參數 rollback
 - `src/osd/OSD.cc:10064-10168` — OSD bench 自動估 IOPS capacity 與 threshold warning
 - `src/osd/OSD.cc:10171-10241` — recovery/backfill option rollback defaults
+- `src/osd/OSD.cc:9499-9526` — recovery active/reserved gate；mClock dequeue 之後仍要過這關
+- `src/osd/PG.cc:2091-2147` — recovery/backfill fullness gate
 - `src/test/osd/TestMClockScheduler.cc:199-268` — immediate / high priority / mClock queue dequeue 順序測試
 - `qa/standalone/misc/mclock-config.sh:201-230,304-378` — recovery override 與 built-in profile 低階參數保護測試

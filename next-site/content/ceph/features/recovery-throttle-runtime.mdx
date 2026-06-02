@@ -22,7 +22,7 @@ ceph tell osd.* injectargs --osd-recovery-max-active 3
 
 ## TL;DR — 結論先講
 
-- **不會 cancel in-flight op。** 新值只收緊「下一個 op 能不能啟動」的閘門 (`OSDService::_recover_now`)；已經跑的 op 跑完後才透過 `finish_recovery_op` → `_maybe_queue_recovery` 重新評估。
+- **不會 cancel in-flight op。** 新值只收緊「下一個 op 能不能啟動」的閘門 (`OSDService::_recover_now`)；已經跑的 op 跑完後會透過 `finish_recovery_op` → `_maybe_queue_recovery` 重新評估，其他 PG enqueue / kick path 也可能觸發同一個檢查。
 - **沒有 hysteresis、沒有 grace period。** 改完那一刻 `cct->_conf` 已生效，下次比較立刻看到新 max。
 - **Squid 預設 mClock scheduler 會把這次 inject rollback。** `OSD::handle_conf_change` 內部呼叫 `maybe_override_options_for_qos`，會以 mon command `config rm` 把改動撤掉並發 cluster log warning。要實際生效必須先 `ceph config set osd osd_mclock_override_recovery_settings true`。
 
@@ -161,7 +161,7 @@ void OSDService::finish_recovery_op(PG *pg, const hobject_t& soid, bool dequeue)
 }
 ```
 
-`_maybe_queue_recovery()` 是「下一輪嘗試」的唯一觸發點 — 每個 op 跑完才會問一次「現在可以再起一個嗎」。沒有獨立 timer、沒有定期掃描。
+`_maybe_queue_recovery()` 是「下一輪嘗試」會走到的共同入口之一。`finish_recovery_op()` 一定會呼它；PG 被 queue、unpause、reservation 釋放、或 OSD 重新 kick recovery path 時也會回到同一類邏輯。這裡真正的結論不是「只有 op 完成才會觸發」，而是：沒有任何 path 會因為 max 變小就主動 cancel 已啟動的 op；所有 path 都是在下一次嘗試啟動新 work 時讀新值。
 
 ## 自然收斂時序
 
@@ -196,6 +196,28 @@ t11     2       0        3   再跑完一個，2 < 3，下一個 op 可以進來
 - in-flight op 不會收到任何來自 throttle 變化的訊號 — 不會降速、不會 cancel、不會 priority 重排。
 - 上調 max 同樣是「下次 `_recover_now` 被叫到時自然生效」。但「下次被叫」依賴有 op 完成（`finish_recovery_op`）或新的 PG enqueue（`_maybe_queue_recovery` 也會在 PG 路徑呼叫）。如果 OSD 完全 idle，調大 max 不會憑空生出新 op，這合理但偶爾會嚇到人。
 </Callout>
+
+## 為什麼 max 調高了還是沒有進度
+
+現場最常見的誤判是把 `osd_recovery_max_active*` 當成「唯一閥門」。source 裡至少還有四層 gate 會比 max 更早擋住 recovery/backfill：
+
+| gate | source / 訊號 | 你會看到什麼 |
+|---|---|---|
+| mClock rollback | `maybe_override_options_for_qos()` | `config set` 或 `injectargs` 看似成功，但 cluster log 有 `did not take effect`，`ceph config dump` 查不到 key |
+| recovery active gate | `_recover_now()` | `active + reserved >= max` 時不啟動新 recovery op |
+| backfill reservation | local / remote reserver、`osd_max_backfills` | PG 進 `backfill_wait`，或 dump reservations 看到排隊 |
+| fullness gate | `check_full()` / `try_reserve_recovery_space()` | `recovery_toofull`、`backfill_toofull`、`OSD_BACKFILLFULL`、`PG_RECOVERY_FULL` |
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 5660)
+if (!ps->cct->_conf->osd_debug_skip_full_check_in_recovery &&
+    ps->get_osdmap()->check_full(ps->acting_recovery_backfill)) {
+  post_event(RecoveryTooFull());
+  return;
+}
+```
+
+這也是為什麼「把 mClock 切 high_recovery_ops」不等於 recovery 一定前進。mClock 管的是 queue 裡 item 被拿出來的順序；reservation、fullness、peering state、`norecover` / `nobackfill` flag 都可能讓被拿出來的工作無法啟動或立刻回到等待。
 
 ## injectargs 怎麼進到 OSD
 

@@ -278,6 +278,18 @@ groups:
 
 三組 name 集合（rule 2 / 3 / 6）互斥且涵蓋整個 `ceph_health_detail`：rule 2 ∪ rule 6 剛好是 rule 3 排除的那 5 個 name，所以每個 check 只落到一條，不雙噴也不漏接。rule 1 / 4 / 5 是與 health_detail 正交的 cluster 級 / 抓取面 backstop。
 
+`CephMonQuorumLost` 的 `< 2` 是刻意針對本頁場景的 **3-mon cluster**。Prometheus module 輸出的 `ceph_mon_quorum_status` 只有 `ceph_daemon` label，每個 mon 一條 0/1；source 沒有額外輸出「預期 quorum 大小」這個 metric。5-mon cluster 要改成 `< 3`，7-mon cluster 要改成 `< 4`，或在自己的 recording rule 裡從 inventory / 靜態設定帶入 expected mon count。
+
+```python
+# File: ceph/src/pybind/mgr/prometheus/module.py (line 641)
+metrics['mon_quorum_status'] = Metric(
+    'gauge',
+    'mon_quorum_status',
+    'Monitors in quorum',
+    ('ceph_daemon',)
+)
+```
+
 ### Cosmetic 白名單（唯一「不 page」清單，3 個）
 
 | name | 為什麼不 page | 源頭 |
@@ -376,7 +388,7 @@ amtool silence add alertname="CephClientRisk" \
 
 ### 為什麼不做 per-node silence
 
-`ceph_health_detail` 只有 `('name','severity')` 兩個 label（`module.py:113`），無法只靜音某台的 `OSD_DOWN`——`amtool silence ... name="OSD_DOWN"` 是整 cluster 靜音。
+`ceph_health_detail` 只有 `('name','severity')` 兩個 label（`module.py:113`），無法只靜音某台的 `OSD_DOWN`。`amtool silence ... name="OSD_DOWN"` 是整 cluster 靜音，這不是 Alertmanager 的限制，而是 Ceph prometheus module 沒把 per-node 維度帶到 health_detail。
 
 要精準到單台，得另建一條帶 per-osd label 的規則。`ceph_osd_up` 每顆 osd 一條、帶 `ceph_daemon`，join 上 `ceph_osd_metadata` 的 `hostname`：
 
