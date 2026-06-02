@@ -35,7 +35,7 @@ OSDMap flags and daemon metrics
 |---|---|---|
 | 可用性中斷 | `inactive`、`down`、stuck `peering`、`stale`、`incomplete`、`PG_AVAILABILITY` | PG 沒有 active primary 或沒有足夠完整副本，read/write 可能卡住或不可服務 |
 | 副本數不足 | `undersized`、`degraded`、`OSD_DOWN`、`PG_DEGRADED` | 仍可服務，但任何下一顆 OSD 掛掉都更接近資料遺失 |
-| repair 被擋 | `recovery_toofull`、`backfill_toofull`、`OSD_BACKFILLFULL`、`OSDMAP_FLAGS` 裡的 `norecover` / `nobackfill` | 已經知道要修，但 recovery/backfill 無法前進，風險停在現場 |
+| repair / movement 被擋 | `recovery_toofull`、`backfill_toofull`、`recovery_wait`、`backfill_wait`、`remapped`、`OBJECT_MISPLACED`、`OSD_BACKFILLFULL`、`OSDMAP_FLAGS` 裡的 `norecover` / `nobackfill` | 已經知道要修或搬，但 recovery/backfill 無法前進或尚未收斂，風險停在現場 |
 | 資料可能損壞 | `inconsistent`、`recovery_unfound`、`backfill_unfound`、`snaptrim_error`、`OSD_SCRUB_ERRORS`、`PG_DAMAGED` | scrub 或 recovery 找到不一致、找不到物件、或修復失敗，不能當成一般容量警告 |
 
 `nearfull` 比較像「還沒著火的容量告警」；`full` 則會直接進入 write availability 問題。`SLOW_OPS` 不一定表示資料不安全，但代表線上 request 已經被卡住，應該跟 PG/OSD state 一起看。
@@ -247,6 +247,27 @@ auto& d = checks->add("OSD_DOWN", HEALTH_WARN, ss.str(),
 
 這類 WARN 要看範圍：單顆 OSD down 可能只是 background recovery；同 rack 大量 down 會讓很多 PG 同時變成 `stale`、`peering`、`undersized` 或 `inactive`。
 
+## Placement 尚未收斂：remapped、misplaced、wait
+
+`remapped` 很容易被誤讀成「資料壞了」。它比較精準的意思是：PG 的 acting / up set 已經不是 CRUSH baseline，或 object 還在從舊位置搬到新位置。這常發生在 OSD out/in、CRUSH reweight、pgp_num 推進、upmap 調整之後。
+
+```cpp
+// File: ceph/src/osd/PeeringState.cc (line 601)
+state_set(PG_STATE_REMAPPED);
+```
+
+MON 端會把 object 統計裡的 misplaced 聚合成 `OBJECT_MISPLACED`。它是 `HEALTH_WARN`，不是 `HEALTH_ERR`，但長時間不下降代表 backfill/recovery 被 throttle、被 full 擋住、或被人為 flag 暫停。
+
+```cpp
+// File: ceph/src/mon/PGMap.cc (line 3052)
+if (pg_sum.stats.sum.num_objects_misplaced) {
+  auto& d = checks->add("OBJECT_MISPLACED", HEALTH_WARN, ss.str(),
+                        pg_sum.stats.sum.num_objects_misplaced);
+}
+```
+
+還有兩個容易在現場看到但常被忽略的字：`recovery_wait` 和 `backfill_wait`。它們不是「不知道要做什麼」，而是已經排入 recovery/backfill path，但還在等 reservation、priority、fullness、或 throttle。這時候只看 mClock profile 常會誤判；要同時看 `osd_max_backfills`、`osd_recovery_max_active*`、`OSD_BACKFILLFULL` / `PG_BACKFILL_FULL`、以及是否有 `norecover` / `nobackfill`。
+
 ## Recovery 被擋：recovery_toofull、backfill_toofull、unfound
 
 `recovery_toofull` 和 `backfill_toofull` 都是「Ceph 知道要補資料，但目的端太滿」。差別在 recovery/backfill 的路徑不同，PGMap 也把 severity 分開：`PG_BACKFILL_FULL` 是 WARN，`PG_RECOVERY_FULL` 是 ERR。
@@ -364,7 +385,8 @@ MON/OSDMap 端的 health code：
 |---|---|---|
 | `nearfull` / `OSD_NEARFULL` | `HEALTH_WARN` | 早期容量壓力；Ceph 會提高 delete priority，但不代表 write 已停 |
 | `backfillfull` / `OSD_BACKFILLFULL` | `HEALTH_WARN` | backfill 可能被擋，PG 可能進 `backfill_toofull` |
-| `full` / `OSD_FULL` | `HEALTH_ERR` | pool/cluster 可能標 full，client write 會被 pause 或拿到 `ENOSPC` / `EDQUOT` |
+| pool `FLAG_FULL` / `POOL_FULL` | `HEALTH_WARN` 或 `HEALTH_ERR`（看來源） | pool quota 或 full flag 造成 write 被暫停 / 回錯；不要只看 severity，要看 detail |
+| `full` / `OSD_FULL` | `HEALTH_ERR` | OSDMap 看到 OSD full；client write 會被 pause 或拿到 `ENOSPC` / `EDQUOT` |
 | failsafe full | cluster log error，不一定先經 OSDMap health | OSD 直接 drop updates；recovery push 甚至會 abort，屬於立即擴容或清空間等級 |
 | `OSD_OUT_OF_ORDER_FULL` | `HEALTH_ERR` | `nearfull`、`backfillfull`、`full`、failsafe ratio 排序不合理，OSD 與 MON 會自動拉高門檻但設定本身危險 |
 
@@ -388,7 +410,20 @@ if ((ctx->delta_stats.num_bytes > 0 ||
 }
 ```
 
-這就是為什麼 `nearfull` 可以排進容量計畫，`backfillfull` 要看 recovery 是否停住，`full` 則要當成線上 write incident。
+OSDMap health code 裡，`OSD_FULL` 是 `HEALTH_ERR`；同檔的 pool flag path 會把 pool `FLAG_FULL` 聚成 `POOL_FULL` / `HEALTH_WARN`。但 PGMap 也會用同一個 health name `POOL_FULL`，而那條是 `HEALTH_ERR`。這個同名不同來源的細節容易讓人誤判：pool quota / pool full 對單一 workload 仍可能已經是 write incident，不該因為某條 path 是 WARN 就當成低風險。
+
+```cpp
+// File: ceph/src/osd/OSDMap.cc (line 7431)
+checks->add("OSD_FULL", HEALTH_ERR, ss.str(), full.size());
+
+// File: ceph/src/osd/OSDMap.cc (line 7613)
+checks->add("POOL_FULL", HEALTH_WARN, ss.str(), full_pools.size());
+
+// File: ceph/src/mon/PGMap.cc (line 3041)
+checks->add("POOL_FULL", HEALTH_ERR, ss.str(), full_pools);
+```
+
+這就是為什麼 `nearfull` 可以排進容量計畫，`backfillfull` 要看 recovery 是否停住，`POOL_FULL` / `full` 則要當成對應 pool 或整個 cluster 的線上 write incident。
 
 ## OSDMAP flags：不是壞掉，但會讓壞掉恢復不了
 

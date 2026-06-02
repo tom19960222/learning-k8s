@@ -195,6 +195,23 @@ if (found_skew) {
 - 健康 cluster：均勻分布在 `[0, 300]` 秒，平均 150s、最壞 300s
 - 已知 skew：均勻分布在 `[0, 30s × N]`，最少時平均 15s、最壞 30s
 
+有一個例外會把「最壞 300s」拉長：上一輪 timecheck 如果已經開始、但某個 peon 的 PONG 一直沒回來，leader 不會每次 timer 到就直接開新輪。source 會先保留當前 round，最多留到 `mon_timecheck_interval * 3`，才 cancel 舊 round。
+
+File: `ceph/src/mon/Monitor.cc` (line 4852)
+
+```cpp
+if (timecheck_round % 2) {
+  double max = g_conf()->mon_timecheck_interval*3;
+  if (curr_time - timecheck_round_start < max) {
+    goto out;              // keep current round going
+  } else {
+    timecheck_cancel_round();
+  }
+}
+```
+
+所以健康 cluster 的「平均約 2.5 分、最壞約 5 分」是 clean round 的估算；如果 timecheck round 本身卡住，偵測延遲可能多一個 stuck-round 保留時間。這種情境通常代表 mon 之間已經有 packet loss、暫停或嚴重排程延遲，應該同時看 mon log，而不只看 `ceph -s` 何時變 WARN。
+
 ## 第 2 段：PING / PONG / skew_bound 計算（< 100ms）
 
 leader timer 到了，跑 `timecheck_start_round()`：

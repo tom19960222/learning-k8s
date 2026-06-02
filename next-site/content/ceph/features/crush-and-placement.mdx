@@ -19,19 +19,22 @@ N 個 object  ──hash──>  K 個 PG (per pool)  ──CRUSH──>  OSD se
 ```
 
 ```
-pg_id = pool_id + (hash(object_name) % pg_num)
-osd_set = CRUSH(CRUSHMap, pg_id, rule, num_replicas)
+raw_pg = hash(object_name)
+actual_pg = pool_id + stable_mod(raw_pg, pg_num)
+placement_seed = stable_mod(raw_pg, pgp_num)
+osd_set = CRUSH(CRUSHMap, placement_seed, rule, num_replicas)
+up/acting = apply OSDMap override and primary_affinity
 ```
 
 ![Ceph CRUSH placement：object name → hash → PG ID → CRUSHMap rule traversal (root → datacenter → rack → host → osd) → Acting Set；底部以 straw2 bucket draw 解釋為什麼加減 osd 只影響部分 PG (stable property)](/diagrams/ceph/crush-placement.png)
 
 *圖：上半段是 object 到 OSD 的決定路徑，中段是 CRUSHMap 階層樹，被選中的分支以實線高亮；下半段以 straw2 視覺化「為何 stable」——每個 bucket 抽 weighted random 取最大，新增 osd 只動到原本沒贏過的位置。*
 
-- 第一步是 cheap hash（client 自己算）
-- 第二步才是 CRUSH 演算法
+- 第一步是 cheap hash（client 自己算），用 `pg_num` 決定「object 屬於哪個 actual PG」
+- 第二步才是 CRUSH 演算法，而且 v19.2.3 的 placement seed 走 `pgp_num`；這就是 `pg_num` / `pgp_num` 可以分批收斂的原因
 - CRUSH 的 input 是 PG ID，不是 object name → 計算量取決於 PG 數，不取決於 object 數
 
-`pg_num` 在 pool 創建時設定，可以動態 scale up（會引發部分 PG 的 placement 變動）。
+`pg_num` 在 pool 創建時設定，可以動態 scale up；`pgp_num` 追上之前，新的 actual PG 可能已經存在，但多個 PG 仍會暫時 collapse 到同一批 CRUSH placement seed。這段細節在 [pg_num 與 pgp_num](/ceph/features/pool-pgnum-pgpnum) 會完整拆。
 
 **PG 也是 OSD 內部的工作單位**：OSD 不單獨追每個 object 的 status，而是追每個 PG 的 status (active+clean / degraded / undersized / inconsistent / scrubbing)。`ceph -s` 看的 PG 狀態統計就是這個。
 
@@ -82,7 +85,7 @@ class CrushWrapper {
 stable property 來自 **straw2** 算法（每個 bucket 內部用的 weighted random sampling）。straw2 的特性：
 
 - 給定 bucket 內 N 個 item 與各自 weight，挑出一個 item
-- 加新 item 時，**只有 1/(N+1) 機率讓某 PG 改挑新 item**
+- 在 equal-weight 直覺模型裡，加新 item 時約 **1/(N+1)** 機率讓某 PG 改挑新 item；實際程式碼會把每個 item 的 weight 放進 `ln(draw) / weight`，所以非等重 bucket 的移動比例會往新 weight 佔比靠
 - 拔 item 時，被影響的 PG 重新挑（且大致均勻分散到剩餘 item）
 
 對比 modular hashing (`item = hash(x) % N`)：N 變了所有 mapping 都改。straw2 把這個「要 reshuffle 多少」最小化。
@@ -135,6 +138,38 @@ stable property 來自 **straw2** 算法（每個 bucket 內部用的 weighted r
 
 這就是為什麼 `ceph osd df` 看 OSD utilization 不會剛好一樣，差幾 percent 是 CRUSH 的固有 noise。
 
+## CRUSH 不是最後一層：OSDMap 還會改 acting set
+
+很多文章把流程講成「CRUSH 算完就是答案」，但 source 裡真正的順序是：`raw_pg_to_pg()` 先用 `pg_num` 算 actual PG，`raw_pg_to_pps()` 再用 `pgp_num` 算 placement seed，`OSDMap::_pg_to_raw_osds()` 呼叫 CRUSH，最後 `OSDMap::pg_to_up_acting_osds()` 還會套 override。
+
+```cpp
+// File: ceph/src/osd/osd_types.cc (line 1806)
+pg_t pg_pool_t::raw_pg_to_pg(pg_t pg) const
+{
+  ps_t pps = raw_pg_to_pps(pg);
+  unsigned rem = pps % pg_num;
+  return pg_t(rem, pg.pool());
+}
+```
+
+```cpp
+// File: ceph/src/osd/OSDMap.cc (line 2673)
+ps_t pps = pool.raw_pg_to_pps(pg);
+crush->do_rule(..., pps, ...);
+```
+
+CRUSH 後面還有三種常見 override：
+
+| override | 做什麼 | 典型來源 |
+|---|---|---|
+| `pg_upmap` / `pg_upmap_items` | 把特定 PG 的某個 OSD 換成另一個 OSD | balancer 或人工修正 outlier utilization |
+| `pg_temp` | 暫時指定 acting set | peering / backfill 過程中的暫態 |
+| `primary_affinity` / `pg_upmap_primaries` | 調整 primary 選擇 | 降低特定 OSD 當 primary 的機率或手動指定 |
+
+所以比較精準的說法是：CRUSH 給 Ceph 一個 deterministic baseline，OSDMap 再把 balancer、暫態 peering、primary 選擇這些 runtime 決策疊上去。debug placement 時，`ceph osd map` / `ceph pg map` 看到的是疊完後的 up/acting，不只是 CRUSH rule 的輸出。
+
+還有一個容易忽略的邊界：CRUSH rule 說「跨 host」不代表一定永遠湊得滿。如果 failure domain 不足、OSD 被 mark out、weight 變 0，或 erasure-coded pool 的 k+m 要求比拓樸可提供的 fault domain 還寬，CRUSH 可能回傳較短或重試很久。Squid 的 CRUSH code 裡已經有 MSR（multi-step retry）路徑處理某些寬 EC / 小 cluster 的 retry 問題，但設計上還是要先確定 rule 與實際拓樸匹配。
+
 ## PG 的常見狀態
 
 ```
@@ -153,7 +188,7 @@ deep             — 在做 data 級 cross-check
 
 ## 不靠中央 server 的代價
 
-- **CRUSHMap 必須廣播**：任何 OSD 上下線 → MON 算新 OSDMap → broadcast 給所有 client。`Objecter` (上一頁提到的 client dispatcher) 在 OSDMap 變動時自動重 route in-flight op
+- **OSDMap / CRUSHMap 必須傳到 client**：任何 OSD 上下線 → MON 產生新 OSDMap；client / daemon 透過訂閱或 request 拿到新版 map。`Objecter` (上一頁提到的 client dispatcher) 在 OSDMap 變動時自動重 route in-flight op
 - **client 必須能看 cluster 拓樸**：rule + 物理拓樸對 client 可見（沒有保密）
 - **拓樸變動時計算負擔分散**：cluster 內所有 client 各自重算 placement，不是中央 server 一次重算
 
@@ -166,9 +201,14 @@ deep             — 在做 data 級 cross-check
 
 ## 原始碼參考
 
-- [src/crush/mapper.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/mapper.c) — `crush_do_rule` (line 2016)
-- [src/crush/CrushWrapper.h](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/CrushWrapper.h) — `class CrushWrapper` (line 51)
-- [src/crush/builder.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/builder.c) — CRUSHMap 建構
-- [src/crush/hash.c](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/hash.c) — bucket hash 函式
-- [src/crush/types.h](https://github.com/ceph/ceph/blob/v19.2.3/src/crush/types.h) — bucket types
+- `src/crush/mapper.c:315-342` — straw2 draw 計算；`weight` 直接影響 draw
+- `src/crush/mapper.c:2016` — `crush_do_rule()` 主入口
+- `src/osdc/Objecter.cc:2851` — client 端 object locator 轉 PG
+- `src/osd/osd_types.cc:1806-1817` — `pg_num` 算 actual PG，`pgp_num` 算 placement seed
+- `src/osd/OSDMap.cc:2673-2724` — CRUSH baseline 後套 `pg_upmap` / `pg_upmap_items`
+- `src/osd/OSDMap.cc:2796-2803` — primary affinity / primary override
+- `src/crush/CrushWrapper.h:51` — `class CrushWrapper`
+- `src/crush/builder.c` — CRUSHMap 建構
+- `src/crush/hash.c` — bucket hash 函式
+- `src/crush/types.h` — bucket types
 - [CRUSH paper (2006)](https://ceph.io/assets/pdfs/weil-crush-sc06.pdf) — 原始 paper

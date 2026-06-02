@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: Ceph — Prometheus alert 重新設計：穩定性第一、新手好維護的 6 條 rule
-description: 從 ceph 原始碼（OSDMap.cc / PGMap.cc / HealthMonitor.cc / mgr 各 module）核對每個 health check 的觸發路徑與 severity，設計成「health_detail 預設全 page、3 個 cosmetic 白名單例外、維護期用 amtool 手動 silence」的 6 條 alert rule，並附逐 alert 成因證據與維護 silence SOP。
+description: 從 ceph 原始碼（OSDMap.cc / PGMap.cc / HealthMonitor.cc / mgr 各 module）核對每個 health check 的觸發路徑與 severity，設計成「health_detail 預設全 page、3 個低優先提示例外、維護期用 amtool 手動 silence」的 6 條 alert rule，並附逐 alert 成因證據與維護 silence SOP。
 ---
 
 ## 場景
@@ -31,7 +31,7 @@ ceph orch host maintenance exit cephnode-3
 
 1. ceph mgr/prometheus 模組丟了哪些 metric、`ceph_health_detail` 的資料模型長怎樣。
 2. 一個正當的維護動作（`ceph orch host maintenance enter`）在原始碼裡實際點亮哪些 health check。
-3. 重新設計成 6 條 rule：預設把所有會危及 client 的訊號 page，只留一張很短的 cosmetic 白名單；維護期不靠 PromQL 猜測，改用人工 `amtool silence`。
+3. 重新設計成 6 條 rule：預設把所有會危及 client 的訊號 page，只留 3 個低優先提示例外；維護期不靠 PromQL 猜測，改用人工 `amtool silence`。
 
 ## 從原始碼追：HEALTH_WARN 是怎麼被丟出來的
 
@@ -125,7 +125,7 @@ if "osd" in host_daemons:
 
 1. 丟出 `HOST_IN_MAINTENANCE` health check（HEALTH_WARN）。
 2. 對該 host 的 crush bucket 下 `osd set-group noout`，連帶丟出 `OSD_FLAGS` health check（HEALTH_WARN）。
-3. systemd 停掉這台所有 ceph daemon，過 5 分鐘 OSD 會被 mon 標 down，丟出 `OSD_DOWN`（與 host 層級的 down）。
+3. systemd 停掉這台所有 ceph daemon，過 5 分鐘 OSD 會被 mon 標 down，丟出 `OSD_DOWN`（以及 host 層級的 `OSD_HOST_DOWN`）。
 4. PG 因為 OSD 不足而從 `active+clean` 變 `active+undersized+degraded`，丟出 `PG_DEGRADED`。
 
 **一個正當的維護動作，會同時讓五~六條 health check 都進 HEALTH_WARN**。stock alert rules 不知道這些是同一個原因引發的——這就是警報風暴的根。
@@ -199,6 +199,7 @@ def get_metadata_and_osd_status(self) -> None:
 ceph_health_status                                       == 1  # WARN
 ceph_health_detail{name="HOST_IN_MAINTENANCE"}           == 1
 ceph_health_detail{name="OSD_FLAGS"}                     == 1
+ceph_health_detail{name="OSD_HOST_DOWN"}                 == 1
 ceph_health_detail{name="OSD_DOWN"}                      == 1
 ceph_health_detail{name="PG_DEGRADED"}                   == 1
 ceph_osd_flag_noout                                      == 0  # 因為是 subtree/per-osd flag，不反映在 cluster flag
@@ -214,7 +215,7 @@ stock `ceph-mixin/prometheus_alerts.yml` 的哲學是「全部丟出來、oncall
 
 新設計把「現在是不是維護」這件事從 PromQL 移回人身上，只留一句心法：
 
-> **`ceph_health_detail` 噴出來的，預設全部 page；只有一張很短（3 個）的 cosmetic 白名單例外。維護前人工下一條 `amtool silence`，到期自動解除。**
+> **`ceph_health_detail` 噴出來的，預設全部 page；只有 3 個低優先提示例外（info，不 page）。維護前人工下一條 `amtool silence`，到期自動解除。**
 
 規則永遠只回答「cluster 有沒有壞」，不回答「這個壞是不是我預期的」——後者交給維護 SOP。
 
@@ -266,8 +267,8 @@ groups:
         for: 5m
         labels: { severity: critical }
 
-      # 6) 純雜訊 / 自己設的狀態 —— 只進 Slack，不 page
-      - alert: CephCosmeticNag
+      # 6) 低優先提示 —— 只進 Slack，不 page
+      - alert: CephLowPriorityNotice
         expr: |
           ceph_health_detail{
             name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING"
@@ -278,7 +279,19 @@ groups:
 
 三組 name 集合（rule 2 / 3 / 6）互斥且涵蓋整個 `ceph_health_detail`：rule 2 ∪ rule 6 剛好是 rule 3 排除的那 5 個 name，所以每個 check 只落到一條，不雙噴也不漏接。rule 1 / 4 / 5 是與 health_detail 正交的 cluster 級 / 抓取面 backstop。
 
-### Cosmetic 白名單（唯一「不 page」清單，3 個）
+`CephMonQuorumLost` 的 `< 2` 是刻意針對本頁場景的 **3-mon cluster**。Prometheus module 輸出的 `ceph_mon_quorum_status` 只有 `ceph_daemon` label，每個 mon 一條 0/1；source 沒有額外輸出「預期 quorum 大小」這個 metric。5-mon cluster 要改成 `< 3`，7-mon cluster 要改成 `< 4`，或在自己的 recording rule 裡從 inventory / 靜態設定帶入 expected mon count。
+
+```python
+# File: ceph/src/pybind/mgr/prometheus/module.py (line 641)
+metrics['mon_quorum_status'] = Metric(
+    'gauge',
+    'mon_quorum_status',
+    'Monitors in quorum',
+    ('ceph_daemon',)
+)
+```
+
+### 低優先提示清單（唯一「不 page」清單，3 個）
 
 | name | 為什麼不 page | 源頭 |
 |---|---|---|
@@ -301,6 +314,7 @@ groups:
 | `OSD_BACKFILLFULL` | WARN | 7451 | CephClientRisk |
 | `OSD_FULL` | ERR | 7441 | CephHealthError (+CephClientRisk) |
 | `OSD_UNREACHABLE` | ERR | 7745 | CephHealthError (+CephClientRisk) |
+| `OSD_<crush type>_DOWN` | WARN | 7316-7319 | CephClientRisk（host 維護時 `OSD_HOST_DOWN` 要 silence） |
 | `OSDMAP_FLAGS` | WARN | 7493 | CephClientRisk（維護時 silence） |
 | `OSD_FLAGS` | WARN | 7540 | CephClientRisk（維護時 silence） |
 
@@ -319,8 +333,8 @@ groups:
 | `POOL_NEAR_FULL` | WARN | 3047 | CephClientRisk |
 | `POOL_FULL` | ERR | 3041 | CephHealthError (+CephClientRisk) |
 | `OBJECT_UNFOUND` | WARN | 3078 | CephClientRisk |
-| `OBJECT_MISPLACED` | WARN | 3064 | CephCosmeticNag |
-| `PG_SLOW_SNAP_TRIMMING` | WARN | 3412 | CephCosmeticNag |
+| `OBJECT_MISPLACED` | WARN | 3064 | CephLowPriorityNotice |
+| `PG_SLOW_SNAP_TRIMMING` | WARN | 3412 | CephLowPriorityNotice |
 
 ### 客戶請求被擋（`src/mgr/DaemonHealthMetricCollector.cc`）
 
@@ -361,7 +375,7 @@ amtool silence add alertname="CephClientRisk" 'name="MON_DOWN"' \
 
 # B. 維護 osd node（整台）
 amtool silence add alertname="CephClientRisk" \
-  'name=~"OSD_DOWN|PG_DEGRADED|OSDMAP_FLAGS|OSD_FLAGS"' \
+  'name=~"OSD_HOST_DOWN|OSD_DOWN|PG_DEGRADED|OSDMAP_FLAGS|OSD_FLAGS"' \
   --duration=2h -c "maint osd host Y"
 
 # C. 維護單顆 osd（換硬碟）
@@ -370,13 +384,32 @@ amtool silence add alertname="CephClientRisk" \
   --duration=1h -c "replace osd.N"
 ```
 
-**為什麼這樣 silence 是安全的**：上面壓的全是「冗餘下降」訊號。真正「client 被擋」的 `PG_AVAILABILITY` / `SLOW_OPS`（→ `CephClientBlocked`）、任何 ERR 升級（→ `CephHealthError`）、quorum 失守（→ `CephMonQuorumLost`）、抓取面盲區（→ `CephExporterDown`）都**不在 silence list**，維護窗內若真的出事照樣 page。`OBJECT_MISPLACED` 因已是 cosmetic，維護時不必再 silence——少一個要記的名字。
+**為什麼這樣 silence 是安全的**：上面壓的全是「冗餘下降」訊號。真正「client 被擋」的 `PG_AVAILABILITY` / `SLOW_OPS`（→ `CephClientBlocked`）、任何 ERR 升級（→ `CephHealthError`）、quorum 失守（→ `CephMonQuorumLost`）、抓取面盲區（→ `CephExporterDown`）都**不在 silence list**，維護窗內若真的出事照樣 page。`OBJECT_MISPLACED` 因已走低優先提示，維護時不必再 silence——少一個要記的名字。
 
 也就是說：維護 osd-3 期間若另一台 node 的 osd 也掛、而且真的危及 client，它會立刻以 `PG_AVAILABILITY` / `SLOW_OPS` / ERR 噴出來。你損失的只是「第二顆純 down 但還沒影響 client」那段較早的提醒——以穩定性第一來說，這條 backstop 就是真正在乎的線。
 
+### 如果是一台 node 非預期掛掉
+
+**OSD node 掛掉**：不要先 silence。`OSD_HOST_DOWN` / `OSD_DOWN` / `PG_DEGRADED` 落在 `CephClientRisk`，意思是「冗餘下降、需要人處理」，不是低優先提示。先用這條 PromQL 找出實際 down 的 OSD 與 host：
+
+```promql
+(ceph_osd_up == 0) * on(ceph_daemon) group_left(hostname) ceph_osd_metadata
+```
+
+如果同時沒有 `CephClientBlocked`、`CephHealthError`、`CephMonQuorumLost`，代表 client I/O 尚未被明確擋住，但 cluster 已少一個 failure domain；處理方向是修 host、網路、systemd 或 OSD daemon，並盯著 recovery。只有在你已確認原因、把它轉成「預期中的維修窗口」後，才套用上面的 B silence，而且 duration 要短。`PG_AVAILABILITY` / `SLOW_OPS` / HEALTH_ERR 任何一個出現，就不要把它當成警報雜訊。
+
+**mon node 掛掉**：3-mon cluster 掉 1 台時，`MON_DOWN` 會落在 `CephClientRisk`；`CephMonQuorumLost` 不會響，因為 quorum 還有 2 台。這不是可忽略狀態，而是「只剩一次 failure buffer」。先用這條找出 out-of-quorum 的 mon：
+
+```promql
+(ceph_mon_quorum_status == 0)
+  + on(ceph_daemon) group_left(hostname) (ceph_mon_metadata * 0)
+```
+
+如果是計畫內維護，先跑 `ceph orch host ok-to-stop <hostname>`（或直接 `ceph mon ok-to-stop <mon-id>`），active mgr 在該 node 上時先 `ceph mgr fail <active-mgr>` 讓它切走，再套用 A silence。`CephMonQuorumLost` / `CephExporterDown` 一律不要 silence；它們響就代表不是「少一台但還能服務」，而是 quorum 或觀測面已經失守。
+
 ### 為什麼不做 per-node silence
 
-`ceph_health_detail` 只有 `('name','severity')` 兩個 label（`module.py:113`），無法只靜音某台的 `OSD_DOWN`——`amtool silence ... name="OSD_DOWN"` 是整 cluster 靜音。
+`ceph_health_detail` 只有 `('name','severity')` 兩個 label（`module.py:113`），無法只靜音某台的 `OSD_DOWN`。`amtool silence ... name="OSD_DOWN"` 是整 cluster 靜音，這不是 Alertmanager 的限制，而是 Ceph prometheus module 沒把 per-node 維度帶到 health_detail。
 
 要精準到單台，得另建一條帶 per-osd label 的規則。`ceph_osd_up` 每顆 osd 一條、帶 `ceph_daemon`，join 上 `ceph_osd_metadata` 的 `hostname`：
 
@@ -398,7 +431,7 @@ rule_files: [ ./ceph-alerts.yml ]
 evaluation_interval: 30s
 tests:
   - interval: 30s
-    name: "client IO blocked 與 cosmetic 分流"
+    name: "client IO blocked 與低優先提示分流"
     input_series:
       - series: 'ceph_health_detail{name="PG_AVAILABILITY"}'
         values: '1x10'
@@ -412,8 +445,8 @@ tests:
       - eval_time: 2m            # OBJECT_MISPLACED 在白名單 → CephClientRisk 不該 fire
         alertname: CephClientRisk
         exp_alerts: []
-      - eval_time: 31m           # OBJECT_MISPLACED for:30m → CephCosmeticNag fire
-        alertname: CephCosmeticNag
+      - eval_time: 31m           # OBJECT_MISPLACED for:30m → CephLowPriorityNotice fire
+        alertname: CephLowPriorityNotice
         exp_alerts:
           - exp_labels: { severity: info, name: "OBJECT_MISPLACED" }
 ```
@@ -439,7 +472,7 @@ promtool test rules tests.yml          # 預期 SUCCESS
 
 ### alertmanager inhibit（選配）
 
-若想雙保險，可在 alertmanager 對 `CephCosmeticNag` 的 `HOST_IN_MAINTENANCE` 設 inhibit，把同一台維護期間的雜訊再壓一層。這是選配，不是主路徑——主路徑就是上面的 `amtool silence`。
+若想雙保險，可在 alertmanager 對 `CephLowPriorityNotice` 的 `HOST_IN_MAINTENANCE` 設 inhibit，把同一台維護期間的低優先提示再壓一層。這是選配，不是主路徑——主路徑就是上面的 `amtool silence`。
 
 ## 接下來 / 相關頁面
 

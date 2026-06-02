@@ -118,6 +118,30 @@ if (p->second.is_unhealthy(now)) {
 
 `osd_heartbeat_grace` 預設 20 秒（`src/common/options/global.yaml.in:2856-2864`）。意思是：peer 至少 **連續 20 秒 ping 不回**，這顆 OSD 才會把 peer 算成可疑。
 
+還沒送到 MON 的 failure report 可以被取消。`handle_osd_ping` 收到新的健康 ping 後，如果 peer 又變 healthy，OSD 會把 `failure_queue` 裡還沒送出的條目 erase；但如果 `send_failures()` 已經把 `MOSDFailure` 送出去，這顆 OSD 端只會把本地 queue 清掉，MON 端已收到的 reporter 還是要靠後續 OSD up / cancel report / grace 判斷收斂。
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 6070)
+if (i->second.is_healthy(now)) {
+  auto failure_queue_entry = failure_queue.find(from);
+  if (failure_queue_entry != failure_queue.end()) {
+    failure_queue.erase(failure_queue_entry);
+  }
+}
+```
+
+```cpp
+// File: ceph/src/osd/OSD.cc (line 7237)
+void OSD::send_failures()
+{
+  while (!failure_queue.empty()) {
+    monc->send_mon_message(new MOSDFailure(...));
+    failure_pending[osd] = make_pair(...);
+    failure_queue.erase(osd);
+  }
+}
+```
+
 **但有一條 shortcut**：peer 的 TCP 連線收到 RST（例如 OSD process 乾淨退出、kernel 還在），messenger 直接走 `ms_handle_refused`，發 `FLAG_IMMEDIATE` 的 failure：
 
 ```cpp
@@ -507,7 +531,7 @@ if (can_mark_out(-1)) {
 
 ### A1：1 個 node，1 分鐘內 5 次 flap
 
-- 每次 down/up cycle ≈ 12 秒，**小於 `osd_heartbeat_grace=20s`**。多數 cycle 在 grace 到期前 node 就回來，peer OSD `is_unhealthy()` 還沒持續到 deadline 全過，`failure_queue` 條目會被新 ping 的 last_rx 給「擦掉」。
+- 每次 down/up cycle ≈ 12 秒，**小於 `osd_heartbeat_grace=20s`**。多數 cycle 在 grace 到期前 node 就回來，peer OSD `is_unhealthy()` 還沒持續到 deadline 全過；即使已經短暫進 `failure_queue`，只要還沒送出 `MOSDFailure`，新的 healthy ping 會把本地 queue 取消。
 - 但 OSD 一回來通常 MON 已收到 `MOSDFailure`（多 peer、同時被觸發），即使 `failed_for < grace` 也可能因為下一輪 tick 拿到的 `failed_for` 已經 ≥ grace 而 mark down。**結果：5 次 flap 中通常會有 1–3 次成功 mark down**，難以給確切數字。
 - 每次 mark down + 回來，MON `preprocess_boot` 走 laggy 分支：`laggy_probability` 累積到 ≈ 0.3 → 0.51 → 0.657。`laggy_interval` 因每次 down 只 ~12s，EMA 慢慢爬到約 8–10s。下次 mark down 的 grace ≈ 20 + 0.3 × 10 ≈ 23s，幾乎沒拉長。
 - `down_pending_out`：每次 up 都會 `erase()` 整條記錄（`OSDMonitor.cc:935-937`），timer 一直被 reset，**遠不到 `mon_osd_down_out_interval = 600s`，永遠不會 mark out**。

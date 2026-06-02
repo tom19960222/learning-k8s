@@ -105,7 +105,7 @@ if (cct->_conf->bluestore_volume_selection_policy == "fit_to_fast") {
 }
 ```
 
-這就是「為什麼 block.db 給太小會 spillover」的程式入口 — volume selector 拿到 BDEV_DB 容量後，發現某個 SST level 放不下，就 fallback 到 BDEV_SLOW。
+這就是「為什麼 block.db 給太小會 spillover」的程式入口 — volume selector 拿到 BDEV_DB 容量後，若某些 BlueFS / RocksDB file extent 被配置到 BDEV_SLOW，後面的 alert path 就會把它視為 spillover。它常見於 BDEV_DB 容量不足，但 source 的直接條件不是「DB 裝置已滿」，而是「BlueFS metadata 已經用到 slow device」。
 
 ## OSD 目錄為什麼是 tmpfs + symlink
 
@@ -204,7 +204,7 @@ if (!spillover_alert.empty() &&
 }
 ```
 
-`spilled over X metadata from 'db' device ... to slow device` — 直接讀程式碼就知道警告字串是怎麼組的，也知道**前提**是 `shared_bdev == BDEV_SLOW`：也就是說 BlueFS 已經把 BDEV_DB 用滿，必須把部分 RocksDB SST 寫到 BDEV_SLOW 上。HDD + 小 NVMe DB 的 cluster 最容易撞到。
+`spilled over X metadata from 'db' device ... to slow device` — 直接讀程式碼就知道警告字串是怎麼組的，也知道**直接前提**是 `shared_bdev == BDEV_SLOW` 且 `bluefs->get_used(BDEV_SLOW) > 0`。也就是說 BlueFS metadata 已經使用 slow device；BDEV_DB 太小是最常見原因，但 alert 本身不是先問「DB 是否滿」，而是看 slow device 上是否有 BlueFS 使用量。HDD + 小 NVMe DB 的 cluster 最容易撞到。
 
 ## 寫入路徑：TransContext 狀態機
 
@@ -589,7 +589,7 @@ if (cct->_conf->bluestore_slow_ops_warn_threshold) {
 
 | ceph 顯示 | 出處 | 真正在講什麼 |
 |---|---|---|
-| `BLUEFS_SPILLOVER` | BlueStore.cc:18927-18931 | BDEV_DB 滿，RocksDB SST 寫到 BDEV_SLOW |
+| `BLUEFS_SPILLOVER` | BlueStore.cc:18888-18897 | BlueFS metadata 已使用 BDEV_SLOW；常見原因是 BDEV_DB 容量不足 |
 | `BLUESTORE_SLOW_OP_ALERT` | BlueStore.cc:18901-18907 | 內部 op 等待過久（看哪個 state 慢） |
 | `BLUESTORE_SPURIOUS_READ_ERRORS` | BlueStore.cc:18911-18915 | csum retry 觸發過，但最終讀回（device 邊緣狀態） |
 | `BLUESTORE_DISK_SIZE_MISMATCH` | BlueStore.cc:18917-18920 | bdev 容量跟 BlueStore 記的對不上 |

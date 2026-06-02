@@ -233,6 +233,8 @@ if (!out_report.ok_to_stop()) {
 | `-EAGAIN` (`11`) | 有 PG state == 0（mgr cache 不完整） | 等一下再試 |
 | `-EBUSY` (`16`) | 至少一個 PG 落在 bad_no_pool / bad_already_inactive / bad_become_inactive | **不要** 停；先看 `not_ok` 哪些 PG，補完 recovery 再來 |
 
+source 這段還有一個實作細節：handler 先對 `unknown` 回 `-EAGAIN`，下一個 `if (!out_report.ok_to_stop())` 又會因為 `unknown` 非空而進入失敗分支。對使用者來說不用把它解讀成「有些 PG 一定會 offline」；unknown 的語意仍是「mgr 現在無法判斷」。實際 CLI 輸出以你跑到的版本為準，現場 SOP 應該一律等 PGMap 收斂後重試。
+
 ## 邊界與除錯
 
 ok-to-stop 不檢查的東西也很重要：
