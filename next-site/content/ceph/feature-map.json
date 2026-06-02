@@ -18,7 +18,7 @@
     {"id": "osd-ok-to-stop", "label": "osd ok-to-stop", "description": "每 PG 跑一次 min_size 模擬：扣掉這幾顆後 acting 還夠不夠維持 active", "featureSlug": "osd-ok-to-stop", "category": "tooling", "position": {"x": 400, "y": 660}},
     {"id": "osd-safe-to-destroy", "label": "osd safe-to-destroy", "description": "三條規則：osdmap.exists / pg map 仍在此 OSD / 不健康 cluster 中仍持有 PG 資料", "featureSlug": "osd-safe-to-destroy", "category": "tooling", "position": {"x": 700, "y": 660}},
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}},
-    {"id": "prometheus-alert-design", "label": "Prometheus alert 補強", "description": "保留 ceph-mixin 預設 rule，新增 per-host/per-OSD scoped OSD down page rule，維護時只 silence 目標 host 或 daemon", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}}
+    {"id": "prometheus-alert-design", "label": "Prometheus alert 補強", "description": "保留 ceph-mixin 預設 rule，新增 scoped OSD / MON down page rule，cluster-wide warning 不進 Pager", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}}
   ],
   "edges": [
     {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
