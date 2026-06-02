@@ -8,7 +8,7 @@ description: 建 VM 時動態加 label 與 topologySpreadConstraints，如何一
 
 你自己寫了一個 VM create service：使用者送出「我要一組 redis-primary VM」，service 要幫他建 KubeVirt `VirtualMachine`，而且同一組 VM 不能全部擠在同一台 node。這不是 KubeVirt 自己另外寫 scheduler，而是把 VM template 裡的 scheduling intent 傳到最底下的 `virt-launcher` Pod，最後交給 Kubernetes `PodTopologySpread` plugin 判斷。
 
-本頁使用已驗證的 stable 原始碼版本：Kubernetes `v1.36.0`、KubeVirt `v1.8.2`。upstream tag 檢查時，Kubernetes `v1.37.0` 仍是 alpha，KubeVirt 最新 stable tag 仍是 `v1.8.2`。
+本頁使用已驗證的原始碼版本：Kubernetes `v1.36.0`、KubeVirt `v1.5.0`（本 repo submodule 釘選的版本）。
 
 ## 結論
 
@@ -94,7 +94,7 @@ TopologySpreadConstraints []k8sv1.TopologySpreadConstraint `json:"topologySpread
 
 ## VM controller：template 變成 VMI
 
-VM controller 建 VMI 時，核心函式是 `SetupVMIFromVM()`。它先把 VM template metadata copy 到 VMI，再把 VM template spec copy 到 VMI spec。
+VM controller 建 VMI 時，核心函式是 `setupVMIFromVM()`。它先把 VM template metadata copy 到 VMI，再把 VM template spec copy 到 VMI spec。
 
 ```go
 // File: kubevirt/pkg/virt-controller/watch/vm/vm.go
@@ -269,7 +269,7 @@ if p.GetPod().DeletionTimestamp != nil || p.GetPod().Namespace != ns {
 
 ## KubeVirt webhook 驗證的邊界
 
-KubeVirt 在 VMI create validating webhook 裡會檢查 `spec.topologySpreadConstraints`，但 v1.8.2 的驗證碼是「copy Kubernetes 部分 validation」，不是把最新 Kubernetes validation 全部直接拿進來。
+KubeVirt 在 VMI create validating webhook 裡會檢查 `spec.topologySpreadConstraints`，但 v1.5.0 的驗證碼是「copy Kubernetes 部分 validation」，不是把最新 Kubernetes validation 全部直接拿進來。
 
 ```go
 // File: kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/vmi-create-admitter.go
@@ -362,10 +362,10 @@ spec:
 
 ## 原始碼參考
 
-- [kubevirt/staging/src/kubevirt.io/api/core/v1/types.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/staging/src/kubevirt.io/api/core/v1/types.go) — VM/VMI API 欄位
-- [kubevirt/pkg/virt-controller/watch/vm/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/vm/vm.go) — VM template 轉 VMI
-- [kubevirt/pkg/virt-controller/services/template.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/services/template.go) — VMI 轉 virt-launcher Pod
-- [kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go) — KubeVirt VMI topology spread validation
+- [kubevirt/staging/src/kubevirt.io/api/core/v1/types.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/staging/src/kubevirt.io/api/core/v1/types.go) — VM/VMI API 欄位
+- [kubevirt/pkg/virt-controller/watch/vm/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-controller/watch/vm/vm.go) — VM template 轉 VMI
+- [kubevirt/pkg/virt-controller/services/template.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-controller/services/template.go) — VMI 轉 virt-launcher Pod
+- [kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-api/webhooks/validating-webhook/admitters/validate-k8s-utils.go) — KubeVirt VMI topology spread validation
 - [kubernetes/staging/src/k8s.io/api/core/v1/types.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/api/core/v1/types.go) — PodSpec 與 TopologySpreadConstraint API
 - [kubernetes/pkg/scheduler/framework/plugins/podtopologyspread/](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/scheduler/framework/plugins/podtopologyspread) — scheduler plugin 實作
 - [kubernetes/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go](https://github.com/kubernetes/kubernetes/blob/v1.36.0/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/helpers.go) — LabelSelector 轉 labels.Selector
