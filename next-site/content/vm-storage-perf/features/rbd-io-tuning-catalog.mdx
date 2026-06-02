@@ -1,0 +1,328 @@
+---
+layout: doc
+title: VM Disk IO 調教參數目錄 — KubeVirt / libvirt / QEMU / krbd / Ceph 五層可調旋鈕
+description: 接續 datapath 頁，把一個 IO 從 guest 到 OSD 經過的五層拆成可調參數目錄；每個參數標明在哪設、改變哪一跳的行為、impact（純機制推論加原始碼來源）、以 krbd 為主軸，版本對齊 kubevirt v1.5.0 / libvirt v10.10.0 / qemu v9.1.0 / host kernel 6.8.0-52 / ceph-csi v3.14.0 / ceph v19.2.3。
+---
+
+## 場景：datapath 拆完了，現在每一層能調什麼
+
+[VM Disk IO datapath 頁](./rbd-io-datapath) 把一個 4K write 從 guest virtio-blk、vring/ioeventfd、KVM vmexit、QEMU block layer、host `/dev/rbdX`、krbd、libceph 一路追到 TCP 上線到 OSD，每一跳都釘在原始碼上。地圖有了，下一個問題很實際：**這條路徑上，每一層到底能調什麼旋鈕？哪個調了真的有差、哪個只是情境性？**
+
+這頁就是那份目錄。它把 datapath 五層重新整理成一個「調教 taxonomy」：
+
+```
+ ① KubeVirt VMI 層   ── VMI spec 欄位，最終被 converter 翻成 libvirt domain XML
+ ② libvirt / QEMU 層 ── domain XML driver 屬性、QEMU -blockdev 的 aio / cache.direct
+ ③ guest virtio 層   ── guest 內 /sys/block/vdX/queue/* 與 virtio 協商出的 queue 深度
+ ④ host krbd 層      ── rbd map --options（ceph-csi mapOptions）與 host /sys/block/rbdX/queue/*
+ ⑤ Ceph / RBD 層     ── RBD image layout（object-size / striping）與 OSD 端 osd_op_num_shards
+```
+
+這個分層是「在哪一層設定」的視角，跟 datapath 頁的 ① ～ ⑤ 跳號不是一對一對應（例如本頁的 ② libvirt/QEMU 對應 datapath 的 §③ §④），每節開頭都會點明它連回 datapath 的哪一跳。主軸一樣是 **krbd**（kernel RBD，`volumeMode: Block` map 出 `/dev/rbdX`）；librbd-only 的旋鈕（`rbd_cache` 之類）統一在第 ⑤ 層收尾並標清楚「krbd 路徑不走」。
+
+## 怎麼用這頁
+
+每個參數都用同一個五欄格式描述：
+
+- **在哪設**：實際下這個設定的位置（VMI spec 欄位 / domain XML / `rbd map --options` / `ceph.conf` / sysfs 路徑）。
+- **作用機制**：它改變 datapath 哪一跳的什麼行為，並連回 [datapath 頁](./rbd-io-datapath) 對應節。
+- **impact**：用三個等級標示，理由一律是**機制推論**，不寫具體 benchmark 數字（這頁不做實測，實測在後面的實驗計畫頁）。
+- **來源**：`File: repo/path` 原始碼錨點、官方文件 URL，或在找不到固定 source 時誠實標「依環境實測，無固定 source」。
+- **風險 / 前提**：correctness 代價、版本前提、與其他參數的交互。
+
+impact 圖例：
+
+- 🔴 **高**：直接決定某一跳的 IO 提交模型（同步 vs 非同步、O_DIRECT vs page cache、單 queue vs 多 queue），機制上對 throughput / latency 影響最大。
+- 🟡 **中**：在既定提交模型下調整深度、批次、親和性，影響並行度與 CPU 分佈。
+- 🟢 **低或情境性**：只在特定 workload（大 IO、discard 密集、特定拓樸）下才有感，或屬 correctness / 維運取捨而非吞吐旋鈕。
+
+所有參數的快速 triage 索引在文末的「全參數 impact 總表」，按 impact 由高到低排好——冷讀者可以直接跳到那張表挑要先量的。
+
+<Callout type="warning" title="一次只動一個參數">
+  這些參數彼此會交互（最典型：`cache` 決定 `io` 能不能 auto 變 `native`）。要量出某個旋鈕的真實效果，務必一次只改一個、其餘固定，再對照 datapath 頁的兩個 iostat 邊界（guest `/dev/vda` 與 host `/dev/rbdX`）看延遲落在哪一段。系統化的做法見後續的效能實驗計畫頁。
+</Callout>
+
+## ① KubeVirt VMI 層
+
+這一層是你在 `VirtualMachineInstance` spec 裡寫的東西。它最終被 virt-launcher 的 converter 翻成 libvirt domain XML（對應 datapath 頁的 §③ QEMU virtio-blk device 的設定來源）。這層的旋鈕大多是「宣告意圖」，真正生效要看第 ② 層 converter / libvirt 怎麼把它組成 QEMU 命令列。
+
+KubeVirt 的 disk driver 欄位定義在 `schema.go` 的 `DiskDevice` / disk driver 區塊，`cache` 與 `io` 的型別與合法值定義在 `types.go`。
+
+```go
+// File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go
+	// Cache specifies which kvm disk cache mode should be used.
+	// Supported values are: CacheNone, CacheWriteThrough.
+	// +optional
+	Cache DriverCache `json:"cache,omitempty"`
+	// IO specifies which QEMU disk IO mode should be used.
+	// Supported values are: native, default, threads.
+	// +optional
+	IO DriverIO `json:"io,omitempty"`
+```
+
+### cache（對應 datapath 第 ④ 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.devices.disks[].cache`，合法值 `none` / `writethrough` / `writeback`（`DriverCache` 常數在 `types.go`）。
+- **作用機制**：決定 host 端開 `/dev/rbdX` 時走不走 page cache。`cache=none` 會讓 QEMU 用 `O_DIRECT` 開檔（datapath §④ `raw_co_prw` 的 O_DIRECT 分支），繞過 host page cache 直接打 block device；這也是 `io=native` 的前提。`writethrough` / `writeback` 則經 host page cache。
+- **impact**：🔴 高 —— 它同時決定「走不走 page cache」與「能不能用 native AIO」，是這一層影響最大的單一旋鈕。
+- **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go`（`CacheNone = "none"` 等常數，約 L1846-1860）。
+- **風險 / 前提**：對 RBD block device，`cache=none` 是最常見且語意最乾淨的選擇；改成 writeback 會把 correctness 賭在 host page cache 與 flush 行為上，與下面 `io` 的 auto 推導交互（見第 ② 層 `SetOptimalIOMode`）。
+
+### io（對應 datapath 第 ④ 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.devices.disks[].io`，合法值 `native` / `default` / `threads`（`DriverIO`：`IONative = "native"`、`IOThreads = "threads"`）。
+- **作用機制**：對應 datapath §④ QEMU 對 `/dev/rbdX` 發 aio 的介面選擇——`native` 走 Linux native AIO（laio）、`threads` 走 thread pool 同步 `pread`/`pwrite`。注意 KubeVirt 這個欄位不直接給 `io_uring`；要 io_uring 得在第 ② 層 QEMU 的 `aio` 選項層處理。
+- **impact**：🔴 高 —— 同步 thread pool 與 native AIO 是兩種不同的提交模型，直接決定 host 端 submit 路徑的並行能力。
+- **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go`（`IONative` / `IOThreads` 常數，約 L1854-1859）。
+- **風險 / 前提**：`io=native` 需要 `O_DIRECT`，所以實務上要搭 `cache=none`；若沒設 `io`，KubeVirt 會在第 ② 層自動推導（見 `SetOptimalIOMode`），這是「留空讓它 auto」常常比手動填更安全的原因。
+
+### ioThreadsPolicy + dedicatedIOThread（對應 datapath 第 ②③④ 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.ioThreadsPolicy`（`shared` / `auto` / `supplementalPool`）與每顆 disk 的 `spec.domain.devices.disks[].dedicatedIOThread`。
+- **作用機制**：決定 QEMU 用幾條 IOThread、以及這顆 disk 是否獨佔一條。IOThread 是 QEMU 跑 block backend AioContext event loop 的執行緒（datapath §② host notifier 收事件、§③④ submit 都在它上面跑）；獨佔可避免多 disk 共用一條 event loop 互相排隊。
+- **impact**：🟡 中 —— 在 native AIO 已開的前提下，IOThread 配置影響的是「多顆盤 / 高並行時會不會卡在同一條 event loop」，對單盤單流影響有限。
+- **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`IOThreadsPolicy` 常數約 L30-35、欄位 `IOThreadsPolicy` 約 L206、`DedicatedIOThread` 約 L644）；`supplementalPool` 的執行緒數來自 `DiskIOThreads.SupplementalPoolThreadCount`（約 L1599-1602）。
+- **風險 / 前提**：`dedicatedIOThread` 註解明寫「Enabling this implies useIOThreads = true」；`supplementalPool` 需要額外指定 `supplementalPoolThreadCount`。IOThread 在 converter 只對 virtio bus 的 disk 生效（見第 ② 層）。
+
+### blockMultiQueue（virtio 多 queue，對應 datapath 第 ① 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.devices.blockMultiQueue: true`。
+- **作用機制**：開啟後 converter 把 disk 的 `driver.queues` 設成 vCPU 數，讓 guest virtio-blk 協商出多條 virtqueue（datapath §① guest 把 request 放進 vring、§② 每條 queue 各自 kick）。多 queue 讓不同 vCPU 各走一條 vring，減少 §② kick 路徑的鎖爭用。converter 只對 `Bus == virtio` 的 disk 設 `Driver.Queues`。
+- **impact**：🟡 中 —— 對多 vCPU、多並行 IO 的 workload 有感（拉開 §①② 的並行度）；單 vCPU 或低並行時幾乎沒差。
+- **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`disk.Driver.Queues = numQueues` 僅在 virtio bus，約 L205-206；`blockMultiQueue` 推導出 `numBlkQueues = &vcpus` 約 L1580-1588）；欄位定義 `File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`BlockMultiQueue` 約 L493）。
+- **風險 / 前提**：注意 converter 裡那個 `multiQueueMaxQueues = uint32(256)`（約 L74）是**網路介面** multi-queue 的上限（用在 `network.go` 的 `NetworkQueuesCapacity`），不是 block 路徑的 cap；block 路徑直接用 vCPU 數，別把 256 當成 block queue 上限。
+
+### blockSize（對應 datapath 第 ① 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.devices.disks[].blockSize`，二選一：`custom.{logical,physical}` 或 `matchVolume`。
+- **作用機制**：決定 guest 看到的 logical / physical block size。guest block layer 會以這個粒度對齊與切 request（datapath §① 之前的 guest block layer）；對齊到底層 RBD object / `alloc_size` 邊界可減少 read-modify-write。
+- **impact**：🟢 低或情境性 —— 只有在 guest 與底層對齊不一致、或 4Kn 對齊敏感的 workload 才有感。
+- **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`BlockSize` 約 L658、`CustomBlockSize{Logical,Physical}` 約 L668-670、`MatchVolume` 約 L677）。
+- **風險 / 前提**：`custom` 與 `matchVolume` 只能擇一；改 block size 會改變 guest 看到的 geometry，對已有 filesystem 的盤要小心。
+
+### discard（對應 datapath 第 ⑤ 跳 / ① 層）
+- **在哪設**：不是直接欄位——KubeVirt 對 Disk / LUN 預設就把 `driver.discard = "unmap"`，除非該 volume 列在 `VolumesDiscardIgnore`。
+- **作用機制**：讓 guest 的 `discard`/`TRIM` 透傳成 RBD 的 discard op（datapath §⑤ krbd `rbd_img_fill_nodata` 走的就是 discard 路徑），可回收 thin-provisioned RBD image 的空間。
+- **impact**：🟢 低或情境性 —— 影響的是空間回收與 thin pool 健康度，不是穩態 throughput；對 discard 密集的 workload（刪檔多）才明顯。
+- **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`disk.Driver.Discard = "unmap"` 約 L196）。
+- **風險 / 前提**：discard 透傳到底層後，krbd 端的 discard 對齊由第 ④ 層 `alloc_size` 決定（小於一個 object 的 discard 會被 punt，見 rbd.c）。
+
+### hugepages（對應 datapath 第 ① 跳 / ① 層）
+- **在哪設**：VMI spec `spec.domain.memory.hugepages.pageSize`（x86_64 合法值 `2Mi` / `1Gi`）。
+- **作用機制**：用 hugepage 當 guest RAM backing。datapath §① §③ 的 vring buffer 與 `req->qiov` 都指向 guest memory（zero-copy），較大的 page 減少 TLB miss 與 page table walk，對高 IOPS 下的 memory access 路徑有間接幫助。
+- **impact**：🟢 低或情境性 —— 對 IO 路徑是間接效果（透過降低 memory 存取開銷），不是 IO 提交路徑本身的旋鈕。
+- **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`Memory.Hugepages` 約 L387、`Hugepages.PageSize` 約 L411-413）。
+- **風險 / 前提**：需要 host 預先保留 hugepage；保留不足會讓 VM 起不來。屬全域 memory 設定，影響面超出單顆盤。
+
+## ② libvirt / QEMU 層
+
+這一層是 VMI spec 被翻成 libvirt domain XML、再被 libvirt 組成 QEMU `-blockdev` / `-device` 命令列的地方（對應 datapath 頁的 §③ QEMU virtio-blk device 與 §④ QEMU 對 `/dev/rbdX` 發 aio）。多數情況你不直接寫這層，但理解它能解釋「為什麼我在 VMI 留空 `io`，最後 QEMU 卻跑 native AIO」。
+
+關鍵在 converter 的 `SetOptimalIOMode`：使用者沒指定 `io` 時，只要 `cache=none` 且後端是 block device（或預先配置好的 image），它就自動把 `io` 設成 `native`。
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go
+	// O_DIRECT is needed for io="native"
+	if v1.DriverCache(disk.Driver.Cache) == v1.CacheNone {
+		// set native for block device or pre-allocateed image file
+		if (disk.Source.Dev != "") || IsPreAllocated(disk.Source.File) {
+			disk.Driver.IO = v1.IONative
+		}
+	}
+```
+
+### aio mode（threads / native / io_uring，對應 datapath 第 ④ 跳 / ② 層）
+- **在哪設**：QEMU `-blockdev` 的 `aio` 選項（libvirt domain XML disk `driver io=` 屬性）。QEMU file-posix 接受 `threads` / `native` / `io_uring`。
+- **作用機制**：直接決定 datapath §④ `raw_co_prw` 走哪個分支——`io_uring` 走 `luring_co_submit`、`native`（laio）走 `laio_co_submit`、`threads` 退回 thread pool 的同步 `pread`/`pwrite`。這是 host 端 submit 路徑的核心岔路。
+- **impact**：🔴 高 —— 三種模式是三種提交模型，對 host submit 的 batching 與並行能力影響最大。
+- **來源**：`File: qemu/block/file-posix.c`（aio 選項 help「host AIO implementation (threads, native, io_uring)」約 L555-557；`use_linux_io_uring` 設定約 L640；分岔判斷 `raw_check_linux_io_uring` / `raw_check_linux_aio` 約 L2438-2459）。
+- **風險 / 前提**：`native` 與 `io_uring` 都要求 `O_DIRECT`（見下一個參數）；io_uring 需要 host kernel 與 QEMU 編譯時都支援。KubeVirt 的 `io` 欄位本身只給到 `native`/`threads`，io_uring 屬這層的能力。
+
+### cache.direct / O_DIRECT（對應 datapath 第 ④ 跳 / ② 層）
+- **在哪設**：QEMU `-blockdev` 的 `cache.direct=on`（由 VMI `cache=none` 一路翻下來）。
+- **作用機制**：開啟後 QEMU 用 `O_DIRECT` 開 `/dev/rbdX`，繞過 host page cache。這是 `aio=native` 的硬前提：QEMU 在 `cache.direct` 沒開時用 `aio=native` 會直接報錯。
+- **impact**：🔴 高 —— 它是 native / io_uring 能否啟用的開關，且決定 IO 走不走 host page cache。
+- **來源**：`File: qemu/block/file-posix.c`（`aio=native` 缺 `cache.direct=on` 時 `error_setg` 報「it requires cache.direct=on」約 L716-718；`BDRV_O_NATIVE_AIO` 判斷約 L619）。
+- **風險 / 前提**：與 VMI `cache` 欄位是同一件事的兩個視角；改這層等於改第 ① 層的 cache 語意。
+
+### num-queues / queue-size（QEMU virtio-blk，對應 datapath 第 ① 跳 / ② 層）
+- **在哪設**：QEMU virtio-blk device 的 `num-queues` 與 `queue-size` 屬性（由第 ① 層 `blockMultiQueue` 推導 `num-queues`）。
+- **作用機制**：`num-queues` 決定 QEMU 端建幾條 virtqueue（對應 guest 看到的多 queue，datapath §①②）；`queue-size` 是每條 virtqueue 的 ring 大小，預設 256，間接決定 guest 端 virtio-blk 的 queue 深度（datapath §① 填 vring 的容量）。
+- **impact**：🟡 中 —— 在多 queue 已開的前提下，queue-size 影響的是單條 vring 能容納多少 in-flight request；對高並行 workload 有感。
+- **來源**：`File: qemu/hw/block/virtio-blk.c`（`DEFINE_PROP_UINT16("num-queues", ...)` 與 `DEFINE_PROP_UINT16("queue-size", VirtIOBlock, conf.queue_size, 256)` 約 L1997-1999；`s->conf.num_queues` 使用約 L1061、L1260）。
+- **風險 / 前提**：透過 KubeVirt 走時你通常只控 `blockMultiQueue`（決定 num-queues），`queue-size` 走 QEMU 預設；直接改要確認 libvirt / KubeVirt 版本是否允許覆寫。
+
+### cache=none ⇒ io=native 自動推導（這層的核心教學點）
+- **在哪設**：不是手設參數，是 converter `SetOptimalIOMode` 的自動行為。
+- **作用機制**：VMI 沒指定 `io` 時，只要 `cache=none` 且後端是 block device（RBD `/dev/rbdX` 即是），converter 自動把 `io` 設成 `native`。這解釋了「我只設了 `cache=none`，最後卻跑 native AIO」。若使用者已明設 `io`，函式開頭直接 return、不覆蓋。
+- **impact**：🔴 高（理解它，而非調它）—— 它是第 ① 層 `cache` 與 host 端 AIO 模型之間的隱形連結；不懂這條推導，就會誤以為要手動填 `io`。
+- **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`SetOptimalIOMode` 約 L441-470，O_DIRECT 註解與 `disk.Driver.IO = v1.IONative` 約 L457-462）。
+- **風險 / 前提**：推導只在「使用者沒指定 `io`」時發生；一旦手填 `io`，這條 auto 路徑就被跳過。註解也明說目前對 sparse file 不主動設 `io=threads`，所以非 block / 非 preallocated 後端可能留空。
+
+## ③ guest virtio 層
+
+這一層是在 **guest 內部**調 block queue 行為——也就是 datapath §① guest block layer → virtio-blk → vring 那一段。這些是 guest kernel 的 sysfs / blk-mq 旋鈕，host 端看不到，要 ssh 進 VM 改。多數沒有單一可引用的「參數定義」原始碼行，機制可在 kernel source 找到、但旋鈕本身是通用 block-queue sysfs，因此來源以官方 kernel 文件為準。
+
+### guest IO scheduler（對應 datapath 第 ① 跳 / ③ 層）
+- **在哪設**：guest 內 `/sys/block/vda/queue/scheduler`（none / mq-deadline / bfq / kyber）。
+- **作用機制**：決定 guest blk-mq 在送進 virtio-blk `virtio_queue_rq`（datapath §①）之前怎麼排序 / 合併 request。底層是 RBD（已有 ceph 端排程），guest 端再排一次通常多餘，`none` 把排序交給下層。
+- **impact**：🟡 中 —— 對 virtio + 網路後端，guest 端再排程多半是負擔；切 `none` 常見地降低 guest 內 CPU 與延遲，但屬情境性。
+- **來源**：官方 kernel 文件 `https://www.kernel.org/doc/html/latest/block/queue-sysfs.html`（`scheduler`）；機制端對應 `File: linux/drivers/block/virtio_blk.c` 的 `virtio_queue_rq`。
+- **風險 / 前提**：scheduler 選擇與 workload 強相關，必須在你環境實測對照，不能照抄。
+
+### nr_requests（guest queue 深度，對應 datapath 第 ① 跳 / ③ 層）
+- **在哪設**：guest 內 `/sys/block/vda/queue/nr_requests`。
+- **作用機制**：guest blk-mq 每個 hw queue 允許的 in-flight request 數。深度不足會讓並行 IO 卡在 §① `virtio_queue_rq` 之前排隊。注意 virtio-blk 的預設 tag 深度其實是「填滿 vring」——沒設 module 參數時取 `vq->num_free`，所以 nr_requests 的可調上限受 virtqueue 大小（第 ② 層 `queue-size`）約束。
+- **impact**：🟡 中 —— 並行度不夠時拉高有感；但實際上限被 vring 大小綁住，不是無限。
+- **來源**：機制 `File: linux/drivers/block/virtio_blk.c`（預設 queue 深度填 ring，`queue_depth = vblk->vqs[0].vq->num_free` 約 L1305-1313）；旋鈕本身見官方 kernel 文件 `https://www.kernel.org/doc/html/latest/block/queue-sysfs.html`。
+- **風險 / 前提**：拉高 nr_requests 超過 vring 容量不會生效；要同時放大 queue-size 才有意義。
+
+### rq_affinity（對應 datapath 第 ① 跳 / ③ 層）
+- **在哪設**：guest 內 `/sys/block/vda/queue/rq_affinity`（0 / 1 / 2）。
+- **作用機制**：決定 IO completion 在哪個 CPU 處理——讓 completion 回到送出 request 的 CPU（或其 cache domain），減少 cache miss 與跨核搬運。對多 vCPU + 多 virtqueue 的 guest 影響並行 completion 的 CPU 分佈。
+- **impact**：🟢 低或情境性 —— 只在多核高 IOPS 下才量得出差異。
+- **來源**：官方 kernel 文件 `https://www.kernel.org/doc/html/latest/block/queue-sysfs.html`（`rq_affinity`）。
+- **風險 / 前提**：依環境實測，效果與 vCPU 數、IRQ affinity 設定強相關。
+
+### virtio queue depth（guest 端可見深度，對應 datapath 第 ① 跳 / ③ 層）
+- **在哪設**：guest virtio-blk module 參數 `virtio_blk.queue_depth`（開機參數），或退而求其次靠 vring 大小決定。
+- **作用機制**：直接覆寫 virtio-blk 的 blk-mq tag 深度（`tag_set.queue_depth`）。沒設時走「填滿 ring」的預設邏輯。這控制的是 datapath §① 進 vring 之前的並行容量。
+- **impact**：🟡 中 —— 與 nr_requests 同一條路徑上的並行旋鈕，受 vring 大小約束。
+- **來源**：`File: linux/drivers/block/virtio_blk.c`（module 參數 `queue_depth` 約 L1248-1249，套用到 `tag_set.queue_depth` 約 L1306-1317）。
+- **風險 / 前提**：是開機 module 參數，改了要重開 guest；與 host 端 `queue-size` / vring 容量交互。
+
+## ④ host krbd 層
+
+這一層是 host kernel 把 `/dev/rbdX` 接出來的地方——datapath §⑤ krbd → libceph → TCP。調的方式有兩類：一是 `rbd map` 的 `--options`（ceph-csi 透過 StorageClass / PV 的 `mapOptions` 傳進來），二是 host 端 `/sys/block/rbdX/queue/*`。
+
+ceph-csi 對 krbd 固定先補 `--device-type krbd --options noudev`，使用者的 `mapOptions` 接在後面、可覆寫預設。
+
+```go
+// File: ceph-csi/internal/rbd/rbd_attach.go
+func appendKRbdDeviceTypeAndOptions(cmdArgs []string, userOptions string) []string {
+	// Enable mapping and unmapping images from a non-initial network
+	// namespace (e.g. for Multus CNI).  The network namespace must be
+	// owned by the initial user namespace.
+	cmdArgs = append(cmdArgs, "--device-type", accessTypeKRbd, "--options", "noudev")
+
+	if userOptions != "" {
+		// userOptions is appended after, possibly overriding the above
+		// default options.
+		cmdArgs = append(cmdArgs, "--options", userOptions)
+	}
+
+	return cmdArgs
+}
+```
+
+這些 `--options` 字串實際由 kernel 解析：`queue_depth` 與 `alloc_size` 由 rbd.c 自己的 parser 處理，`read_from_replica` 與 `crush_location` 則由底層 libceph 的 option parser 處理。
+
+```c
+// File: linux/drivers/block/rbd.c
+static const struct fs_parameter_spec rbd_parameters[] = {
+	fsparam_u32	("alloc_size",			Opt_alloc_size),
+	...
+	fsparam_u32	("queue_depth",			Opt_queue_depth),
+	...
+};
+```
+
+### queue_depth（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：`rbd map --options queue_depth=...`（ceph-csi StorageClass `mapOptions`）。
+- **作用機制**：直接設 krbd 的 blk-mq `tag_set.queue_depth`，也就是 host 端 `/dev/rbdX` 允許的 in-flight request 數（datapath §⑤ `rbd_queue_workfn` 之前的排隊容量）。深度不足會在 host 端就把並行壓下來，不管 ceph 端多快。
+- **impact**：🔴 高 —— 它是 host 到 OSD 這一段的並行上限；對高 QD workload 直接決定能不能打滿 ceph。
+- **來源**：`File: linux/drivers/block/rbd.c`（token `queue_depth` 約 L817、`opt->queue_depth = result.uint_32` 約 L6282、套用 `tag_set.queue_depth = rbd_dev->opts->queue_depth` 約 L4959；預設 `RBD_QUEUE_DEPTH_DEFAULT = BLKDEV_DEFAULT_RQ` 約 L837）。
+- **風險 / 前提**：拉太高會增加 OSD 端壓力與 memory 佔用；要搭配 ceph 端容量一起看，不是越大越好。
+
+### alloc_size（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：`rbd map --options alloc_size=...`（預設 64KiB）。
+- **作用機制**：krbd 把它設成 block queue 的 `io_min` / `io_opt`，並當作 discard 對齊粒度。它影響 §⑤ 把 block request 切成 object op 時的對齊，以及小於一個 object 的 discard 會不會被 punt。
+- **impact**：🟡 中 —— 影響 IO 對齊與 discard 行為；對一般 read/write throughput 是次要旋鈕，對 discard 密集或對齊敏感 workload 才明顯。
+- **來源**：`File: linux/drivers/block/rbd.c`（token `alloc_size` 約 L809、`opt->alloc_size` 約 L6289、`blk_queue_io_min/io_opt` 與 `discard_granularity` 約 L4994-4998；預設 `RBD_ALLOC_SIZE_DEFAULT = 64 * 1024` 約 L838；必須是 2 的次方，否則 `inval_plog` 報錯 約 L6288）。
+- **風險 / 前提**：必須是 power of 2，且不能大於 object size（大於會被 rbd 調回 object size，rbd.c 約 L7144-7147）。
+
+### read_from_replica（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：`rbd map --options read_from_replica=...`（`no` / `balance` / `localize`），由底層 libceph 解析。
+- **作用機制**：改變 read op 的目標 OSD 選擇——預設 read 一律打 primary（datapath §⑤ libceph 用 CRUSH 算 primary）；`localize` 讓 read 可走 CRUSH 拓樸上較近的 replica，配合 `crush_location` 用。它設定的是 `osd_req->r_flags`。
+- **impact**：🟢 低或情境性 —— 只對 read-heavy 且 client 與 replica 有明顯拓樸 / 網路距離差異的場景有感；write 不受影響（write 一律走 primary）。
+- **來源**：`File: linux/net/ceph/ceph_common.c`（`read_from_replica` 的 enum `no`/`balance`/`localize` 約 L258-263）；套用點 `File: linux/drivers/block/rbd.c`（`osd_req->r_flags = CEPH_OSD_FLAG_READ | opt->read_from_replica` 約 L1413）。語意參考官方 `rbd` man page `https://docs.ceph.com/en/latest/man/8/rbd/`。
+- **風險 / 前提**：`localize` 沒搭 `crush_location` 標好 client 拓樸位置就沒意義；讀到非 primary 在某些一致性敏感場景要評估。
+
+### crush_location（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：`rbd map --options crush_location=...`（例如 `zone:zone1`），由 libceph 解析。
+- **作用機制**：告訴 libceph「這個 client 在 CRUSH 拓樸的哪個位置」，配合 `read_from_replica=localize` 讓 read 選擇拓樸上較近的 OSD（datapath §⑤ OSD 選擇）。
+- **impact**：🟢 低或情境性 —— 只有搭 `read_from_replica=localize` 且跨 zone / 跨 rack 拓樸時才有意義。
+- **來源**：`File: linux/net/ceph/ceph_common.c`（`fsparam_string("crush_location", Opt_crush_location)` 約 L288）；語意參考官方 `rbd` man page `https://docs.ceph.com/en/latest/man/8/rbd/`。
+- **風險 / 前提**：拓樸字串要對得上實際 CRUSHMap 的 bucket 名稱，否則無效。ceph-csi 也有 read-affinity 機制可自動帶這個（見 `getMapOptions` 的 `GetReadAffinityMapOptions`）。
+
+### host sysfs /sys/block/rbdX/queue/*（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：host 端 `/sys/block/rbdX/queue/nr_requests`、`/scheduler` 等。
+- **作用機制**：host 端對 `/dev/rbdX` 這顆 block device 的 blk-mq 行為（排程、queue 深度）。krbd 預設把 scheduler 走 blk-mq、`QUEUE_FLAG_NONROT` 設好（rbd.c 建 disk 時設定），多數情況不需動。
+- **impact**：🟢 低或情境性 —— `queue_depth` 已經涵蓋主要並行旋鈕，這裡的 sysfs 多為微調。
+- **來源**：機制 `File: linux/drivers/block/rbd.c`（建立 disk / 設定 queue flag 約 L4987-4998）；sysfs 旋鈕本身見官方 kernel 文件 `https://www.kernel.org/doc/html/latest/block/queue-sysfs.html`。
+- **風險 / 前提**：依環境實測；與 `queue_depth` map option 的效果可能重疊。
+
+## ⑤ Ceph / RBD 層
+
+最後一層是 image 本身在 RADOS 的 layout，以及 OSD 端的排程。這對應 datapath 頁文末交棒給 [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) 的部分。RBD image layout 的細節見 [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi)。
+
+<Callout type="info" title="librbd-only 的旋鈕，krbd 路徑不走">
+  Ceph 有一批常被提到的 RBD 效能旋鈕——`rbd_cache`、`rbd_readahead_max_bytes` 等——是 **librbd**（user-space）的選項，service 標的就是 `rbd`。本頁主軸 krbd 走的是 host kernel 的 rbd module，**完全不經過 librbd**，所以這些 `rbd_cache` / `rbd_readahead` 對 krbd 路徑無效。要用它們得改走 librbd（QEMU 內建 rbd driver 或 rbd-nbd mounter），那是另一條 datapath。來源：`File: ceph/src/common/options/rbd.yaml.in`（`rbd_cache` 約 L100、`services: [rbd]`；`rbd_readahead_max_bytes` 約 L257）。
+</Callout>
+
+### RBD object-size（對應 datapath 第 ⑤ 跳 / ⑤ 層）
+- **在哪設**：建 image 時 `rbd create --object-size ...`（ceph-csi StorageClass 也可帶；預設 4MiB）。
+- **作用機制**：決定一個 RBD image 被切成多大的 RADOS object（datapath §⑤ `rbd_img_fill_from_bio` 把 block request 依 object layout 切片）。object 越大，單一 4K write 落在同一 object 的機率越高（單一 obj_request）；但大 object 也讓並行寫同一 object 時 contention 上升。
+- **impact**：🟡 中 —— 改變 IO 與 object 的切片關係，對大 IO / 順序 IO 的 object 命中與並行有結構性影響。
+- **來源**：官方文件 `https://docs.ceph.com/en/latest/man/8/rbd/`（`--object-size`）；切片機制見 datapath §⑤ `File: linux/drivers/block/rbd.c`。
+- **風險 / 前提**：建立後不能直接改既有 image 的 object-size；屬建檔期決策。
+
+### RBD striping（stripe-unit / stripe-count，對應 datapath 第 ⑤ 跳 / ⑤ 層）
+- **在哪設**：建 image 時 `rbd create --stripe-unit ... --stripe-count ...`。
+- **作用機制**：把連續 IO 打散到多個 object（進而多個 OSD），提高並行（datapath §⑤ 一個 request 可能切成落在不同 OSD 的多個 obj_request），對大順序 IO 有利。
+- **impact**：🟡 中 —— 對大 IO / 高吞吐順序 workload 有結構性幫助；對小隨機 IO 幫助有限。
+- **來源**：官方文件 `https://docs.ceph.com/en/latest/man/8/rbd/`（`--stripe-unit` / `--stripe-count`）。
+- **風險 / 前提**：建立後不可改；striping 設不好反而打散 locality。屬建檔期決策。
+
+### osd_op_num_shards（對應 datapath OSD 端 / ⑤ 層）
+- **在哪設**：OSD 端 `ceph.conf` / `ceph config set osd osd_op_num_shards ...`（預設 0，0 表示用 `_hdd` / `_ssd` 變體：HDD 1、SSD 8）。
+- **作用機制**：決定每個 OSD 有幾個 shard，每個 shard 有自己的處理 queue，PG 平均分到各 shard。這是 OSD 端（datapath 交棒給 BlueStore 之前）處理並行度的旋鈕。
+- **impact**：🟡 中 —— 屬 OSD 端 throughput 旋鈕，影響的是 ceph 那一側能吃多少並行，不是虛擬化層；要搭 OSD CPU / 媒體型態一起看。
+- **來源**：`File: ceph/src/common/options/osd.yaml.in`（`osd_op_num_shards` 約 L945、`osd_op_num_shards_hdd` 預設 1、`osd_op_num_shards_ssd` 預設 8 約 L955-969）。
+- **風險 / 前提**：是 `startup` flag，改了要重啟 OSD；屬 ceph cluster 範圍設定，影響所有 pool。深入見 [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) 與 mClock 排程頁。
+
+## 全參數 impact 總表
+
+依 impact 由高到低排序。這張表是後續效能實驗計畫頁挑「先驗證哪幾個」的依據——🔴 的優先量。
+
+| 參數 | 層 | 在哪設 | impact 一句話 | 風險 / 前提 |
+|------|----|--------|--------------|-------------|
+| cache | ① | VMI `disks[].cache` | 🔴 決定走不走 page cache、是不是 O_DIRECT，並開關 native AIO | writeback 把 correctness 押在 page cache |
+| io | ① | VMI `disks[].io` | 🔴 native vs threads 是兩種提交模型 | native 需 O_DIRECT（搭 cache=none） |
+| aio mode | ② | QEMU `-blockdev` aio | 🔴 threads/native/io_uring 決定 host submit 路徑 | native/io_uring 需 cache.direct=on |
+| cache.direct / O_DIRECT | ② | QEMU `cache.direct=on` | 🔴 是 native/io_uring 的硬前提 | 與 ① cache 同一件事 |
+| cache=none⇒io=native 推導 | ② | converter `SetOptimalIOMode` | 🔴 理解項（非旋鈕）：知道為何留空也跑 native | 手填 io 會跳過推導 |
+| queue_depth | ④ | `rbd map --options` | 🔴 host→OSD 這段的並行上限 | 太高增加 OSD 壓力 |
+| ioThreadsPolicy / dedicatedIOThread | ① | VMI `ioThreadsPolicy` / `dedicatedIOThread` | 🟡 多盤高並行時避免共用 event loop | dedicated 隱含 useIOThreads |
+| blockMultiQueue | ① | VMI `devices.blockMultiQueue` | 🟡 多 vCPU 各走一條 vring，減 kick 爭用 | 256 是網路 cap，非 block |
+| num-queues / queue-size | ② | QEMU virtio-blk | 🟡 每條 vring 容納多少 in-flight | 透過 KubeVirt 多走預設 |
+| guest IO scheduler | ③ | guest `/sys/block/vda/queue/scheduler` | 🟡 底層已排程，guest 再排多半多餘 | 強依 workload，須實測 |
+| nr_requests（guest） | ③ | guest `/sys/.../nr_requests` | 🟡 guest 並行容量，受 vring 約束 | 超過 vring 不生效 |
+| virtio queue depth | ③ | guest `virtio_blk.queue_depth` | 🟡 覆寫 virtio-blk tag 深度 | module 參數，要重開 guest |
+| alloc_size | ④ | `rbd map --options` | 🟡 IO 對齊 / discard 粒度 | 須 power of 2、不大於 object |
+| RBD object-size | ⑤ | `rbd create --object-size` | 🟡 IO 與 object 切片關係 | 建檔期決策，不可改 |
+| RBD striping | ⑤ | `rbd create --stripe-*` | 🟡 連續 IO 打散到多 OSD | 建檔期決策，不可改 |
+| osd_op_num_shards | ⑤ | OSD `ceph.conf` | 🟡 OSD 端處理並行度 | startup flag，要重啟 OSD |
+| blockSize | ① | VMI `disks[].blockSize` | 🟢 對齊敏感 workload 才有感 | custom / matchVolume 擇一 |
+| discard | ① | converter 預設 `unmap` | 🟢 空間回收，非穩態吞吐 | 對齊受 alloc_size 約束 |
+| hugepages | ① | VMI `memory.hugepages` | 🟢 間接降 memory 存取開銷 | 需 host 預留 hugepage |
+| rq_affinity | ③ | guest `/sys/.../rq_affinity` | 🟢 completion CPU 親和，多核才有感 | 依環境實測 |
+| read_from_replica | ④ | `rbd map --options` | 🟢 read-heavy + 拓樸差異才有感 | 需搭 crush_location |
+| crush_location | ④ | `rbd map --options` | 🟢 搭 localize 跨 zone 才有意義 | 字串要對上 CRUSHMap |
+| host sysfs rbdX/queue/* | ④ | host `/sys/block/rbdX/queue/*` | 🟢 queue_depth 已涵蓋主要旋鈕 | 與 map option 重疊 |
+
+## 接下來 / 相關頁面
+
+<Callout type="info" title="目錄有了，下一步是按 impact 系統化驗證">
+  這頁把五層的旋鈕、各自改變哪一跳、impact 機制理由與原始碼來源整理成目錄。但 impact 等級是**機制推論**，不是你環境的實測——真正的數字要按上面總表，從 🔴 開始一個一個量。
+
+  - [VM Disk IO datapath](./rbd-io-datapath) — 這份目錄的地圖底稿；每個參數的「作用機制」都連回它的某一跳
+  - **效能實驗計畫**（即將補上 `./rbd-io-experiment-plan`）— 用 fio 在 guest `/dev/vda` 與 host `/dev/rbdX` 兩個邊界各跑一輪，從本頁 🔴 參數開始系統化驗證
+  - [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi) — RBD image 在 RADOS 的 object layout，第 ⑤ 層 object-size / striping 的背景
+  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) — `osd_op_num_shards` 之後 OSD 端怎麼落地，本頁 ⑤ 層交棒處
+</Callout>
