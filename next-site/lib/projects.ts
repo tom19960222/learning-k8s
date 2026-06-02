@@ -503,6 +503,43 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
     },
   },
+  'vm-storage-perf': {
+    id: 'vm-storage-perf',
+    displayName: 'VM Disk IO 效能調教',
+    shortName: 'VM IO',
+    description: '跨 KubeVirt / libvirt / QEMU / Linux kernel / Ceph 五層，追 VM disk IO 全路徑與效能調教',
+    githubUrl: '',
+    submodulePath: '',
+    color: 'cyan',
+    accentClass: 'border-cyan-500 text-cyan-400',
+    features: ['rbd-io-datapath'],
+    featureGroups: [
+      { label: 'IO 路徑', icon: '🔬', slugs: ['rbd-io-datapath'] },
+    ],
+    usecases: [],
+    difficulty: '🔴 進階',
+    difficultyColor: 'text-red-400 bg-red-400/10 border-red-400/30',
+    problemStatement: 'KubeVirt VM 的 disk 在 Ceph RBD 上，一個 IO 從 guest 內到 OSD 要穿過 virtio、KVM、QEMU、host kernel krbd、libceph 五層。每一層都有可調參數會影響效能。這個分類從原始碼層拆完整 datapath，再逐步建立可調參數目錄與效能實驗計畫。',
+    story: {
+      protagonist: '🧑‍💻 平台 SRE 你自己',
+      challenge: 'KubeVirt VM 跑在 Ceph RBD 上，benchmark 數字不如預期。但 IO 從 guest 到 OSD 經過太多層，不知道瓶頸在哪、也不知道該調哪個參數。決定先把整條 datapath 從原始碼拆透，再來做效能調教。',
+      scenes: [
+        { step: 1, icon: '🔬', actor: '你', action: '讀 rbd-io-datapath：一個 4K write 的完整路徑', detail: 'guest virtio-blk → vring/ioeventfd → KVM vmexit → QEMU block layer → host /dev/rbdX → krbd → libceph → TCP → OSD。每一跳對應一個資料結構與關鍵函式。' },
+      ],
+      outcome: '從此 VM disk IO 不是黑盒。看到延遲時知道該量哪一跳、調哪一層的參數。',
+    },
+    learningPaths: {
+      beginner: [
+        { slug: 'rbd-io-datapath', note: '先把一個 IO 從 VM 到 Ceph 的完整路徑走一遍' },
+      ],
+      intermediate: [
+        { slug: 'rbd-io-datapath', note: '每一跳的資料結構與關鍵函式，建立後續調參的地圖' },
+      ],
+      advanced: [
+        { slug: 'rbd-io-datapath', note: '邊界與除錯：延遲落在哪一跳怎麼判斷' },
+      ],
+    },
+  },
 }
 
 export const PROJECT_IDS: ProjectId[] = Object.keys(PROJECTS)
