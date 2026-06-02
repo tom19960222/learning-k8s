@@ -18,7 +18,7 @@
 | QEMU | `v9.1.0` | v1.5.0 `rpm/BUILD.bazel`：`qemu-kvm-core-9.1.0-12.el9` | submodule v11.0.0 → **v9.1.0** re-pin |
 | libvirt | `v10.10.0` | v1.5.0 `rpm/BUILD.bazel`：`libvirt-*-10.10.0-4.el9` | submodule v12.3.0 → **v10.10.0** re-pin |
 | Linux kernel | `applied/6.8.0-52.53_22.04.1` | 使用者 host：`6.8.0-52-generic #53~22.04.1-Ubuntu` | **新增** submodule，from `https://git.launchpad.net/ubuntu/+source/linux-hwe-6.8`（`applied/...` tag = Ubuntu patch 已套用，貼合 running kernel）|
-| ceph-csi | `v3.12.x`（clone 時確認該系列最新 patch tag） | krbd mounter 路徑 | **新增** submodule |
+| ceph-csi | `v3.14.0` | krbd mounter 路徑（使用者指定） | **新增** submodule |
 | ceph | `v19.2.3` | 既有 submodule | 不動 |
 
 備註：
