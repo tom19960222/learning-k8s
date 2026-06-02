@@ -18,7 +18,7 @@ description: VirtualMachineInstanceMigration → target Pod → libvirt MigrateV
         │  spec.vmiName = "my-vm"
         │
         ▼  apiserver watch event
-   Migration controller (pkg/virt-controller/watch/migration/migration.go:120)
+   Migration controller (pkg/virt-controller/watch/migration/migration.go:95)
         │
         ├─ validate VMI 處於可 migrate 狀態 (Running、Pod Ready、有 LiveMigratable condition)
         ├─ 建 target virt-launcher Pod
@@ -57,7 +57,7 @@ description: VirtualMachineInstanceMigration → target Pod → libvirt MigrateV
 ## libvirt MigrateVMI 的入口
 
 ```go
-// File: pkg/virt-launcher/virtwrap/manager.go (line 683)
+// File: pkg/virt-launcher/virtwrap/manager.go (line 659)
 func (l *LibvirtDomainManager) MigrateVMI(vmi *v1.VirtualMachineInstance, options *cmdclient.MigrationOptions) error {
     // 算 migration flags
     // 起 monitor goroutine
@@ -68,7 +68,7 @@ func (l *LibvirtDomainManager) MigrateVMI(vmi *v1.VirtualMachineInstance, option
 具體流程在 `live-migration-source.go`：
 
 ```go
-// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 285)
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 318)
 func (l *LibvirtDomainManager) startMigration(vmi *v1.VirtualMachineInstance, options *cmdclient.MigrationOptions) error {
     // 1. classify volumes (shared / generated / local-to-migrate)
     // 2. 計算 disk migration target list (block migration)
@@ -81,7 +81,7 @@ func (l *LibvirtDomainManager) startMigration(vmi *v1.VirtualMachineInstance, op
 migration flags 由 `generateMigrationFlags` 產出：
 
 ```go
-// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 96)
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 99)
 func generateMigrationFlags(isBlockMigration, migratePaused bool, options *cmdclient.MigrationOptions) libvirt.DomainMigrateFlags {
     // 組 LIVE | PEER2PEER | TUNNELLED | AUTO_CONVERGE | POSTCOPY | ... 等 flag
 }
@@ -164,7 +164,7 @@ source: 抄一輪 (state + 部分 page)
 ## migrationMonitor：判斷收不收斂
 
 ```go
-// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 407)
+// File: pkg/virt-launcher/virtwrap/live-migration-source.go (line 423)
 func newMigrationMonitor(vmi *v1.VirtualMachineInstance, l *LibvirtDomainManager, options *cmdclient.MigrationOptions, migrationErr chan error) *migrationMonitor {
     // 起一個 goroutine 定時 query libvirt migration job stat
     // 看 iteration 次數、dirty rate、bytes transferred
@@ -222,9 +222,9 @@ source virt-launcher 發 MigrateVMI 時，libvirt 看到的是「對 unix socket
 
 ## 原始碼參考
 
-- [pkg/virt-controller/watch/migration/migration.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migration.go) — Migration controller
-- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/manager.go) — `MigrateVMI` (line 683)
-- [pkg/virt-launcher/virtwrap/live-migration-source.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/live-migration-source.go) — flags (line 96)、startMigration (line 285)、monitor (line 407)
-- [pkg/virt-handler/migration-proxy/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-handler/migration-proxy) — socket→TCP proxy
-- [pkg/virt-controller/watch/migration/migrationpolicy.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-controller/watch/migration/migrationpolicy.go) — migration policy CRD handling
+- [pkg/virt-controller/watch/migration/migration.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-controller/watch/migration/migration.go) — Migration controller
+- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-launcher/virtwrap/manager.go) — `MigrateVMI` (line 659)
+- [pkg/virt-launcher/virtwrap/live-migration-source.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-launcher/virtwrap/live-migration-source.go) — flags (line 99)、startMigration (line 318)、monitor (line 423)
+- [pkg/virt-handler/migration-proxy/](https://github.com/kubevirt/kubevirt/tree/v1.5.0/pkg/virt-handler/migration-proxy) — socket→TCP proxy
+- [pkg/virt-controller/watch/migration/migrationpolicy.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-controller/watch/migration/migrationpolicy.go) — migration policy CRD handling
 - [libvirt MigrateToURI3](https://libvirt.org/html/libvirt-libvirt-domain.html#virDomainMigrateToURI3) — libvirt 官方 doc

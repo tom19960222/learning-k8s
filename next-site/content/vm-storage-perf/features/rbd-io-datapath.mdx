@@ -1,0 +1,615 @@
+---
+layout: doc
+title: VM Disk IO — KubeVirt + Ceph RBD（krbd）一個 IO 從 guest 到 OSD 的完整路徑
+description: 以 krbd 為主軸，把 KubeVirt VM（volumeMode Block 的 RBD PVC）裡一個 guest 4K write，從 guest virtio-blk、ioeventfd/KVM、virt-launcher 內 QEMU、host kernel krbd 到 libceph TCP 上線到 OSD 的五層全路徑拆透，每一跳附原始碼錨點。版本對齊 kubevirt v1.5.0 / libvirt v10.10.0 / qemu v9.1.0 / host kernel 6.8.0-52 / ceph v19.2.3 / ceph-csi v3.14.0。
+---
+
+## 場景：guest 裡一個 4K write 到底經過幾層
+
+你有一個 KubeVirt VM，它的 disk 是一個 Ceph RBD 的 PVC。ceph-csi 用 krbd mounter、`volumeMode: Block` 把這個 RBD image map 成 node 上的一個 `/dev/rbdX`，virt-launcher Pod 裡的 QEMU 直接拿這個 block device 當 VM 的 virtio-blk disk。
+
+現在 VM 裡的 guest 應用程式對它的 disk 發一個 4K write。這個 write 不是「寫到一顆硬碟」這麼單純 — 它要依序穿過五層：
+
+1. **guest 內**：guest kernel 的 block layer → virtio-blk driver → 把 request 放進 vring
+2. **guest→host 邊界**：vring kick → ioeventfd → KVM 把 vmexit 轉成 host 上 eventfd 的訊號 → QEMU 收到 host notifier
+3. **virt-launcher 內的 QEMU**：QEMU virtio-blk device backend 解析 request → 丟進 QEMU block layer
+4. **QEMU→host kernel**：QEMU 對 `/dev/rbdX` 發 aio（pwrite / io_uring / libaio）
+5. **host kernel**：krbd 把 block request 變成 RBD object op → libceph 算出 target OSD → messenger 走 TCP 把 message 送上線
+
+OSD 收到之後 BlueStore 怎麼落地，這頁不重複（見文末連結到 Ceph 的頁面）。本頁主軸是 **krbd**（kernel RBD），librbd（user-space）只在最後做一兩句對照。
+
+## 全路徑一張圖
+
+先看整條路徑。左到右是五層，每一跳標出關鍵函式所在的 repo 與檔案。這張圖請先看過，後面每一節的程式碼都對得回這張圖上的某一跳。
+
+```
+ guest（VM 內）            │ guest→host 邊界        │ virt-launcher Pod 內的 QEMU   │ host kernel（krbd）
+─────────────────────────┼────────────────────────┼──────────────────────────────┼─────────────────────────────
+                         │                        │                              │
+ app write(4K)           │                        │                              │
+   │                     │                        │                              │
+ guest block layer       │                        │                              │
+   │ blk-mq              │                        │                              │
+ virtio_blk driver       │                        │                              │
+   │ virtio_queue_rq     │                        │                              │
+   │ virtblk_add_req     │                        │                              │
+ vring（descriptor）     │                        │                              │
+   │ virtqueue_add_sgs   │                        │                              │
+   │ virtqueue_notify    │                        │                              │
+   └── kick (MMIO write) ──► KVM 攔下 vmexit       │                              │
+                         │  ioeventfd_write        │                              │
+                         │  eventfd_signal         │                              │
+                         │     │                   │                              │
+                         │  host eventfd 變 readable                              │
+                         │     └──► QEMU host notifier                            │
+                         │        virtio_queue_host_notifier_read                 │
+                         │        virtio_queue_notify_vq                          │
+                         │           │                                            │
+                         │        virtio_blk_handle_output ──► virtio_blk_handle_request
+                         │                        │   解析 virtio_blk req header  │
+                         │                        │   submit_requests             │
+                         │                        │   blk_aio_pwritev             │
+                         │                        │      │ QEMU block layer       │
+                         │                        │   raw_co_prw（file-posix）    │
+                         │                        │   handle_aiocb_rw             │
+                         │                        │      │ pwrite() to /dev/rbdX ─┼──► krbd
+                         │                        │                              │ rbd_queue_rq
+                         │                        │                              │ rbd_queue_workfn
+                         │                        │                              │ rbd_img_fill_from_bio
+                         │                        │                              │ rbd_osd_submit
+                         │                        │                              │   │ libceph
+                         │                        │                              │ ceph_osdc_start_request
+                         │                        │                              │ ceph_con_send
+                         │                        │                              │ ceph_tcp_send ──► TCP ──► OSD
+```
+
+> 註：「kick」實作上是 guest 對 virtio device 的 notify register 做一次 MMIO/PIO write；KVM 把這個 write 攔成 vmexit，比對 ioeventfd 註冊的 addr/val 後 signal 對應的 host eventfd。第 ② 節會逐函式對照。
+
+## 前置：ceph-csi 怎麼把 RBD 變成 host 的 /dev/rbdX
+
+> 這節是前情提要：先看 RBD image 怎麼變成 host 的 `/dev/rbdX`，IO 路徑本體從第 ① 節 guest 內第一跳開始。
+
+在 VM 跑起來之前，ceph-csi 的 node plugin 已經先把 RBD image map 成 host 的 block device。`NodeStageVolume` 是 CSI node 端 stage 階段的入口，它最終走到 `attachRBDImage`。
+
+`attachRBDImage` 先 `waitForPath` 看 image 是不是已經 map 過；沒有的話就 `createPath`，由它組出 `rbd map` 的參數。
+
+```go
+// File: ceph-csi/internal/rbd/rbd_attach.go
+func attachRBDImage(ctx context.Context, volOptions *rbdVolume, device string, cr *util.Credentials) (string, error) {
+	var err error
+
+	image := volOptions.RbdImageName
+	useNBD := false
+	if volOptions.Mounter == rbdTonbd && hasNBD {
+		useNBD = true
+	}
+
+	devicePath, found := waitForPath(ctx, volOptions.Pool, volOptions.RadosNamespace, image, 1, useNBD)
+	if !found {
+		// ... waitForrbdImage(...)
+		devicePath, err = createPath(ctx, volOptions, device, cr)
+	}
+
+	return devicePath, err
+}
+```
+
+`createPath` 組出 mapArgs。對 krbd（非 NBD）來說，命令就是 `rbd --id <id> -m <monitors> --keyfile=... map <pool/image>`。注意 `cli := rbd` 走的是核心模組路徑，與 NBD 的 user-space mounter 不同 — 這就是 krbd 與 rbd-nbd 在 ceph-csi 裡分岔的地方。
+
+```go
+// File: ceph-csi/internal/rbd/rbd_attach.go
+	mapArgs := []string{
+		"--id", cr.ID,
+		"-m", volOpt.Monitors,
+		"--keyfile=" + cr.KeyFile,
+	}
+```
+
+接著補上 `map` 子命令與 device-type 參數——這個 `else` 分支就是 krbd 與 rbd-nbd 真正分岔的那幾行：krbd 走 `appendKRbdDeviceTypeAndOptions`（核心模組），rbd-nbd 走 `appendNbdDeviceTypeAndOptions`（user-space）。
+
+```go
+// File: ceph-csi/internal/rbd/rbd_attach.go
+	} else {
+		mapArgs = append(mapArgs, "map", imagePath)
+		if isNbd {
+			mapArgs = appendNbdDeviceTypeAndOptions(mapArgs, volOpt.MapOptions, volOpt.VolID)
+		} else {
+			mapArgs = appendKRbdDeviceTypeAndOptions(mapArgs, volOpt.MapOptions)
+		}
+	}
+```
+
+`rbd map` 成功後 host 上就出現 `/dev/rbd0`（或 `/dev/rbd/<pool>/<image>`）。因為 PVC 是 `volumeMode: Block`，這顆 block device 會被 bind 進 virt-launcher Pod，QEMU 直接拿它當 virtio-blk 的後端。底下五節就從 guest 內第一跳開始。
+
+## ① guest 內：block layer → virtio-blk driver → vring
+
+guest 應用程式的 write 經過 guest 自己的 VFS / page cache / block layer 之後，落到 blk-mq 的 `queue_rq` callback。virtio-blk 的 `queue_rq` 就是 `virtio_queue_rq`。它把這個 request 準備好，呼叫 `virtblk_add_req` 把它塞進 virtqueue，最後在 `bd->last` 時 `virtqueue_notify` kick host。
+
+```c
+// File: linux/drivers/block/virtio_blk.c
+static blk_status_t virtio_queue_rq(struct blk_mq_hw_ctx *hctx,
+			   const struct blk_mq_queue_data *bd)
+{
+	struct virtio_blk *vblk = hctx->queue->queuedata;
+	struct request *req = bd->rq;
+	struct virtblk_req *vbr = blk_mq_rq_to_pdu(req);
+	...
+	status = virtblk_prep_rq(hctx, vblk, req, vbr);
+	if (unlikely(status))
+		return status;
+
+	spin_lock_irqsave(&vblk->vqs[qid].lock, flags);
+	err = virtblk_add_req(vblk->vqs[qid].vq, vbr);
+	...
+	if (bd->last && virtqueue_kick_prepare(vblk->vqs[qid].vq))
+		notify = true;
+	spin_unlock_irqrestore(&vblk->vqs[qid].lock, flags);
+
+	if (notify)
+		virtqueue_notify(vblk->vqs[qid].vq);
+	return BLK_STS_OK;
+}
+```
+
+在進 vring 之前，request 先被翻成 virtio-blk 的命令格式。`virtblk_setup_cmd` 對一個 `REQ_OP_WRITE` 設定 `type = VIRTIO_BLK_T_OUT` 並記下起始 sector — 這就是 4K write 變成「virtio-blk OUT 命令」的地方。
+
+```c
+// File: linux/drivers/block/virtio_blk.c
+	switch (req_op(req)) {
+	case REQ_OP_READ:
+		type = VIRTIO_BLK_T_IN;
+		sector = blk_rq_pos(req);
+		break;
+	case REQ_OP_WRITE:
+		type = VIRTIO_BLK_T_OUT;
+		sector = blk_rq_pos(req);
+		break;
+```
+
+`virtblk_add_req` 把三段 scatter-gather（out header、data、in header for status）組成 `sgs[]`，交給 `virtqueue_add_sgs`。對 write 來說 data 段算在 `num_out` 裡，因為資料是 guest 要送出去的方向。
+
+```c
+// File: linux/drivers/block/virtio_blk.c
+static int virtblk_add_req(struct virtqueue *vq, struct virtblk_req *vbr)
+{
+	struct scatterlist out_hdr, in_hdr, *sgs[3];
+	unsigned int num_out = 0, num_in = 0;
+
+	sg_init_one(&out_hdr, &vbr->out_hdr, sizeof(vbr->out_hdr));
+	sgs[num_out++] = &out_hdr;
+
+	if (vbr->sg_table.nents) {
+		if (vbr->out_hdr.type & cpu_to_virtio32(vq->vdev, VIRTIO_BLK_T_OUT))
+			sgs[num_out++] = vbr->sg_table.sgl;
+		else
+			sgs[num_out + num_in++] = vbr->sg_table.sgl;
+	}
+
+	sg_init_one(&in_hdr, &vbr->in_hdr.status, vbr->in_hdr_len);
+	sgs[num_out + num_in++] = &in_hdr;
+
+	return virtqueue_add_sgs(vq, sgs, num_out, num_in, vbr, GFP_ATOMIC);
+}
+```
+
+`virtqueue_add_sgs` 數完 sg 總數後呼叫 `virtqueue_add`，把這些 buffer 變成 vring 的 descriptor 暴露給對端（host 的 QEMU）。
+
+```c
+// File: linux/drivers/virtio/virtio_ring.c
+int virtqueue_add_sgs(struct virtqueue *_vq,
+		      struct scatterlist *sgs[],
+		      unsigned int out_sgs,
+		      unsigned int in_sgs,
+		      void *data,
+		      gfp_t gfp)
+{
+	unsigned int i, total_sg = 0;
+
+	/* Count them first. */
+	for (i = 0; i < out_sgs + in_sgs; i++) {
+		struct scatterlist *sg;
+
+		for (sg = sgs[i]; sg; sg = sg_next(sg))
+			total_sg++;
+	}
+	return virtqueue_add(_vq, sgs, total_sg, out_sgs, in_sgs,
+			     data, NULL, gfp);
+}
+```
+
+## ② guest→host 邊界：vring kick → ioeventfd → KVM → QEMU host notifier
+
+descriptor 放好之後，guest 要通知 host「有東西可以處理了」。這就是 `virtqueue_notify`：它呼叫 `vq->notify(_vq)`，對 virtio-pci 來說就是對 device 的 notify register 做一次 MMIO write。
+
+```c
+// File: linux/drivers/virtio/virtio_ring.c
+bool virtqueue_notify(struct virtqueue *_vq)
+{
+	struct vring_virtqueue *vq = to_vvq(_vq);
+
+	if (unlikely(vq->broken))
+		return false;
+
+	/* Prod other side to tell it about changes. */
+	if (!vq->notify(_vq)) {
+		vq->broken = true;
+		return false;
+	}
+	return true;
+}
+```
+
+這個 MMIO write 會觸發一次 vmexit，落進 KVM。KVM 在 IO bus 上比對位址，若命中註冊過的 ioeventfd，就走 `ioeventfd_write`。它確認 addr/val 在範圍內後，呼叫 `eventfd_signal` 把對應的 host eventfd 點亮 — 注意這裡 **不** return 回 guest 之外做任何 device emulation，KVM 只負責 signal eventfd。這是 ioeventfd 的關鍵：把 guest 的 doorbell write 變成 host 上一個 eventfd 的可讀事件，讓 QEMU 的 IO thread 在 event loop 裡收。
+
+```c
+// File: linux/virt/kvm/eventfd.c
+/* MMIO/PIO writes trigger an event if the addr/val match */
+static int
+ioeventfd_write(struct kvm_vcpu *vcpu, struct kvm_io_device *this, gpa_t addr,
+		int len, const void *val)
+{
+	struct _ioeventfd *p = to_ioeventfd(this);
+
+	if (!ioeventfd_in_range(p, addr, len, val))
+		return -EOPNOTSUPP;
+
+	eventfd_signal(p->eventfd);
+	return 0;
+}
+```
+
+host eventfd 變 readable 之後，QEMU 在它的 AioContext event loop 裡收到，呼叫 `virtio_queue_host_notifier_read`。它 test-and-clear eventfd 後呼叫 `virtio_queue_notify_vq`。
+
+```c
+// File: qemu/hw/virtio/virtio.c
+void virtio_queue_host_notifier_read(EventNotifier *n)
+{
+    VirtQueue *vq = container_of(n, VirtQueue, host_notifier);
+    if (event_notifier_test_and_clear(n)) {
+        virtio_queue_notify_vq(vq);
+    }
+}
+```
+
+`virtio_queue_notify_vq` 呼叫這個 vq 的 `handle_output` callback。對 virtio-blk 來說，這個 callback 就是 `virtio_blk_handle_output` — 我們從此進入 QEMU 的 virtio-blk device backend。
+
+```c
+// File: qemu/hw/virtio/virtio.c
+static void virtio_queue_notify_vq(VirtQueue *vq)
+{
+    if (vq->vring.desc && vq->handle_output) {
+        VirtIODevice *vdev = vq->vdev;
+
+        if (unlikely(vdev->broken)) {
+            return;
+        }
+
+        trace_virtio_queue_notify(vdev, vq - vdev->vq, vq);
+        vq->handle_output(vdev, vq);
+        ...
+    }
+}
+```
+
+## ③ virt-launcher：QEMU virtio-blk device → QEMU block layer
+
+先補一句 virt-launcher 是怎麼讓 QEMU 認得這顆 disk 的。KubeVirt 的 virt-launcher Pod 裡是 libvirtd 啟動 QEMU，libvirt 把每個 disk 翻成 QEMU 的 `-blockdev` + `-device`。`qemuBuildDiskCommandLine` 是 libvirt 組 disk 命令列的入口，它先組 disk source（`-blockdev`），再組 `-device`。
+
+```c
+// File: libvirt/src/qemu/qemu_command.c
+qemuBuildDiskCommandLine(virCommand *cmd,
+                         const virDomainDef *def,
+                         virDomainDiskDef *disk,
+                         virQEMUCaps *qemuCaps)
+{
+    g_autoptr(virJSONValue) devprops = NULL;
+
+    if (qemuBuildDiskSourceCommandLine(cmd, disk, qemuCaps) < 0)
+        return -1;
+    ...
+    if (!(devprops = qemuBuildDiskDeviceProps(def, disk, qemuCaps)))
+        return -1;
+
+    if (qemuBuildDeviceCommandlineFromJSON(cmd, devprops, def, qemuCaps) < 0)
+        return -1;
+
+    return 0;
+}
+```
+
+實際把 `-blockdev` 加進命令列的是這幾行（storage / format 兩層各一個 `-blockdev`）。對 ceph-csi 的 `volumeMode: Block` 來說，底層的 `node-name` 指向的就是 host 的 `/dev/rbdX`，QEMU 用 `file-posix` driver 開它。
+
+```c
+// File: libvirt/src/qemu/qemu_command.c
+    if (data->storageProps) {
+        if (!(tmp = virJSONValueToString(data->storageProps, false)))
+            return -1;
+
+        virCommandAddArgList(cmd, "-blockdev", tmp, NULL);
+        VIR_FREE(tmp);
+    }
+```
+
+回到 IO 路徑。第 ② 節的 `handle_output` 落到 `virtio_blk_handle_output`，它（在 ioeventfd 已啟動的情況下）走 `virtio_blk_handle_vq`，逐一處理 vring 上的 request。
+
+```c
+// File: qemu/hw/block/virtio-blk.c
+static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+{
+    VirtIOBlock *s = (VirtIOBlock *)vdev;
+
+    if (!s->ioeventfd_disabled && !s->ioeventfd_started) {
+        /* Some guests kick before setting VIRTIO_CONFIG_S_DRIVER_OK so start
+         * ioeventfd here instead of waiting for .set_status().
+         */
+        virtio_device_start_ioeventfd(vdev);
+        if (!s->ioeventfd_disabled) {
+            return;
+        }
+    }
+
+    virtio_blk_handle_vq(s, vq);
+}
+```
+
+每個 request 由 `virtio_blk_handle_request` 解析。它先把 guest 放進 vring 的 virtio-blk out header 讀出來（`req->out`），算出方向與 sector。對 write（`VIRTIO_BLK_T_OUT`）來說，它用 out_iov 初始化 `req->qiov`，再把 request 放進 multi-request buffer 準備合併送出。
+
+```c
+// File: qemu/hw/block/virtio-blk.c
+    if (unlikely(iov_to_buf(out_iov, out_num, 0, &req->out,
+                            sizeof(req->out)) != sizeof(req->out))) {
+        virtio_error(vdev, "virtio-blk request outhdr too short");
+        return -1;
+    }
+    ...
+    type = virtio_ldl_p(vdev, &req->out.type);
+```
+
+`req->qiov` 是 QEMU 這側的 IO vector，直接指向 guest 的 buffer（zero-copy）。`block_acct_start` 開始計時這筆 IO（之後 `iostat` / `query-blockstats` 看到的 latency 就從這裡起算）。
+
+```c
+// File: qemu/hw/block/virtio-blk.c
+        if (is_write) {
+            qemu_iovec_init_external(&req->qiov, out_iov, out_num);
+            trace_virtio_blk_handle_write(vdev, req, req->sector_num,
+                                          req->qiov.size / BDRV_SECTOR_SIZE);
+```
+
+連續且相鄰的 request 會被 `virtio_blk_submit_multireq` 嘗試合併（依 sector 排序、不超過 max_transfer / max_iov），最後由 `submit_requests` 真正下發。
+
+```c
+// File: qemu/hw/block/virtio-blk.c
+        if (sector_num + nb_sectors != req->sector_num ||
+            niov > blk_get_max_iov(s->blk) - req->qiov.niov ||
+            req->qiov.size > max_transfer ||
+            nb_sectors > (max_transfer -
+                          req->qiov.size) / BDRV_SECTOR_SIZE) {
+            submit_requests(s, mrb, start, num_reqs, niov);
+            num_reqs = 0;
+        }
+```
+
+## ④ QEMU→host kernel：QEMU 對 /dev/rbdX 發 aio
+
+`submit_requests` 是 device 層與 block 層的交接點。write 走 `blk_aio_pwritev`，把 `req->qiov` 與起始 offset（sector 換成 byte）交給 QEMU block backend，並掛上 `virtio_blk_rw_complete` 當完成 callback。
+
+```c
+// File: qemu/hw/block/virtio-blk.c
+    if (is_write) {
+        blk_aio_pwritev(blk, sector_num << BDRV_SECTOR_BITS, qiov,
+                        flags, virtio_blk_rw_complete,
+                        mrb->reqs[start]);
+    } else {
+        blk_aio_preadv(blk, sector_num << BDRV_SECTOR_BITS, qiov,
+                       flags, virtio_blk_rw_complete,
+                       mrb->reqs[start]);
+    }
+```
+
+`blk_aio_pwritev` 是 BlockBackend 對外的 async write API，它轉成 `blk_aio_prwv` 起一個 coroutine 跑 block graph，最終落到該 disk 後端 driver 的讀寫實作。
+
+```c
+// File: qemu/block/block-backend.c
+BlockAIOCB *blk_aio_pwritev(BlockBackend *blk, int64_t offset,
+                            QEMUIOVector *qiov, BdrvRequestFlags flags,
+                            BlockCompletionFunc *cb, void *opaque)
+{
+    IO_CODE();
+    assert((uint64_t)qiov->size <= INT64_MAX);
+    return blk_aio_prwv(blk, offset, qiov->size, qiov,
+                        blk_aio_write_entry, flags, cb, opaque);
+}
+```
+
+因為後端是 host 的 `/dev/rbdX`（一個普通 block device file），driver 是 `file-posix`，讀寫實作是 `raw_co_prw`。這裡是 QEMU 決定用哪個 host IO 介面的分岔：對齊的 O_DIRECT IO 會優先走 io_uring 或 linux-aio；否則退回 thread pool 的同步 `pread`/`pwrite`。VM disk 效能的一個重要旋鈕（`aio=native` vs `io_uring` vs `threads`）就決定在這裡。
+
+```c
+// File: qemu/block/file-posix.c
+#ifdef CONFIG_LINUX_IO_URING
+    } else if (raw_check_linux_io_uring(s)) {
+        assert(qiov->size == bytes);
+        ret = luring_co_submit(bs, s->fd, offset, qiov, type);
+        goto out;
+#endif
+#ifdef CONFIG_LINUX_AIO
+    } else if (raw_check_linux_aio(s)) {
+        assert(qiov->size == bytes);
+        ret = laio_co_submit(s->fd, offset, qiov, type,
+                              s->aio_max_batch);
+        goto out;
+#endif
+    }
+```
+
+走 thread pool 那條路時，實際的 syscall 在 `handle_aiocb_rw`：單一對齊 iovec 走 `pread`/`pwrite`，多段走 `preadv`/`pwritev`。不論哪條，這一刻 QEMU 對 `s->fd`（也就是 `/dev/rbdX`）發出真正的 write syscall — IO 在此跨過 QEMU 與 host kernel 的邊界。
+
+```c
+// File: qemu/block/file-posix.c
+static int handle_aiocb_rw(void *opaque)
+{
+    RawPosixAIOData *aiocb = opaque;
+    ssize_t nbytes;
+    char *buf;
+
+    if (!(aiocb->aio_type & QEMU_AIO_MISALIGNED)) {
+        /*
+         * If there is just a single buffer, and it is properly aligned
+         * we can just use plain pread/pwrite without any problems.
+         */
+        if (aiocb->io.niov == 1) {
+            nbytes = handle_aiocb_rw_linear(aiocb, aiocb->io.iov->iov_base);
+            goto out;
+        }
+```
+
+## ⑤ host kernel：krbd → libceph → TCP 上線到 OSD
+
+write syscall 打到 `/dev/rbdX`，落進 krbd 的 blk-mq `queue_rq`，也就是 `rbd_queue_rq`。它建好對應這個 request 的 `rbd_img_request` 後，不在 submit context 裡同步處理，而是把實際工作掛上 workqueue（`rbd_wq`）非同步跑——下面這幾行就是那個交接：
+
+```c
+// File: linux/drivers/block/rbd.c
+	INIT_WORK(&img_req->work, rbd_queue_workfn);
+	queue_work(rbd_wq, &img_req->work);
+	return BLK_STS_OK;
+}
+```
+
+`rbd_queue_workfn` 是真正幹活的地方。它算出 offset / length，`blk_mq_start_request` 開始計時（host 端 `/dev/rbdX` 的 iostat latency 從這裡起算），然後 `rbd_img_fill_from_bio` 把這個 block request 依 RBD 的 object layout 切成一個或多個 RBD object op（一個 4K write 通常落在單一 4 MiB object 內，只產生一個 obj_request）。
+
+```c
+// File: linux/drivers/block/rbd.c
+	blk_mq_start_request(rq);
+	...
+	if (op_type == OBJ_OP_DISCARD || op_type == OBJ_OP_ZEROOUT)
+		result = rbd_img_fill_nodata(img_request, offset, length);
+	else
+		result = rbd_img_fill_from_bio(img_request, offset, length,
+					       rq->bio);
+	if (result)
+		goto err_img_request;
+
+	rbd_img_handle_request(img_request, 0);
+```
+
+每個切出來的 obj_request 對應一個 libceph 的 `ceph_osd_request`。krbd 透過 `rbd_osd_submit` 把它交給 libceph：
+
+```c
+// File: linux/drivers/block/rbd.c
+static void rbd_osd_submit(struct ceph_osd_request *osd_req)
+{
+	struct rbd_obj_request *obj_req = osd_req->r_priv;
+
+	dout("%s osd_req %p for obj_req %p objno %llu %llu~%llu\n",
+	     __func__, osd_req, obj_req, obj_req->ex.oe_objno,
+	     obj_req->ex.oe_off, obj_req->ex.oe_len);
+	ceph_osdc_start_request(osd_req->r_osdc, osd_req);
+}
+```
+
+`ceph_osdc_start_request` 把 request 註冊進 osd client 並送出第一次嘗試（`submit_request`）。libceph 在這裡會用 CRUSH 算出這個 object 的 target OSD、建立或取得到那個 OSD 的 connection。
+
+```c
+// File: linux/net/ceph/osd_client.c
+void ceph_osdc_start_request(struct ceph_osd_client *osdc,
+			     struct ceph_osd_request *req)
+{
+	down_read(&osdc->lock);
+	submit_request(req, false);
+	up_read(&osdc->lock);
+}
+```
+
+最後一跳是 messenger。libceph 把 OSD op 包成一個 `ceph_msg`，`ceph_con_send` 把它掛上該 connection 的 out_queue 並排程送出。
+
+```c
+// File: linux/net/ceph/messenger.c
+void ceph_con_send(struct ceph_connection *con, struct ceph_msg *msg)
+{
+	/* set src+dst */
+	msg->hdr.src = con->msgr->inst.name;
+	BUG_ON(msg->front.iov_len != le32_to_cpu(msg->hdr.front_len));
+	msg->needs_out_seq = true;
+
+	mutex_lock(&con->mutex);
+	...
+	list_add_tail(&msg->list_head, &con->out_queue);
+	...
+	if (!ceph_con_flag_test_and_set(con, CEPH_CON_F_WRITE_PENDING))
+		queue_con(con);
+}
+```
+
+真正把 bytes 推上 socket 的是 messenger v2 的 `ceph_tcp_send`，它對 connection 的 socket 做 `do_sendmsg`（或 sendpage）。到這一刻，這個 4K write 已經以 ceph messenger v2 protocol 的 message 形式，透過 TCP 送往 primary OSD。
+
+```c
+// File: linux/net/ceph/messenger_v2.c
+static int ceph_tcp_send(struct ceph_connection *con)
+{
+	int ret;
+
+	dout("%s con %p have %zu try_sendpage %d\n", __func__, con,
+	     iov_iter_count(&con->v2.out_iter), con->v2.out_iter_sendpage);
+	if (con->v2.out_iter_sendpage)
+		ret = do_try_sendpage(con->sock, &con->v2.out_iter);
+	else
+		ret = do_sendmsg(con->sock, &con->v2.out_iter);
+	dout("%s con %p ret %d left %zu\n", __func__, con, ret,
+	     iov_iter_count(&con->v2.out_iter));
+	return ret;
+}
+```
+
+OSD 收到之後的事 — primary 把 op 寫進 BlueStore、複製到其他 replica、回 ack — 不在本頁。完整的 OSD / BlueStore tail 見 [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore)。
+
+## 每一跳：資料結構 + 關鍵函式 對照表
+
+把上面五層壓成一張對照表。延遲落在哪一跳時，這張表告訴你該去看哪個函式、量哪個資料結構。
+
+| 跳 | 在哪一層 | 關鍵函式 | 資料結構 | source |
+|----|---------|---------|---------|--------|
+| guest blk-mq → virtio-blk | guest kernel | `virtio_queue_rq` / `virtblk_setup_cmd` | `struct request` → `virtblk_req` | linux/drivers/block/virtio_blk.c |
+| 填 vring descriptor | guest kernel | `virtblk_add_req` / `virtqueue_add_sgs` | `scatterlist sgs[3]` → vring desc | linux/drivers/block/virtio_blk.c, virtio_ring.c |
+| kick host | guest kernel | `virtqueue_notify` | notify register（MMIO） | linux/drivers/virtio/virtio_ring.c |
+| vmexit → signal eventfd | KVM（host kernel） | `ioeventfd_write` / `eventfd_signal` | `struct _ioeventfd` / eventfd | linux/virt/kvm/eventfd.c |
+| host notifier 收事件 | QEMU | `virtio_queue_host_notifier_read` → `virtio_queue_notify_vq` | `EventNotifier` / `VirtQueue` | qemu/hw/virtio/virtio.c |
+| 解析 virtio-blk request | QEMU | `virtio_blk_handle_request` | `VirtIOBlockReq` / `req->qiov` | qemu/hw/block/virtio-blk.c |
+| 下發到 block backend | QEMU | `submit_requests` / `blk_aio_pwritev` | `QEMUIOVector` / `BlockBackend` | qemu/hw/block/virtio-blk.c, block/block-backend.c |
+| 對 /dev/rbdX 發 aio | QEMU | `raw_co_prw` / `handle_aiocb_rw` | `RawPosixAIOData` / `s->fd` | qemu/block/file-posix.c |
+| block request → RBD object op | krbd（host kernel） | `rbd_queue_workfn` / `rbd_img_fill_from_bio` | `rbd_img_request` / `rbd_obj_request` | linux/drivers/block/rbd.c |
+| obj op → osd request | libceph（host kernel） | `rbd_osd_submit` / `ceph_osdc_start_request` | `ceph_osd_request` | linux/drivers/block/rbd.c, net/ceph/osd_client.c |
+| message 上 TCP | libceph（host kernel） | `ceph_con_send` / `ceph_tcp_send` | `ceph_msg` / `ceph_connection` | linux/net/ceph/messenger.c, messenger_v2.c |
+
+## librbd 路徑差一在哪
+
+本頁主軸是 krbd。另一條路是 **librbd**（user-space RBD），ceph-csi 在 `rbd-nbd` mounter 或 QEMU 直接用 `block/rbd.c`（QEMU 內建的 rbd block driver）時走它。差別只有一句話：librbd 不需要 host 的 `/dev/rbdX`，也就沒有第 ④ 節「QEMU pwrite 到 `/dev/rbdX` → 落進 host kernel krbd」這一跳。
+
+具體說，走 librbd 時 QEMU 的 block 後端不是 `file-posix` 而是 `block/rbd.c`，QEMU 在自己的 process 內就用 librbd 把 object op 經 user-space messenger 直接送 OSD；CRUSH 計算、osd connection、TCP 全在 QEMU process 裡完成，不經 host kernel 的 krbd / libceph。優點是不依賴 host kernel 的 rbd module、image feature 支援度跟 ceph 版本綁得緊；代價是少了 host page cache 與 `/dev/rbdX` 這層可觀測點（你沒辦法對它跑 `iostat`）。KubeVirt + ceph-csi 的預設是 krbd（`volumeMode: Block` map 出 `/dev/rbdX`），所以本頁以 krbd 為準。
+
+## 邊界與除錯：延遲落在哪一跳怎麼判斷
+
+整條路徑有兩個關鍵的「block device 邊界」可以下探針，把延遲切成 guest 內 / host 內兩段：
+
+- **host 端的 `/dev/rbdX`**：`rbd showmapped` 確認 image 對到哪個 `/dev/rbdN`，再對它跑 `iostat -x 1 /dev/rbdN`。這裡的 `await` / `aqu-sz` 反映的是「krbd 收到 request 到 OSD ack」這一段（第 ⑤ 節，`blk_mq_start_request` 起算）。如果這裡就很高，瓶頸在 ceph / 網路，不在虛擬化層。
+- **guest 端的 vda**：在 guest 內對 `/dev/vda` 跑 `iostat`，跟 host 的 `/dev/rbdX` 對比。兩者差距就是「虛擬化稅」 — 第 ① 到 ④ 節（vring / ioeventfd / QEMU block layer）貢獻的延遲。
+
+再往細節：
+
+- **virtio queue 深度**：guest 內 `cat /sys/block/vda/queue/nr_requests` 看 blk-mq 深度；queue 深度不足會讓並行 IO 卡在第 ① 節的 `virtio_queue_rq` 之前。多 queue（virtio-blk num-queues）讓不同 vCPU 各走一條 vring，減少第 ② 節 kick 的爭用。
+- **QEMU 的 aio 模式**：第 ④ 節 `raw_co_prw` 的分岔（io_uring / linux-aio / threads）直接影響 host 端 submit 路徑；`query-blockstats`（QMP）給 QEMU 自己量到的 per-disk latency（從第 ③ 節 `block_acct_start` 起算），可以跟 host iostat 對照，分出 QEMU block layer 與 krbd 各自吃了多少。
+- **libceph 在線追蹤**：krbd / libceph 的 `dout` debug（需開 dynamic debug）能看到 `ceph_con_send` / `ceph_tcp_send` 的每筆 message；正常排障先不用到這層，先用上面兩個 iostat 邊界定位到「ceph 側 vs 虛擬化側」就夠。
+
+原則：先用 host `/dev/rbdX` 的 iostat 把「ceph/網路」這段切出來。切出來之後若 ceph 側才是大頭，往 [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) 追；若虛擬化側才是大頭，回到第 ① 到 ④ 節按 queue 深度 / aio 模式 / num-queues 逐一排查。
+
+## 接下來 / 相關頁面
+
+<Callout type="info" title="這頁是 datapath 地圖，後面接調參與實驗">
+  這頁只做一件事：把一個 IO 從 guest 到 OSD 的完整路徑、每一跳的函式與資料結構釘在原始碼上。接下來這個分類會往兩個方向長：
+
+  - **可調參數目錄**：把本頁每一跳的旋鈕（virtio num-queues / queue 深度、QEMU `aio` 模式 / `cache` 模式、krbd map options、ceph-csi `mapOptions`、OSD 端參數）收成一份「在哪一層、調什麼、影響哪一跳」的目錄。
+  - **效能實驗計畫**：用 fio 在 guest 內與 host `/dev/rbdX` 兩個邊界各跑一輪，把每一跳的延遲量出來，驗證上面「延遲落在哪一跳」的判斷方法。
+
+  延伸閱讀：
+  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) — OSD 收到 op 之後 BlueStore 怎麼落地，本頁的 datapath tail
+  - [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi) — RBD image 在 RADOS 的 object layout，以及 ceph-csi 把它接成 PVC 的那一段
+  - [KubeVirt — virt-handler 與 virt-launcher](/kubevirt/features/virt-handler-and-launcher) — virt-launcher Pod 內 libvirtd / QEMU 的 process tree，本頁第 ③ 節的上游
+</Callout>

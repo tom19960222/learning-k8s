@@ -11,7 +11,7 @@
 [submodule "kubevirt"]
 	path = kubevirt
 	url = https://github.com/kubevirt/kubevirt.git
-	branch = v1.8.2
+	branch = v1.5.0
 	shallow = true
 [submodule "ceph"]
 	path = ceph
@@ -29,12 +29,12 @@
 [submodule "libvirt"]
 	path = libvirt
 	url = https://gitlab.com/libvirt/libvirt.git
-	branch = v12.3.0
+	branch = v10.10.0
 	shallow = true
 [submodule "qemu"]
 	path = qemu
 	url = https://github.com/qemu/qemu.git
-	branch = v11.0.0
+	branch = v9.1.0
 	shallow = true
 [submodule "systemd"]
 	path = systemd
@@ -43,4 +43,14 @@
 	path = rook
 	url = https://github.com/rook/rook.git
 	branch = v1.19.6
+	shallow = true
+[submodule "ceph-csi"]
+	path = ceph-csi
+	url = https://github.com/ceph/ceph-csi.git
+	branch = v3.14.0
+	shallow = true
+[submodule "linux"]
+	path = linux
+	url = https://git.launchpad.net/ubuntu/+source/linux-hwe-6.8
+	branch = applied/6.8.0-52.53_22.04.1
 	shallow = true

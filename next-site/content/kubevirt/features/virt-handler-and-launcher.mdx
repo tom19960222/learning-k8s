@@ -13,7 +13,7 @@ scheduler 把 virt-launcher Pod 放到 worker-X。從這時起到 QEMU 真的跑
 virt-handler 是 DaemonSet，每個 node 一個。它跟 kubelet 平起平坐：kubelet 管 container，virt-handler 管 VM（precisely: 它管 VMI 的 lifecycle、跟 virt-launcher Pod 內的 libvirt 對話）。
 
 ```go
-// File: cmd/virt-handler/virt-handler.go (line 202)
+// File: cmd/virt-handler/virt-handler.go (line 180)
 func (app *virtHandlerApp) Run() {
     // 起 VirtualMachineController (主迴圈)
     // 起 cmd-server (對 virt-launcher Pod 開 unix socket gRPC)
@@ -25,39 +25,41 @@ func (app *virtHandlerApp) Run() {
 主迴圈是 `VirtualMachineController`：
 
 ```go
-// File: pkg/virt-handler/vm.go (line 120)
-func NewVirtualMachineController( /* informers, clients, cache, ... */ ) *VirtualMachineController {
+// File: pkg/virt-handler/vm.go (line 161)
+func NewController( /* informers, clients, cache, ... */ ) (*VirtualMachineController, error) {
     // ...
 }
 
-// File: pkg/virt-handler/vm.go (line 242)
+// File: pkg/virt-handler/vm.go (line 1661)
 func (c *VirtualMachineController) Run(threadiness int, stopCh chan struct{}) {
     // 跑 worker goroutines, 每個 goroutine 從 queue 拿 key 做 Execute()
 }
 
-// File: pkg/virt-handler/vm.go (line 290)
+// File: pkg/virt-handler/vm.go (line 1707)
 func (c *VirtualMachineController) Execute() bool {
     // pop key → call execute(key) → requeue on err
 }
 
-// File: pkg/virt-handler/vm.go (line 306)
+// File: pkg/virt-handler/vm.go (line 2073)
 func (c *VirtualMachineController) execute(key string) error {
     // load VMI from informer
     // load Domain (libvirt 那邊回傳的真實狀態) from cache
-    // call sync(key, vmi, domain)
+    // call defaultExecute(key, vmi, vmiExists, domain, domainExists)
 }
 
-// File: pkg/virt-handler/vm.go (line 1354)
-func (c *VirtualMachineController) sync(key string, /* ... */) (err error) {
+// File: pkg/virt-handler/vm.go (line 1877)
+func (c *VirtualMachineController) defaultExecute(key string,
+    vmi *v1.VirtualMachineInstance, vmiExists bool,
+    domain *api.Domain, domainExists bool) error {
     // 對比 desired (vmi spec) vs actual (domain state)
-    // 決定要 processVmUpdate / processVmShutdown / processVmDelete / processVmCleanup
+    // 決定要 processVmUpdate / shutdown / delete / cleanup
 }
 ```
 
 關鍵 sync 動作：
 
 ```go
-// File: pkg/virt-handler/vm.go (line 2130)
+// File: pkg/virt-handler/vm.go (line 3252)
 func (c *VirtualMachineController) processVmUpdate(vmi *v1.VirtualMachineInstance, domain *api.Domain) error {
     // 拿 VMI 的當前 spec
     // 跟 virt-launcher 的 cmd-server 對話 (gRPC SyncVMI)
@@ -88,13 +90,13 @@ PID 1: virt-launcher-monitor       ← watchdog
 `virt-launcher` 本身做幾件事：
 
 ```go
-// File: cmd/virt-launcher/virt-launcher.go (line 343)
+// File: cmd/virt-launcher/virt-launcher.go (line 337)
 func main() {
     // 1. 起 cmd-server 監聽 unix socket (給 virt-handler 連)
     // 2. 連 libvirtd
-    // 3. 啟 startDomainEventMonitoring (line 136) 從 libvirt 收 event
+    // 3. 啟 startDomainEventMonitoring (line 130) 從 libvirt 收 event
     // 4. wait for SyncVMI gRPC, 收到後翻 spec、call libvirt
-    // 5. domain 啟動後 markReady (line 77)
+    // 5. domain 啟動後 markReady (line 71)
 }
 ```
 
@@ -126,20 +128,20 @@ protobuf 在 `pkg/handler-launcher-com/`。
 virt-launcher 內把所有 libvirt 操作收斂到 `DomainManager` 介面：
 
 ```go
-// File: pkg/virt-launcher/virtwrap/manager.go (line 135)
+// File: pkg/virt-launcher/virtwrap/manager.go (line 116)
 type DomainManager interface {
-    SyncVMI(vmi *v1.VirtualMachineInstance, options *cmdv1.VirtualMachineOptions) (*api.DomainSpec, error)
+    SyncVMI(*v1.VirtualMachineInstance, bool, *cmdv1.VirtualMachineOptions) (*api.DomainSpec, error)
     PauseVMI(*v1.VirtualMachineInstance) error
     UnpauseVMI(*v1.VirtualMachineInstance) error
     KillVMI(*v1.VirtualMachineInstance) error
     DeleteVMI(*v1.VirtualMachineInstance) error
     SignalShutdownVMI(*v1.VirtualMachineInstance) error
     MigrateVMI(*v1.VirtualMachineInstance, *cmdclient.MigrationOptions) error
-    PrepareMigrationTarget(...) error
+    PrepareMigrationTarget(*v1.VirtualMachineInstance, bool, *cmdv1.VirtualMachineOptions) error
     // ... ~30 個 method
 }
 
-// File: pkg/virt-launcher/virtwrap/manager.go (line 239)
+// File: pkg/virt-launcher/virtwrap/manager.go (line 205)
 func NewLibvirtDomainManager( /* connection, virtShareDir, ephemeralDiskDir, agentStore, ovmfPath, ... */ ) (DomainManager, error) {
     // ...
 }
@@ -153,12 +155,13 @@ func NewLibvirtDomainManager( /* connection, virtShareDir, ephemeralDiskDir, age
 
 ```go
 // File: pkg/virt-launcher/virtwrap/converter/converter.go
-// (~300 個 Convert_* function)
+// 主入口 Convert_v1_VirtualMachineInstance_To_api_Domain (line 1402)
+// 下面再呼叫一連串 Convert_* / setter
 // e.g.
-// Convert_v1_Disk_To_api_Disk(...)        // line 87 — disk → libvirt <disk>
-// Convert_v1_Interface_To_api_Interface() // network interface
-// Convert_v1_Memory_To_api_Memory()       // memory + hugepages
-// Convert_v1_CPU_To_api_CPU()             // cpu topology + pinning
+// Convert_v1_Disk_To_api_Disk(...)         // line 131 — disk → libvirt <disk>
+// Convert_v1_Volume_To_api_Disk(...)       // line 550 — volume → libvirt <disk>
+// Convert_v1_Input_To_api_InputDevice(...) // line 939 — tablet/keyboard
+// memory / hugepages / cpu topology 由主入口內的 setter 直接填，不另設獨立 Convert_* 函式
 ```
 
 這些 Convert 函式拼出一個 `*api.DomainSpec` (KubeVirt 自己的 Go struct)，最終 marshal 成 libvirt 接受的 XML。每個 disk / interface / volume hot-plug 都是一個 Convert 來回。
@@ -178,10 +181,10 @@ func NewLibvirtDomainManager( /* connection, virtShareDir, ephemeralDiskDir, age
 
 ## 原始碼參考
 
-- [cmd/virt-handler/virt-handler.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-handler/virt-handler.go) — handler main
-- [pkg/virt-handler/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-handler/vm.go) — VirtualMachineController
-- [cmd/virt-launcher/virt-launcher.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/cmd/virt-launcher/virt-launcher.go) — launcher main
-- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/manager.go) — DomainManager
-- [pkg/virt-launcher/virtwrap/converter/converter.go](https://github.com/kubevirt/kubevirt/blob/v1.8.2/pkg/virt-launcher/virtwrap/converter/converter.go) — VMI → libvirt XML
-- [pkg/handler-launcher-com/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/handler-launcher-com) — gRPC protobuf
-- [pkg/virt-launcher/notify-client/](https://github.com/kubevirt/kubevirt/tree/v1.8.2/pkg/virt-launcher/notify-client) — event push back
+- [cmd/virt-handler/virt-handler.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/cmd/virt-handler/virt-handler.go) — handler main
+- [pkg/virt-handler/vm.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-handler/vm.go) — VirtualMachineController
+- [cmd/virt-launcher/virt-launcher.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/cmd/virt-launcher/virt-launcher.go) — launcher main
+- [pkg/virt-launcher/virtwrap/manager.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-launcher/virtwrap/manager.go) — DomainManager
+- [pkg/virt-launcher/virtwrap/converter/converter.go](https://github.com/kubevirt/kubevirt/blob/v1.5.0/pkg/virt-launcher/virtwrap/converter/converter.go) — VMI → libvirt XML
+- [pkg/handler-launcher-com/](https://github.com/kubevirt/kubevirt/tree/v1.5.0/pkg/handler-launcher-com) — gRPC protobuf
+- [pkg/virt-launcher/notify-client/](https://github.com/kubevirt/kubevirt/tree/v1.5.0/pkg/virt-launcher/notify-client) — event push back
