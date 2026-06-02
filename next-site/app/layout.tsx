@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { BuildVersion } from '@/components/BuildVersion'
 
 export const metadata: Metadata = {
   title: 'Kubernetes 深潛 — k8s / cilium / kubevirt / ceph / multus 原始碼學習站',
@@ -11,6 +12,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="zh-TW" className="dark">
       <body className="antialiased min-h-screen">
         {children}
+        <BuildVersion />
       </body>
     </html>
   )
