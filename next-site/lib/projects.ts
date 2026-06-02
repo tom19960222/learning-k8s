@@ -512,9 +512,10 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: '',
     color: 'cyan',
     accentClass: 'border-cyan-500 text-cyan-400',
-    features: ['rbd-io-datapath'],
+    features: ['rbd-io-datapath', 'rbd-io-tuning-catalog', 'rbd-io-experiment-plan'],
     featureGroups: [
       { label: 'IO 路徑', icon: '🔬', slugs: ['rbd-io-datapath'] },
+      { label: '效能調教', icon: '🎛️', slugs: ['rbd-io-tuning-catalog', 'rbd-io-experiment-plan'] },
     ],
     usecases: [],
     difficulty: '🔴 進階',
@@ -534,9 +535,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
       ],
       intermediate: [
         { slug: 'rbd-io-datapath', note: '每一跳的資料結構與關鍵函式，建立後續調參的地圖' },
+        { slug: 'rbd-io-tuning-catalog', note: '每一層有哪些參數可調、impact 多大、優先調哪個' },
       ],
       advanced: [
         { slug: 'rbd-io-datapath', note: '邊界與除錯：延遲落在哪一跳怎麼判斷' },
+        { slug: 'rbd-io-experiment-plan', note: '從 impact 最高的幾個參數開始系統化驗證' },
       ],
     },
   },
