@@ -1,84 +1,55 @@
 ---
 layout: doc
 title: Ceph — node 間時間差 51ms / 401ms / 1s / 1min / 1hr / 1day 分別壞掉什麼
-description: 用 v19.2.3 原始碼回答「node 時鐘差 N 會發生什麼」這題。MON-MON 有兩個門檻：50ms（MON_CLOCK_SKEW 偵測）與 5s（mon_lease，Paxos lease 用 wall clock 算的崩潰線）。但時鐘差不是只有 MON-MON 的事：MON↔OSD 的 cephx ticket / rotating secret 由發證的 mon 用自己 wall clock 戳絕對 expiration，所以雙向都會爆——OSD 領先 mon 到 1hr 等級會讓 OSD 起不來 exit(1)；而 mon 先快、簽出未來的 secret 後再 NTP 跳回，會把那批 secret 作廢、造成在線 OSD 大量掉線（最常見最痛的觸發，是 transition 不是穩態）。OSD↔OSD 走 mono_clock + delta 補償才是真的 skew 免疫。並釐清 client service ticket（單機 duration、skew 免疫）與 daemon rotating secret（跨 node 絕對時間、會被 skew 弄爆）是兩條不同路徑。
+description: 用 v19.2.3 原始碼回答「node 時鐘差 N 會發生什麼」。三條獨立的線：MON↔MON 在 50ms 報 MON_CLOCK_SKEW、5s（mon_lease）lease 崩 election churn；MON↔OSD 的 cephx 到期是 mon 蓋的絕對時間戳，所以雙向都會爆——OSD 比 mon 快會起不來 exit(1)，mon 先快再 NTP 跳回會讓在線 OSD 大量掉線；OSD↔OSD 走 mono_clock 免疫。並澄清 client ticket 為何不會因 skew 過期。
 ---
 
 ## 場景
 
-[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把 MON-MON / MON-OSD / OSD-OSD 在毫秒級的差距攤開過了，結論是「沒有全域的 50ms 規則」。這頁問的是相鄰但不同的問題：
+[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把毫秒級的差距攤開過了，結論是「沒有全域的 50ms 規則」。這頁把刻度往上拉——**51ms、401ms、1000ms、1 分鐘、1 小時、1 天**——問每跨過一個量級，多壞掉什麼。
 
-> 把刻度往上拉——**51ms、401ms、1000ms、1 分鐘、1 小時、1 天**——每跨過一個量級，到底*多*壞掉一件什麼新的事？
+答案是：cluster 裡有**三條互相獨立的線**，各自有自己的門檻、自己的受害者、自己的時鐘來源。先看表，再逐條拆。
 
-整條 ladder 上有**三個**門檻會改變行為——兩個在 MON-MON、一個在 MON↔OSD：
+## 一張表看完
 
-- **50ms**（`mon_clock_drift_allowed`，MON-MON）：超過就報 `MON_CLOCK_SKEW` `HEALTH_WARN`。
-- **5s**（`mon_lease`，MON-MON）：超過這個，Paxos lease 因為**用 wall clock 計算**而開始崩——skew 的 mon 守不住 lease，進入 election churn。
-- **~1hr 等級（`auth_service_ticket_ttl`，MON↔OSD，且是雙向）**：cephx 的 ticket / rotating secret 由發證的 mon 用自己 wall clock 戳**絕對 expiration**，所以 mon 與 OSD 哪邊快都會出事。OSD 領先 mon 到一個 ticket TTL 時，mon 給的 secret 在 OSD 看來太舊、OSD 起不來 `exit(1)`；反過來 mon 先快、簽出未來 expiration 的 secret 後再 NTP **跳回**正確時間，會把那批 secret 作廢、讓抱著舊 `secret_id` 的**在線 OSD 認證成片失敗、大量掉線**。後者是 transition（跳變那一刻引爆），跟穩態 skew 大小無關，也是實務上最常見的觸發。
+預設值、3-mon cluster，沒手動改 `mon_clock_drift_allowed` / `mon_lease`。穩態 skew（固定 offset）下：
 
-> 訂正聲明：這頁前一版把 MON↔OSD 寫成單向（只有「OSD 領先 mon」會爆）。那是錯的——cephx 到期是絕對時間戳、由 mon 蓋，所以**雙向都會爆**，而且 mon 時鐘「先快再跳回」造成在線 OSD 大量掉線，比 OSD 領先的穩態 case 更常見也更痛。這次把反方向那條 transition 補進來（MON↔OSD 專節的後半）。
-
-下面把三條 pair 一格一格從 v19.2.3 source 證出來；MON↔OSD 那節會把「OSD 領先（穩態）」與「mon 跳回（transition）」兩個方向都拆開。
-
-## 先看結論表
-
-預設值、3-mon cluster、沒手動改 `mon_clock_drift_allowed` / `mon_lease`：
-
-MON↔OSD 那欄要看的是 cephx 的 ticket / rotating secret，它的到期時間是**絕對 wall-clock 時間戳、由發證的 mon 蓋**。所以 **mon 與 OSD 哪邊快都會出事，而且兩種觸發機制不同**——下表把兩個方向都列出來。最危險的其實不是穩態 skew，而是 **mon 時鐘「跳變」那一刻**（見表後說明與專節）。
-
-| 差距 | MON ↔ MON | MON ↔ OSD（cephx ticket / rotating secret） | OSD ↔ OSD |
+| 差距 | 線 1：MON ↔ MON | 線 2：MON ↔ OSD（cephx） | 線 3：OSD ↔ OSD |
 |---|---|---|---|
-| **51ms** | `MON_CLOCK_SKEW` WARN（剛過 50ms，下一輪 timecheck 後） | 無感（遠小於 ticket TTL） | 無門檻（走 mono_clock） |
+| **51ms** | `MON_CLOCK_SKEW` WARN | 無感 | 無門檻 |
 | **401ms** | 同上 WARN，lease 仍正常 | 無感 | 無門檻 |
-| **1000ms** | 同上 WARN，lease 仍正常（1s < 5s） | 無感 | 無門檻 |
-| **1 min** | WARN **＋ lease 崩**：領先 leader >5s 的 mon 守不住 lease → bootstrap → **election churn**；每個訊息被戳「60s in the future」洗 cluster log | 無感（1min ≪ 1hr TTL） | 無門檻 |
-| **1 hr** | 同 1 min（lease 完全失效，skew mon 待不住 quorum） | **進風險區**：到 `auth_service_ticket_ttl`(1hr) 等級，30s cutoff 與 current/next state 開始重要（兩個方向都是） | 無門檻 |
-| **1 day（OSD 領先 mon）** | 同 1 min/1 hr，只是數字更大 | **OSD 起不來**：mon 給的 secret 在 OSD 看來太舊，`wait_auth_rotating` 逾時、重試 10 次後 `exit(1)`，log `maybe I have a clock skew against the monitors?` | 無門檻 |
-| **mon 領先後「跳回」（你的案例）** | mon 跳回時自己也會踩 MON-MON lease | **大量在線 OSD 同時掉線**：mon 先簽出「未來 1 年」的 secret/ticket，校時跳回後把那批 secret rotate 作廢，OSD 還抱著舊 `secret_id` → `verify_authorizer` 查不到 secret → 認證成片失敗 | 無門檻 |
+| **1000ms** | 同上 WARN，lease 仍正常 | 無感 | 無門檻 |
+| **1 min** | WARN **＋ lease 崩 → election churn** | 無感（≪ 1hr TTL） | 無門檻 |
+| **1 hr** | 同 1 min | **進風險區**（到 `auth_service_ticket_ttl` 等級） | 無門檻 |
+| **1 day** | 同 1 min | **OSD 起不來 `exit(1)`**（OSD 比 mon 快時） | 無門檻 |
 
-讀法：**MON-MON 在 50ms、5s 兩點變化；OSD-OSD 整欄無門檻**（走 mono_clock，後面證）。**MON↔OSD 是雙向的**——OSD 領先 mon 到 1hr/1day 會讓 OSD 起不來；而 mon 領先（時鐘錯誤）再「跳回正確時間」那一刻，會把整批被污染的 secret 作廢、造成**在線 OSD 大量掉線**，這是實務上最常見也最痛的觸發，專節在後面拆。
+三句話讀法：
 
-## 三條 pair、三個門檻一張圖
+- **線 1（MON↔MON）** 有兩個量級門檻：50ms 報警、5s 真正崩。
+- **線 2（MON↔OSD）** 量級門檻在 1hr（`auth_service_ticket_ttl`）等級，**但它還有一個跟量級無關的觸發**：mon 時鐘「跳回」那一刻會讓在線 OSD 大量掉線——這個不在上表（它不是穩態 skew），是線 2 的主菜。
+- **線 3（OSD↔OSD）** 整欄空白：OSD 之間走 mono clock，wall-clock skew 完全不影響。
 
-```
-MON ↔ MON（wall-clock 差距）
-0 ───────── 50ms ───────── 5s ─────────────────────▶  ∞
-            │              │
-            │              └─ mon_lease：Paxos lease 用 real_clock 算
-            │                 skew > 5s 的 mon 收到的 lease「已經過期」
-            │                 → is_lease_valid()=false → lease_timeout
-            │                 → bootstrap → election churn
-            │
-            └─ mon_clock_drift_allowed：timecheck skew_bound > 50ms
-               → MON_CLOCK_SKEW HEALTH_WARN（只有 WARN，永遠不升 ERR）
+## 心智模型：誰用 wall clock、誰用 mono clock
 
-MON ↔ OSD（cephx ticket / rotating secret，雙向都會爆）
-   ticket/secret 的 expiration 是「絕對 wall-clock 時間戳」，由發證的 mon 蓋
+三條線會不會被 skew 弄爆，只取決於兩個問題：**它用哪種時鐘**，以及**到期時間是「絕對時間點」還是「相對時長」**。
 
-  方向 A：OSD 領先 mon（穩態 skew）
-  0 ───────────────── ~1hr (auth_service_ticket_ttl) ──────▶  ∞
-                              └─ mon 給的 secret 在 OSD 的 now-30s cutoff 下太舊
-                                 → need_new_secrets(cutoff) 持續 true → rotate 不動
-                                 → wait_auth_rotating 逾時 → 啟動重試 10 次 exit(1)
+| | 用哪種時鐘 | 到期算法 | 對 skew |
+|---|---|---|---|
+| 線 1 MON↔MON lease | `real_clock`（wall clock） | leader 蓋「leader_now + 5s」，peon 拿自己 wall clock 比 | **不免疫** |
+| 線 2 MON↔OSD cephx | `ceph_clock_now()`（wall clock） | **mon 蓋絕對 expiration**，OSD 拿自己 wall clock 比 | **不免疫（且雙向）** |
+| 線 3 OSD↔OSD | `mono_clock` | 用 heartbeat 帶的 mono delta 換算 | **免疫** |
+| （對照）client ticket | wall clock | **client 自己蓋 `now + validity`**，自己檢查 | **免疫（同機抵消）** |
 
-  方向 B：mon 領先後「跳回」（transition，不是穩態 ← 最痛）
-  mon +1yr ──簽出 expiration≈now+1yr 的 secret/ticket──▶ OSD 收下、視為有效
-       │
-       └─ NTP 校時，mon 跳回正確時間
-              └─ mon 用正確時間重 rotate，把那批 +1yr secret 擠出 prev/current/next
-                 → OSD 手上舊 secret_id 在 mon keyserver 查不到
-                 → verify_authorizer 失敗 → 在線 OSD 認證成片失敗、大量掉線
+關鍵差別只有一個：**到期時間是「誰蓋的、誰檢查的」**。
 
-OSD ↔ OSD（wall-clock 差距）
-0 ───────────────────────────────────────────────────────────────▶  ∞
-   （整條線無 clock-skew 門檻：走 mono_clock + heartbeat delta 補償）
-```
+- 同一台機器蓋、同一台檢查（client ticket、線 3 的 delta）→ skew 在減法裡抵消 → 免疫。
+- 一台蓋、另一台檢查（線 1 lease、線 2 cephx）→ 兩台時鐘直接比大小 → skew 一旦到門檻就爆。
 
-下面分三條 pair 拆。
+線 2 最特別：**蓋章的永遠是 mon**（發證方），所以 mon 的時鐘錯誤會污染所有 OSD 手上的票。這就是為什麼線 2 是雙向的，下面會看到。
 
-## MON ↔ MON：50ms 偵測、5s lease 崩
+## 線 1 — MON ↔ MON：50ms 報警、5s lease 崩
 
-### 50ms：唯一的偵測門檻
+### 50ms：偵測線
 
 leader 對 quorum 內每個 peon 跑 timecheck（ping/pong），算出 `skew_bound = |delta| − latency`，再跟 `mon_clock_drift_allowed` 比。判定是**嚴格大於**：
 
@@ -93,11 +64,7 @@ bool timecheck_has_skew(const double skew_bound, double *abs) const {
 }
 ```
 
-`mon_clock_drift_allowed` 預設 `0.05`（50ms）：
-
-File: `ceph/src/common/options/mon.yaml.in` (line 609)
-
-所以 **51ms** 是剛好踩過門檻（同 DC latency 通常 < 1ms，`skew_bound` 還是 > 50ms）→ 下一輪 timecheck 後產生 health check。`401ms` / `1000ms` / `1min` / `1hr` / `1day` 全都遠在門檻之上，**報的是同一條 WARN，沒有分級**：
+`mon_clock_drift_allowed` 預設 `0.05`（50ms，`mon.yaml.in:609`）。所以 **51ms** 剛好踩過門檻（同 DC latency 通常 `< 1ms`，`skew_bound` 仍 `> 50ms`），下一輪 timecheck 後報 `MON_CLOCK_SKEW`。而 `401ms` 到 `1 day` 全都遠在門檻之上，**報的是同一條 WARN，沒有分級**：
 
 File: `ceph/src/mon/HealthMonitor.cc` (line 862)
 
@@ -106,11 +73,11 @@ auto& d = checks->add("MON_CLOCK_SKEW", HEALTH_WARN, ss.str(), details.size());
 d.detail.swap(details);
 ```
 
-整份 source 裡 `MON_CLOCK_SKEW` 只 add 過這一次，severity 寫死 `HEALTH_WARN`。**clock skew 永遠不會自己升成 `HEALTH_ERR`**——1 天的 skew 跟 51ms 在 `ceph -s` 的顏色上是一樣的。從 51ms 到 1 天，這條 WARN 線本身沒有再多做任何事。`ceph -s` 多久才看到這條 WARN，拆在 [MON clock skew 偵測那一頁](./mon-clock-skew-detection)。
+整份 source 裡 `MON_CLOCK_SKEW` 只 add 過這一次，severity 寫死 `HEALTH_WARN`。**它永遠不會自己升成 `HEALTH_ERR`**——1 天的 skew 跟 51ms 在 `ceph -s` 的顏色上一模一樣。`ceph -s` 多久才看到這條 WARN，拆在 [MON clock skew 偵測那一頁](./mon-clock-skew-detection)。
 
-### 5s：lease 用 wall clock，這才是真正崩的地方
+### 5s：lease 崩（真正出事的地方）
 
-關鍵非直覺點：**Paxos lease 的到期時間是 `ceph::real_clock`（wall clock），不是 monotonic**。
+報警歸報警，MON↔MON **真正崩**是在 5s。原因：Paxos lease 的到期時間用 `ceph::real_clock`（wall clock），不是 monotonic。
 
 File: `ceph/src/mon/Paxos.h` (line 405)
 
@@ -118,7 +85,7 @@ File: `ceph/src/mon/Paxos.h` (line 405)
 ceph::real_clock::time_point lease_expire;
 ```
 
-leader 每次 renew lease，把「**自己 wall clock 的** now + `mon_lease`」當作到期點，塞進 lease 訊息送出去：
+leader 每次 renew lease，把「**自己 wall clock 的** now + `mon_lease`」當到期點送出去：
 
 File: `ceph/src/mon/Paxos.cc` (line 979)
 
@@ -127,7 +94,7 @@ lease_expire = ceph::real_clock::now();
 lease_expire += ceph::make_timespan(g_conf()->mon_lease);
 ```
 
-`mon_lease` 預設 `5` 秒（`mon.yaml.in:379`）。peon 收到後，直接拿 leader 送來的到期時間，跟**自己的** wall clock 比：
+`mon_lease` 預設 `5` 秒（`mon.yaml.in:379`）。peon 收到後，拿 leader 送來的到期時間跟**自己的** wall clock 比：
 
 File: `ceph/src/mon/Paxos.cc` (line 1118)
 
@@ -144,9 +111,9 @@ if (auto new_expire = lease->lease_timestamp.to_real_time();
 }
 ```
 
-這幾行就是分界：lease 訊息帶的是 leader 時間軸上的「now + 5s」。如果**這個 peon 的 wall clock 比 leader 快超過 5 秒**，那麼 `lease_expire`（leader 時間的 now+5s）在 peon 自己的時間軸上**已經是過去式**了——`lease_expire < now` 成立，印出那行 `clocks are too skewed`，而且 lease 一拿到就等於過期。
+分界就在這裡：lease 訊息帶的是 leader 時間軸上的「now + 5s」。如果**這個 peon 的 wall clock 比 leader 快超過 5 秒**，`lease_expire` 在 peon 自己的時間軸上**已經是過去式**——`lease_expire < now` 成立，印 `clocks are too skewed`，lease 一拿到就等於過期。
 
-之後所有讀寫都過不了這個閘：
+到期的 lease 過不了寫入閘：
 
 File: `ceph/src/mon/Paxos.cc` (line 1514)
 
@@ -158,13 +125,11 @@ bool Paxos::is_lease_valid()
 }
 ```
 
-`is_lease_valid()` 一旦回 false，`is_writeable()` 與 `is_readable()` 跟著垮，peon 收不到「未來的」有效 lease → `lease_timeout` 觸發 → `mon.bootstrap()` → 退出 quorum 重選。這條 timeout → bootstrap → election 的鏈，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。
+`is_lease_valid()` 回 false → `is_writeable()` / `is_readable()` 跟著垮 → peon 的 `lease_timeout` 觸發 → `mon.bootstrap()` → 退出 quorum 重選。**所以 1min / 1hr / 1day 的 MON↔MON skew 做的是同一件事**：那台快超過 5s 的 mon 守不住 lease，反覆 bootstrap、反覆 election。3-mon cluster 裡只有 1 台這樣時，另外 2 台同步的 mon 仍能撐住 quorum=2（cluster 帶 WARN + 一台 mon 一直 flap）；2 台以上 skew 就掉進 quorum loss。timeout → bootstrap → election 那條鏈拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。
 
-所以 **1 min / 1 hr / 1 day 的 MON-MON skew 做的是同一件事**：那台快超過 5s 的 mon 守不住 lease，反覆 bootstrap、反覆 election。3-mon cluster 裡若只有 1 台這樣，另外 2 台同步的 mon 仍能組 quorum=2 撐住（cluster 帶著 `MON_CLOCK_SKEW` WARN + 一台 mon 一直 flap）；若 2 台以上都 skew，就掉進 quorum loss。
+### 附帶：訊息被戳「在未來」洗 log
 
-### bonus：每個訊息被戳「在未來」洗 log
-
-只要 skew > 50ms，skew mon 送出的每個 Paxos 訊息都會被收方判定「戳在未來」，寫一行 cluster log（用同一個 `mon_clock_drift_allowed` 當門檻，再套指數 backoff）：
+只要 skew `> 50ms`，skew mon 送出的每個 Paxos 訊息都會被收方判定「戳在未來」，寫一行 cluster log（同一個 `mon_clock_drift_allowed` 門檻 + 指數 backoff）：
 
 File: `ceph/src/mon/Paxos.cc` (line 1024)
 
@@ -180,15 +145,15 @@ void Paxos::warn_on_future_time(utime_t t, entity_name_t from)
                        << "s in the future, clocks not synchronized";
 ```
 
-1 天的 skew 在這裡會印 `stamped 86400s in the future`。這只是 cluster log，不是 health check。
+1 天的 skew 在這裡印 `stamped 86400s in the future`。只是 cluster log，不是 health check。
 
-## MON ↔ OSD：beacon 那條免疫，但 rotating key 那條會被 skew 弄爆
+## 線 2 — MON ↔ OSD：cephx 到期由 mon 蓋，雙向都會爆
 
-這條 pair 有兩條獨立路徑，**一條對 skew 免疫、一條不免疫**。先講免疫的，再講你遇過的那條。
+MON↔OSD 之間有兩條跟時間有關的路徑，命運相反：**beacon 那條免疫，cephx 那條不免疫**。
 
-### 免疫的：beacon / mark-down 走時間*間隔*不走 wall-clock 差
+### 不出事的那半：beacon 走 mono clock
 
-OSD 決定多久送一次 beacon，用的是 **monotonic clock**（`coarse_mono_clock`），跟 wall clock 無關：
+OSD 多久送一次 beacon、MON 多久沒收到 beacon 就 mark down——這整條走 monotonic clock 與「收件間隔」，跟 wall-clock 差無關：
 
 File: `ceph/src/osd/OSD.cc` (line 6444)
 
@@ -204,11 +169,11 @@ const auto now = ceph::coarse_mono_clock::now();
 }
 ```
 
-MON 把 OSD mark down 的時間判斷，是「太久沒收到 beacon」——用 MON 自己連續收件的時間差算，門檻 `max(mon_osd_report_timeout, 2 × osd_beacon_report_interval) = max(15min, 10min) = 15 分鐘`。這量的是 MON 收到兩次 beacon 的*間隔*，**不是 MON 跟 OSD 的 wall clock 差**——OSD 時鐘偏 1 天，只要它還在送 beacon，這條路徑不會踢它。(`mon_osd_report_timeout` 預設 `15_min`：`global.yaml.in:1635`；`osd_beacon_report_interval` 預設 `5_min`：`global.yaml.in:2940`。)
+MON 端 mark down 的門檻是 `max(mon_osd_report_timeout, 2 × osd_beacon_report_interval) = max(15min, 10min) = 15 分鐘`，量的是 MON 收到兩次 beacon 的*間隔*。**OSD 時鐘偏 1 天，只要它還在送 beacon，這條不會踢它。**（`mon_osd_report_timeout` 預設 `15_min`、`osd_beacon_report_interval` 預設 `5_min`。）
 
-### 不免疫的：cephx ticket / rotating secret —— 「大量 OSD 被踢」的真兇（雙向）
+### 出事的那半：cephx 的到期是「mon 蓋的絕對時間戳」
 
-每個 OSD 跑起來都要持有一份由 mon 簽發的 **rotating service key**。這不是單一 key，而是一組 previous / current / next secret；`current()` 在 source 裡取的是中間那把，所以 rotate 判定有狀態，不是只拿「最新一把」做單點比較。
+每個 OSD 都要持有一份 mon 簽發的 rotating service key。它不是單一 key，是一組 previous / current / next；`current()` 取中間那把：
 
 ```cpp
 // File: ceph/src/auth/Auth.h (line 248)
@@ -223,7 +188,7 @@ const ExpiringCryptoKey& current() const {
 }
 ```
 
-mon 端產生 key 時，用**自己的 wall clock** 戳一個**絕對** expiration（`now + ttl`，ttl 對 service key 是 `auth_service_ticket_ttl` 預設 1 小時）：
+mon 產生 key 時，用**自己的 wall clock** 蓋一個**絕對** expiration（`now + ttl`，service key 的 ttl 是 `auth_service_ticket_ttl`，預設 1 小時）：
 
 File: `ceph/src/auth/cephx/CephxKeyServer.cc` (line 180)
 
@@ -236,7 +201,7 @@ while (r.need_new_secrets(now)) {
   ek.expiration += ttl;
 ```
 
-`expiration` 是一個 `utime_t`（絕對 wall-clock 時間點），不是 duration。OSD 收到 key 後，用**自己的 wall clock** 判斷夠不夠新——`current().expiration <= now` 就算「該換新的了」：
+OSD 收到後，拿**自己的 wall clock** 判斷夠不夠新——`current().expiration <= now` 就算「該換了」：
 
 File: `ceph/src/auth/Auth.h` (line 324)
 
@@ -246,7 +211,11 @@ bool need_new_secrets(const utime_t& now) const {
 }
 ```
 
-OSD 週期性檢查時，`now` 取自己的 `ceph_clock_now()`，cutoff 再往前抓 30 秒：
+**mon 蓋、OSD 比——兩台時鐘直接對撞。** 兩台差到 TTL（1hr）等級就出事，而且 mon 與 OSD 哪邊快，爆法不同。下面兩個方向分開講。
+
+### 方向 A — OSD 比 mon 快：OSD 起不來
+
+OSD 週期檢查 rotating key 時，`now` 取自己的時鐘，cutoff 再往前抓 30 秒：
 
 File: `ceph/src/mon/MonClient.cc` (line 1103)
 
@@ -262,7 +231,7 @@ if (!rotating_secrets->need_new_secrets(cutoff)) {
 }
 ```
 
-把兩端的時鐘擺在一起看就是問題所在：**mon 戳的 expiration 在 mon 的時間軸上，OSD 拿自己的 `OSD_now - 30s` cutoff 去比 current secret**。如果 OSD 領先 mon 到 1 小時等級，mon 能給的 current/next secret 在 OSD 眼裡會太舊，`need_new_secrets(cutoff)` 持續回 true，OSD 不停要求 renew。source 自己就標出這個徵兆：
+如果 OSD 領先 mon 到 1 小時等級，mon 能給的最新 secret 在 OSD 的 `now − 30s` cutoff 下都嫌太舊，`need_new_secrets(cutoff)` 一直回 true，OSD 不停要求 renew 卻永遠拿不到夠新的。source 自己就標出這個徵兆：
 
 File: `ceph/src/mon/MonClient.cc` (line 1115)
 
@@ -275,7 +244,7 @@ if (!rotating_secrets->need_new_secrets() &&
 }
 ```
 
-OSD 啟動時這條會直接擋住它上線。`wait_auth_rotating` 等不到「夠新」的 key 就逾時（預設 `rotating_keys_bootstrap_timeout` 30 秒），重試到 `max_rotating_auth_attempts`（預設 10）就放棄、`exit(1)`：
+OSD 啟動時這條會直接擋住上線。`wait_auth_rotating` 等不到夠新的 key 就逾時（`rotating_keys_bootstrap_timeout` 30 秒），重試到 `max_rotating_auth_attempts`（預設 10）就放棄、`exit(1)`：
 
 File: `ceph/src/osd/OSD.cc` (line 4068)
 
@@ -291,15 +260,11 @@ while (monc->wait_auth_rotating(rotating_auth_timeout) < 0) {
 }
 ```
 
-`wait_auth_rotating` 裡的 cutoff 算法跟上面一致（`MonClient.cc:1150`），同一個 skew 條件。
+**方向 A 一句話**：OSD node 的 wall clock 比 mon 快上「天」級 → 啟動時 `exit(1)`，硬失敗。修法不是調 ceph，是把 OSD node 時鐘拉回跟 mon 一致（day 級偏差通常是 RTC 壞、時區設成 localtime、或根本沒在跑 timesyncd/chrony）。
 
-這是**方向 A（OSD 領先 mon 的穩態 skew）**：OSD node 的 wall clock 比 mon 快上「天」級，mon 給的 secret 在 OSD 看來全部太舊。source 直接保證的硬失敗點是 OSD 啟動時 `wait_auth_rotating` 重試到上限後 `exit(1)`。修復方向不是調 ceph，是**先把 OSD node 的時鐘拉回跟 mon 一致**（day 級偏差通常是 RTC 壞、時區設成 localtime、或 timesyncd/chrony 根本沒在跑）。
+### 方向 B — mon 先快、再跳回：在線 OSD 大量掉線（最痛）
 
-但這只是兩個方向之一。**反方向（mon 先快、再跳回）才是更常見、會打掉一整批在線 OSD 的觸發**——下一段專門拆。
-
-### 反方向更痛：mon 時鐘「先快、再跳回」會打掉一整批在線 OSD
-
-上面那條是 **OSD 領先 mon** 的穩態 skew。但實務上更常見、破壞力更大的是**反方向的 transition**：mon 的時鐘先錯（變快很多），簽出一批「未來」的 secret/ticket，然後 NTP 校時把 mon 時鐘**跳回**正確時間——就在那一刻，整批在線 OSD 認證成片失敗、大量掉線。關鍵在於 **mon 是發證方**，它的時鐘錯誤會污染所有人手上的 ticket/secret，而**修正時鐘才是引爆點**。逐步對 source：
+實務上更常見、破壞力更大的不是方向 A 的穩態 skew，而是 **mon 時鐘先錯、再被 NTP 校回** 的那一刻。因為 mon 是發證方，它的時鐘錯誤會污染所有 OSD 手上的票，而**修正時鐘才是引爆點**。三步：
 
 **Step 1 — mon 時鐘 +1 年，簽出「未來」的 secret。** mon rotate 時用自己（快了一年的）`ceph_clock_now()` 蓋 expiration，所以每把 secret 的到期都在約一年後：
 
@@ -312,7 +277,7 @@ ek.expiration = std::max(next_ttl, r.next().expiration);
 ek.expiration += ttl;
 ```
 
-OSD 收下這批 secret/ticket，自己時間是對的，`have_key()` 檢查 `ceph_clock_now() < expires`（真實now `<` 真實now+1年）為真，**全部視為有效**——所以 mon 時鐘錯的當下 cluster 表面正常，沒人掉線。
+OSD 收下這批 secret/ticket，自己時間是對的，`have_key()` 檢查 `ceph_clock_now() < expires`（真實 now `<` 真實 now+1年）為真，**全部視為有效**——所以 mon 時鐘錯的當下 cluster 表面正常，沒人掉線：
 
 File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 215)
 
@@ -325,7 +290,7 @@ bool CephXTicketHandler::have_key() {
 }
 ```
 
-**Step 2 — mon 校時跳回，把「未來」那批 secret rotate 作廢。** mon 時鐘回到正確值後重新 rotate；`add()` 永遠只保留 prev/current/next 三把，舊的直接 erase。新一輪用正確時間蓋的 secret 進來，那批 +1 年的就被擠出視窗：
+**Step 2 — mon 校時跳回，把「未來」那批 secret 擠掉。** mon 時鐘回到正確值後重新 rotate；`add()` 永遠只保留 prev/current/next 三把，舊的直接 erase。新一輪用正確時間蓋的 secret 進來，那批 +1 年的就被擠出視窗：
 
 File: `ceph/src/auth/Auth.h` (line 316)
 
@@ -334,7 +299,7 @@ while (secrets.size() > KEY_ROTATE_NUM)   // KEY_ROTATE_NUM = 3
   secrets.erase(secrets.begin());
 ```
 
-**Step 3 — OSD 還抱著舊 secret_id，驗證直接查不到。** OSD 之間（及 OSD-client）互相驗證走 `verify_authorizer`，拿 ticket 裡的 `secret_id` 去 mon keyserver 查那把 secret。一旦那個 `secret_id` 被 Step 2 擠掉，查找失敗 → 認證失敗 → 連線被拒：
+**Step 3 — OSD 還抱著舊 `secret_id`，驗證直接查不到。** OSD 之間（及 OSD-client）互驗走 `verify_authorizer`，拿 ticket 裡的 `secret_id` 去 mon keyserver 查那把 secret。一旦那個 `secret_id` 被 Step 2 擠掉，查找失敗 → 認證失敗 → 連線被拒：
 
 File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 459)
 
@@ -354,20 +319,18 @@ ldout(cct, 10) << "get_service_secret service " << ceph_entity_type_name(service
 return false;
 ```
 
-更糟的是 OSD **不會主動換掉**那批被作廢的 secret：OSD 用 `current().expiration <= cutoff`（`cutoff = OSD_now − 30s`）判斷要不要 renew，而它手上 secret 的 expiration 是 +1 年的絕對值，在 OSD 看來「還很新」，`need_new_secrets(cutoff)` 回 false → OSD 繼續拿已被 mon 作廢的 secret 去互相驗證，全部失敗。表現就是：**校時跳回的那一刻，heartbeat / replication 的 authorizer 驗證成片失敗 → OSD 互判失聯 → 大量 mark down / 掉線**。
+更糟的是 OSD **不會主動換掉**那批被作廢的 secret：它用 `current().expiration <= cutoff`（`cutoff = OSD_now − 30s`）判斷要不要 renew，而手上 secret 的 expiration 是 +1 年的絕對值，在 OSD 看來「還很新」→ 不 renew → 繼續拿已被 mon 作廢的 secret 互驗 → 全部失敗。表現就是：**校時跳回的那一刻，heartbeat / replication 的 authorizer 驗證成片失敗 → OSD 互判失聯 → 大量 mark down / 掉線。**
 
-這就是你遇過的案例：mon 時間快了一年、OSD 拿到未來的 service ticket，mon 同步 NTP 跳回後，OSD renew / 互驗失敗、大量下線。
+<Callout type="warning" title="方向 A 與方向 B 是兩種不同的爆法">
+  - **方向 A（OSD 比 mon 快，穩態）**：OSD 起不來，硬失敗點是啟動的 `wait_auth_rotating` → `exit(1)`。
+  - **方向 B（mon 先快、再跳回，transition）**：在線 OSD 大量掉線，失敗點是 `verify_authorizer` 查不到被 rotate 作廢的 `secret_id`。穩態時也許都沒事，**跳變才引爆**。
 
-<Callout type="warning" title="跟「OSD 領先 mon」是兩種不同觸發">
-  - **OSD 領先 mon（穩態）**：OSD 起不來，硬失敗點是啟動的 `wait_auth_rotating` → `exit(1)`。
-  - **mon 先快、再跳回（transition）**：在線 OSD 大量掉線，失敗點是 `verify_authorizer` 查不到被 rotate 作廢的 `secret_id`。穩態時也許都沒事，**跳變才引爆**。
-
-  共同根因都是「ticket/secret 的 expiration 是絕對 wall-clock 時間戳、由 mon 蓋」。所以排查 mon 時鐘問題時，**校時「跳回」本身就是高風險動作**：寧可挑維護窗、分批讓 mon 收斂，也不要在尖峰直接讓一台時間錯很多的 mon 一步跳回。修復後若已大量掉線，通常要逐台確認 OSD 重新拿到有效 rotating key（必要時 restart OSD 強制重新 auth）。
+  共同根因都是「cephx 的 expiration 是絕對 wall-clock 時間戳、由 mon 蓋」。所以排查 mon 時鐘問題時，**對一台時間錯很多的 mon「校時跳回」本身就是高風險動作**：寧可挑維護窗、分批讓 mon 收斂，也不要在尖峰一步跳回。若已大量掉線，通常要逐台確認 OSD 重新拿到有效 rotating key（必要時 restart OSD 強制重新 auth）。
 </Callout>
 
-## OSD ↔ OSD：mono_clock + delta 補償，skew 免疫
+## 線 3 — OSD ↔ OSD：走 mono clock，skew 免疫
 
-OSD 之間有兩條跟時間有關的路徑，但**兩條都不看 wall clock**。
+OSD 之間有兩條跟時間有關的路徑，**兩條都不看 wall clock**。
 
 第一條，OSD service 的「現在」用 monotonic clock：
 
@@ -380,9 +343,9 @@ ceph::signedspan OSDService::get_mnow() const
 }
 ```
 
-heartbeat deadline、read lease 的 `readable_until` 判斷全建在 `get_mnow()` 上。monotonic clock 不受 NTP 校正、不受 wall-clock skew 影響，所以兩台 OSD 的 wall clock 差多少，對 heartbeat 的存活判斷沒有直接作用。
+heartbeat deadline、read lease 的 `readable_until` 全建在 `get_mnow()` 上。mono clock 不受 NTP 校正、不受 wall-clock skew 影響，所以兩台 OSD 的 wall clock 差多少，對 heartbeat 存活判斷沒有作用。
 
-第二條，跨 OSD 的 read lease 確實要把對方時間軸換算成自己的，但用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
+第二條，跨 OSD 的 read lease 要把對方時間軸換算成自己的，但用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
 
 File: `ceph/src/osd/PeeringState.h` (line 119)
 
@@ -395,29 +358,13 @@ File: `ceph/src/osd/PeeringState.h` (line 119)
 // local_time + delta -> peer_time, and peer_time - delta -> local_time.
 ```
 
-primary 把 lease 換算給 replica 時就是減掉這個 delta bound。**這個 delta 是兩台 OSD mono_clock 起跑點的差，跟 wall-clock skew 是兩回事**——你把某台 OSD 的 `date` 調快一天，這個 mono delta 不會跟著變。
+這個 delta 是兩台 OSD mono_clock 起跑點的差，**跟 wall-clock skew 是兩回事**——你把某台 OSD 的 `date` 調快一天，這個 delta 不會跟著變。所以 OSD↔OSD 在 51ms → 1 天的任何刻度，wall-clock skew 都不觸發任何健康或 lease 問題。（OSD↔OSD 真正會 WARN 的是 heartbeat *latency* `> ~1s`，那是「訊息來回多久」不是「時鐘差多少」，拆在 [10ms 到 5s 那一頁](./cluster-time-skew-impact)。）
 
-結論：OSD-OSD 在 51ms → 1 天的任何刻度，**wall-clock skew 都不會觸發任何健康或 lease 問題**。(OSD-OSD 真正會 WARN 的是 heartbeat *latency* 超過 ~1s，那是「訊息來回多久」不是「時鐘差多少」，拆在 [10ms 到 5s 那一頁](./cluster-time-skew-impact)。)
+## 容易搞混：client ticket 不會因 skew 過期
 
-## 原始碼路徑
+`auth_service_ticket_ttl`(1hr) 這個數字在 cephx 裡被**兩條不同路徑**用到，skew 對它們的影響相反。線 2 講的是 **daemon rotating secret**（mon 蓋、會被 skew 弄爆）；這裡是另一條 **client service ticket**（client 自己蓋、對 skew 免疫），很容易混。
 
-| pair | 入口 | 門檻 / 效果 | 對 51ms→1day 的反應 |
-|---|---|---|---|
-| MON-MON 偵測 | `Monitor::timecheck_has_skew()` → `HealthMonitor` | `skew_bound > 50ms` → `MON_CLOCK_SKEW` WARN | 51ms 起一路都只是同一條 WARN，不升 ERR |
-| MON-MON lease | `Paxos::extend_lease()` / `handle_lease()` / `is_lease_valid()`（`real_clock`） | skew > `mon_lease`(5s) → lease 過期 → election churn | 1000ms 仍正常；1min/1hr/1day 全崩 |
-| MON-MON log | `Paxos::warn_on_future_time()` | `> 50ms` 寫 cluster log（非 health check） | 數字越大，log 裡的 "N s in the future" 越大 |
-| MON-OSD beacon | `OSD::send_beacon()`（mono）/ `OSDMonitor` 15min 沉默偵測 | 無 clock-skew 門檻（量間隔不量 wall-clock 差） | 整條 ladder 無反應 |
-| **MON-OSD（方向 A：OSD 領先）** | `KeyServer::_rotate_secret()`（mon wall clock 戳絕對 expiration）/ `RotatingSecrets::current()` / `need_new_secrets(cutoff)` / `MonClient::_check_auth_rotating()` / `OSD::init() wait_auth_rotating` | OSD 領先 mon 到 **1hr 等級**，加 30s cutoff 與 current/next state 後 secret 太舊 → rotate 不動 → 啟動重試 10 次 `exit(1)` | 1min 無感；**1hr 進風險區、1day OSD 起不來** |
-| **MON-OSD（方向 B：mon 先快再跳回）** | `_rotate_secret()` 簽未來 expiration / `RotatingSecrets::add()` 擠掉舊 secret / `cephx_verify_authorizer()` → `get_service_secret(secret_id)` 查不到 | mon 校時跳回 → 作廢那批未來 secret → OSD 舊 `secret_id` 查不到 → **在線 OSD 認證成片失敗、大量掉線** | 跳變那一刻引爆，與穩態 skew 大小無關 |
-| OSD-OSD | `OSDService::get_mnow()`（mono）/ `HeartbeatStamps` delta | 無 clock-skew 門檻 | 整條 ladder 無反應 |
-
-## 邊界與除錯
-
-### client service ticket（單機 duration）vs daemon rotating key（跨 node）—— 別搞混
-
-`auth_service_ticket_ttl`(1hr) 這個數字在 cephx 裡其實被**兩條完全不同的路徑**用到，skew 對它們的影響相反。上面 MON↔OSD 那節講的是 **daemon rotating key**（會被 skew 弄爆）；這裡補另一條 **client service ticket**（對 skew 免疫），因為很容易把兩者混為一談。
-
-client（librbd / kernel rbd 等）拿來跟 OSD 講話的 service ticket，到期判斷是用**自己一台機器上的 wall clock 量的 duration**，不是絕對時間。收到時記下 `expires = 自己的 now + validity`：
+client（librbd / kernel rbd 等）的 service ticket，到期是用**自己一台機器的 wall clock 量的 duration**，收到時記 `expires = 自己的 now + validity`：
 
 File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 199)
 
@@ -428,48 +375,39 @@ renew_after = expires;
 renew_after -= ((double)msg_a.validity.sec() / 4);
 ```
 
-之後檢查到期，也是用同一台 client 的 wall clock：
+檢查到期也是同一台 client 的 wall clock（`have_key()`，`CephxProtocol.cc:215`）。`expires` 和檢查它的時鐘在**同一台機器**，固定 skew offset 在減法裡抵消——**client 跟誰差多少，對它自己這張 ticket 的壽命沒有影響**。驗 ticket 那端（OSD）的 `cephx_verify_authorizer()` 也沒有 wall-clock 到期檢查，靠的是 `secret_id` 解不解得開（`CephxProtocol.cc:422`）。
 
-File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 215)
-
-```cpp
-bool CephXTicketHandler::have_key()
-{
-  if (have_key_flag) {
-    have_key_flag = ceph_clock_now() < expires;
-  }
-  return have_key_flag;
-}
-```
-
-`expires` 和檢查它的 `ceph_clock_now()` 都在**同一台機器、同一個時鐘**上。一個固定的 skew offset 在減法裡直接抵消掉——所以 **client 跟誰差多少，對它自己這張 ticket 的壽命沒有影響**。驗 ticket 的那一端（例如 OSD）`cephx_verify_authorizer()` 也**沒有** wall-clock 到期檢查，靠的是 rotating `secret_id` 解不解得開（`CephxProtocol.cc:422`）。
-
-關鍵差別一句話：
-
-| | 用什麼戳到期 | 用什麼檢查 | 對 node 間 skew |
+| | 誰蓋到期 | 誰檢查 | 對 skew |
 |---|---|---|---|
-| **client service ticket** | client 自己 `now + validity`（相對 duration） | client 自己的 clock | **免疫**（同機減法抵消） |
-| **daemon rotating key** | mon 自己 `now + ttl`（**絕對** wall-clock 時間點） | OSD 自己的 clock | **不免疫**（跨兩台時鐘比大小） |
+| **client service ticket** | client 自己 `now + validity`（相對 duration） | client 自己 | **免疫**（同機抵消） |
+| **daemon rotating secret** | **mon** `now + ttl`（絕對時間點） | OSD | **不免疫**（跨兩台時鐘比） |
 
-差別就在「絕對時間點」vs「相對 duration」：rotating key 把 mon 的絕對時間搬到 OSD 上比，兩台時鐘一旦差到 TTL 等級就爆；client ticket 全程在同一台機器上算 duration，skew 抵消。所以「skew 1 小時讓 *client* I/O 斷」是誤解，但「skew 1 天讓 *OSD daemon* 起不來 / 掉線」是真的。別把這兩件事混在一起。`auth_service_ticket_ttl`(1hr) 在「mon **掛掉**」情境下的角色（client renew 不到而斷）拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。
+所以「skew 1 小時讓 *client* I/O 斷」是誤解，但「skew 弄垮 *OSD daemon*」是真的。`auth_service_ticket_ttl`(1hr) 在「mon **掛掉**」（非 skew）情境下讓 client renew 不到而斷，那是另一回事，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。
 
-### 兩條真正會弄壞東西的線：5s lease 與 ~1hr rotating key
+## 排查：看到 skew 怎麼定位
 
-`MON_CLOCK_SKEW` WARN 很顯眼，但 51ms 的 WARN 其實人畜無害——quorum 穩、I/O 正常。真正改變行為的有兩條，要分清楚是哪一條：
+先 `ceph -s` 確認有沒有 `MON_CLOCK_SKEW`（確認真的有 skew），再依「誰在出事」分流——三條線的徵兆與 log 完全不同：
 
-- **MON-MON skew > `mon_lease`(5s)**：mon 開始 flap、election 反覆、control plane 卡頓。徵兆在 mon log：`clocks are too skewed` / 反覆 `calling new election`。
-- **OSD 領先 mon 到 `auth_service_ticket_ttl`(1hr) 等級**：OSD 可能拿不到夠新的 rotating key，啟動時起不來、在線時後續 renew/reconnect 風險升高。徵兆在 OSD log：`unable to obtain rotating service keys`、`maybe I have a clock skew against the monitors`、`rotating keys expired way too early`。
+| 現象 | 是哪條線 | 去哪看 |
+|---|---|---|
+| mon 反覆 flap / election | 線 1，skew `> 5s` | mon log：`clocks are too skewed`、反覆 `calling new election` |
+| OSD 起不來、一直重啟 | 線 2 方向 A，OSD 比 mon 快到 1hr+ | OSD log：`unable to obtain rotating service keys`、`maybe I have a clock skew against the monitors`、`rotating keys expired way too early` |
+| 一台 mon 校時後，OSD 突然大量掉線 | 線 2 方向 B，mon 跳回 | OSD log：`verify_authorizer could not get service secret`；對照 mon 剛做過 NTP 大幅校時 |
+| OSD 之間 heartbeat 慢、read lease 進 `laggy` | 不是 skew | 這是 latency 不是時鐘差，看 [10ms 到 5s 那一頁](./cluster-time-skew-impact) |
 
-排查順序：先 `ceph -s` 看有沒有 `MON_CLOCK_SKEW`（確認確實有 skew），再依「是 mon 在 flap」還是「是 OSD 起不來/掉線」分別去對應的 log 抓上面的關鍵字。兩條的共同根因都是「node 時鐘沒對齊」，但門檻、徵兆、受害者完全不同。
+兩個常見誤判：毫秒到分鐘級的單台 OSD 偏移**不會**觸發任何 health warning（線 3 走 mono clock）；client I/O 斷掉**通常不是** ticket 因 skew 過期（client ticket 免疫，見上節）。
 
-### 單台 OSD 偏掉：毫秒到分鐘沒事，但 day 級會出事
+## 原始碼路徑一覽
 
-如果只有某台 OSD 的 system clock 偏掉、MON-MON 之間同步良好，分兩種量級看：
-
-- **毫秒到分鐘級**：OSD-OSD 走 mono_clock + delta，beacon 走 mono cadence + 分鐘級沉默偵測，**沒有對應的 health warning**。這部分這頁第一版講對了。
-- **小時到天級（尤其 OSD 領先 mon）**：踩 rotating service key 那條。OSD `wait_auth_rotating` 逾時、重試到上限 `exit(1)` 是啟動階段的硬失敗；在線 OSD 則會在後續 renew / reconnect path 上出問題。這就是「大量 OSD 起不來 / 掉線」的路徑，這頁第一版漏了。
-
-排查訊號因此分兩組：毫秒級偏差看 read lease 是否一直進 `laggy`、beacon 是否超過 15 分鐘 timeout；**懷疑 day 級偏差就直接去 OSD log 抓 `unable to obtain rotating service keys` / `maybe I have a clock skew against the monitors`**，看到就是時鐘問題，先校時再說。
+| 線 | 入口 | 門檻 / 效果 |
+|---|---|---|
+| MON-MON 偵測 | `Monitor::timecheck_has_skew()` → `HealthMonitor` | `skew_bound > 50ms` → `MON_CLOCK_SKEW` WARN，不升 ERR |
+| MON-MON lease | `Paxos::extend_lease()` / `handle_lease()` / `is_lease_valid()`（`real_clock`） | skew `> mon_lease`(5s) → lease 過期 → election churn |
+| MON-MON log | `Paxos::warn_on_future_time()` | `> 50ms` 寫 cluster log（非 health check） |
+| MON-OSD beacon | `OSD::send_beacon()`（mono）/ `OSDMonitor` 15min 沉默偵測 | 無 clock-skew 門檻（量間隔不量 wall-clock 差） |
+| MON-OSD 方向 A | `KeyServer::_rotate_secret()` / `need_new_secrets(cutoff)` / `OSD::init() wait_auth_rotating` | OSD 比 mon 快到 1hr 等級 → secret 太舊 → 啟動重試 10 次 `exit(1)` |
+| MON-OSD 方向 B | `_rotate_secret()` 簽未來 expiration / `RotatingSecrets::add()` 擠掉舊 secret / `cephx_verify_authorizer()` → `get_service_secret()` 查不到 | mon 跳回 → 作廢未來 secret → OSD 舊 `secret_id` 查不到 → 在線 OSD 大量掉線 |
+| OSD-OSD | `OSDService::get_mnow()`（mono）/ `HeartbeatStamps` delta | 無 clock-skew 門檻 |
 
 ## 接下來 / 相關頁面
 
