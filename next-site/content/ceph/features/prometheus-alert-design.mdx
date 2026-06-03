@@ -1,51 +1,20 @@
 ---
 layout: doc
-title: Ceph - Prometheus alert rules with default rules
-description: 在已套用 ceph-mixin 預設 alert rules 的前提下，保留 CephHealthError，補上 stability-first 與 scoped OSD / MON rules，並定義維護 silence 與 alert 發生時的處理方式。
+title: Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計
+description: 已套用 ceph v19.2.3 內建 prometheus_alerts.yml 的前提下，補一層分層設計：保留 CephHealthError 當 page 總開關、用帶 hostname/ceph_daemon 的 scoped rule 取代直接 page OSD/MON down、把維護期 silence 與 client 風險訊號分開。核心洞見是 ceph_health_detail 只有 name/severity 沒有 host label，所以維護時不能靠它精準 silence。
 ---
 
 ## 場景
 
-這頁的前提是：你已經套用 ceph v19.2.3 內建的 `ceph-mixin/prometheus_alerts.yml`。也就是 `CephHealthError`、`CephHealthWarning`、`CephOSDDown`、`CephOSDHostDown`、`CephMonDown`、`CephMonDownQuorumAtRisk`、`CephPGUnavailableBlockingIO`、`CephMgrPrometheusModuleInactive` 這些預設 rule 都在。
+假設你已經套用 ceph v19.2.3 內建的 `ceph-mixin/prometheus_alerts.yml`——`CephHealthError`、`CephHealthWarning`、`CephOSDDown`、`CephOSDHostDown`、`CephMonDown`、`CephMonDownQuorumAtRisk`、`CephPGUnavailableBlockingIO`、`CephMgrPrometheusModuleInactive` 這些預設 rule 都在。
 
-因此這頁不是「自己重寫一整套 Ceph alert」。比較好的做法是把預設 rule 留著，然後明確分工：
+預設 rule 拿來「看 cluster 健不健康」夠用，但拿來**當 oncall 的 pager 訊號**有個痛點：維護一台 node 時，那些 cluster-wide 的 aggregate alert（`CephOSDHostDown`、`CephMonDown`…）會一起叫，而你**沒辦法只 silence 維護中的那台**。結果不是被維護噪音吵，就是粗暴地把整類 alert 全 silence、連真故障一起蓋掉。
 
-1. `CephHealthError` 用預設 rule，照樣 page。
-2. `ceph_health_detail` 只適合做「哪個 health check active」的穩定性 page，不適合用來做 host / daemon 維護 silence。
-3. OSD / MON down 改用 scoped rule，alert label 裡要有 `hostname` 或 `ceph_daemon`，維護時才能只 silence 目標。
-4. 維護期間可以短時間 silence aggregate context alert，但不能 silence 會代表 client I/O blocked、quorum lost、或 metrics blind spot 的 alert。
+這頁不是重寫一整套 alert，而是在預設 rule **之上加一層**：保留預設 rule 當 context，另外補一組「維護友善、可精準 silence」的 rule，並把三件事分清楚——哪些該 page、哪些只進 Slack、哪些維護時可以安全 silence。
 
-下面的設計是把兩個方向合併：一組 `ceph-stability-first` rules 負責 client 風險，一組 `ceph-scoped-availability` rules 負責 MON / OSD 維度。
+## 核心問題：`ceph_health_detail` 沒有 host label
 
-## 預設 rules 怎麼保留
-
-預設 `CephHealthError` 保留，因為它是 cluster 已經進 `HEALTH_ERR` 的總開關。這種 alert 沒有維護目標 label，但語意夠重：它不是「哪台 node 維護中」的雜訊。
-
-File: `ceph/monitoring/ceph-mixin/prometheus_alerts.yml` (line 4)
-
-```yaml
-- alert: "CephHealthError"
-  expr: "ceph_health_status == 2"
-  for: "5m"
-  labels:
-    severity: "critical"
-    type: "ceph_default"
-```
-
-預設 `CephHealthWarning` 也保留，但不進 Pager。它只是 `ceph_health_status == 1`，任何 maintenance、rebalance、scrub backlog、OSD down、MON down 都可能讓它 active。
-
-File: `ceph/monitoring/ceph-mixin/prometheus_alerts.yml` (line 14)
-
-```yaml
-- alert: "CephHealthWarning"
-  expr: "ceph_health_status == 1"
-  for: "15m"
-  labels:
-    severity: "warning"
-    type: "ceph_default"
-```
-
-`ceph_health_detail` 也要理解清楚。mgr/prometheus module 只把 `name` 與 `severity` 放進 `health_detail`，沒有 host / daemon label。
+整頁的設計都繞著一個事實轉，先講清楚：**mgr/prometheus module 匯出的 `ceph_health_detail` 只帶 `name` 與 `severity`，沒有 host / daemon label。**
 
 File: `ceph/src/pybind/mgr/prometheus/module.py` (line 113)
 
@@ -66,13 +35,63 @@ for name, info in self.health_history.healthcheck.items():
     )
 ```
 
-這解釋了為什麼 `CephClientBlocked` / `CephClientRisk` 可以逐 `name` page，但 OSD / MON 維護不能只靠 `ceph_health_detail`。`MON_DOWN`、`OSD_DOWN`、`OSD_HOST_DOWN` 都會變成 cluster-wide health check name；如果拿它們直接 page，維護時很難只 silence 目標 node。
+所以 `MON_DOWN`、`OSD_DOWN`、`OSD_HOST_DOWN` 在 `ceph_health_detail` 裡都只是一個 cluster-wide 的 `name`，**查不到是哪台 host**。預設 `CephOSDHostDown` / `CephOSDDown` 的 expr 也正是直接看這個：
 
-## 合併後的 alert rules
+```yaml
+- alert: "CephOSDHostDown"
+  expr: "ceph_health_detail{name=\"OSD_HOST_DOWN\"} == 1"
 
-這份 rule set 假設你的 MON 是 3-mon quorum，因此 `CephMonQuorumLost` 用 `count(...) < 2`。如果未來改成 5-mon 或更多，這條要改成動態 majority。
+- alert: "CephOSDDown"
+  expr: "ceph_health_detail{name=\"OSD_DOWN\"} == 1"
+```
 
-我也對你的基底做一個必要修正：`CephClientRisk` 要排除 `MON_DOWN`。否則 MON node 維護時，`CephMonDownScoped` 雖然可以精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page，等於把維護噪音繞回來。
+它們的 annotation 雖然能用 query 列出哪台 host，但 **annotation 不是 alert label，Alertmanager 的 silence matcher 不能 match annotation**。所以維護一台 OSD host 時，沒辦法用 `hostname=...` 去 silence 這條 alert——這就是痛點的根源。
+
+好消息是 host / daemon 資訊本來就在**另一個** metric 裡。OSD / MON 的 metadata metric 帶 `ceph_daemon` 與 `hostname`：
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 88)
+
+```python
+OSD_METADATA = ('back_iface', 'ceph_daemon', 'cluster_addr', 'device_class',
+                'front_iface', 'hostname', 'objectstore', 'public_addr',
+                'ceph_version')
+```
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 77)
+
+```python
+MON_METADATA = ('ceph_daemon', 'hostname',
+                'public_addr', 'rank', 'ceph_version')
+```
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 641)
+
+```python
+metrics['mon_quorum_status'] = Metric(
+    'gauge',
+    'mon_quorum_status',
+    'Monitors in quorum',
+    ('ceph_daemon',)
+)
+```
+
+**結論：OSD / MON down 的 pager 主訊號要從 metadata metric 拿 label（才有 `hostname` / `ceph_daemon` 可以 silence），而不是直接從 `ceph_health_detail` 拿。** 這就是下面「scoped rule」的全部動機。
+
+## 三種角色：每條 alert 該扮演什麼
+
+加這一層之前，先定清楚每條 alert 屬於哪一類——這決定它進 routing 的哪條路、維護時能不能 silence：
+
+| 角色 | 意思 | 維護時能 silence 嗎 |
+|---|---|---|
+| **Page 主訊號** | client I/O blocked、quorum lost、metrics 盲區、scoped 的 host/daemon down | 只有 scoped 的能按目標 silence；client/quorum/exporter 類**不可** silence |
+| **Slack / ticket context** | 預設 aggregate rule、低優先 notice | 可以短時間 silence 降噪 |
+| **維護可 silence** | scoped host/daemon down（帶 `hostname`/`ceph_daemon`） | 維護時只 silence 目標那台 |
+
+對應地，這層補兩組 rule：`ceph-stability-first`（負責 client 風險，幾乎都不可 silence）與 `ceph-scoped-availability`（負責 MON/OSD 維度，帶 label 可精準 silence）。下面分別給 YAML。
+
+## `ceph-stability-first`：client 風險，多數不可 silence
+
+這組的共通點是「真的出事才會 active」，所以多數是 page 主訊號、維護時也不該 silence。
 
 ```yaml
 groups:
@@ -128,7 +147,19 @@ groups:
           source: ceph_stability
         annotations:
           summary: "Ceph low-priority notice: {{ $labels.name }}"
+```
 
+兩個設計重點：
+
+- **`CephClientBlocked` vs `CephClientRisk` 的分工**：前者只盯 `PG_AVAILABILITY` / `SLOW_OPS`（client I/O 已經被擋），1 分鐘就 page；後者是「其餘所有會危及 client 的 health check」的 catch-all，5 分鐘 page。
+- **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、以及 `HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING`（這些是低優先，交給 `CephLowPriorityNotice`）。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
+- **`CephMonQuorumLost` 寫死 3-mon majority**（`count(...) < 2`）。非 3-mon 的改法見文末邊界。
+
+## `ceph-scoped-availability`：帶 label，維護可精準 silence
+
+這組把上一節的洞見落實：用 `ceph_osd_metadata` / `ceph_mon_metadata` 把 down 狀態接上 `hostname` / `ceph_daemon`，alert label 裡就有 host 可以 silence。
+
+```yaml
   - name: ceph-scoped-availability
     rules:
       - record: ceph:osd_up:with_hostname
@@ -179,83 +210,30 @@ groups:
           runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"
 ```
 
-<details>
-<summary>為什麼 OSD / MON down 要另外做 scoped rules</summary>
+query 怎麼讀：
 
-預設 `CephOSDDown` 與 `CephOSDHostDown` 的 expr 只看 `ceph_health_detail`：
+- `ceph:osd_up:with_hostname` 是 recording rule，把 `ceph_osd_up` 的 0/1 狀態接上 `ceph_osd_metadata` 的 `hostname`。
+- `ceph:osd_host_down:scoped` 用「同一台 host 上 down 的 OSD 數」等於「該 host 全部 OSD 數」判斷整台 OSD host down。
+- `CephOSDDaemonDownScoped` 的 `unless on (hostname) ceph:osd_host_down:scoped`：第一句找單顆 OSD down，第二句排除已經由 host alert 接手的 hostname。效果是 **只有 `osd.5` down 時 page `CephOSDDaemonDownScoped{ceph_daemon="osd.5"}`；整台 `osd-host-a` 掛掉時只 page `CephOSDHostDownScoped{hostname="osd-host-a"}`，不會每顆 OSD 各叫一次。**
+
+預設 `CephHealthError` 則直接保留當 page 總開關——它是 cluster 已進 `HEALTH_ERR` 的訊號，沒有維護目標 label，但語意夠重，不是「哪台 node 維護中」的雜訊：
+
+File: `ceph/monitoring/ceph-mixin/prometheus_alerts.yml` (line 4)
 
 ```yaml
-- alert: "CephOSDHostDown"
-  expr: "ceph_health_detail{name=\"OSD_HOST_DOWN\"} == 1"
-
-- alert: "CephOSDDown"
-  expr: "ceph_health_detail{name=\"OSD_DOWN\"} == 1"
+- alert: "CephHealthError"
+  expr: "ceph_health_status == 2"
+  for: "5m"
+  labels:
+    severity: "critical"
+    type: "ceph_default"
 ```
 
-它們的 annotation query 可以列出哪台 host / 哪顆 OSD，但是 annotation 不是 alert label，Alertmanager silence matcher 不能 match annotation 裡查出來的 host。
+預設 `CephHealthWarning`（`ceph_health_status == 1`）保留但**不 page**——任何 maintenance、rebalance、scrub backlog、OSD/MON down 都會讓它 active，當不了精準訊號，只放 Slack。
 
-OSD metadata 本身有 `ceph_daemon` 與 `hostname`：
+## Alertmanager routing：把角色映射到 receiver
 
-File: `ceph/src/pybind/mgr/prometheus/module.py` (line 88)
-
-```python
-OSD_METADATA = ('back_iface', 'ceph_daemon', 'cluster_addr', 'device_class',
-                'front_iface', 'hostname', 'objectstore', 'public_addr',
-                'ceph_version')
-```
-
-MON metric 也有同樣的 label 來源：
-
-File: `ceph/src/pybind/mgr/prometheus/module.py` (line 77)
-
-```python
-MON_METADATA = ('ceph_daemon', 'hostname',
-                'public_addr', 'rank', 'ceph_version')
-```
-
-File: `ceph/src/pybind/mgr/prometheus/module.py` (line 641)
-
-```python
-metrics['mon_quorum_status'] = Metric(
-    'gauge',
-    'mon_quorum_status',
-    'Monitors in quorum',
-    ('ceph_daemon',)
-)
-```
-
-所以 OSD / MON down 的 pager 主訊號要從 metadata metric 裡拿 label，而不是直接從 `ceph_health_detail` 拿。
-
-</details>
-
-<details>
-<summary>OSD daemon down query 怎麼讀</summary>
-
-`ceph:osd_up:with_hostname` 是 recording rule，把 `ceph_osd_up` 的 0/1 狀態接上 `ceph_osd_metadata` 的 `hostname`。
-
-```promql
-ceph_osd_up
-  * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
-```
-
-`ceph:osd_host_down:scoped` 用同一台 host 上「down 的 OSD 數量」等於「全部 OSD 數量」判斷整台 OSD host down。
-
-`CephOSDDaemonDownScoped` 剩下兩句：
-
-```promql
-(ceph:osd_up:with_hostname == 0)
-unless on (hostname) ceph:osd_host_down:scoped
-```
-
-第一句找單顆 OSD down，第二句排除已經由 host alert 接手的 hostname。效果是：只有 `osd.5` down 時 page `CephOSDDaemonDownScoped{ceph_daemon="osd.5"}`；整台 `osd-host-a` 掛掉時只 page `CephOSDHostDownScoped{hostname="osd-host-a"}`，不會每顆 OSD 各叫一次。
-
-</details>
-
-## Alertmanager routing
-
-因為預設 ceph-mixin rules 仍然存在，routing 不能再寫成「所有 `severity=critical` 都送 Pager」。那會讓預設 `CephMonDownQuorumAtRisk`、`CephOSDDownHigh` 這類 aggregate alert 在維護期間繼續叫。
-
-比較清楚的 routing 是：
+因為預設 ceph-mixin rules 仍在，routing 不能寫成「所有 `severity=critical` 都送 Pager」——那會讓預設 `CephMonDownQuorumAtRisk`、`CephOSDDownHigh` 這類 aggregate alert 在維護期間繼續叫。把上面三種角色映射到 receiver：
 
 ```yaml
 route:
@@ -279,17 +257,15 @@ route:
         - type="ceph_default"
 ```
 
-這樣預設 rule 還是會被保留在 Slack / ticket / Dashboard 裡，但 Pager 的主訊號來自：
-
-- 預設 `CephHealthError`
-- `ceph-stability-first`
-- `ceph-scoped-availability`
+效果：Pager 的主訊號只來自**預設 `CephHealthError` + `ceph-stability-first` + `ceph-scoped-availability`**；預設 aggregate rule 仍保留在 Slack / ticket / Dashboard 當 context，跟 upstream 文件一致，但不吵 pager。
 
 ## 維護時怎麼 silence
 
+scoped rule 帶 `hostname` / `ceph_daemon`，所以維護可以只 silence 目標那台。三種粒度：
+
 ### 維護 MON node
 
-MON 維護前先確認停這台 host 或這個 mon 不會立刻打掉可用性。`mon ok-to-stop` 是 Ceph 原生 monitor command；`orch host ok-to-stop` 是 host 級檢查。
+先確認停這台 mon / host 不會立刻打掉可用性。`mon ok-to-stop` 是 Ceph 原生 monitor command；`orch host ok-to-stop` 是 host 級檢查。
 
 File: `ceph/src/mon/MonCommands.h` (line 250)
 
@@ -326,7 +302,7 @@ amtool silence add \
 ceph orch host maintenance enter mon-host-a
 ```
 
-如果 Slack / ticket 不想在維護期間一直收到預設 aggregate context，可以短時間 silence 這些 context alert：
+若不想在維護期間一直收到預設 aggregate context，可以短時間 silence 它們：
 
 ```bash
 amtool silence add \
@@ -335,11 +311,11 @@ amtool silence add \
   -c "mute aggregate ceph context during mon.a maintenance"
 ```
 
-不要 silence `CephMonQuorumLost`。如果 3-mon cluster 在維護 `mon.a` 時又掉 `mon.b`，`count(ceph_mon_quorum_status == 1) < 2` 會 page，這就是你要保留的生命線。
+**不要 silence `CephMonQuorumLost`。** 如果 3-mon cluster 在維護 `mon.a` 時又掉 `mon.b`，`count(ceph_mon_quorum_status == 1) < 2` 會 page——這是維護期間要保留的生命線。
 
 ### 維護整台 OSD node
 
-整台 OSD node 維護前先跑 host ok-to-stop。這會比直接進 maintenance 更適合 oncall SOP，因為你會先看到停這台 host 是否讓 PG 風險上升。
+先跑 host ok-to-stop（比直接進 maintenance 更適合 SOP，因為會先看到停這台是否讓 PG 風險上升）：
 
 ```bash
 ceph orch host ok-to-stop osd-host-a
@@ -353,9 +329,7 @@ amtool silence add \
 ceph orch host maintenance enter osd-host-a
 ```
 
-這只會 silence `hostname="osd-host-a"`。如果維護期間 `osd-host-b` 掛掉，`CephOSDHostDownScoped{hostname="osd-host-b"}` 還是會 page。
-
-如果 Slack / ticket 也想降噪，可以 silence aggregate context：
+這只 silence `hostname="osd-host-a"`；維護期間 `osd-host-b` 掛掉，`CephOSDHostDownScoped{hostname="osd-host-b"}` 照樣 page。若 Slack / ticket 也要降噪：
 
 ```bash
 amtool silence add \
@@ -364,11 +338,11 @@ amtool silence add \
   -c "mute aggregate ceph context during osd-host-a maintenance"
 ```
 
-不要 silence `CephClientBlocked`、`CephClientRisk`、`CephHealthError`。如果維護真的讓 client I/O 或更高層 health check 出問題，那就不是噪音。
+**不要 silence `CephClientBlocked`、`CephClientRisk`、`CephHealthError`。** 如果維護真的讓 client I/O 或更高層 health check 出問題，那就不是噪音。
 
 ### 維護單顆 OSD
 
-單顆 OSD 先跑 `ok-to-stop`，再只 silence 該 daemon。
+先 `ok-to-stop`，再只 silence 該 daemon：
 
 ```bash
 ceph osd ok-to-stop 5
@@ -380,7 +354,7 @@ amtool silence add \
   -c "replace osd.5"
 ```
 
-如果這台 host 上只有一顆 OSD，停它會同時符合「整台 OSD host down」。這種小 cluster 要多加 host silence：
+如果這台 host 上只有一顆 OSD，停它會同時符合「整台 OSD host down」，要多加 host silence：
 
 ```bash
 amtool silence add \
@@ -392,11 +366,11 @@ amtool silence add \
 
 ## 發出 alert 時怎麼處理
 
+每條 page 主訊號的第一步動作：
+
 ### `CephClientBlocked`
 
-這代表 client I/O 已經被 `PG_AVAILABILITY` 或 `SLOW_OPS` 影響。不要 silence。
-
-先做：
+client I/O 已被 `PG_AVAILABILITY` 或 `SLOW_OPS` 影響。**不要 silence。** 目標不是先分類，是先恢復 client 可用性。
 
 ```bash
 ceph -s
@@ -406,24 +380,22 @@ ceph pg dump_stuck unclean
 ceph osd tree
 ```
 
-如果是 `PG_AVAILABILITY`，優先找 inactive / unavailable PG、down OSD、full / backfillfull 狀態。這類 alert 的目標不是「先分類」，而是先恢復 client 可用性。
-
-如果是 `SLOW_OPS`，先看 slow op 是卡在 MON、OSD，還是整體 I/O 壓力。接著看 OSD latency、磁碟、網路、recovery / backfill 壓力。
+`PG_AVAILABILITY` → 優先找 inactive / unavailable PG、down OSD、full / backfillfull。`SLOW_OPS` → 先看 slow op 卡在 MON、OSD 還是整體 I/O 壓力，再看 OSD latency、磁碟、網路、recovery / backfill。
 
 ### `CephClientRisk`
 
-這是「沒有被低優先或 scoped rule 接走的 health check」。處理方式是以 `$labels.name` 為入口：
+「沒被低優先或 scoped rule 接走的 health check」。以 `$labels.name` 為入口：
 
 ```bash
 ceph health detail
 ceph -s
 ```
 
-如果 `$labels.name` 是明確的 client 風險，照 health detail 的 check 名稱往下查。如果你發現某個 check 其實只是維護期間常態噪音，不要直接 silence 整條 `CephClientRisk`；應該把那個 health check name 移到排除清單或 `CephLowPriorityNotice`，讓規則語意保持乾淨。
+照 health detail 的 check 名稱往下查。**如果發現某個 check 其實只是維護期間常態噪音，不要直接 silence 整條 `CephClientRisk`**；把那個 health check name 移到排除清單或 `CephLowPriorityNotice`，讓規則語意保持乾淨。
 
 ### `CephMonQuorumLost`
 
-這是 MON quorum 低於 3-mon majority。不要 silence，不要等它自己恢復。
+MON quorum 低於 3-mon majority。**不要 silence，不要等它自己恢復。**
 
 ```bash
 ceph quorum_status
@@ -431,11 +403,11 @@ ceph health detail
 ceph orch ps --daemon_type mon
 ```
 
-先確認是否還能拿到 quorum。如果 quorum 已經失守，優先恢復 MON host 的網路、時間同步、磁碟空間與 mon daemon。不要同時重啟多台 mon；先讓一台已知健康的 mon 回到 quorum。
+先確認是否還能拿到 quorum。若已失守，優先恢復 MON host 的網路、時間同步、磁碟空間與 mon daemon。**不要同時重啟多台 mon**；先讓一台已知健康的 mon 回 quorum。
 
 ### `CephExporterDown`
 
-這代表 Prometheus 抓不到 Ceph metrics。它本身不是 client I/O failure，但它會讓所有 Prometheus alert 變成盲區，所以不要 silence。
+Prometheus 抓不到 Ceph metrics。它本身不是 client I/O failure，但會讓所有 Prometheus alert 變盲區，所以**不要 silence**。
 
 ```bash
 ceph -s
@@ -443,11 +415,11 @@ ceph mgr services
 ceph mgr module ls
 ```
 
-如果 mgr/prometheus module 沒啟用，修正 module。若 active mgr 掛掉，先恢復 mgr。這段期間不要只看 Prometheus，改用 `ceph -s` / `ceph health detail` 做人工確認。
+mgr/prometheus module 沒啟用就修 module；active mgr 掛掉就先恢復 mgr。這段期間改用 `ceph -s` / `ceph health detail` 人工確認，別只看 Prometheus。
 
 ### `CephOSDHostDownScoped`
 
-這是整台 OSD host 的 OSD 都 down。先判斷是 planned maintenance、host power、網路、systemd，還是 cephadm 問題。
+整台 OSD host 的 OSD 都 down。先判斷是 planned maintenance、host power、網路、systemd 還是 cephadm 問題：
 
 ```bash
 ceph osd tree
@@ -455,11 +427,11 @@ ceph orch ps --host osd-host-a
 ceph health detail
 ```
 
-如果不是計畫內維護，不要先做 cluster-wide silence。先恢復 host 或確認是否需要讓資料恢復路徑接手。
+不是計畫內維護就**不要先 cluster-wide silence**；先恢復 host 或確認是否要讓資料恢復路徑接手。
 
 ### `CephOSDDaemonDownScoped`
 
-這是單顆 OSD down，不是整台 host down。
+單顆 OSD down，不是整台 host。
 
 ```bash
 ceph osd tree
@@ -467,11 +439,11 @@ ceph osd ok-to-stop <id>
 ceph health detail
 ```
 
-接著查該 OSD 的 daemon log、device、BlueStore 狀態、是否被 mark out。這條 alert 有 `ceph_daemon` 與 `hostname`，所以維護或更換硬碟時可以只 silence 該 OSD。
+查該 OSD 的 daemon log、device、BlueStore 狀態、是否被 mark out。這條帶 `ceph_daemon` 與 `hostname`，維護或換硬碟時可只 silence 該 OSD。
 
 ### `CephMonDownScoped`
 
-這是某個 mon 不在 quorum。先看 quorum，再看該 host：
+某個 mon 不在 quorum。先看 quorum，再看該 host：
 
 ```bash
 ceph quorum_status
@@ -479,13 +451,11 @@ ceph health detail
 ceph orch ps --daemon_type mon
 ```
 
-如果是計畫內維護，確認 silence 是否只 match 目標 `ceph_daemon` / `hostname`。如果不是計畫內維護，先恢復 mon host 的網路、時間、磁碟，再看 mon log。
+計畫內維護就確認 silence 是否只 match 目標 `ceph_daemon` / `hostname`；不是的話先恢復 mon host 的網路、時間、磁碟，再看 mon log。
 
 ### `CephLowPriorityNotice`
 
-這只進 Slack / ticket，不 page。典型例子是 `HOST_IN_MAINTENANCE`、`OBJECT_MISPLACED`、`PG_SLOW_SNAP_TRIMMING`。
-
-處理方式是記錄、追蹤、看是否超過預期時間。它不應該把人叫醒，但也不應該完全消失。
+只進 Slack / ticket，不 page。典型是 `HOST_IN_MAINTENANCE`、`OBJECT_MISPLACED`、`PG_SLOW_SNAP_TRIMMING`。記錄、追蹤、看是否超過預期時間——不該把人叫醒，但也不該完全消失。
 
 ## 邊界
 
@@ -497,7 +467,7 @@ ceph orch ps --daemon_type mon
 count(ceph_mon_quorum_status == 1) < 2
 ```
 
-如果 cluster 不是 3-mon，改成：
+非 3-mon 的 cluster 改成動態 majority：
 
 ```promql
 count(ceph_mon_quorum_status == 1) < (floor(count(ceph_mon_metadata) / 2) + 1)
@@ -505,11 +475,11 @@ count(ceph_mon_quorum_status == 1) < (floor(count(ceph_mon_metadata) / 2) + 1)
 
 ### 預設 rules 仍然會出現
 
-預設 `CephOSDDown`、`CephOSDHostDown`、`CephMonDown`、`CephMonDownQuorumAtRisk` 仍然會 fire。差別是 routing 不讓它們當 pager 主訊號。它們留在 Slack / ticket / Dashboard，提供跟 upstream 文件一致的 context。
+預設 `CephOSDDown`、`CephOSDHostDown`、`CephMonDown`、`CephMonDownQuorumAtRisk` 仍會 fire——差別只是 routing 不讓它們當 pager 主訊號。它們留在 Slack / ticket / Dashboard，提供跟 upstream 文件一致的 context。
 
 ### `CephClientRisk` 不要變成垃圾桶
 
-`CephClientRisk` 的重點是「其餘會危及 client 的 health check」。如果某個 check 長期不是 client 風險，就把它移出這條 rule；不要讓 oncall 被一條過大的 catch-all rule 訓練到無視 Pager。
+`CephClientRisk` 的重點是「其餘會危及 client 的 health check」。如果某個 check 長期不是 client 風險，就把它移出這條 rule——不要讓 oncall 被一條過大的 catch-all 訓練到無視 Pager。
 
 ## 接下來 / 相關頁面
 
