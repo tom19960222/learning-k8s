@@ -314,6 +314,16 @@ amtool silence add \
 
 **不要 silence `CephMonQuorumLost`。** 如果 3-mon cluster 在維護 `mon.a` 時又掉 `mon.b`，`count(ceph_mon_quorum_status == 1) < 2` 會 page——這是維護期間要保留的生命線。
 
+<Callout type="info" title="維護 mon 會升哪些 health check，上面的 silence 蓋得完整嗎">
+  `ceph orch host maintenance enter mon-host-a` 之後實際會升的是 `MON_DOWN`（`HealthMonitor.cc:820`，`HEALTH_WARN`）與 `HOST_IN_MAINTENANCE`（`cephadm/module.py:2126`，`HEALTH_WARN`）。對照三條 pager 訊號：
+
+  - `CephMonDownScoped{hostname="mon-host-a"}` —— 已被上面第一條 silence 蓋掉。它能精準 match 是因為 `mon_quorum_status` / `mon_metadata` 是**對 monmap 裡每一個 mon** 匯出的（`prometheus/module.py:1021` iterate `monmap['mons']`），停掉的 `mon.a` 仍在 monmap，所以 `mon_quorum_status{ceph_daemon="mon.a"}=0` 與帶 `hostname` 的 metadata 都還在、silence matcher 接得到。
+  - `CephClientRisk{name="MON_DOWN"}` —— **不會叫**，因為 `MON_DOWN` 在排除清單裡（這就是當初把 `MON_DOWN` 排掉的原因）。
+  - `HOST_IN_MAINTENANCE` —— 不 page，它在 `CephLowPriorityNotice`（Slack-only）。
+
+  所以維護單台 mon，**上面那條 scoped silence 就完整了**，不用再多 silence。`CephMonQuorumLost` 維護 1 台時 `count==2` 不觸發，保留它當第二台也掉時的生命線。
+</Callout>
+
 ### 維護整台 OSD node
 
 先跑 host ok-to-stop（比直接進 maintenance 更適合 SOP，因為會先看到停這台是否讓 PG 風險上升）：
@@ -340,6 +350,15 @@ amtool silence add \
 ```
 
 **不要 silence `CephClientBlocked`、`CephClientRisk`、`CephHealthError`。** 如果維護真的讓 client I/O 或更高層 health check 出問題，那就不是噪音。
+
+<Callout type="info" title="維護整台 OSD node 會升哪些 health check，上面的 silence 蓋得完整嗎">
+  `ceph orch host maintenance enter osd-host-a` 對 OSD host 會做兩件有 health check 副作用的事：停掉該 host 全部 OSD，並**自動對該 host subtree 設 `noout`**（`cephadm/module.py:2131` 的 `osd set-group noout`，避免維護期間資料搬移）。所以實際升起的是：
+
+  - `OSD_HOST_DOWN` / `OSD_DOWN`（`OSDMap.cc:7316`/`7342`，`HEALTH_WARN`）—— 已被上面 `CephOSDHostDownScoped|CephOSDDaemonDownScoped{hostname="osd-host-a"}` 蓋掉；`CephClientRisk` 排除清單也有這兩個 name。
+  - **`OSDMAP_FLAGS`**（`OSDMap.cc:7493`，因為自動設了 `noout`）與 **`PG_DEGRADED`**（副本掉一份）—— 這兩個**不在** scoped silence 裡，但它們被歸進 Slack-only 的 `CephLowPriorityNotice`、且在 `CephClientRisk` 排除清單裡，所以**不會 page**，維護時不用特別 silence。（這就是為什麼排除清單一定要有 `OSDMAP_FLAGS`：`noout` 是 maintenance enter 自動設的，不設它這條一定漏。）
+
+  唯一仍會 page 的是真出事：若維護讓 PG 掉到 `min_size` 以下變 `PG_AVAILABILITY`，`CephClientBlocked` 會叫——那時不該 silence。前面的 `ceph orch host ok-to-stop osd-host-a` 通過就是在確認不會走到這一步。
+</Callout>
 
 ### 維護單顆 OSD
 
