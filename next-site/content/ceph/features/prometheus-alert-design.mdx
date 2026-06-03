@@ -109,7 +109,7 @@ groups:
       - alert: CephClientRisk
         expr: |
           ceph_health_detail{
-            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING"
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
           } == 1
         for: 5m
         labels:
@@ -139,7 +139,7 @@ groups:
       - alert: CephLowPriorityNotice
         expr: |
           ceph_health_detail{
-            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING"
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
           } == 1
         for: 30m
         labels:
@@ -152,7 +152,8 @@ groups:
 兩個設計重點：
 
 - **`CephClientBlocked` vs `CephClientRisk` 的分工**：前者只盯 `PG_AVAILABILITY` / `SLOW_OPS`（client I/O 已經被擋），1 分鐘就 page；後者是「其餘所有會危及 client 的 health check」的 catch-all，5 分鐘 page。
-- **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、以及 `HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING`（這些是低優先，交給 `CephLowPriorityNotice`）。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
+- **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、以及 `HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING` / `PG_DEGRADED` / `OSDMAP_FLAGS`（這些是低優先，交給 `CephLowPriorityNotice`）。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
+- **特別注意 `PG_DEGRADED` / `OSDMAP_FLAGS` —— 這兩個是「換硬碟一定會叫」的元兇**。停一顆 OSD 換硬碟時，它上面的 PG 副本掉一份 → ceph 升 `PG_DEGRADED`；如果維護前設了 `noout` 旗標，會升 `OSDMAP_FLAGS`。`CephClientRisk` 是 `name!~` 的 catch-all，**任何不在排除清單裡的 health check active 滿 5 分鐘都 page**——所以早期版本只 silence `CephOSDDaemonDownScoped` 是不夠的，`CephClientRisk{name="PG_DEGRADED"}` 還是會在 5 分鐘後叫。把這兩個排除掉、歸到 Slack-only 的 `CephLowPriorityNotice` 是對的：`PG_DEGRADED` 在 ceph 內部就是 `HEALTH_WARN`（`PGMap.cc:2578`，`sev = HEALTH_WARN`），而且 upstream ceph-mixin 預設**沒有任何 rule 直接 page 它**（degraded 只讓 `CephHealthWarning` 這條 Slack-only 的 warning 亮）。換句話說，把 degraded 排出 pager 不是「降級一個該叫的訊號」，是把它修回 ceph 預設本來的等級——真正擋到 I/O 的 `PG_AVAILABILITY` 仍由 `CephClientBlocked` page，生命線不動。
 - **`CephMonQuorumLost` 寫死 3-mon majority**（`count(...) < 2`）。非 3-mon 的改法見文末邊界。
 
 ## `ceph-scoped-availability`：帶 label，維護可精準 silence
@@ -363,6 +364,12 @@ amtool silence add \
   --duration=1h \
   -c "single-osd host maintenance"
 ```
+
+<Callout type="tip" title="換硬碟為什麼上面這樣就夠了（不用再 silence PG_DEGRADED）">
+  停一顆 OSD 換硬碟，除了 `OSD_DOWN`，ceph 一定會升 `PG_DEGRADED`（副本掉一份），設了 `noout` 還會升 `OSDMAP_FLAGS`。這兩個**不是**用上面的 `CephOSDDaemonDownScoped` silence 蓋掉的——它們是被歸進 Slack-only 的 `CephLowPriorityNotice`（見前面 rule 設計），本來就不 page，所以維護時不用特別為它們加 silence。
+
+  你只需要 silence `CephOSDDaemonDownScoped{ceph_daemon="osd.5"}` 這一條 pager 訊號。**唯一仍會 page 的情況是真的出事**：如果換硬碟讓某些 PG 掉到 `min_size` 以下變成 `PG_AVAILABILITY`（client I/O 被擋），`CephClientBlocked` 會 page——這時不該 silence，那是你要知道的。先 `ceph osd ok-to-stop 5` 通過就是在確認不會走到這一步。
+</Callout>
 
 ## 發出 alert 時怎麼處理
 
