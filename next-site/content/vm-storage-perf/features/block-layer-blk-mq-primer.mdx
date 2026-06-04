@@ -1,0 +1,81 @@
+---
+layout: doc
+title: 底層 primer ② — block layer 與 blk-mq：request 怎麼排隊、合併、完成
+description: rbd-io-datapath 的底層名詞 primer 第二篇。解釋 Linux block layer 這層中介——bio、request、request queue、blk-mq（多佇列）、queue_rq callback、queue depth/nr_requests、merge/coalesce、scatter-gather/iovec、completion、blk_mq_start_request——並對回 datapath 裡 guest virtio_queue_rq 與 host krbd rbd_queue_rq 兩處同樣的 blk-mq 抽象。
+---
+
+## 接續上一篇
+
+[primer ①](./linux-io-stack-primer) 畫了整條 IO 棧的分層地圖，其中有一層叫 **block layer**。datapath 頁裡 guest 端的 `virtio_queue_rq`、host 端的 `rbd_queue_rq` 都掛在這層上——它們是同一個抽象（blk-mq）在兩個不同位置的實作。這篇就把 block layer 放大來看。
+
+## 一句話直覺
+
+block layer 是「把上層的讀寫變成裝置看得懂的 **request**，幫你排隊、合併、送下去、完成後通知你」的中介層。它讓 ext4 不必懂 NVMe、讓 krbd 不必懂檔案系統——大家都只跟 block layer 講「請讀/寫這段 sector」。
+
+生活類比：餐廳出餐。客人點的每道菜是一個 **bio**（要什麼、送去哪桌）；廚房把相鄰的單併成一張工單就是 **request**；工單排在出餐線上就是 **request queue**；菜做好端出去叫 **completion**。
+
+## 為什麼從「單佇列」變成 blk-mq
+
+早年 Linux 的 block layer 只有**一條** request queue，配一把大鎖。單顆 SATA 硬碟時代沒問題；但 NVMe SSD 動輒百萬 IOPS、CPU 又是多核，所有 core 搶同一把鎖就成了瓶頸。
+
+**blk-mq（multi-queue block layer）** 的解法：每個 CPU（或一組 CPU）有自己的 software queue，再對應到裝置的 hardware queue。各走各的、不互搶鎖。這就是為什麼 datapath 第①節會出現 `struct blk_mq_hw_ctx *hctx`（hardware context）這種型別——它正是「這筆 IO 走哪條硬體佇列」的代表。
+
+```
+ 舊：single-queue                    新：blk-mq（multi-queue）
+ ─────────────────                  ──────────────────────────
+ CPU0 ┐                             CPU0 → swq0 ┐
+ CPU1 ┤  一條 queue + 大鎖           CPU1 → swq1 ┼→ hwq → 裝置
+ CPU2 ┤  （搶鎖瓶頸）                CPU2 → swq2 ┘
+ CPU3 ┘                             …各走各的，少搶鎖
+```
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **bio** | 「一段資料要讀/寫到裝置哪個位置」的最小描述單位 | 一個 bio 可以指向記憶體裡好幾段不連續的 buffer（見 scatter-gather） |
+| **request（`struct request`）** | block layer 真正排隊、送給 driver 的單位，由一個或多個 bio 組成 | datapath 裡 `bd->rq` 就是它 |
+| **request queue** | request 排隊等著被 driver 取走的佇列 | blk-mq 下其實是「每 CPU software queue + 每裝置 hardware queue」兩層 |
+| **blk-mq（multi-queue block layer）** | 現代 Linux 的 block layer 架構，用多佇列避免多核搶鎖 | datapath 兩端（guest virtio-blk、host krbd）都是 blk-mq driver |
+| **`queue_rq` callback** | driver 要實作的函式：「block layer 給你一筆 request，你去送」 | virtio-blk 的是 `virtio_queue_rq`；krbd 的是 `rbd_queue_rq` |
+| **queue depth / `nr_requests`** | 一條 queue 最多能同時容納幾筆 in-flight request | guest 內 `cat /sys/block/vda/queue/nr_requests` 可看；太淺會卡住並行 IO |
+| **merge / coalesce** | 把位置相鄰的 request 合併成一筆，減少下發次數 | 對循序 IO 幫助最大；datapath QEMU 端用 `virtio_blk_submit_multireq` 做類似的事 |
+| **scatter-gather（散佈/聚集）** | 一筆 IO 的資料散在記憶體多段不連續 buffer，用一張清單描述 | kernel 用 `struct scatterlist`，QEMU 用 `iovec` / `QEMUIOVector`。datapath 第①節 `sgs[3]` 就是它 |
+| **completion** | 裝置完成這筆 IO 後，回呼 callback 通知上層 | virtio-blk 的完成 callback 是 `virtio_blk_rw_complete` |
+| **`blk_mq_start_request`** | 標記「這筆 request 開始處理」並起算計時 | host `/dev/rbdX` 的 `iostat` latency 就從這裡起算——量延遲的關鍵錨點 |
+
+> 補一個常聽到的：**plug / unplug**。block layer 會短暫「塞住」（plug）佇列把幾筆 IO 累積起來，再一次「拔塞」（unplug）批次送下去，好讓 merge 有機會發生。是上面 merge 的配套機制，知道名字即可。
+
+## blk-mq 在 datapath 出現兩次
+
+這是最容易混淆、也最值得記住的一點：**同一套 blk-mq 抽象，在 datapath 裡出現在兩個位置**。
+
+```
+ guest 內 blk-mq              host 上 blk-mq
+ ─────────────              ─────────────
+ virtio_queue_rq    ←→      rbd_queue_rq      ← 兩個都是 queue_rq callback
+ /dev/vda 的 queue          /dev/rbdX 的 queue ← 兩個都有 nr_requests 深度
+ guest iostat 量這裡         host iostat 量這裡  ← 兩個邊界相減 = 虛擬化稅
+```
+
+guest 應用程式 → guest blk-mq（`virtio_queue_rq`）→ …過虛擬化邊界… → host blk-mq（`rbd_queue_rq`）→ krbd。兩端都能用 `iostat` 量，相減就把延遲切成「VM 內」與「VM 外」兩段。
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| `queue_rq` callback（guest 端） | **第①節** `virtio_queue_rq(struct blk_mq_hw_ctx *hctx, …)` |
+| `queue_rq` callback（host 端） | **第⑤節** `rbd_queue_rq` → 丟 `rbd_wq` |
+| scatter-gather | **第①節** `virtblk_add_req` 組 `scatterlist sgs[3]` → `virtqueue_add_sgs` |
+| merge / 批次下發 | **第③節** `virtio_blk_submit_multireq`（依 sector 排序、不超過 max_transfer/max_iov） |
+| completion callback | **第④節** `blk_aio_pwritev(... virtio_blk_rw_complete ...)` |
+| latency 起算點 | **第⑤節** `blk_mq_start_request`；除錯節 `iostat` 的 `await` / `aqu-sz` |
+| queue 深度旋鈕 | **除錯節** `cat /sys/block/vda/queue/nr_requests`、virtio num-queues |
+
+<Callout type="info" title="下一步">
+  request 排好隊、要送下去了——但「送」這個動作本身可以是同步（卡住呼叫者）或非同步（丟出去不等）。下一篇講 QEMU 怎麼用 libaio / io_uring / thread pool 把 IO 非同步丟給 host kernel。
+
+  - 上一篇：[底層 primer ① — Linux 儲存 IO 棧](./linux-io-stack-primer)
+  - 下一篇：[底層 primer ③ — 同步 vs 非同步 IO](./async-io-interfaces-primer)
+  - 主線：[rbd-io-datapath](./rbd-io-datapath)
+</Callout>

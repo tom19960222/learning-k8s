@@ -1,0 +1,87 @@
+---
+layout: doc
+title: 底層 primer ③ — 同步 vs 非同步 IO：syscall、libaio、io_uring、thread pool、coroutine
+description: rbd-io-datapath 的底層名詞 primer 第三篇。解釋為什麼一個 write syscall 會「卡住」呼叫端，以及 QEMU 怎麼用非同步介面避免卡住 vCPU——blocking syscall（pread/pwrite/preadv/pwritev）、linux-aio（libaio）、io_uring、thread pool、completion callback、QEMU coroutine——對回 datapath 第④節 raw_co_prw 的 io_uring/linux-aio/threads 三岔與 aio= 旋鈕。
+---
+
+## 接續上一篇
+
+[primer ②](./block-layer-blk-mq-primer) 講 block layer 怎麼把 request 排好隊。但 request 要真正「送出去」時，有個關鍵選擇：**送出的這個動作，要不要卡住呼叫它的那條 thread？** datapath 第④節 QEMU 對 `/dev/rbdX` 發 IO 時，會在 io_uring / linux-aio / thread pool 三條路裡挑一條——這篇就解釋這三條路差在哪、為什麼重要。
+
+## 一句話直覺
+
+**同步（blocking）**：你在櫃台點咖啡，站著等到咖啡做好才能離開——這段時間你什麼都不能做。
+**非同步（async）**：你點完拿一個取餐呼叫器，回座位繼續做事，咖啡好了呼叫器響（completion），你再去拿。
+
+對 VM 來說這是生死問題：如果 QEMU 用同步方式對 `/dev/rbdX` 發 IO，那條 thread 會卡到 Ceph 回來為止；期間它沒辦法服務 guest 其他 IO，整台 VM 的 IO 並行度就崩了。所以 QEMU 想盡辦法用非同步。
+
+## 為什麼 syscall 會「卡住」
+
+`write()` / `pwrite()` 這類 syscall 預設是 **blocking** 的：呼叫後，這條 thread 進到 kernel、睡著，直到資料送到裝置（或至少進了 page cache）才醒來回到使用者空間。對慢裝置（網路上的 Ceph）來說，這一睡可能是毫秒等級。
+
+解法有兩大類：
+
+1. **真非同步介面**：syscall 本身就「提交了就回來，不等完成」——libaio、io_uring 屬此。
+2. **用 thread 假裝非同步**：syscall 還是 blocking，但丟給背景 worker thread 去卡，主 thread 不受影響——thread pool 屬此。
+
+## 三條路怎麼選（datapath 第④節的分岔）
+
+```
+ QEMU 要對 /dev/rbdX 發一筆 IO（raw_co_prw）
+        │
+        ├─ 對齊的 O_DIRECT？─是→ io_uring 可用？─是→ luring_co_submit   ← 最新、最少 syscall
+        │                                     └否→ linux-aio 可用？─是→ laio_co_submit  ← libaio
+        │
+        └─ 否則（不對齊 / 沒開）→ thread pool → handle_aiocb_rw → pwrite()  ← 同步 syscall 丟背景 thread
+```
+
+這三條路對應 KubeVirt / QEMU 的 `aio=` 設定：`io_uring`、`native`（= linux-aio）、`threads`。這就是 VM disk 效能一個很有感的旋鈕。
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **blocking syscall** | 呼叫後 thread 睡著等完成才回來的系統呼叫 | 簡單但會卡住呼叫端，不適合高並行 |
+| **`pread` / `pwrite`** | 帶 offset 的同步讀/寫（不動 file 的當前位置） | datapath 第④節單段對齊 IO 走這個 |
+| **`preadv` / `pwritev`** | 一次讀/寫「多段不連續 buffer」的版本（v = vector） | 對應 scatter-gather；多段 iovec 走這個 |
+| **linux-aio（libaio）** | Linux 較早的真非同步 IO 介面（`io_submit` / `io_getevents`） | 只在 `O_DIRECT` 下才真正非同步；KubeVirt 的 `aio=native` 走它 |
+| **io_uring** | 較新的非同步 IO 介面，用兩個共享 ring buffer 大幅減少 syscall | SQ（submission queue）放要做的事、CQ（completion queue）收結果，user 與 kernel 共享，不必每筆都進 kernel |
+| **thread pool** | 一群背景 worker thread，專門去跑那些 blocking syscall | 不需要裝置/檔案支援真 async，相容性最好；代價是 thread 切換開銷。`aio=threads` 走它 |
+| **completion / callback** | IO 完成時被呼叫的回呼，通知「這筆好了」 | 三條路最後都會回到同一個完成 callback（datapath 的 `virtio_blk_rw_complete`） |
+| **coroutine（QEMU）** | QEMU **使用者空間**的協程，讓非同步程式碼寫起來像同步 | 注意：這是 QEMU library 層的東西，**不是 kernel 概念**。`blk_aio_pwritev` 內部起一個 coroutine 跑 block graph |
+
+<Callout type="warning" title="coroutine ≠ kernel thread">
+  io_uring / libaio / thread pool 是「IO 怎麼提交給 host kernel」的三種**機制**；coroutine 是 QEMU 內部「怎麼把這段非同步流程寫得好讀」的**程式碼風格**，跑在 QEMU process 自己的 user space。兩者是不同層次的東西，別混在一起。
+</Callout>
+
+## io_uring 為什麼快：少 syscall
+
+libaio 每提交一批、每收一批結果，都還要進 kernel（`io_submit` / `io_getevents` 各一次 syscall）。io_uring 把「要做的事」和「做完的結果」放在兩個 **user 與 kernel 共享的環形 buffer**：
+
+```
+ user space            kernel
+ ──────────            ──────
+ [SQ ring] ──放入要做的 IO──► kernel 取走去做
+ [CQ ring] ◄──放回完成結果──── kernel 做完填回
+   ↑ user 直接讀 CQ，不必每筆都 syscall
+```
+
+高 IOPS 下，這個「少進 kernel」的差別很明顯。這也是為什麼新版 KubeVirt / QEMU 預設偏好 `aio=io_uring`（前提是 host kernel 夠新、IO 對齊走 `O_DIRECT`）。
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| 三條路的分岔 | **第④節** `raw_co_prw`：`luring_co_submit` / `laio_co_submit` / 退回 thread pool |
+| 同步 syscall 落點 | **第④節** `handle_aiocb_rw`：單段走 `pread`/`pwrite`，多段走 `preadv`/`pwritev` |
+| coroutine | **第④節** `blk_aio_pwritev` → `blk_aio_prwv` 起 coroutine 跑 block graph |
+| completion callback | **第④節** `blk_aio_pwritev(... virtio_blk_rw_complete ...)` |
+| `aio=` 旋鈕 | **除錯節**「QEMU 的 aio 模式（io_uring / linux-aio / threads）直接影響 host 端 submit 路徑」 |
+
+<Callout type="info" title="下一步">
+  到這裡都還在講「IO 在 host 上怎麼提交」。但別忘了 IO 是從 **guest 內**發起的——它怎麼跨過 VM 與 host 的牆？下一篇講 virtio 與 vring，guest 與 host 之間那條共享記憶體的高速公路。
+
+  - 上一篇：[底層 primer ② — block layer 與 blk-mq](./block-layer-blk-mq-primer)
+  - 下一篇：[底層 primer ④ — virtio 與 vring](./virtio-vring-primer)
+  - 主線：[rbd-io-datapath](./rbd-io-datapath)
+</Callout>

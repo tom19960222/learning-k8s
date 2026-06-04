@@ -1,0 +1,93 @@
+---
+layout: doc
+title: 底層 primer ⑤ — KVM 邊界：vmexit、ioeventfd、eventfd、event loop
+description: rbd-io-datapath 的底層名詞 primer 第五篇。解釋 guest 的 doorbell 寫入怎麼穿過硬體虛擬化的牆到 host——CPU guest/host mode、vmexit、MMIO trap、為什麼 vmexit 昂貴、ioeventfd、eventfd、QEMU host notifier、AioContext event loop——對回 datapath 第②節的 ioeventfd_write / eventfd_signal / virtio_queue_host_notifier_read。
+---
+
+## 接續上一篇
+
+[primer ④](./virtio-vring-primer) 結尾，guest 對 doorbell 做了一次 MMIO write（kick）。問題來了：guest 跑在 VM 裡，這一下寫入怎麼被 host 上的 QEMU 收到？這篇講 datapath 第②節那道**虛擬化邊界**——也是整條路徑裡最「硬體」的一跳。
+
+## 一句話直覺
+
+現代 CPU 有兩種執行模式：**guest mode**（跑 VM 內的程式）和 **host mode**（跑 host kernel / QEMU）。guest 大多數指令 CPU 直接幫它跑，飛快；但碰到「不能讓 guest 自己做」的事（例如戳裝置暫存器），CPU 就**掉出** guest mode、回到 host——這一掉就叫 **vmexit**。
+
+生活類比：自助結帳機。你大部分商品自己刷（guest 直接執行），飛快；但碰到需要店員確認的商品（酒類），機器就亮燈呼叫店員（vmexit），店員過來處理完你才繼續。每次呼叫店員都有等待成本——vmexit 也一樣，所以越少越好。
+
+## vmexit 為什麼貴
+
+vmexit 不只是「跳一下」。CPU 要把 guest 的完整狀態存起來、載入 host 狀態、進 KVM 處理、再反向切回去。這一來一回是幾百到上千個 cycle。一筆 IO 若每次 kick 都觸發一次完整的 device emulation vmexit，高 IOPS 下光切換就吃掉大量 CPU。
+
+所以關鍵優化是：**讓 doorbell 這種「只是想通知一下」的寫入，用最輕的方式處理掉，不要拖著 KVM 去做完整模擬**。這就是 ioeventfd 的價值。
+
+## ioeventfd：把 doorbell 變成一盞燈
+
+先認識 **eventfd**：它是 Linux kernel 的一個通知原語——一個檔案描述子，底下是個計數器。一邊「寫」它就 +1（等於亮燈），另一邊用 `poll` / `read` 等它變可讀（看到燈亮）。它專門用來跨 thread / 跨 process 做「事件通知」，而且**可以被丟進 event loop 一起 poll**。
+
+**ioeventfd** 就是把兩者接起來：事先告訴 KVM「如果 guest 寫了 doorbell 這個位址，你不要叫醒我做模擬，直接幫我把這個 eventfd 點亮就好」。於是流程變成：
+
+```
+ guest 寫 doorbell（MMIO write）
+        │  觸發 vmexit，落進 KVM
+        ▼
+ KVM 比對位址：命中註冊過的 ioeventfd？
+        │  是 → 只做一件事：eventfd_signal（把燈點亮）
+        │       不返回 guest 之外做任何 device emulation ← 關鍵：超輕
+        ▼
+ host eventfd 變 readable
+        │
+        ▼
+ QEMU 的 event loop 早就在 poll 這個 eventfd → 收到 → 處理 vring
+```
+
+datapath 第②節 `ioeventfd_write` → `eventfd_signal` 就是「KVM 只負責點燈」這兩行；它特別強調「**不** return 回 guest 之外做任何 device emulation」——這正是 ioeventfd 比一般 MMIO 攔截便宜的原因。
+
+## QEMU 這側：event loop 收燈
+
+QEMU（每個 IOThread / 主 thread）跑一個 **event loop**（QEMU 裡叫 AioContext），本質是一個大 `poll()`：同時盯著一堆 fd（各 disk 的 eventfd、網路、timer…），誰可讀就呼叫對應 handler。
+
+doorbell 那盞燈（eventfd）亮了，event loop 就呼叫它的 handler `virtio_queue_host_notifier_read`，把燈關掉（test-and-clear）後進 `virtio_queue_notify_vq` → `virtio_blk_handle_output`——於是控制權回到 [primer ③](./async-io-interfaces-primer) 講的 QEMU block layer，IO 繼續往 host kernel 送。
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **guest mode / host mode** | CPU 跑 VM 內程式 vs 跑 host 的兩種模式 | 由硬體虛擬化（Intel VT-x / AMD-V）支援 |
+| **vmexit** | CPU 從 guest mode 掉回 host 處理某件事 | 一來一回幾百到上千 cycle，越少越好 |
+| **MMIO trap** | guest 對某記憶體映射位址的存取被攔下 | doorbell 寫入就是被當成 MMIO trap 攔下 |
+| **ioeventfd** | KVM 的優化：把「某位址被寫」直接轉成點亮一個 eventfd | KVM 不做完整模擬，所以特別輕 |
+| **eventfd** | kernel 的通知原語：一個可 poll 的計數器 fd | 寫它 +1（點燈）、poll 它等可讀（看燈）；可放進 event loop |
+| **eventfd_signal** | 「點亮 eventfd」的動作 | datapath 第②節 KVM 命中 ioeventfd 後就呼叫它 |
+| **host notifier** | QEMU 包住那個 eventfd 的物件（EventNotifier） | 它的讀 handler 是 `virtio_queue_host_notifier_read` |
+| **event loop / AioContext** | QEMU 一個大 `poll()`，盯著一堆 fd 分派 handler | 一條 thread 服務很多 IO 來源的關鍵 |
+
+## 把第②節串起來
+
+```
+ guest: virtqueue_notify ──MMIO write──► [vmexit] ──► KVM: ioeventfd_write
+                                                              │
+                                                       eventfd_signal（點燈）
+                                                              │
+ QEMU event loop poll 到 ──► virtio_queue_host_notifier_read（關燈）
+                                                              │
+                                                   virtio_queue_notify_vq
+                                                              │
+                                                   virtio_blk_handle_output（回到 block 處理）
+```
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| doorbell = 一次 vmexit | **第②節**「這個 MMIO write 會觸發一次 vmexit，落進 KVM」 |
+| KVM 只點燈 | **第②節** `ioeventfd_write` → `eventfd_signal`（強調不做 device emulation） |
+| QEMU 收燈 | **第②節** `virtio_queue_host_notifier_read`（test-and-clear 後 `virtio_queue_notify_vq`） |
+| 回到 block 處理 | **第③節** `virtio_blk_handle_output` |
+
+<Callout type="info" title="下一步">
+  IO 已經穿過虛擬化邊界、經 QEMU block layer 對 `/dev/rbdX` 發出 write。最後一篇回到 host kernel：krbd 為什麼把工作丟 workqueue（而不是當場做完）、interrupt/softirq 是什麼、以及最後一跳怎麼透過 socket / TCP 把 message 送上線到 OSD。
+
+  - 上一篇：[底層 primer ④ — virtio 與 vring](./virtio-vring-primer)
+  - 下一篇：[底層 primer ⑥ — kernel 非同步執行與網路送出](./kernel-async-and-net-primer)
+  - 主線：[rbd-io-datapath](./rbd-io-datapath)
+</Callout>

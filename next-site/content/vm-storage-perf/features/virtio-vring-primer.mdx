@@ -1,0 +1,87 @@
+---
+layout: doc
+title: 底層 primer ④ — virtio 與 vring：guest 與 host 之間的 IO 高速公路
+description: rbd-io-datapath 的底層名詞 primer 第四篇。解釋 guest 怎麼把一筆 IO 交給 host——paravirtualization、virtio device/driver、virtqueue、vring、descriptor、available/used ring、kick/notify、doorbell（MMIO/PIO）、num-queues——對回 datapath 第①②節的 virtblk_add_req / virtqueue_add_sgs / virtqueue_notify。
+---
+
+## 接續上一篇
+
+前三篇都在講「IO 在某一側的 kernel 裡怎麼流動」。但 VM 的 IO 有個獨特問題：它從 **guest 內**發起，卻要交給 **host 上**的 QEMU 處理。中間隔著一道虛擬化的牆。virtio + vring 就是穿牆的機制——datapath 第①②節整段都在走它。
+
+## 一句話直覺
+
+虛擬機可以「假裝有一顆真硬碟」，讓 guest 用原本的硬碟 driver 去戳一堆暫存器，host 再一個個攔下來模擬——但這超慢。**virtio** 換個思路：guest 大方承認「我在 VM 裡」，於是 guest 與 host 約定好用一塊**共享記憶體的環形佇列**直接傳遞 IO 請求，不再模擬實體硬體。
+
+生活類比：共用收發匣。guest 把「要寄的單子」（descriptor）放進共用信箱的待寄格（available ring），按一下門鈴（kick）通知 host；host 處理完把單子放進已完成格（used ring）。雙方看同一塊記憶體，不必每次都驚動對方。
+
+## 為什麼要 paravirtualization
+
+- **全模擬（emulation）**：guest 以為自己在跟真的 SATA / NVMe 控制器講話，每次讀寫暫存器都觸發一次昂貴的攔截（vmexit，下一篇講）。相容性好，但慢。
+- **半虛擬化（paravirtualization）**：guest 裝的是「知道自己在 VM 裡」的 virtio driver，直接用共享環溝通，把昂貴的攔截壓到最少。這就是 virtio 的價值。
+
+KubeVirt 的 VM disk 預設就是 **virtio-blk**（或 virtio-scsi），走的正是這條路。
+
+## vring 長怎樣
+
+一個 **virtqueue** 內部由三塊組成（合稱 vring）：
+
+```
+ guest 端                                   host(QEMU) 端
+ ───────                                    ─────────────
+ descriptor table  ← 每格描述一段 buffer：位址 + 長度 + 方向
+        ▲                                          │
+        │ guest 填好 descriptor                     │ host 讀 descriptor
+        │                                          ▼
+ available ring    ──「我放了新工作」──►   host 取走處理
+                                                   │
+ used ring         ◄──「這些我做完了」──    host 回填完成
+```
+
+- **descriptor**：一張「資料在記憶體哪裡、多長、是讀還是寫」的單子。一筆 IO 的資料若散在多段（scatter-gather），就用一串 descriptor 串起來。
+- **available ring**：guest 的「待處理」清單——guest 把新 descriptor 的編號放這。
+- **used ring**：host 的「已完成」清單——host 處理完把編號放回這，guest 之後來收。
+
+datapath 第①節 `virtblk_add_req` 把 out header、data、in header 三段組成 `sgs[3]`，再由 `virtqueue_add_sgs` 變成 vring 上的 descriptor——就是「填單子放進待寄格」這一步。
+
+## kick：按門鈴通知對方
+
+光把 descriptor 放進 available ring，host 不會自動知道。guest 要「踢」host 一下——這就是 **kick / notify**。實作上是 guest 對 virtio device 的一個特殊位址（notify register，俗稱 **doorbell**）做一次寫入。這個寫入會被 host 攔下（下一篇的 vmexit / ioeventfd）。
+
+datapath 第①節結尾 `virtqueue_notify` 就是這個 kick；第②節整段在講這一下 kick 怎麼穿牆到 host。
+
+> 反方向也有對稱機制：host 處理完、要通知 guest「做好了」，會送一個中斷（interrupt）給 guest。為了省事，雙方都可暫時關掉通知、用輪詢批次收（類似網路的 NAPI），這也是高 IOPS 下的優化點。
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **paravirtualization（半虛擬化）** | guest 知道自己在 VM 裡，用約定好的高效介面溝通 | 對立面是全模擬（guest 以為在跟真硬體講話） |
+| **virtio** | 一套半虛擬化裝置的標準（blk、net、scsi…） | guest 裝 virtio driver，host 出 virtio device |
+| **virtio device / driver** | device 在 host(QEMU) 側、driver 在 guest kernel 側 | datapath 第①節在 guest driver、第③節在 host device |
+| **virtqueue** | guest 與 host 之間傳遞請求的佇列（一個或多個） | virtio-blk 可有多條，對應多 vCPU |
+| **vring** | virtqueue 的實際記憶體佈局：descriptor table + available + used | 三塊都在 guest 與 host 共享的記憶體 |
+| **descriptor** | 描述「一段 buffer：位址 + 長度 + 方向」的單子 | 多段資料用一串 descriptor 串接（scatter-gather） |
+| **available ring** | guest 放「待 host 處理」的 descriptor 編號 | guest 寫、host 讀 |
+| **used ring** | host 放「已完成」的 descriptor 編號 | host 寫、guest 讀 |
+| **kick / notify** | guest 通知 host「有新工作了」 | datapath 的 `virtqueue_notify` |
+| **doorbell** | guest kick 時寫的那個 notify register（一個特殊位址） | 寫它會觸發攔截 → 下一篇的 vmexit / ioeventfd |
+| **MMIO / PIO** | 「對某個位址寫值來操作裝置」的兩種方式 | doorbell 寫入就是一次 MMIO（或 PIO）write |
+| **num-queues** | virtio-blk 配幾條 virtqueue | 多 queue 讓不同 vCPU 各走一條 vring，減少 kick 爭用 |
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| 填 descriptor / scatter-gather | **第①節** `virtblk_add_req` → `virtqueue_add_sgs`（`sgs[3]` → vring desc） |
+| kick host | **第①節** `virtqueue_notify`；圖上「kick (MMIO write)」 |
+| doorbell = MMIO write | **第②節** 註解：「kick 實作上是 guest 對 notify register 做一次 MMIO/PIO write」 |
+| host 收到 vring 事件 | **第②③節** `virtio_queue_host_notifier_read` → `virtio_blk_handle_output` |
+| num-queues 旋鈕 | **除錯節**「多 queue（virtio-blk num-queues）讓不同 vCPU 各走一條 vring」 |
+
+<Callout type="info" title="下一步">
+  guest 按了門鈴（kick / MMIO write）之後，這一下寫入怎麼從 VM 內穿到 host 上的 QEMU？答案是 CPU 掉出 VM 模式（vmexit），再經 ioeventfd 轉成一個 host 事件。下一篇講這道 KVM 邊界。
+
+  - 上一篇：[底層 primer ③ — 同步 vs 非同步 IO](./async-io-interfaces-primer)
+  - 下一篇：[底層 primer ⑤ — KVM 邊界：vmexit / ioeventfd / eventfd](./kvm-io-boundary-primer)
+  - 主線：[rbd-io-datapath](./rbd-io-datapath)
+</Callout>

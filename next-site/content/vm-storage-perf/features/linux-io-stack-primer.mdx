@@ -1,0 +1,90 @@
+---
+layout: doc
+title: 底層 primer ① — 從 write() 到 block device：Linux 儲存 IO 棧的分層地圖
+description: rbd-io-datapath 的底層名詞 primer 第一篇。用白話建立「IO 棧分層」的世界觀——應用程式一個 write() 怎麼經過 VFS、page cache、filesystem、block layer、device driver 才落到 block device，並解釋 buffered/direct IO、O_DIRECT、block device、/dev/rbdX、sector/LBA、對齊這些 datapath 反覆出現的地基名詞。
+---
+
+## 這系列在做什麼
+
+[rbd-io-datapath](./rbd-io-datapath) 把一個 4K write 從 guest 一路追到 OSD，每一跳都釘在原始碼上。但那頁假設你已經懂 blk-mq、vring、ioeventfd、vmexit、io_uring、workqueue 這些 Linux / kernel 底層名詞。**這系列六篇 primer 就是補這塊地基**——讀完再回頭看 datapath，每一跳都對得上。
+
+順序刻意對齊 datapath 由上到下的五層：
+
+```
+ ① 本篇：IO 棧分層的世界觀（write 怎麼變成 block device 上的讀寫）
+ ② block layer 與 blk-mq（request 怎麼排隊、合併、完成）
+ ③ 同步 vs 非同步 IO（libaio / io_uring / thread pool / coroutine）
+ ④ virtio 與 vring（guest 與 host 之間的 IO 傳輸）
+ ⑤ KVM 邊界（vmexit / ioeventfd / eventfd）
+ ⑥ kernel 非同步執行與網路送出（softirq / workqueue / socket / TCP）
+```
+
+## 一句話直覺
+
+你的程式呼叫 `write()` **不是「直接戳硬碟」**，而是把資料交給一條由很多層組成的輸送帶。每一層只做一件事，再把資料往下一層推。datapath 那頁追的，就是這條輸送帶從 VM 內接到 Ceph 的全貌。
+
+生活類比：寄包裹。你（應用程式）不會自己開車送到對方家門口；你把包裹交給樓下管理員（VFS），管理員先放進待寄區（page cache），物流排車併單（block layer），最後司機開車送達（device driver → block device）。你只知道「我寄了」，中間每一層都有自己的緩衝、批次、排程——而每一層也都是延遲可能卡住的地方。
+
+## 為什麼要分這麼多層
+
+一句話：**解耦 + 快取 + 批次**。
+
+- **解耦**：應用程式不想知道底下是 SSD、HDD、還是網路上的 Ceph RBD，它只想 `write(fd, buf, len)`。分層讓上層完全不必管裝置細節。
+- **快取**：中間層（page cache）可以把熱資料留在記憶體，省掉真正的裝置存取。
+- **批次**：小 IO 可以被合併、排序後一次送下去，對裝置更有效率。
+
+代價是：每多一層，就多一次「複製 / 排隊 / 切換」的機會。這正是 datapath 頁要逐層拆延遲的理由——延遲是每一層各吃一點累加出來的。
+
+## 這條棧長怎樣
+
+```
+ 應用程式   write(fd, buf, 4K)
+    │  syscall
+ ───────────────────────────── user space │ kernel 邊界
+ VFS（虛擬檔案系統）            ← 統一的 read/write 介面，不管底下是哪種 fs
+    │
+ page cache（記憶體快取）       ← buffered IO 在這裡停留；O_DIRECT 會跳過這層
+    │
+ filesystem（ext4 / xfs…）      ← 把「檔案 offset」翻成「裝置上的 block 位置」
+    │                            （直接開 block device 時這層省略）
+ block layer（blk-mq）          ← 把讀寫變成 request，排隊、合併、送下去
+    │
+ device driver                 ← virtio-blk / krbd / NVMe… 真正對裝置動作
+    │
+ block device（/dev/…）         ← 一顆「可定址的儲存」：硬碟、SSD、或 /dev/rbdX
+```
+
+VM 的情境特別之處：**這張圖會出現兩次**。一次在 guest 內（VM 自己的 kernel），一次在 host 上（krbd 那層）。datapath 頁的「虛擬化稅」就是 guest 那條棧到 host 那條棧之間多出來的搬運成本。
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **block device（區塊裝置）** | 可以「隨機定址、以固定大小區塊讀寫」的儲存抽象 | `/dev/sda`、`/dev/nvme0n1`、`/dev/rbd0` 都是。對照 character device（如 `/dev/tty`）是一串 byte stream、不能跳著讀 |
+| **`/dev/rbdX`** | krbd 把一個 Ceph RBD image map 成 host block device 後出現的節點 | 對 kernel 來說它跟一顆本機硬碟長一樣，可以 `iostat` / `fio` / `mkfs`。這是 datapath 最重要的可觀測邊界 |
+| **sector** | block device 的最小定址單位 | 傳統 512 byte，現代多為 4K |
+| **LBA（Logical Block Address）** | 「第幾個 sector」的編號 | datapath 裡 `blk_rq_pos(req)` 拿到的就是這筆 IO 的起始 sector |
+| **VFS（Virtual File System）** | kernel 裡一層「統一的檔案操作介面」 | 不管底下是 ext4、xfs 還是直接開 block device，應用程式都用同一組 `open/read/write` |
+| **page cache** | kernel 用記憶體（以 4K page 為單位）幫檔案內容做的快取 | 讀過的留著、寫的先放這（稱 dirty page），晚點再 writeback。這就是預設的「buffered IO」 |
+| **buffered IO** | 經過 page cache 的讀寫（預設行為） | 好處是快取命中很快；壞處是資料先停在記憶體、要 `fsync` 才保證落地 |
+| **direct IO / `O_DIRECT`** | `open()` 的一個 flag，讓 IO **跳過 page cache**、資料直接在使用者 buffer 與裝置間搬 | 資料庫 / VM 常用它自己管快取，避免「guest 快取 + host 快取」雙重快取 |
+| **dirty page / writeback** | 被改過、還沒寫回裝置的 page 叫 dirty；背景刷回去叫 writeback | `fsync()` 會強制把某檔案的 dirty page 刷完才回來 |
+| **對齊（alignment）** | IO 的起點與大小是不是 sector / page 的整數倍 | 對齊的 `O_DIRECT` 才能走最快的零複製路；不對齊會退回慢路徑甚至報錯 |
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| 整條 IO 棧分層 | **第①節**開頭：「guest 應用程式的 write 經過 guest 自己的 VFS / page cache / block layer 之後，落到 blk-mq」——那一句就是上面整張圖在 guest 內走一遍 |
+| `/dev/rbdX` 怎麼來的 | **前置節**「ceph-csi 怎麼把 RBD 變成 host 的 /dev/rbdX」 |
+| `O_DIRECT` + 對齊 | **第④節** `raw_co_prw`：「對齊的 O_DIRECT IO 會優先走 io_uring 或 linux-aio」 |
+| sector / LBA | **第①節** `virtblk_setup_cmd` 的 `sector = blk_rq_pos(req)` |
+| 兩條 IO 棧（guest / host） | **除錯節**兩個 iostat 邊界：guest `/dev/vda` 與 host `/dev/rbdX` |
+
+<Callout type="info" title="下一步">
+  地基有了，接著放大 block layer 那一層——request 是什麼、blk-mq 怎麼排隊與合併、queue 深度為什麼會卡住並行 IO。
+
+  - 下一篇：[底層 primer ② — block layer 與 blk-mq](./block-layer-blk-mq-primer)
+  - 主線：[rbd-io-datapath](./rbd-io-datapath)
+  - 延伸：[Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi)（`/dev/rbdX` 背後 RBD image 在 RADOS 的 layout）
+</Callout>

@@ -1,0 +1,100 @@
+---
+layout: doc
+title: 底層 primer ⑥ — kernel 的非同步執行與網路送出：interrupt、softirq、workqueue、socket、TCP
+description: rbd-io-datapath 的底層名詞 primer 第六篇。解釋 host kernel 端為什麼 krbd 把工作丟 workqueue、以及最後一跳怎麼把 message 送上線——process/interrupt context、interrupt(hardirq)、softirq、workqueue(rbd_wq)、spin_lock_irqsave、GFP_ATOMIC、socket、TCP、do_sendmsg/sendpage、zero-copy——對回 datapath 第⑤節 rbd_queue_rq→rbd_wq 與 ceph_con_send/ceph_tcp_send。
+---
+
+## 接續上一篇
+
+IO 已經穿過虛擬化邊界（[primer ⑤](./kvm-io-boundary-primer)）、經 QEMU 對 `/dev/rbdX` 發出 write，落進 host kernel 的 krbd。datapath 第⑤節有個乍看奇怪的動作：krbd 收到 request 後**不當場處理**，而是把工作 `queue_work(rbd_wq, ...)` 丟給 workqueue 非同步跑。這篇解釋為什麼要這樣，以及最後怎麼把 message 透過 socket / TCP 送上線。
+
+## 一句話直覺
+
+kernel 裡有些「上下文」**不准你慢慢來**——特別是處理硬體中斷的當下，你不能睡、不能做會阻塞的事，得趕快做完讓 CPU 回去做正事。所以 kernel 的通則是：**緊急的事當場做一點點，剩下的重活丟到「可以慢慢做」的地方**。krbd 把工作丟 workqueue，就是這個通則的實例。
+
+生活類比：你正在開會（持鎖 / 中斷處理），電話響了。你不會在會議中處理整件事，而是記下「待辦」（排進 workqueue），散會後（可睡眠的 context）再好好處理。
+
+## process context vs interrupt context
+
+kernel 程式碼跑在兩種上下文，差別決定你「能不能睡」：
+
+| | process context | interrupt context |
+|---|---|---|
+| 何時 | 代表某個行程在跑（syscall、workqueue 的 worker） | 硬體中斷打進來、或 softirq | 
+| 能睡眠嗎 | **能**（可等記憶體、等鎖、等網路） | **不能**（必須快、不可阻塞） |
+| 能做的事 | 幾乎都行 | 只能做不阻塞的事，重活要往後丟 |
+
+「送一筆 Ceph op」需要配記憶體、算 CRUSH、建/取 connection、可能要等——這些**可能會睡**。所以不能在會睡不得的提交路徑當場做，得丟到 process context 的 workqueue。這就是 `rbd_wq` 存在的理由。
+
+## interrupt / softirq / workqueue 三件套
+
+```
+ 硬體完成事件
+      │
+ hardirq（硬中斷）       ← 最緊急、最短，不能睡。只做「登記一下、排個後續」
+      │  排程
+ softirq / tasklet      ← 中斷的「下半部」，稍微多做一點，仍不能睡
+      │  需要可睡眠時改丟
+ workqueue（kernel thread）← 跑在 process context，可以睡、可配記憶體、可等網路 ★ krbd 用這個
+```
+
+- **interrupt（hardirq）**：硬體（網卡、磁碟）有事時硬打斷 CPU。要極短，馬上做完讓 CPU 回去。
+- **softirq**：把中斷裡來不及做、但又不必睡的工作延後一點做（網路收送大量走這）。仍**不能睡**。
+- **workqueue**：把工作交給一條 kernel thread，跑在 process context，**可以睡**。`rbd_wq` 就是 krbd 的 workqueue。
+
+## 兩個「不能睡」配套的名詞
+
+datapath 第①節 guest 的 `virtio_queue_rq` 裡有 `spin_lock_irqsave` 和 `GFP_ATOMIC`，它們都是「在不能睡的場合」的配套：
+
+- **`spin_lock_irqsave`**：一種 spinlock（搶不到就原地空轉、不睡）。`irqsave` 表示「上鎖時順手關掉本 CPU 的中斷」——因為這把鎖也可能被中斷處理路徑搶，不關中斷會自我死鎖。
+- **`GFP_ATOMIC`**：配記憶體時的旗標，意思是「**不准睡**，配不到就直接失敗」。在中斷 / 持 spinlock 的場合配記憶體只能用它。對照 process context 常用的 `GFP_KERNEL`（配不到可以睡著等）。
+
+看到這兩個名詞，腦中就該浮現「喔，這段在不能睡的 context」。
+
+## 最後一跳：socket 與 TCP
+
+krbd 把 block request 切成 RBD object op、交給 libceph 之後，最後要真正把 bytes 送出去。kernel 用 **socket** 抽象網路連線，Ceph 走 **TCP**（可靠、有序的位元組串流）。
+
+- **socket**：kernel 對「一條網路連線」的抽象，讀寫它就像讀寫一個特殊的 fd。
+- **TCP**：保證送達、保證順序的傳輸協定；Ceph 的 messenger 跑在它上面。
+- **`do_sendmsg`**：把一段資料（可多段 iovec）寫進 socket 送出去的核心路徑。
+- **sendpage（`do_try_sendpage`）**：`sendmsg` 的零複製版本——直接把記憶體 page 交給網路堆疊，不先複製進 socket buffer。
+- **zero-copy**：少一次資料複製。大 IO 時省下的 CPU 與記憶體頻寬很可觀。
+
+datapath 第⑤節 `ceph_tcp_send` 就是在 `do_try_sendpage` 與 `do_sendmsg` 之間二選一，把這個 4K write 以 messenger v2 的 message 形式推上 TCP，送往 primary OSD。
+
+## 名詞速查表
+
+| 名詞 | 白話解釋 | 再多一句 |
+|---|---|---|
+| **process context** | 代表某行程在跑的 kernel 上下文，**可睡眠** | syscall 路徑、workqueue worker 都是 |
+| **interrupt context** | 處理中斷 / softirq 的上下文，**不可睡眠** | 要短、不可阻塞，重活往後丟 |
+| **interrupt（hardirq）** | 硬體硬打斷 CPU 的最緊急通知 | 只做最少、馬上排後續 |
+| **softirq** | 中斷的「下半部」，延後一點做、仍不能睡 | 網路大量收送走這 |
+| **workqueue** | 把工作丟給 kernel thread、跑在 process context | 可睡、可配記憶體、可等網路。krbd 用 `rbd_wq` |
+| **`spin_lock_irqsave`** | 不睡的 spinlock，上鎖時順手關本 CPU 中斷 | 避免與中斷路徑自我死鎖 |
+| **`GFP_ATOMIC`** | 配記憶體「不准睡，配不到就失敗」 | 對照可睡的 `GFP_KERNEL` |
+| **socket** | kernel 對一條網路連線的抽象 | 讀寫它像讀寫特殊的 fd |
+| **TCP** | 可靠、有序的位元組串流協定 | Ceph messenger 跑在 TCP 上 |
+| **`do_sendmsg` / sendpage** | 把資料寫進 socket 送出；sendpage 是零複製版 | datapath `ceph_tcp_send` 在兩者間二選一 |
+| **zero-copy** | 少一次資料複製，省 CPU 與記憶體頻寬 | sendpage、O_DIRECT、virtio buffer 都靠它省成本 |
+
+## 連回 datapath
+
+| 本篇概念 | datapath 對應位置 |
+|---|---|
+| 為何丟 workqueue | **第⑤節** `INIT_WORK(&img_req->work, rbd_queue_workfn)` + `queue_work(rbd_wq, ...)` |
+| 不能睡的配套 | **第①節** `virtio_queue_rq` 的 `spin_lock_irqsave` 與 `virtblk_add_req(... GFP_ATOMIC)` |
+| latency 起算 | **第⑤節** `rbd_queue_workfn` 裡的 `blk_mq_start_request` |
+| message 上 socket | **第⑤節** `ceph_con_send`（掛 out_queue）→ `ceph_tcp_send` |
+| sendpage vs sendmsg | **第⑤節** `ceph_tcp_send`：`do_try_sendpage` 或 `do_sendmsg` |
+
+<Callout type="info" title="Ceph domain 在這裡接手">
+  第⑤節之後出現的 CRUSH、OSD、PG、object layout、messenger v2、BlueStore 已經是 **Ceph 自己的領域**，不屬本系列「Linux/kernel 底層」的範圍，本站另有專頁：
+
+  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore)：OSD 收到 op 之後 BlueStore 怎麼落地（datapath 的 tail）
+  - [Ceph — RBD 與 ceph-csi](/ceph/features/rbd-and-csi)：RBD image 在 RADOS 的 object layout
+  - [Ceph — CRUSH 與 placement](/ceph/features/crush-and-placement)：CRUSH 怎麼算出 target OSD
+
+  六篇 primer 到此走完。回 [rbd-io-datapath](./rbd-io-datapath) 從頭讀一遍，每一跳的名詞現在都該對得上了。
+</Callout>

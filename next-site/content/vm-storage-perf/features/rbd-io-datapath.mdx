@@ -18,6 +18,12 @@ description: 以 krbd 為主軸，把 KubeVirt VM（volumeMode Block 的 RBD PVC
 
 OSD 收到之後 BlueStore 怎麼落地，這頁不重複（見文末連結到 Ceph 的頁面）。本頁主軸是 **krbd**（kernel RBD），librbd（user-space）只在最後做一兩句對照。
 
+<Callout type="info" title="看不懂底下的 kernel 名詞？先讀「📚 底層基礎」">
+  這頁假設你已懂 blk-mq、vring、ioeventfd、vmexit、io_uring、workqueue、softirq 這些 Linux / kernel 底層名詞。若讀起來卡，先看「底層基礎」這 6 篇用白話把每個名詞拆開、再連回本頁對應的那一跳：
+
+  ① [Linux 儲存 IO 棧](./linux-io-stack-primer) → ② [block layer 與 blk-mq](./block-layer-blk-mq-primer) → ③ [同步 vs 非同步 IO](./async-io-interfaces-primer) → ④ [virtio 與 vring](./virtio-vring-primer) → ⑤ [KVM 邊界](./kvm-io-boundary-primer) → ⑥ [kernel 非同步執行與網路送出](./kernel-async-and-net-primer)
+</Callout>
+
 ## 全路徑一張圖
 
 先看整條路徑。左到右是五層，每一跳標出關鍵函式所在的 repo 與檔案。這張圖請先看過，後面每一節的程式碼都對得回這張圖上的某一跳。
