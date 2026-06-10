@@ -28,6 +28,13 @@ EOF
   systemctl restart systemd-timesyncd
 }
 
+cleanup_side_effects() {  # TERM/EXIT 兜底：清掉所有持久副作用（冪等）
+  unblock_ntp || true
+  ntp_counter_del || true
+  [[ -n "${CLIENT_IFACE:-}" ]] && tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true
+  set_poll_max default || true
+}
+
 JCURSOR=""
 start_monitors() {  # $1 = outdir
   local d=$1
@@ -110,26 +117,32 @@ run_scenario() {
   case "$name" in
     baseline-2048)
       set_poll_max default
-      soak "$outdir" "$((HOURS * 3600))" ;;
+      soak "$outdir" "$((HOURS * 3600))" \
+        || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; } ;;
     soak-256)
       set_poll_max 256
-      soak "$outdir" "$((HOURS * 3600))" ;;
+      soak "$outdir" "$((HOURS * 3600))" \
+        || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; } ;;
     restart)
       set_poll_max 256
-      soak "$outdir" "$((HOURS * 3600))" action_restart ;;
+      soak "$outdir" "$((HOURS * 3600))" action_restart \
+        || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; } ;;
     outage-30m)
       set_poll_max 256
-      soak "$outdir" "$((HOURS * 3600))" action_outage ;;
+      soak "$outdir" "$((HOURS * 3600))" action_outage \
+        || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; } ;;
     inject-80ms)
-      local poll sub t0
+      local poll sub t0 warm
       for poll in 256 2048; do
         sub="$outdir/poll-$poll"
         mkdir -p "$sub"
         if [[ "$poll" == 2048 ]]; then set_poll_max default; else set_poll_max 256; fi
         trap 'stop_monitors "$sub"; set_poll_max default' RETURN
-        wait_synced 50 600 || { log "ERROR: baseline 收斂失敗，中止此情境（環境異常，請檢查 server）"; return 1; }
+        wait_synced 50 600 || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; }
         start_monitors "$sub"
-        sleep 600   # 讓 poll interval 自然爬升後再注入
+        warm=600
+        [[ "$poll" == 2048 ]] && warm=2400  # 32→2048 的 poll 倍增需 ~2016s，2400s 保證注入時已在 max poll
+        sleep "$warm"
         t0=$(raw_now)
         echo "$t0 inject_80ms" >> "$sub/events.log"
         $PY "$LIB_DIR/clock_inject.py" set-offset --ms 80
@@ -144,7 +157,8 @@ run_scenario() {
     jitter)
       set_poll_max 256
       tc qdisc add dev "$CLIENT_IFACE" root netem delay 5ms 3ms
-      soak "$outdir" 3600   # 固定 1 小時（spec）
+      soak "$outdir" 3600 \
+        || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; }
       tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true ;;
     *) die "未知情境 $name（可用：${SCENARIOS[*]}）" ;;
   esac
@@ -179,13 +193,19 @@ case "${1:-}" in
   --all)
     shift
     [[ "${1:-}" == "--hours" ]] && { HOURS="$2"; shift 2; }
-    require_root; preflight; mkdir -p "$EXP_DIR"
+    require_root
+    [[ -n "${CLIENT_IFACE:-}" ]] || die "env.sh 缺 CLIENT_IFACE（exp4 的 jitter/tc 需要）"
+    trap cleanup_side_effects EXIT INT TERM
+    preflight; mkdir -p "$EXP_DIR"
     for s in "${SCENARIOS[@]}"; do run_scenario "$s"; done
     log "exp4 全部完成；各情境 verdict 在 $EXP_DIR/*/verdict.md" ;;
   --scenario)
     name="$2"; shift 2
     [[ "${1:-}" == "--hours" ]] && { HOURS="$2"; shift 2; }
-    require_root; preflight; mkdir -p "$EXP_DIR"
+    require_root
+    [[ -n "${CLIENT_IFACE:-}" ]] || die "env.sh 缺 CLIENT_IFACE（exp4 的 jitter/tc 需要）"
+    trap cleanup_side_effects EXIT INT TERM
+    preflight; mkdir -p "$EXP_DIR"
     run_scenario "$name" ;;
   *)
     die "用法見檔頭註解（--all / --scenario 名稱 / --status / --detach）" ;;

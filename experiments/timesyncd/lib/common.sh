@@ -16,6 +16,7 @@ load_env() {
   : "${SERVER_IP:?env.sh 缺 SERVER_IP}"
   : "${NTP_PORT:=123}"
   : "${RESULTS_DIR:=$EXP_ROOT/results}"
+  : "${CLIENT_IFACE:=}"
   mkdir -p "$RESULTS_DIR"
 }
 
