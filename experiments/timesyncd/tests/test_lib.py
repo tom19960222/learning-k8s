@@ -1,8 +1,10 @@
 """L2 unit tests for timesyncd drift lab lib. Run: python3 -m unittest discover -s experiments/timesyncd/tests -v"""
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 LIB = os.path.join(os.path.dirname(__file__), "..", "lib")
@@ -200,6 +202,93 @@ class TestLeaseSentinelLogic(unittest.TestCase):
 
     def test_backward(self):
         self.assertEqual(self.m.classify(-0.3, 1.0, lease_s=5.0), "backward")
+
+
+def write_csv(path, rows):
+    with open(path, "w") as f:
+        f.write("raw_s,wall_s,offset_ms,delay_ms,err\n")
+        for r in rows:
+            f.write(",".join(str(x) for x in r) + "\n")
+
+
+class TestAnalyze(unittest.TestCase):
+    def _run(self, *args, ok=True):
+        p = subprocess.run(
+            [sys.executable, os.path.join(LIB, "analyze.py"), *args],
+            capture_output=True, text=True)
+        if ok:
+            self.assertEqual(p.returncode, 0, p.stderr)
+        return p
+
+    def test_convergence_exponential_decay(self):
+        # offset = 400·exp(−t/7.5)：跌破 50ms 在 t = ln(8)·7.5 ≈ 15.6s
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "probe.csv")
+            rows = [(100.0 + t, 1000.0 + t, f"{400 * math.exp(-t / 7.5):.3f}", 0.2, "")
+                    for t in range(0, 180)]
+            write_csv(csv, rows)
+            p = self._run("convergence", "--csv", csv, "--t0-raw", "100.0")
+            d_ = json.loads(p.stdout)
+            self.assertTrue(d_["converged"])
+            self.assertGreater(d_["t_converge_s"], 13)
+            self.assertLess(d_["t_converge_s"], 18)
+
+    def test_convergence_not_reached_exit3(self):
+        # 永遠在 ±200ms 徘徊 → exit 3、converged false
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "probe.csv")
+            rows = [(100.0 + t, 1000.0 + t,
+                     f"{200 * (1 if t % 2 else -1)}", 0.2, "") for t in range(0, 180)]
+            write_csv(csv, rows)
+            p = self._run("convergence", "--csv", csv, "--t0-raw", "100.0", ok=False)
+            self.assertEqual(p.returncode, 3)
+            self.assertFalse(json.loads(p.stdout)["converged"])
+
+    def test_convergence_hold_resets_on_excursion(self):
+        # 進 50ms 內 30s 後又彈出去 → 第一段不算，要等第二段滿 60s
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "probe.csv")
+            rows = []
+            for t in range(0, 30):
+                rows.append((100.0 + t, 0, "10", 0.2, ""))
+            rows.append((130.0, 0, "80", 0.2, ""))      # 彈出
+            for t in range(31, 180):
+                rows.append((100.0 + t, 0, "10", 0.2, ""))
+            write_csv(csv, rows)
+            p = self._run("convergence", "--csv", csv, "--t0-raw", "100.0")
+            d_ = json.loads(p.stdout)
+            self.assertGreater(d_["t_converge_s"], 30)
+
+    def test_calibrate_slope(self):
+        # offset 以 −0.01 ms/s 下降 → client 快 → client_ppm = +10
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "cal.csv")
+            rows = [(100.0 + t, 0, f"{50 - 0.01 * t:.4f}", 0.2, "")
+                    for t in range(0, 1800)]
+            write_csv(csv, rows)
+            out = os.path.join(d, "calibration.json")
+            self._run("calibrate", "--csv", csv, "--out", out)
+            cal = json.load(open(out))
+            self.assertAlmostEqual(cal["client_ppm"], 10.0, places=1)
+
+    def test_soak_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "ping.txt"), "w") as f:
+                f.write("1440000 packets transmitted, 1440000 received, 0% packet loss, time 14400000ms\n")
+            with open(os.path.join(d, "steps.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,jump_ms\n100.0,0,hb,\n")
+            with open(os.path.join(d, "sentinel.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,wall_elapsed_ms,raw_elapsed_ms\n100.0,0,hb,,\n")
+            with open(os.path.join(d, "journal-errors.txt"), "w") as f:
+                f.write("")
+            p = self._run("soak-verdict", "--dir", d)
+            self.assertIn("PASS", p.stdout)
+            # 加一個 step 事件 → FAIL（exit 3）
+            with open(os.path.join(d, "steps.csv"), "a") as f:
+                f.write("200.0,0,jump,401.0\n")
+            p = self._run("soak-verdict", "--dir", d, ok=False)
+            self.assertEqual(p.returncode, 3)
+            self.assertIn("FAIL", p.stdout)
 
 
 if __name__ == "__main__":
