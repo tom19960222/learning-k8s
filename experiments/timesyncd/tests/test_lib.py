@@ -258,6 +258,7 @@ class TestAnalyze(unittest.TestCase):
             p = self._run("convergence", "--csv", csv, "--t0-raw", "100.0")
             d_ = json.loads(p.stdout)
             self.assertGreater(d_["t_converge_s"], 30)
+            self.assertLess(d_["t_converge_s"], 40)
 
     def test_calibrate_slope(self):
         # offset 以 −0.01 ms/s 下降 → client 快 → client_ppm = +10
@@ -289,6 +290,29 @@ class TestAnalyze(unittest.TestCase):
             p = self._run("soak-verdict", "--dir", d, ok=False)
             self.assertEqual(p.returncode, 3)
             self.assertIn("FAIL", p.stdout)
+
+    def test_convergence_resets_on_probe_gap(self):
+        # 50 筆好樣本 → probe 斷流 10s → 再 65 筆好樣本：第一段作廢，從第二段起算
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "probe.csv")
+            rows = [(100.0 + t, 0, "10", 0.2, "") for t in range(0, 50)]
+            rows += [(160.0 + t, 0, "10", 0.2, "") for t in range(0, 65)]
+            write_csv(csv, rows)
+            p = self._run("convergence", "--csv", csv, "--t0-raw", "100.0")
+            d_ = json.loads(p.stdout)
+            self.assertTrue(d_["converged"])
+            self.assertGreater(d_["t_converge_s"], 55)
+            self.assertLess(d_["t_converge_s"], 65)
+
+    def test_calibrate_rejects_constant_raw_s(self):
+        with tempfile.TemporaryDirectory() as d:
+            csv = os.path.join(d, "cal.csv")
+            rows = [(100.0, 0, "5", 0.2, "") for _ in range(100)]
+            write_csv(csv, rows)
+            out = os.path.join(d, "calibration.json")
+            p = self._run("calibrate", "--csv", csv, "--out", out, ok=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

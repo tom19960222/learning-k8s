@@ -79,6 +79,8 @@ def cmd_calibrate(args):
     my = sum(s[1] for s in samples) / n
     sxx = sum((s[0] - mx) ** 2 for s in samples)
     sxy = sum((s[0] - mx) * (s[1] - my) for s in samples)
+    if sxx == 0:
+        sys.exit("calibrate: 所有樣本的 raw_s 相同，量測資料異常")
     slope = sxy / sxx  # ms/s
     cal = {
         "client_ppm": round(-slope * 1000, 3),
