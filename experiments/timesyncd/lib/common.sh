@@ -82,7 +82,7 @@ reset_clock_state() {
   $PY "$LIB_DIR/clock_inject.py" reset
   local i off
   for i in 1 2 3 4 5; do
-    off="$(ntp_offset_ms)" || die "reset_clock_state: 量不到 server offset"
+    off="$(ntp_offset_ms)" || { log "ERROR reset_clock_state: 量不到 server offset"; return 1; }
     # off = server - client；把 client 撥 +off 就對齊 server
     if $PY -c "import sys; sys.exit(0 if abs(float('$off')) < 5 else 1)"; then
       log "reset_clock_state 完成（|offset| = ${off}ms < 5ms）"
@@ -91,7 +91,7 @@ reset_clock_state() {
     $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$off"
     sleep 1
   done
-  die "reset_clock_state: 5 次校正後仍未進 5ms（最後 offset=${off}ms）"
+  log "ERROR reset_clock_state: 5 次校正後仍未進 5ms（最後 offset=${off}ms）"; return 1
 }
 
 # ---------- 背景監視器 ----------
@@ -113,7 +113,7 @@ stop_step_detector() {
 }
 
 # ---------- 注入 ----------
-inject_ppm() {  # $1 = ppm（可 0；±100 倍數走 tick，其餘走 freq）
+inject_ppm() {  # $1 = ppm（整數；可 0；±100 倍數走 tick，其餘走 freq）
   local ppm=$1
   [[ "$ppm" == 0 ]] && return 0
   if (( ppm % 100 == 0 )); then
@@ -162,7 +162,7 @@ run_recovery_cell() {
   local outdir=$1 offset_ms=$2 ppm=$3 timeout_s=$4 rc=0 t0
   mkdir -p "$outdir"
   # trap：不管成功失敗都復原（恢復連線、清暫存器、停監視器）
-  trap 'stop_probe "$outdir/probe.csv"; [[ "${WITH_STEP_DETECTOR:-0}" == 1 ]] && stop_step_detector "$outdir/steps.csv"; reset_clock_state' RETURN
+  trap 'stop_probe "$outdir/probe.csv"; [[ "${WITH_STEP_DETECTOR:-0}" == 1 ]] && stop_step_detector "$outdir/steps.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
   reset_clock_state
   inject_ppm "$ppm"
   if [[ "$offset_ms" != 0 ]]; then

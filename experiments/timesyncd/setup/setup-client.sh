@@ -35,7 +35,7 @@ systemctl daemon-reload
 timedatectl set-ntp true
 systemctl restart systemd-timesyncd
 sleep 5
-timedatectl timesync-status | head -8
+timedatectl timesync-status | head -8 || true
 
 preflight
 echo "setup-client: OK。下一步：sudo ./setup/calibrate.sh"
