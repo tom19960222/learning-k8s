@@ -4,3 +4,4 @@ next-site/out/
 .ssh/
 .claude/scheduled_tasks.lock
 experiments/timesyncd/env.sh
+__pycache__/
