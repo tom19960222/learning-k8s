@@ -163,7 +163,7 @@ run_recovery_cell() {
   mkdir -p "$outdir"
   # trap：不管成功失敗都復原（恢復連線、清暫存器、停監視器）
   trap 'stop_probe "$outdir/probe.csv"; [[ "${WITH_STEP_DETECTOR:-0}" == 1 ]] && stop_step_detector "$outdir/steps.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
-  reset_clock_state
+  reset_clock_state || { log "ERROR: cell 前置 reset 失敗，略過此 cell"; return 4; }
   inject_ppm "$ppm"
   if [[ "$offset_ms" != 0 ]]; then
     $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$offset_ms"
