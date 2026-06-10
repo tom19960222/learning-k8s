@@ -1,0 +1,209 @@
+---
+layout: doc
+title: timesyncd Drift Lab — 實驗方法論：怎麼在幾小時內測完 24 小時的失聯漂移
+description: 設計一套可重現的 systemd-timesyncd 行為實驗：用數學折疊把 1–24 小時 NTP 失聯壓成零等待、用 adjtimex 三暫存器（SETOFFSET/TICK/FREQUENCY）高保真注入時鐘誤差、用獨立 SNTP probe 量收斂、用 CLOCK_MONOTONIC_RAW 錨定的假 NTP server 做單機驗證。並從 linux/kernel/time/ntp.c 拆穿「kernel slew 上限 500ppm」的 lore：PLL 相位滑動無 ppm 上限（τ≈7.5s 指數衰減）、MAXFREQ ±500ppm 是頻率補償極限、古典 adjtime() 的 500µs/s 才是 lore 出處。
+---
+
+## 場景
+
+ceph mon 之間一旦 clock skew 超過 50ms 就跳 `MON_CLOCK_SKEW` WARN，超過 5 秒就可能弄垮 Paxos lease。維護一台 node 的網路斷掉幾小時，回來那一刻時鐘已經漂出去——這時 systemd-timesyncd 要花多久把它拉回 50ms 內？而且我想要的不是「跑一次看看」，是一張能對照預測的表。
+
+具體要回答四個問題：
+
+1. **失聯恢復**：跟 NTP server 失聯 1hr / 4hr / 24hr、且 client 時鐘有 0 / ±10 / ±100 / ±1000 ppm 頻率誤差時，恢復連線後多久把 offset 降到 50ms 以下？再加 ±400 / ±500 ppm 的邊界探針，定位 kernel 頻率補償極限。
+2. **滑動修正速度**：刻意把 offset 卡在 399ms（0.4s 跳錶門檻下 1ms），kernel 純靠相位滑動要多久滑回 50ms 內？
+3. **重啟對時行為**：`systemctl restart systemd-timesyncd` 之後 daemon 是不是馬上對時？10 / 50 / 100 / 500ms 偏移各要多久收斂？
+4. **低 max poll 穩定度**：把 `PollIntervalMaxSec` 從預設 2048 壓到 256 秒，在「一個 ping 封包都不能掉、5 秒 downtime 都不可接受」的生產判準下會不會引入任何不穩定？
+
+這頁只講**怎麼設計這套實驗**——為什麼不必等真實時間、誤差怎麼注入才高保真、收斂怎麼量才不被受測物自己騙、以及一台 VM 怎麼端到端驗證整套 rig。實驗本身的步驟、矩陣與預測 vs 實測結果在下一篇 [實驗設計與預測](/systemd/features/timesyncd-drift-lab-experiments)。
+
+設計的事實基礎來自三篇既有文章：失聯時 timesyncd 完全不碰時鐘的 source 證明在 [斷網時 timesyncd 在做什麼](/systemd/features/timesyncd-outage-and-maintenance)；重啟路徑在 [重啟對系統時間的影響](/systemd/features/timesyncd-restart-impact)；低 max poll 的理論推演在 [把 PollIntervalMaxSec 壓低會怎樣](/systemd/features/timesyncd-low-max-poll-simulation)。
+
+## TL;DR
+
+| 設計決策 | 一句理由 |
+|---|---|
+| **失聯階段用數學折疊**，不做 10x/100x 時間加速 | 失聯期是確定性 free-run（timesyncd 不碰時鐘），累積 offset = T × F 可直接一次注入；比加速既更準（不是近似）又更快（失聯 0 秒） |
+| **誤差用 adjtimex 三暫存器注入**（SETOFFSET / TICK / FREQUENCY） | tick 是 timesyncd 與 kernel PLL 都不會改寫的暫存器，注入後像真實晶振誤差持續存在，逼 NTP 真的學會補償，保真度最高 |
+| **收斂用獨立 SNTP probe 量**，不採信受測物 | timesyncd 自報的 offset 是它的決策依據，不能拿來判它對不對；獨立 probe 直接量 server 與 client 的真實差 |
+| **單機驗證用 CLOCK_MONOTONIC_RAW 錨定的假 server** | RAW 時鐘不受 adjtimex 影響，所以同一顆 kernel 上把 REALTIME 撥成什麼樣，假 server 回的時間都還是真的——一台 VM 就能驗整套 rig |
+
+## 為什麼不用等真實時間：數學折疊
+
+直覺做法是真的斷網 24 小時，再插回去看收斂。問題是這要 24 小時，而且 4hr / 24hr 兩個 cell 就吃掉一天。退而求其次的「時間加速」（把 guest 時鐘 tick 調快 100 倍模擬時間流逝）只是近似，還會引入它自己的假象。
+
+更好的辦法是看清楚失聯階段到底發生了什麼。[斷網時 timesyncd 在做什麼](/systemd/features/timesyncd-outage-and-maintenance) 已從 src/timesync source 證明一件事：**沒有有效 NTP reply 時，timesyncd 完全不碰系統時鐘**。系統時間的唯一寫入點 `manager_adjust_clock` 只在收到、解析、通過合法性檢查的 packet 之後才被呼叫；斷網期間它頂多是退避重試，時鐘則以硬體晶振速率自己走。
+
+這代表失聯階段是**確定性的 free-run**：沒有任何回授、沒有任何決策，時鐘就是以固定的頻率誤差 F 累積偏移：
+
+```
+累積 offset = 失聯時長 T × 頻率誤差 F
+```
+
+例如 10ppm 漂 24 小時 = `10e-6 × 86400s = 0.864s`。既然這段完全沒有 timesyncd 參與、結果可以閉式算出來，就沒有理由真的去等它——直接把這段「折疊」成兩個初始條件，一次注入到恢復階段的起點：
+
+- **(a) 累積 offset**：失聯時長 × 頻率誤差算出來的數字，直接撥進 client 時鐘。
+- **(b) 殘留頻率誤差**：晶振本來就在漂，恢復後它還繼續漂，所以這個 ppm 也要當成持續存在的條件注入（見下一節）。
+
+折疊之後，實驗只跑**恢復階段**——也就是 timesyncd 重新拿到 reply、kernel 開始修正的那段。這段是受 kernel slew 機制約束的真實動力學，本來就無法（也不該）加速，最長的 cell 大約十幾分鐘。整套實驗於是從「24 小時 × 多個 cell」壓成「每個 cell 幾分鐘到半小時」，而且結果不是近似：失聯階段被精確的數學取代，恢復階段是 1:1 真實時間。
+
+<Callout type="warning" title="折疊的前提">
+折疊只對「失聯期 timesyncd 不碰時鐘」這個 source 事實成立。一旦中途有任何一個合法 reply（哪怕只是封包亂序漏進來一封），free-run 假設就破了——所以 preflight 必須確認注入前 NTP 流量是真的被擋住的。
+</Callout>
+
+## adjtimex 三暫存器解剖
+
+注入誤差的正當性，全靠把每種誤差對應到正確的 kernel 暫存器。`clock_adjtime(2)` 透過 `struct timex` 操作三組互相獨立的狀態，各有不同的「誰會改寫它」性質：
+
+| 模擬目標 | 機制（modes） | 為什麼選它 |
+|---|---|---|
+| 失聯累積 offset | `ADJ_SETOFFSET`（一次性把 offset 加進時鐘） | 原子注入、不停錶，比 `clock_settime` 沒有 read-modify-write 的 race |
+| ±100 / ±1000 ppm | `ADJ_TICK`（tick = 10000 ± 1 / ± 10 µs） | tick 是 timesyncd 與 kernel PLL **都不會改寫**的暫存器，注入後像真實晶振誤差一樣持續存在，NTP 必須真的學會補償，保真度最高 |
+| ±10 ppm | `ADJ_FREQUENCY`（直接寫 freq register） | tick 粒度只有 100ppm（1µs / 10000µs），切不出 10ppm；freq register 會被 PLL 逐步改寫，但動力學等價（見下） |
+
+**tick 為什麼是最高保真的注入點。** 每個 timer tick 的長度由 tick 暫存器決定，預設 10000µs（對應 USER_HZ=100）。kernel 守備這個值的合法範圍是 ±10%：
+
+每個 tick 長度在 `do_adjtimex` 裡被夾在 `900000/USER_HZ` 到 `1100000/USER_HZ` 之間，超出就拒絕。
+
+```c File: linux/kernel/time/timekeeping.c:2360
+		    (txc->tick <  900000/USER_HZ ||
+		     txc->tick > 1100000/USER_HZ))
+```
+
+把 tick 設成 10010µs 就等於每秒系統時間慢 10000ppm⋯⋯不，是 `(10010-10000)/10000 = 1000ppm`；設 10001µs 就是 100ppm。關鍵在於：PLL 修正走的是 freq register 與 offset，**從不寫 tick**，所以 tick 注入的誤差會像真實晶振誤差一樣賴著不走，逼 NTP 必須在 freq register 裡真的累積出反向補償才能鎖住。這正是我們要測的東西。
+
+**freq register 注入為什麼也對。** ±10ppm 太細，tick 切不出來，只能寫 freq register。但 freq register 正是 PLL 會去改寫的暫存器，注入的值會被慢慢吃掉——乍看像作弊。其實動力學完全等價，差別只在參考系：
+
+- **真實情境**：晶振有 +10ppm 誤差（tick 端），freq register 從 0 開始，PLL 學習後把它推到 −10ppm 來抵銷。
+- **模擬情境**：晶振 0 誤差，freq register 注入 +10ppm，PLL 學習後把它推回 0。
+
+兩邊 PLL 看到的「有效速率誤差」軌跡（晶振誤差 + register 補償的總和）一模一樣，收斂行為因此相同。對 ±10ppm 這種細偏移，用 freq register 注入是可接受的等價簡化；±100ppm 以上才必須用 tick 拿到完整保真度。
+
+**為什麼是 `ADJ_SETOFFSET` 而不是 `clock_settime`。** 注入累積 offset 時我們要的是「在現有時間上原子地加一個 delta」，`ADJ_SETOFFSET` 一個 syscall 就把 offset 加進時鐘、不停錶。`clock_settime` 是「先讀現在時間、加 delta、再寫回」，讀和寫之間時鐘還在走，會有 race，注入量不精確。
+
+## kernel 三種修正機制、三個上限——「slew 只有 500ppm」是 lore
+
+整套實驗的預測都建立在一件事上：「kernel 的 slew 上限是 500ppm」這句廣為流傳的話是錯的，或者說是把三件不同的事混成了一件。source 攤開來看，是**三種不同的修正機制，各有各的上限**：
+
+| 機制 | 上限 | Source | timesyncd 用嗎 |
+|---|---|---|---|
+| PLL 相位滑動（`ADJ_OFFSET` + `STA_PLL`） | **無 ppm 形式上限**：每秒修掉剩餘 offset 的 `1/2^(SHIFT_PLL+tc)`；offset 進場 clamp ±500ms（`MAXPHASE`）→ 有效上限 ~62,500ppm，指數衰減（32s poll 時 tc=1、τ≈7.5s） | `linux/kernel/time/ntp.c:130`（`ntp_offset_chunk`）、`:315`（`MAXPHASE` clamp）、`linux/include/linux/timex.h:120`（`SHIFT_PLL=2`）、`:135`（`MAXPHASE`） | 是 — 修 `< 0.4s` 偏移的路徑 |
+| 頻率補償（`time_freq` register） | **±500ppm 硬 clamp**（`MAXFREQ`）——可補償晶振誤差的極限 | `linux/include/linux/timex.h:136`（`MAXFREQ`）、`ntp_update_offset` 結尾把 `time_freq` clamp 進 `±MAXFREQ_SCALED` | 是 — 補償持續性晶振誤差 |
+| 古典 `adjtime()` singleshot（`ADJ_OFFSET_SINGLESHOT`） | 固定 500µs/s = **恰好 500ppm**（`MAX_TICKADJ`；500ppm lore 的出處） | `linux/kernel/time/ntp.c:43`（`MAX_TICKADJ`）、`second_overflow` 每秒消耗 `time_adjust` | 否 — 不走這條 |
+
+下面逐一拆三段 source。
+
+**機制一：PLL 相位滑動，沒有 ppm 形式上限。** timesyncd 對小偏移送 `ADJ_OFFSET` + `STA_PLL`，kernel 每秒把剩餘 offset 砍掉一塊。砍多少由 `ntp_offset_chunk` 決定：
+
+每秒消耗的 offset 是剩餘量右移 `SHIFT_PLL + time_constant` 位，也就是乘上 `1/2^(SHIFT_PLL+tc)`。
+
+```c File: linux/kernel/time/ntp.c:130
+		return shift_right(offset, SHIFT_PLL + time_constant);
+```
+
+`SHIFT_PLL` 是固定常數 2：
+
+```c File: linux/include/linux/timex.h:120
+#define SHIFT_PLL	2	/* PLL frequency factor (shift) */
+```
+
+`time_constant`（tc）由 poll interval 決定。32s poll 時 timesyncd 算出的 `.constant = log2(32) − 4 = 1`（見 [timesyncd-manager.c:247](/systemd/features/timesyncd-low-max-poll-simulation) 的 slew 路徑），所以每秒消耗比例是 `1/2^(2+1) = 1/8`。剩餘量每秒乘 7/8，是指數衰減；時間常數：
+
+```
+τ = 1 / ln(8/7) ≈ 7.5 秒
+```
+
+這是個指數，不是定速。對 399ms 偏移，**起始那一刻**的有效修正速率是 `399ms × ln(8/7) ≈ 53ms/s`，換算成頻率等效是約 **53,000ppm**——比那句 lore 的 500ppm 高出兩個數量級。也就是說小偏移收斂之快，跟「500ppm 上限」毫無關係：360ms 偏移約 15 秒收進 50ms（`ln(360/50) × 7.5s ≈ 15s`），144ms 約 8 秒。唯一的硬上限是進場時 offset 被夾進 ±500ms：
+
+```c File: linux/kernel/time/ntp.c:315
+	offset = clamp(offset, -MAXPHASE, MAXPHASE);
+```
+
+`MAXPHASE` = 500000000 ns = 500ms（`linux/include/linux/timex.h:135`）。所以 PLL 相位滑動的「上限」其實是 `500ms / 8ms-per-second-at-start` 換算出來的 ~62,500ppm 等效，而且還在指數衰減——完全不是 500ppm。（實務上 timesyncd 對超過 0.4s 的偏移根本不走 slew，見機制門檻。）
+
+**機制二：頻率補償，這才是真正的 ±500ppm 硬上限。** PLL 學到的持續性頻率誤差存在 `time_freq` register，這個值被硬 clamp 在 ±MAXFREQ：
+
+```c File: linux/include/linux/timex.h:136
+#define MAXFREQ 500000		/* max frequency error (ns/s) */
+```
+
+500000 ns/s = 500µs/s = **500ppm**。這是「kernel 能補償多大的晶振頻率誤差」的真極限。如果晶振本身漂超過 500ppm（壞掉的 RTC、計時異常的 VM），freq register 頂死 clamp 也補不回來，淨漂移永遠 `≥` 0——這就是為什麼實驗 1 預測 ±1000ppm 永不穩定收斂、±500ppm 只能「脆弱鎖定」。注意：這個 500ppm 是**頻率補償**的上限，跟機制一的相位滑動速度完全是兩回事。
+
+**機制三：古典 `adjtime()`，500ppm lore 的真出處。** 老式 `adjtimex(ADJ_OFFSET_SINGLESHOT)` / BSD `adjtime()` 走的是另一條路：把要修的量放進 `time_adjust`，kernel 每秒最多消耗 `MAX_TICKADJ`：
+
+```c File: linux/kernel/time/ntp.c:43
+#define MAX_TICKADJ		500LL		/* usecs */
+```
+
+每秒 500µs = **恰好 500ppm**——這就是「kernel slew 上限 500ppm」這句 lore 的出處。但 **timesyncd 根本不走這條 singleshot 路徑**：它對小偏移用機制一的 PLL（`STA_PLL`），對大偏移直接 step。把古典 `adjtime()` 的 500ppm 安到 timesyncd 頭上，就是這個 lore 的錯誤所在。
+
+**timesyncd 端的門檻：0.4s 決定 slew 還是 step。** kernel 提供機制，但走哪條由 timesyncd 在 user space 決定。門檻常數：
+
+```c File: systemd/src/timesync/timesyncd-manager.c:52
+#define NTP_MAX_ADJUST                  0.4
+```
+
+`manager_adjust_clock` 用它分流：`fabs(offset) < NTP_MAX_ADJUST` 走 slew（機制一的 PLL `STA_PLL` + `ADJ_OFFSET`），否則直接 step（`ADJ_OFFSET` 之外改用設定時間）：
+
+```c File: systemd/src/timesync/timesyncd-manager.c:247
+        if (fabs(offset) < NTP_MAX_ADJUST) {
+```
+
+這就是為什麼實驗 2 要把 offset 卡在 399ms 與 401ms 各差 1ms：399ms 走平滑 PLL 滑動（機制一，τ≈7.5s），401ms 走不連續跳錶——0.4s 的懸崖是這兩種 signature 的分界。
+
+## 量測架構：不採信受測物
+
+致命誘惑是直接讀 timesyncd 自報的 offset（`timedatectl show-timesync` 的 `Offset` 欄、或 journal）。不行——那個數字是 timesyncd 拿來做 slew/step 決策的**依據**，拿它判 timesyncd 對不對，等於請被告當法官。
+
+所以量測必須完全獨立。client 上跑一支 `ntp_probe.py`：用 raw socket 直接對 server 發 SNTP query，1Hz，把 `offset_ms, delay_ms` 記成 CSV。offset 定義為 `server_time − client_time`，純粹由 SNTP 封包的四個時戳算出，跟 timesyncd 的內部狀態無關。LAN 的 RTT 是 sub-ms 等級，對我們 50ms 的判準綽綽有餘（量測雜訊遠小於判準）。
+
+**收斂判定全實驗統一**：`|offset| < 50ms` 持續 60 秒，取首次進入該狀態的時刻。要求「持續 60 秒」是為了排除剛好滑過 50ms 又彈回去的瞬間假合格。
+
+**校準扣除天然漂移。** client 與 server 各有自己的晶振，就算都設 0ppm，兩顆晶振之間還是有天然的相對漂移（±幾 ppm）。如果不處理，±10ppm 那一格的 cell 會被這個背景污染。所以實驗前先跑 `calibrate.sh`：停掉 timesyncd、把 freq/tick 歸零、用 probe 量 30–60 分鐘的天然基線 ppm 存檔；`analyze.py` 之後從每個 cell 的結果扣掉這個 `client_ppm`，得到 `effective_ppm`。這讓 client/server 跑在不同實體機時，細偏移的 cell 也乾淨。
+
+## 單 kernel 驗證 trick：MONOTONIC_RAW 假 server
+
+最妙的一招：整套 rig 不需要兩台機器就能端到端驗。關鍵是 `CLOCK_MONOTONIC_RAW`——它是唯一**不受 adjtimex 影響**的時鐘，不被 NTP slew、不被 freq/tick register、不被 step 撥動，純粹反映硬體計時。
+
+於是可以在同一台 VM 上跑一支 `fake_ntp_server.py`，讓它用 `CLOCK_MONOTONIC_RAW`（加一個固定 epoch 偏移）當作「真時」來回答 SNTP query。然後把 client 的 timesyncd 指向 `NTP=127.0.0.1`。現在不管實驗怎麼把這顆 kernel 的 `CLOCK_REALTIME` 撥歪（注入 offset、灌 ppm、觸發 step），假 server 回的時間都還是來自不受影響的 RAW 時鐘——等於在同一顆 kernel 上同時擁有「被玩壞的受測時鐘」和「乾淨的參考時鐘」。一台 VM 就能跑通注入、收斂量測、step 偵測整條路。
+
+<Callout type="warning" title="啟動順序">
+唯一注意事項：假 server 必須在**注入誤差之前**就啟動並錨定好 epoch。如果先撥 REALTIME 再算 epoch 偏移，參考點就被污染了。
+</Callout>
+
+這也是交付前 L3 端到端驗證的基礎——用一台真實的 client VM（同 kernel、同 systemd 版本、同 PVE 環境）跑單機 rig，就能驗到 preflight、注入、量測、收斂判定整條鏈，不必先開 server VM。
+
+## 實驗包在哪
+
+全部 scripts 在 repo root 的 `experiments/timesyncd/`（不在網站路由內，刻意放在 `next-site/content` 之外）：
+
+```
+experiments/timesyncd/
+  README.md               ← agent 執行計畫：前提、ssh/scp 部署、執行順序、PASS 判準、故障排除
+  env.example.sh          ← SERVER_IP 等變數（複製成 env.sh 填值）
+  lib/
+    common.sh             ← preflight、狀態重置、cleanup trap、log、detach 輔助
+    ntp_probe.py          ← 1Hz SNTP probe → CSV（raw socket、stdlib only）
+    clock_inject.py       ← ctypes 呼叫 clock_adjtime：SETOFFSET / TICK / FREQUENCY
+    step_detector.py      ← REALTIME vs MONOTONIC_RAW 跳變監視
+    lease_sentinel.py     ← 5 秒 deadline 哨兵（模擬 ceph mon lease watchdog）
+    fake_ntp_server.py    ← 單機驗證用（MONOTONIC_RAW 基準假 server）
+    analyze.py            ← CSV → 收斂時間 / 統計 / PASS-FAIL verdict（md+json）
+  setup/
+    setup-server.sh       ← 24.04：chrony 設成 LAN server（一次性）
+    setup-client.sh       ← 22.04：timesyncd 指向 server、deps、安全網檢查
+    calibrate.sh          ← 基線漂移校準（預設 30min，--minutes 可調）
+  run/
+    exp1-drift-recovery.sh   ← --duration-h X --ppm Y 單 cell；--all 全矩陣
+    exp2-slew-399ms.sh       ← 含 401ms 對照
+    exp3-restart-sync.sh     ← --offset-ms N；--all
+    exp4-poll256-soak.sh     ← --scenario <名稱> --hours N；--all
+    all.sh                   ← 全套無人值守（校準→1→2→3→4），斷點續跑
+  tests/
+    test_lib.py            ← L2 單元測試：analyze.py 收斂判定 / 校準扣除、clock_inject 編排
+  results/                 ← CSV + summary，commit 進 repo（文章回填依據）
+```
+
+執行模型：每實驗一條指令，scripts 內建 preflight / cleanup trap / timeout / 結果落檔。長時實驗用 `systemd-run --unit=tsexp-<name>` 跑成 detached transient unit，進度落 `results/state.json`，`--status` 查進度——所以 **SSH 斷線實驗照跑**，`all.sh` 的斷點續跑也建立在這之上。
+
+下一篇把這套方法論套到四組實驗的完整步驟、矩陣與 source 推導預測：[實驗設計與預測](/systemd/features/timesyncd-drift-lab-experiments)。
