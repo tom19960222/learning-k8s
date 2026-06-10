@@ -100,5 +100,60 @@ class TestNtpProbeParse(unittest.TestCase):
             self.m.parse_reply(b"\x00" * 20, 1000.0, 1000.1)
 
 
+class TestFakeServerLoopback(unittest.TestCase):
+    """Mac 可跑的 L2 整合測試：fake server + ntp_probe 走 localhost UDP。"""
+    PORT = 12923
+
+    def test_oneshot_against_fake_server(self):
+        import time as _time
+        srv = subprocess.Popen(
+            [sys.executable, os.path.join(LIB, "fake_ntp_server.py"),
+             "--bind", "127.0.0.1", "--port", str(self.PORT)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out = None
+            for _ in range(20):  # 等 server bind（最多 2s）
+                _time.sleep(0.1)
+                p = subprocess.run(
+                    [sys.executable, os.path.join(LIB, "ntp_probe.py"),
+                     "oneshot", "--server", "127.0.0.1", "--port", str(self.PORT)],
+                    capture_output=True, text=True)
+                if p.returncode == 0:
+                    out = p.stdout.strip()
+                    break
+            self.assertIsNotNone(out, "probe 一直連不上 fake server")
+            # 同一台機器、server 剛用 wall 錨定 → offset 應接近 0
+            self.assertLess(abs(float(out)), 100.0)
+        finally:
+            srv.terminate()
+            srv.wait(timeout=5)
+
+    def test_skew_option(self):
+        import time as _time
+        srv = subprocess.Popen(
+            [sys.executable, os.path.join(LIB, "fake_ntp_server.py"),
+             "--bind", "127.0.0.1", "--port", str(self.PORT + 1),
+             "--skew-ms", "250"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            val = None
+            for _ in range(20):
+                _time.sleep(0.1)
+                p = subprocess.run(
+                    [sys.executable, os.path.join(LIB, "ntp_probe.py"),
+                     "oneshot", "--server", "127.0.0.1", "--port", str(self.PORT + 1)],
+                    capture_output=True, text=True)
+                if p.returncode == 0:
+                    val = float(p.stdout.strip())
+                    break
+            self.assertIsNotNone(val)
+            # server 快 250ms → probe offset（server−client）≈ +250
+            self.assertGreater(val, 150.0)
+            self.assertLess(val, 350.0)
+        finally:
+            srv.terminate()
+            srv.wait(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()
