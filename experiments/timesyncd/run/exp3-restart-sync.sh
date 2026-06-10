@@ -21,7 +21,7 @@ run_cell() {
   fi
   mkdir -p "$outdir"
   log "=== cell ${ms}ms：收斂 → 注入 → 立刻 restart ==="
-  trap 'stop_probe "$outdir/probe.csv"; reset_clock_state' RETURN
+  trap 'stop_probe "$outdir/probe.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
   reset_clock_state || { log "ERROR: cell 前置 reset 失敗，略過此 cell"; return 0; }
   wait_synced 5 300
   start_probe "$outdir/probe.csv"
