@@ -155,5 +155,52 @@ class TestFakeServerLoopback(unittest.TestCase):
             srv.wait(timeout=5)
 
 
+class TestStepDetectorLogic(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, LIB)
+        import step_detector
+        self.m = step_detector
+
+    def test_smooth_ramp_no_events(self):
+        # 500ppm slew @10Hz：每樣本 0.05ms，遠低於 1ms 門檻
+        ds = [i * 0.05 for i in range(100)]
+        self.assertEqual(self.m.find_jumps(ds, 1.0), [])
+
+    def test_single_step_detected(self):
+        ds = [0.0] * 50 + [401.0] * 50  # 一次 401ms step
+        events = self.m.find_jumps(ds, 1.0)
+        self.assertEqual(len(events), 1)
+        idx, jump = events[0]
+        self.assertEqual(idx, 50)
+        self.assertAlmostEqual(jump, 401.0, places=6)
+
+    def test_backward_step_detected(self):
+        ds = [100.0] * 10 + [98.0] * 10
+        events = self.m.find_jumps(ds, 1.0)
+        self.assertEqual(len(events), 1)
+        self.assertLess(events[0][1], 0)
+
+
+class TestLeaseSentinelLogic(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, LIB)
+        import lease_sentinel
+        self.m = lease_sentinel
+
+    def test_normal_tick(self):
+        self.assertIsNone(self.m.classify(1.0, 1.0, lease_s=5.0))
+
+    def test_forward_jump_miss(self):
+        # raw 過 1s 但 wall 過 6.5s → 時鐘前跳吃掉 lease
+        self.assertEqual(self.m.classify(6.5, 1.0, lease_s=5.0), "miss")
+
+    def test_stall_also_miss(self):
+        # wall 與 raw 都過 6.5s → process 卡住，一樣是 miss
+        self.assertEqual(self.m.classify(6.5, 6.5, lease_s=5.0), "miss")
+
+    def test_backward(self):
+        self.assertEqual(self.m.classify(-0.3, 1.0, lease_s=5.0), "backward")
+
+
 if __name__ == "__main__":
     unittest.main()
