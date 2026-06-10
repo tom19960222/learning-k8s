@@ -23,7 +23,7 @@ run_cell() {
   log "=== cell ${ms}ms：收斂 → 注入 → 立刻 restart ==="
   trap 'stop_probe "$outdir/probe.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
   reset_clock_state || { log "ERROR: cell 前置 reset 失敗，略過此 cell"; return 0; }
-  wait_synced 5 300
+  wait_synced 5 300 || { log "ERROR: cell baseline 收斂失敗，略過此 cell"; return 0; }
   start_probe "$outdir/probe.csv"
   sleep 2
   cursor="$(journalctl -u systemd-timesyncd --show-cursor -n 0 2>/dev/null | sed -n 's/^-- cursor: //p')"
