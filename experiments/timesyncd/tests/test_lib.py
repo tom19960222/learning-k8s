@@ -53,5 +53,52 @@ class TestClockInjectDryRun(unittest.TestCase):
         self.assertEqual(d["freq"], -(10 << 16))
 
 
+class TestNtpProbeParse(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, LIB)
+        import ntp_probe
+        self.m = ntp_probe
+
+    def _reply(self, t_server, mode=4, leap=0, stratum=2):
+        """合成 48-byte server reply：T2=T3=t_server（unix 秒）。"""
+        import struct
+        sec = int(t_server) + self.m.NTP_EPOCH_OFFSET
+        frac = int((t_server % 1) * 2**32)
+        pkt = bytearray(48)
+        pkt[0] = (leap << 6) | (4 << 3) | mode
+        pkt[1] = stratum
+        pkt[32:40] = struct.pack("!II", sec, frac)  # receive (T2)
+        pkt[40:48] = struct.pack("!II", sec, frac)  # transmit (T3)
+        return bytes(pkt)
+
+    def test_build_packet(self):
+        pkt = self.m.build_packet()
+        self.assertEqual(len(pkt), 48)
+        self.assertEqual(pkt[0], 0x23)  # LI=0 VN=4 Mode=3 (client)
+
+    def test_offset_delay_math(self):
+        # t1=1000.0, t4=1000.2, server T2=T3=1000.6
+        # offset = ((T2-t1)+(T3-t4))/2 = (0.6+0.4)/2 = 0.5 (server - client)
+        # delay  = (t4-t1)-(T3-T2) = 0.2
+        off, dly = self.m.parse_reply(self._reply(1000.6), 1000.0, 1000.2)
+        self.assertAlmostEqual(off, 0.5, places=6)
+        self.assertAlmostEqual(dly, 0.2, places=6)
+
+    def test_client_fast_reads_negative(self):
+        # client 比 server 快 0.5s → offset 必須是負（sign convention）
+        off, _ = self.m.parse_reply(self._reply(1000.0), 1000.4, 1000.6)
+        self.assertLess(off, 0)
+
+    def test_rejects_bad_packets(self):
+        with self.assertRaises(ValueError):  # mode 3 不是 server reply
+            self.m.parse_reply(self._reply(1000.0, mode=3), 1000.0, 1000.1)
+        with self.assertRaises(ValueError):  # LI=3 unsynchronized
+            self.m.parse_reply(self._reply(1000.0, leap=3), 1000.0, 1000.1)
+        with self.assertRaises(ValueError):  # stratum 0
+            self.m.parse_reply(self._reply(1000.0, stratum=0), 1000.0, 1000.1)
+        with self.assertRaises(ValueError):  # 短封包
+            self.m.parse_reply(b"\x00" * 20, 1000.0, 1000.1)
+
+
 if __name__ == "__main__":
     unittest.main()
