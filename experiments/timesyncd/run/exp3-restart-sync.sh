@@ -39,7 +39,9 @@ run_cell() {
   journalctl -u systemd-timesyncd --after-cursor "$cursor" -o short-monotonic \
     > "$outdir/journal.txt" 2>/dev/null || true
   # short-monotonic 的時戳右對齊有補空白（如 "[    5.123456]"），用 sed 而非 awk $1
-  contact_mono="$(sed -n 's/^\[ *\([0-9.]*\)\].*Contacted time server.*/\1/p' "$outdir/journal.txt" | head -1)"
+  # systemd 249（22.04）寫 "Initial synchronization to time server"，v250+ 改 "Contacted time server"
+  contact_mono="$(grep -E 'Contacted time server|Initial synchronization to time server' "$outdir/journal.txt" \
+    | head -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')"
   if [[ -n "$contact_mono" ]]; then
     contact_latency="$($PY -c "print(round($contact_mono - $t0_mono, 3))")"
   else
