@@ -56,7 +56,10 @@ r.update(cell=f"restart_{ms}ms", injected_offset_ms=float(ms),
 json.dump(r, open(os.path.join(outdir, "result.json"), "w"), indent=1)
 print(json.dumps(r))
 PYEOF
-  [[ $rc -eq 3 ]] && log "警告：${ms}ms 未在 ${TIMEOUT_S}s 內收斂，違反預測"
+  # 注意：這裡不能寫 [[ ... ]] && log（rc=0 時整串回 1 = 函式回傳值 → 炸掉呼叫端 set -e）
+  if [[ $rc -eq 3 ]]; then
+    log "警告：${ms}ms 未在 ${TIMEOUT_S}s 內收斂，違反預測"
+  fi
 }
 
 case "${1:-}" in

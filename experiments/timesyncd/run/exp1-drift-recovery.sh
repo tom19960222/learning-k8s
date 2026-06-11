@@ -11,6 +11,10 @@ load_env
 
 EXP_DIR="$RESULTS_DIR/exp1"
 TIMEOUT_S="${EXP1_TIMEOUT_S:-1800}"   # ±1000ppm cells 預期吃滿（spec：non-convergent 本身是 finding）
+# exp1 的問題是「持續鎖定」：hold = 60s 收斂 + 600s 穩定窗。
+# 超過 MAXFREQ 的 cell 在 32s poll 下鋸齒 < 50ms 會騙過短 hold（L4 實測），
+# poll 爬升後鋸齒破界 → 長 hold 才能正確記成 non-convergent
+HOLD_S="${EXP1_HOLD_S:-660}"
 
 # 25 cells："duration_h ppm"
 CELLS=()
@@ -29,9 +33,9 @@ run_cell() {
     return 0
   fi
   offset_ms="$($PY -c "print(round($d * 3600 * $p / 1000, 3))")"
-  log "=== cell ${d}h × ${p}ppm：折疊 offset=${offset_ms}ms，殘留 ppm=${p}，timeout=${TIMEOUT_S}s ==="
+  log "=== cell ${d}h × ${p}ppm：折疊 offset=${offset_ms}ms，殘留 ppm=${p}，timeout=${TIMEOUT_S}s，hold=${HOLD_S}s ==="
   set +e
-  run_recovery_cell "$outdir" "$offset_ms" "$p" "$TIMEOUT_S"
+  run_recovery_cell "$outdir" "$offset_ms" "$p" "$TIMEOUT_S" "$HOLD_S"
   rc=$?
   set -e
   if [[ $rc -eq 4 ]]; then

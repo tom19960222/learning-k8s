@@ -46,7 +46,9 @@ for ms in 399 401; do
   jumps=$(grep -c ',jump,' "$outdir/steps.csv" || true)
   maxjump=$(awk -F, '$3=="jump" {v=($4<0?-$4:$4); if (v>m) m=v} END {print m+0}' "$outdir/steps.csv" 2>/dev/null || echo 0)
   log "cell ${ms}ms：step 事件 ${jumps} 筆，最大單筆 ${maxjump}ms（預期：399ms=一串小事件、401ms=單筆≈400ms）"
-  [[ $rc -eq 3 ]] && log "警告：${ms}ms 未在 ${TIMEOUT_S}s 內收斂，違反預測，檢查 probe.csv"
+  if [[ $rc -eq 3 ]]; then
+    log "警告：${ms}ms 未在 ${TIMEOUT_S}s 內收斂，違反預測，檢查 probe.csv"
+  fi
 done
 systemctl start systemd-timesyncd 2>/dev/null || true   # 收尾：別讓 timesyncd 停著
 log "exp2 完成 → $EXP_DIR"
