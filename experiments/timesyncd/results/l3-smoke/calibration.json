@@ -1,0 +1,6 @@
+{
+ "client_ppm": 0.003,
+ "slope_ms_per_s": -3e-06,
+ "n": 300,
+ "duration_s": 299.0
+}
