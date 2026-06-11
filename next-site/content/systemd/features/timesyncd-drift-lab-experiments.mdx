@@ -1,0 +1,248 @@
+---
+layout: doc
+title: timesyncd Drift Lab — 四組實驗設計與 source 推導預測
+description: 25 cells 失聯恢復矩陣（1/4/24hr × 0–±1000ppm + MAXFREQ 邊界探針）、399ms vs 401ms 跳錶門檻對照、重啟對時 4 cells、PollIntervalMaxSec=256 的六情境生產級 soak（100Hz ping 0 丟包、step 0、5s lease 0 miss）。每組附 linux/systemd source 推導的預測表與對應執行指令；實測欄留空待環境跑完回填。
+---
+
+## 場景
+
+[實驗方法論](/systemd/features/timesyncd-drift-lab-methodology) 那篇講完「怎麼測才不會被受測物騙、為什麼不必等真實時間」。這頁是另一半：四組實驗的**完整設計**——每個 cell 的初始條件怎麼來、機制上預測收斂要多久、跑哪一條指令、預期看到什麼 signature。
+
+關鍵契約：**每張表都把「預測」與「實測」分成兩欄**。預測欄寫死，數字全部是從 `linux/kernel/time/` 與 `systemd/src/timesync/` 的 source 推導出來的機制結論（推導過程在方法論篇，這裡只引結論）；實測欄一律留「＿＿（在你環境跑後對照）」。這符合 CLAUDE.md 對 lab 指令的驗證等級：需要真實 Proxmox + 多 VM 的實驗，先以 source 交叉驗證並標註待實測，跑完才回填。預測 vs 實測的對照，是這套 lab 的核心價值——如果實測跟機制預測對不上，那是發現了某個環境變因，不是 kernel 變了。
+
+## 共用協定
+
+四組實驗共用一套量測協定，先講一次，後面不重複。
+
+**每個 cell 的標準生命週期**（`run/` 各 script 內建，trap 保證失敗也復原）：
+
+```
+preflight（擋 NTP、驗 clocksource、偵 qemu-guest-agent）
+→ 狀態重置（停 timesyncd、歸零 freq/tick、硬步進回真時、確認 |offset| < 5ms）
+→ 注入初始條件（ADJ_SETOFFSET 撥 offset、ADJ_TICK/ADJ_FREQUENCY 灌殘留 ppm）
+→ 啟動 probe（1Hz 獨立 SNTP）
+→ 解封 NTP / 啟動 timesyncd
+→ 等收斂或 timeout
+→ 收斂判定 → 寫 result.json → 清理（trap）
+```
+
+**收斂判定（全實驗統一）**：`|offset| < 50ms` 持續 60 秒，取首次進入該狀態的時刻。要求「持續 60 秒」是為了排除剛好滑過 50ms 又彈回去的瞬間假合格。offset 一律由獨立的 `ntp_probe.py` 量，不採信 timesyncd 自報值（理由見方法論篇「不採信受測物」一節）。
+
+**時間預算**（wall-clock 概估，全程可無人值守）：校準 ~1h、實驗 1 約 5–6h（±1000ppm 的 6 個 cell 各吃滿 30 分鐘 timeout，其餘多在分鐘級）、實驗 2 ~0.5h、實驗 3 ~1h、實驗 4 預設 ~10h（quick 模式 4h）。
+
+**執行包位置**：所有 script 在 repo root 的 `experiments/timesyncd/`（刻意放在 `next-site/content` 之外，網站路由碰不到）。部署方式（scp 到 client VM）、前提（兩台 VM、停 PVE 備份窗口、qemu-guest-agent 處置）與 `env.sh` 設定都在該目錄的 `README.md`。下面只列每實驗的入口指令與旗標。
+
+<Callout type="warning" title="先校準再跑">
+所有 cell 的結果都會被 `analyze.py` 扣掉 `calibrate.sh` 量到的天然基線 ppm。沒先跑校準就跑實驗，±10ppm 那幾格的 cell 會被兩顆晶振的天然相對漂移污染。`all.sh` 會自動先校準，單獨跑某一實驗時要自己確認 `results/calibration.json` 已存在。
+</Callout>
+
+## 實驗 1：失聯恢復（25 cells）
+
+問題：跟 NTP server 失聯 1hr / 4hr / 24hr、client 時鐘有 0 / ±10 / ±100 / ±1000 ppm 頻率誤差時，恢復連線後多久把 offset 降到 50ms 以下？再加 ±400 / ±500 ppm × 1hr 的邊界探針，定位 kernel 頻率補償的極限（`MAXFREQ` ±500ppm）。
+
+失聯階段是確定性 free-run（方法論篇證明），所以折疊成單一初始 offset 一次注入，實驗只跑恢復段。折疊公式：`offset = 失聯時長 T × 頻率誤差 F`。下表是 6 個頻率 × 3 個時長的折疊後初始 offset（`—` 表示該 cell 不跑——邊界探針只在 1hr 跑，因為邊界行為由殘留 ppm 決定、與失聯時長無關）：
+
+| | 0ppm | ±10ppm | ±100ppm | ±400ppm | ±500ppm | ±1000ppm |
+|---|---|---|---|---|---|---|
+| 1hr | 0（對照） | ±36ms | ±360ms | ±1.44s | ±1.8s | ±3.6s |
+| 4hr | 0 | ±144ms | ±1.44s | — | — | ±14.4s |
+| 24hr | 0 | ±864ms | ±8.64s | — | — | ±86.4s |
+
+主矩陣 3 時長 × 7 頻率（0、±10、±100、±1000）= 21 cells，加 ±400、±500 × 1hr = 4 cells，共 **25 cells**。
+
+### Source 推導預測
+
+預測值全部來自方法論篇拆出的「三種修正機制、三個上限」。每個 band 的機制與預測收斂時間：
+
+| 初始條件 band | 機制 | 預測收斂時間 | 實測 |
+|---|---|---|---|
+| `|offset| < 50ms`（1hr×10ppm = 36ms） | 進場即合格，無需修正 | `t ≈ 0` | ＿＿（在你環境跑後對照） |
+| 50–400ms（4hr×10ppm = 144ms） | PLL 相位滑動，`τ ≈ 7.5s` 指數衰減 | `≈ 8s`（`ln(144/50) × 7.5`） | ＿＿（在你環境跑後對照） |
+| 50–400ms（1hr×100ppm = 360ms） | PLL 相位滑動（同上） | `≈ 15s`（`ln(360/50) × 7.5`） | ＿＿（在你環境跑後對照） |
+| `> 400ms`（其餘大多數 cells） | timesyncd 首個 sample 直接 step（`ADJ_SETOFFSET` 跳錶） | 秒級（跳錶不在乎幅度，24hr×1000ppm = 86.4s 的極端 cell 也一樣秒級） | ＿＿（在你環境跑後對照） |
+| ±400ppm × 1hr | step 後可鎖定，freq register 還有 100ppm headroom | 秒級進場 + 穩定鎖定 | ＿＿（在你環境跑後對照） |
+| ±500ppm × 1hr | **脆弱鎖定**——freq register 頂死 `MAXFREQ` clamp，天然漂移 ±幾 ppm 即破界 | 可能間歇失準 | ＿＿（在你環境跑後對照） |
+| ±1000ppm（三時長） | **永不穩定收斂**——淨漂移 `≥ 500ppm` 超過 `MAXFREQ` | timeout 1800s 記 non-convergent | ＿＿（在你環境跑後對照） |
+
+幾個預測背後的機制要點：
+
+- **50–400ms 走 PLL 滑動而非 step**：timesyncd 的分流門檻是 `NTP_MAX_ADJUST = 0.4s`，`< 0.4s` 走 slew。slew 是 PLL 相位滑動，**沒有 500ppm 上限**（那個 lore 是古典 `adjtime()` 的事），32s poll 時時間常數 `τ ≈ 7.5s`，所以幾百 ms 在十幾秒內就滑掉。
+- **`> 400ms` 一律秒級**：超過 0.4s 直接 step，把 offset 一次撥掉，跟幅度多大無關——所以 86.4s 跟 3.6s 的 cell 收斂時間沒差別，差別只在進場那一下跳多遠。
+- **±1000ppm 永不收斂是預期 finding，不是 bug**：殘留 1000ppm 超過 `MAXFREQ` 的 500ppm 硬 clamp，freq register 頂死也補不回淨漂移，offset 會反覆跨過門檻、反覆跳錶。timeout 1800s 之後記 non-convergent——這正是生產上「晶振故障 / VM 計時異常」的 signature，能在實驗裡複現它本身就有價值。
+
+### 指令
+
+```bash
+# 全 25 cells，斷點續跑（已有 result.json 的 cell 自動 skip）
+sudo ./run/exp1-drift-recovery.sh --all
+
+# 單一 cell（debug 用）：4hr × −100ppm
+sudo ./run/exp1-drift-recovery.sh --duration-h 4 --ppm -100
+
+# detached 跑 --all（SSH 斷線照跑）
+sudo ./run/exp1-drift-recovery.sh --detach
+
+# 查進度（已完成幾個 cell / 25）
+./run/exp1-drift-recovery.sh --status
+```
+
+## 實驗 2：399ms vs 401ms——0.4s 門檻的兩側
+
+問題：把 offset 刻意卡在 0.4s 跳錶門檻的兩側各差 1ms，會看到什麼？這不是在比快慢，是在看 step detector 上兩種**截然不同的 signature**。
+
+門檻常數 `NTP_MAX_ADJUST = 0.4s` 在 `timesyncd-manager.c:52` 定義、`:247` 用 `fabs(offset) < NTP_MAX_ADJUST` 分流。所以：
+
+| cell | 路徑 | 機制 | 預測收斂時間 | 實測 |
+|---|---|---|---|---|
+| 399ms（門檻下 1ms） | slew | PLL 相位滑動，純連續 | `≈ 16s`（`ln(399/50) × 7.5`）+ 首個 sample 延遲 | ＿＿（在你環境跑後對照） |
+| 401ms（門檻上 1ms） | step | 單次跳錶 | 秒級 | ＿＿（在你環境跑後對照） |
+
+**重點不是哪個快**——兩者都是秒到十幾秒級。重點是 step detector 上的 signature 完全不同：
+
+- **399ms = 一串 `≤ 10ms` 遞減的小事件**：PLL 每秒砍掉剩餘 offset 的 `1/8`，時鐘平滑地滑回去，每一步都很小、單調遞減、絕不倒退。
+- **401ms = 單一 `≈ 400ms` 的事件**：一次跳錶，時鐘瞬間移動約 400ms。
+
+對 ceph mon lease、TLS 憑證 `notBefore/notAfter` 邊界、資料庫 timestamp 排序而言，**不連續才是風險**。一個平滑滑動 16 秒的時鐘不會讓任何單調時戳倒退；一個瞬間跳 400ms 的時鐘可能讓「後寫入的記錄帶較早的時戳」。0.4s 那道懸崖兩側差 1ms，行為性質卻是天差地別——這正是這個對照要打在圖上的東西。
+
+`exp2` 會自動統計兩個 cell 的 step 事件數與最大單筆跳幅（`steps.csv`），預期 399ms 是多筆小事件、401ms 是單筆 `≈ 400ms`。
+
+### 指令
+
+```bash
+# 跑 399 與 401 兩個 cell（自帶 step detector）
+sudo ./run/exp2-slew-399ms.sh
+
+# detached
+sudo ./run/exp2-slew-399ms.sh --detach
+
+# 查結果
+./run/exp2-slew-399ms.sh --status
+```
+
+## 實驗 3：重啟後馬上對時嗎？
+
+問題：`systemctl restart systemd-timesyncd` 之後，daemon 是不是**馬上**對時，還是要等一個完整的 poll interval（32s 起跳）才動？順帶量各 offset 收斂多久。
+
+4 個 cell `{10, 50, 100, 500}ms`。每個 cell 先讓時鐘收斂到穩態，注入 offset，**立刻** restart（注入與 restart 之間不等待），量兩件事：
+
+- **`contact_latency_s`**：journal 第一次打出 `Contacted time server` 的時刻（用 `CLOCK_MONOTONIC` 量，不受注入影響）減掉 restart 時刻。回答「是否馬上對時」。
+- **`t_converge`**：probe 量到 `|offset| < 50ms` 持續 60s 的首次時刻。
+
+| cell | 機制 | 預測 | 實測 |
+|---|---|---|---|
+| `contact_latency_s`（共同） | 重啟後立即發 query，poll 從 32s min 重爬、首發不等滿 32s | 數秒內首次 contact | ＿＿（在你環境跑後對照） |
+| 10ms | 進場即 `< 50ms` | 無感，`t ≈ 0` | ＿＿（在你環境跑後對照） |
+| 50ms | 卡在判準臨界 | 邊界，靠 hold 60s 分辨合格與否 | ＿＿（在你環境跑後對照） |
+| 100ms | PLL slew | `5–10s` | ＿＿（在你環境跑後對照） |
+| 500ms | step（`> 0.4s`） | 跳錶秒級 | ＿＿（在你環境跑後對照） |
+
+預測的核心是 `contact_latency_s`：timesyncd 重啟後不會枯等一個 poll interval，它會在啟動流程裡立即發第一個 query，poll interval 從 `PollIntervalMinSec`（32s）重新開始往上爬。所以「馬上對時」這件事的答案預測是「是，首次 contact 在數秒內」——這條 latency 量出來才是這實驗真正回答的問題，各 offset 的收斂時間只是順帶確認 slew/step 分流跟實驗 2 一致。
+
+### 指令
+
+```bash
+# 4 個 cell：10/50/100/500ms
+sudo ./run/exp3-restart-sync.sh --all
+
+# 單一 cell
+sudo ./run/exp3-restart-sync.sh --offset-ms 100
+
+# detached 跑 --all
+sudo ./run/exp3-restart-sync.sh --detach
+
+# 查結果
+./run/exp3-restart-sync.sh --status
+```
+
+## 實驗 4：PollIntervalMaxSec=256 會不會搞死生產環境？
+
+判準先行。這個實驗預設了一組**生產級嚴苛判準**：你的環境是「連 2 個 ping 封包都不能掉、ceph 之類的生產關鍵系統、5 秒 downtime 都不可接受」。把 `PollIntervalMaxSec` 從預設 2048 壓到 256 秒，在這組判準下會不會引入任何不穩定？
+
+六情境，每組判準照 [design spec](/systemd/features/timesyncd-drift-lab-methodology) 的表（情境 / 內容 / 判準三欄）：
+
+| 情境 | 內容 | 判準 |
+|---|---|---|
+| `baseline-2048` | 預設設定 soak N 小時（預設 4h，正式建議 24h） | 對照基線 |
+| `soak-256` | 256s 設定 soak 同時長 | 與基線逐項比 |
+| `restart` | soak 中 restart timesyncd | 不准出現 step |
+| `outage-30m` | NTP 失聯 30 分鐘後恢復 | 恢復無 step、offset 平滑 |
+| `inject-80ms` | 穩態注入 80ms 偏移 | 256s vs 2048s 偵測延遲對比（低 max poll 的實際效益） |
+| `jitter` | `tc netem` 5ms±3ms 延遲 1 小時 | PLL constant 降低後是否失穩（驗證 low-max-poll 的推論） |
+
+### 監測架構
+
+六情境全程同時跑同一套監測（每情境一份 CSV）：
+
+- **100Hz ping**（`ping -i 0.01`）→ 判準 **0 丟包**。
+- **step detector**：`CLOCK_REALTIME` vs `CLOCK_MONOTONIC_RAW` 差值跳變 `> 1ms` 即記錄 → 判準：除預期跳錶外為 0，且時鐘永不倒退。
+- **5 秒 deadline 哨兵**（`lease_sentinel.py`，模擬 ceph mon lease watchdog）→ 判準 **0 miss**。
+- **資源**：timesyncd CPU / 記憶體（cgroup `CPUUsageNSec` / `MemoryCurrent`）、udp/123 封包計數（nft counter）、journal error 掃描。
+- 全部彙整成 PASS/FAIL verdict 表。
+
+### Source 推導預測：六情境全 PASS
+
+| 情境 | 機制預測 | verdict 預測 | 實測 |
+|---|---|---|---|
+| `baseline-2048` | 對照基線 | PASS | ＿＿（在你環境跑後對照） |
+| `soak-256` | 256s 只改 poll 頻率（封包多 8 倍、仍每 4 分鐘 1 個 76-byte UDP）與 PLL time constant；穩態行為不變 | PASS（與基線逐項相當） | ＿＿（在你環境跑後對照） |
+| `restart` | 重啟走 slew/step 分流（同實驗 3），穩態小偏移走 slew 不 step | PASS（0 step） | ＿＿（在你環境跑後對照） |
+| `outage-30m` | 30 分鐘 free-run 累積的漂移遠 `< 0.4s`，恢復後走 slew 平滑收斂 | PASS（無 step、平滑） | ＿＿（在你環境跑後對照） |
+| `inject-80ms` | 80ms `< 0.4s` 全程 slew、不准 step；**唯一預期可量到差異**：偵測延遲上界 256s vs 2048s | PASS，且 256s 偵測明顯較快 | ＿＿（在你環境跑後對照） |
+| `jitter` | PLL constant 降低後是否失穩——驗證 [low-max-poll 模擬](/systemd/features/timesyncd-low-max-poll-simulation) 的推論 | 預測 PASS（除非該篇推論的失穩在此情境現形） | ＿＿（在你環境跑後對照） |
+
+預測總結：**六情境全 PASS**。把 `PollIntervalMaxSec` 壓到 256 改變的只有兩件事——poll 頻率（封包數變 8 倍，但每個還是每 4 分鐘一個 76-byte 的 UDP，CPU/記憶體/頻寬都微不足道）與 PLL 的 time constant。穩態的時鐘正確性不受影響，所以 ping 不掉包、lease 不 miss、不出現非預期 step。
+
+兩個情境值得特別盯：
+
+- **`inject-80ms` 是唯一預期可量到差異的情境**。80ms 在門檻下走純 slew，兩種 poll 設定都不 step；差別在**偵測延遲的上界**——poll=256 最壞要等 256s 才發下一個 query 看到偏移，poll=2048 最壞要等 2048s。這是壓低 max poll 的**實際效益**，也是這實驗唯一會在數字上分出高下的地方。注意 script 對 poll=2048 的子跑會先暖機 2400s 再注入（32→2048 的 poll 倍增需 ~2016s），確保注入時真的已經爬到 max poll，量到的才是 2048s 上界的真實情況。
+- **`jitter` 是驗證另一篇推論的地方**。[把 PollIntervalMaxSec 壓低會怎樣](/systemd/features/timesyncd-low-max-poll-simulation) 從理論推演過：max poll 壓低會降低 PLL 的 noise immunity。這個情境用 `tc netem` 灌 5ms±3ms 的網路抖動 1 小時，看 PLL constant 降低後會不會失穩。預測仍是 PASS（5ms±3ms 對 50ms 判準還有很大餘裕），但如果這裡真的驗出失穩，那就是該篇推論在實驗上現形——這正是它存在的意義。
+
+### 指令
+
+```bash
+# 全六情境，soak 4h（quick 模式）
+sudo ./run/exp4-poll256-soak.sh --all --hours 4
+
+# 單一情境
+sudo ./run/exp4-poll256-soak.sh --scenario soak-256 --hours 4
+
+# detached 跑 --all、soak 24h（正式建議）—— --detach 必須是第一個參數
+sudo ./run/exp4-poll256-soak.sh --detach --hours 24
+
+# 查各情境 verdict
+./run/exp4-poll256-soak.sh --status
+```
+
+整套四實驗一條龍（校準 → 1 → 2 → 3 → 4，斷點續跑）：
+
+```bash
+# --soak-hours 與 --detach 任意順序
+sudo ./run/all.sh --detach --soak-hours 24
+./run/all.sh --status
+```
+
+## 結果回填區
+
+<Callout type="info" title="實測欄怎麼回填">
+上面每張表的「實測＿＿」欄，等 `experiments/timesyncd/results/` 跑完進 repo 後逐一回填。預測 vs 實測的對照是這套 lab 的核心價值——不是「跑出一堆數字」，是「機制推論是否站得住」。
+
+**回填時若實測與預測矛盾，先懷疑實驗、不要懷疑 kernel。** 機制預測全部錨定在 source（行號在方法論篇），kernel 的行為不會因為換一台機器就變。實測對不上，幾乎一定是環境變因在干擾，依序檢查：
+
+- `preflight.json` 記的 `clocksource` 是不是 `kvm-clock`（不是的話 guest 計時基準就不對）。
+- `qemu-guest-agent` 的 `guest-set-time` 有沒有在背後撥時鐘，污染了注入的誤差。
+- PVE 的 vzdump 備份 / snapshot / live migration 窗口有沒有在實驗期間觸發，凍結或跳動了 guest 時鐘。
+- 校準的 `client_ppm` 是不是在那段時間有異常（換了實體機、溫度變化）。
+
+排除這些之後預測還對不上，才值得回頭質疑機制理解——而那會是真正有價值的 finding。
+</Callout>
+
+## 邊界與不變式
+
+這套實驗的結論建立在幾個明確的前提上，換了前提就不適用：
+
+- **chrony 的 step 行為不同**。本實驗測的是 systemd-timesyncd，它的 slew/step 門檻是 `NTP_MAX_ADJUST = 0.4s` 的硬常數。chrony 走 `makestep` 設定（可設「開機後前 N 次 sample 允許跳多大」），分流邏輯完全不同，實驗 2 的 399/401 對照搬不過去。
+- **bare-metal TSC vs kvm-clock**。本實驗的 cell 在 PVE guest 上跑，clocksource 預期是 `kvm-clock`。bare-metal 直接用 TSC，沒有 hypervisor 在中間，PVE 備份窗口那類干擾源不存在，但 TSC 自己的溫度漂移特性也不同——收斂的「平滑度」可能跟 guest 量到的不完全一樣。
+- **`NTP_MAX_ADJUST` 可被發行版 patch 改**。0.4s 是 upstream 常數，但發行版理論上可以 patch 它。如果你的 timesyncd 是改過的版本，399/401 的門檻位置會移動，實驗 2 的 cell 數值要跟著調。
+- **`USER_HZ ≠ 100` 的 tick 基準不同**。tick 注入用的 `10000µs = USER_HZ=100` 對應 1 個 tick 的長度。如果核心編成 `USER_HZ=250` 或 `1000`，tick 暫存器的合法範圍（`900000/USER_HZ` 到 `1100000/USER_HZ`）跟著變，`clock_inject.py` 算 ppm 的基準也要對齊——否則注入的 ppm 會偏。
+
+換句話說，這些預測對「PVE guest、kvm-clock、`USER_HZ=100`、upstream systemd-timesyncd」這組環境成立。換任何一項，先回方法論篇對齊 source，再重新推預測。

@@ -141,5 +141,109 @@
     ],
     "answer": 0,
     "explanation": "systemd-timesyncd.service.xml:59-68 說明 timesyncd 只會 delay time-set.target 到 local clock 從 /var/lib/systemd/timesync/clock 更新，並不等準確遠端同步。systemd.special.xml:1269-1294 則說需要準確遠端時間要看 time-sync.target，並啟用 systemd-time-wait-sync.service 或等價服務。"
+  },
+  {
+    "id": 12,
+    "section": "🧪 drift lab 方法論",
+    "question": "為什麼「NTP 失聯 24 小時」可以數學折疊成初始條件一次注入，而不用等 24 小時或做時間加速？",
+    "options": [
+      "因為沒有有效 NTP reply 時 timesyncd 完全不碰系統時鐘，失聯階段是確定性 free-run：累積 offset = 失聯時長 × 頻率誤差",
+      "因為 kernel 會把失聯期間的漂移自動記在 time_offset 暫存器，恢復時一次補回",
+      "因為 timesyncd 失聯時會以最後一次測得的 drift 繼續修正，所以漂移近似為零",
+      "因為 PVE 的 kvm-clock 會在 guest 失聯時凍結 CLOCK_REALTIME"
+    ],
+    "answer": 0,
+    "explanation": "timesyncd-outage-and-maintenance 篇已從 source 證明：沒有有效 reply 時 timesyncd 不做任何 clock 調整，時鐘以硬體 ppm 純 free-run。漂移因此是確定性的 T×F，可在恢復實驗開始前用 ADJ_SETOFFSET + 殘留 ppm 一次注入，比 10x/100x 時間加速更準（不是近似）也更快（失聯階段 0 秒）。"
+  },
+  {
+    "id": 13,
+    "section": "🧪 drift lab 方法論",
+    "question": "模擬 ±100ppm 以上的晶振誤差時，為什麼選 ADJ_TICK 而不是 ADJ_FREQUENCY？",
+    "options": [
+      "tick 是 timesyncd 與 kernel PLL 都不會改寫的暫存器，注入後如真實晶振誤差般持續存在，NTP 迴路必須真的學會補償",
+      "ADJ_TICK 的解析度比 ADJ_FREQUENCY 高，可以注入小數 ppm",
+      "ADJ_FREQUENCY 需要 root 權限而 ADJ_TICK 不用",
+      "tick 改變對 CLOCK_MONOTONIC_RAW 也生效，量測比較一致"
+    ],
+    "answer": 0,
+    "explanation": "freq register（time_freq）是 PLL 的輸出，timesyncd 同步後會逐步把它改寫掉，注入值不會持續；tick 則只有人為 adjtimex 會動。tick 粒度 100ppm（10000µs ± 1µs/100ppm，範圍 9000–11000 見 timekeeping.c:2360），所以 ±10ppm 的細粒度 cell 才退而用 ADJ_FREQUENCY（動力學等價）。ADJ_TICK 不影響 MONOTONIC_RAW——這正是 RAW 能當獨立基準的原因。"
+  },
+  {
+    "id": 14,
+    "section": "🧪 drift lab 方法論",
+    "question": "「Linux kernel 修時鐘最多只能 slew 500ppm」這句 lore 的真實出處是哪個機制？",
+    "options": [
+      "古典 adjtime()（ADJ_OFFSET_SINGLESHOT）的固定速率：MAX_TICKADJ = 500µs/s，恰好 500ppm——而 timesyncd 根本不走這條路",
+      "PLL 相位滑動（ADJ_OFFSET + STA_PLL）的每秒修正上限",
+      "NTP_MAX_ADJUST = 0.4s 換算成 ppm 的結果",
+      "kvm-clock 對 guest 時鐘調整速率的硬體限制"
+    ],
+    "answer": 0,
+    "explanation": "三種機制三個上限：PLL 相位滑動每秒修剩餘 offset 的 1/2^(SHIFT_PLL+tc)（ntp.c:130），無 ppm 形式上限（offset 進場被 MAXPHASE ±500ms clamp，有效上限 ~62,500ppm）；time_freq 頻率補償被 MAXFREQ 硬 clamp ±500ppm（timex.h:136）；古典 adjtime() 固定 500µs/s（ntp.c:43 MAX_TICKADJ）。lore 把第三條（timesyncd 不用）誤套到第一條上。"
+  },
+  {
+    "id": 15,
+    "section": "🧪 drift lab 方法論",
+    "question": "單一 VM 上要端到端驗證整套實驗 rig（注入、probe、收斂判定），假 NTP server 為什麼要錨定 CLOCK_MONOTONIC_RAW？",
+    "options": [
+      "MONOTONIC_RAW 不受 adjtimex 影響：同一顆 kernel 上不管 REALTIME 被注入什麼誤差，server 回的都是未被打亂的時間線",
+      "MONOTONIC_RAW 的解析度比 REALTIME 高一個數量級",
+      "timesyncd 規定 NTP server 必須以 MONOTONIC_RAW 回應",
+      "MONOTONIC_RAW 在 VM 裡不受 host 排程延遲影響"
+    ],
+    "answer": 0,
+    "explanation": "clock_adjtime 的 offset/freq/tick 調整全部只作用在 CLOCK_REALTIME（與 MONOTONIC），MONOTONIC_RAW 永遠以硬體原始速率走。fake server 啟動時記 anchor_wall + anchor_raw，之後回 anchor_wall + (raw_now − anchor_raw)——等於一台「時鐘沒被動過的第二台機器」，但不需要第二顆 kernel。唯一前提：要在注入誤差前啟動。"
+  },
+  {
+    "id": 16,
+    "section": "🧪 drift lab 實驗",
+    "question": "失聯恢復矩陣中，±1000ppm 的 cells 預測「永不穩定收斂」，依據是什麼？",
+    "options": [
+      "kernel 頻率補償被 MAXFREQ clamp 在 ±500ppm：晶振誤差 1000ppm 時淨漂移仍 ≥ 500ppm，offset 永遠追不平",
+      "1000ppm 超過 ADJ_TICK 的注入範圍，實驗根本做不出來",
+      "timesyncd 會在誤差超過 500ppm 時自動退出",
+      "PLL 相位滑動的 τ≈7.5s 對 1000ppm 來說太慢"
+    ],
+    "answer": 0,
+    "explanation": "time_freq 最多補 ±500ppm（timex.h:136）。殘留 ≥500ppm 的淨漂移讓 offset 持續累積：poll 短時在十幾 ms 徘徊、poll 拉長後跨 poll 漂移超過 0.4s 反覆觸發跳錶。timeout 1800s 記 non-convergent 本身就是 finding——生產上看到這個 signature 代表晶振故障或 VM 計時異常，不是 NTP 設定問題。tick 注入範圍 ±10%（9000–11000µs）≈ ±100,000ppm，1000ppm 完全做得出來。"
+  },
+  {
+    "id": 17,
+    "section": "🧪 drift lab 實驗",
+    "question": "399ms 與 401ms 兩個 cell 的預測收斂時間都是「秒級到十幾秒」，那這組對照實驗到底在量什麼？",
+    "options": [
+      "連續性：399ms 走 PLL 滑動（step detector 看到一串遞減小事件、時間軸連續），401ms 走 ADJ_SETOFFSET 跳錶（單一 ≈400ms 不連續事件）",
+      "量 NTP_MAX_ADJUST 的精確值是不是真的 0.4s",
+      "量 kernel 在 400ms 附近的 slew 速率拐點",
+      "量 timesyncd 重啟後的首次 poll 延遲"
+    ],
+    "answer": 0,
+    "explanation": "timesyncd-manager.c:247 以 fabs(offset) < NTP_MAX_ADJUST(0.4s) 分流：slew 走 ADJ_OFFSET+STA_PLL（指數衰減 τ≈7.5s，ln(399/50)×7.5≈16s），step 走 ADJ_SETOFFSET（瞬間）。對 ceph mon lease、TLS、資料庫 timestamp 而言，風險不在收斂快慢而在時間軸是否不連續——這 1ms 之差正好跨在懸崖兩側。"
+  },
+  {
+    "id": 18,
+    "section": "🧪 drift lab 實驗",
+    "question": "exp4 用什麼判準回答「PollIntervalMaxSec=256 在生產關鍵環境安不安全」？",
+    "options": [
+      "100Hz ping 0 丟包、REALTIME 對 RAW 無 >1ms 跳變、5 秒 deadline 哨兵 0 miss、journal 0 error——六情境（含 restart、30 分鐘失聯、80ms 注入、netem jitter）全程監測",
+      "只比較 256s 與 2048s 兩種設定下的平均 offset 大小",
+      "看 timesyncd 的 CPU 使用率有沒有超過 1%",
+      "讓 ceph cluster 實際跑在上面看 HEALTH_WARN 出不出現"
+    ],
+    "answer": 0,
+    "explanation": "判準從環境需求倒推：「連 2 個 ping 封包都不能掉、5 秒 downtime 不可接受」→ 連續性監測（step detector）、可用性監測（100Hz ping）、lease 語意監測（5s 哨兵，模擬 ceph mon lease watchdog）三者全程開著，再加資源與封包計數。預測唯一可量到的差異是 inject-80ms 情境的偵測延遲上界（256s vs 2048s）——這是低 max poll 的實際效益所在。"
+  },
+  {
+    "id": 19,
+    "section": "🧪 drift lab 實驗",
+    "question": "實驗為什麼不直接讀 timesyncd 自己回報的 offset（timedatectl timesync-status），而要自建 1Hz SNTP probe？",
+    "options": [
+      "量測必須獨立於受測物：timesyncd 的自報值只在它自己 poll 的時刻更新、且反映它自己的演算法視角，無法當收斂判定的 ground truth",
+      "timedatectl 需要 DBus，實驗 VM 上不可用",
+      "timesyncd 的 offset 單位是 NTP 時間戳，換算誤差太大",
+      "自報 offset 只有 root 看得到"
+    ],
+    "answer": 0,
+    "explanation": "受測物自報數據有兩個問題：更新頻率綁在 poll interval（32–2048s，遠粗於收斂判定需要的 1Hz）、且它是演算法內部狀態而非外部真值。probe 直接對 server 做 SNTP query（offset = ((T2−T1)+(T3−T4))/2 = server − client），LAN RTT sub-ms 對 50ms 判準綽綽有餘，並把 raw_s（MONOTONIC_RAW）一起落檔讓注入時刻可對齊。"
   }
 ]
