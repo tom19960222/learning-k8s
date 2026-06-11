@@ -82,17 +82,18 @@ reset_clock_state() {
   unblock_ntp
   $PY "$LIB_DIR/clock_inject.py" reset
   local off
-  for _ in 1 2 3 4 5; do
+  # 容差 1ms：exp2 靠 399/401ms 的 1ms 邊際設計，殘留 4ms 就會把 slew 推成 step（L3 實測教訓）
+  for _ in 1 2 3 4 5 6 7 8; do
     off="$(ntp_offset_ms)" || { log "ERROR reset_clock_state: 量不到 server offset"; return 1; }
     # off = server - client；把 client 撥 +off 就對齊 server
-    if $PY -c "import sys; sys.exit(0 if abs(float('$off')) < 5 else 1)"; then
-      log "reset_clock_state 完成（|offset| = ${off}ms < 5ms）"
+    if $PY -c "import sys; sys.exit(0 if abs(float('$off')) < 1 else 1)"; then
+      log "reset_clock_state 完成（|offset| = ${off}ms < 1ms）"
       return 0
     fi
     $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$off"
     sleep 1
   done
-  log "ERROR reset_clock_state: 5 次校正後仍未進 5ms（最後 offset=${off}ms）"; return 1
+  log "ERROR reset_clock_state: 8 次校正後仍未進 1ms（最後 offset=${off}ms）"; return 1
 }
 
 # ---------- 背景監視器 ----------

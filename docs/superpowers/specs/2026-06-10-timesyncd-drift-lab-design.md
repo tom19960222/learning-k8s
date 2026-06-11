@@ -124,7 +124,7 @@ Source 推導預測（文章先寫預測、結果跑完回填）：
 ### 每 cell 標準生命週期
 
 ```
-preflight → 狀態重置（停 timesyncd、歸零暫存器、硬步進回真時、|offset|<5ms 確認）
+preflight → 狀態重置（停 timesyncd、歸零暫存器、硬步進回真時、|offset|<1ms 確認；原 5ms 在 L3 實測證實太鬆——殘留 4.2ms 會把 399ms cell 推過 0.4s 門檻變 step）
 → 注入初始條件 → 啟動 probe → 解封 NTP / 啟動 timesyncd → 等收斂或 timeout
 → 收斂判定 → 寫結果 → 清理（trap 保證失敗也復原）
 ```
