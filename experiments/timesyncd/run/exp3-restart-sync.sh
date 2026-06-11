@@ -31,10 +31,8 @@ run_cell() {
   $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$ms"
   t0=$(raw_now); t0_mono=$(mono_now)
   systemctl restart systemd-timesyncd
-  set +e
-  wait_convergence "$outdir/probe.csv" "$t0" "$TIMEOUT_S" > "$outdir/convergence.json"
-  rc=$?
-  set -e
+  rc=0
+  wait_convergence "$outdir/probe.csv" "$t0" "$TIMEOUT_S" > "$outdir/convergence.json" || rc=$?
   # journal：restart 後第一次真的打出去的時間（CLOCK_MONOTONIC，不受注入影響）
   journalctl -u systemd-timesyncd --after-cursor "$cursor" -o short-monotonic \
     > "$outdir/journal.txt" 2>/dev/null || true

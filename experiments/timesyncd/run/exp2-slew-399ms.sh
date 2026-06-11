@@ -33,10 +33,8 @@ for ms in 399 401; do
     continue
   fi
   log "=== cell ${ms}ms（門檻 0.4s 的$( [[ $ms -lt 400 ]] && echo 下 || echo 上 )側）==="
-  set +e
-  run_recovery_cell "$outdir" "$ms" 0 "$TIMEOUT_S"
-  rc=$?
-  set -e
+  rc=0
+  run_recovery_cell "$outdir" "$ms" 0 "$TIMEOUT_S" || rc=$?
   if [[ $rc -eq 4 ]]; then
     log "cell ${ms}ms 前置 reset 失敗，未寫 result（下次重跑會自動重試）"
     continue

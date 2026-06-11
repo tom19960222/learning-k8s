@@ -34,10 +34,9 @@ run_cell() {
   fi
   offset_ms="$($PY -c "print(round($d * 3600 * $p / 1000, 3))")"
   log "=== cell ${d}h × ${p}ppm：折疊 offset=${offset_ms}ms，殘留 ppm=${p}，timeout=${TIMEOUT_S}s，hold=${HOLD_S}s ==="
-  set +e
-  run_recovery_cell "$outdir" "$offset_ms" "$p" "$TIMEOUT_S" "$HOLD_S"
-  rc=$?
-  set -e
+  # || 條件語境（不用 set +e 包：被呼叫函式內部的 set -e 會廢掉外層防護）
+  rc=0
+  run_recovery_cell "$outdir" "$offset_ms" "$p" "$TIMEOUT_S" "$HOLD_S" || rc=$?
   if [[ $rc -eq 4 ]]; then
     log "cell ${d}h × ${p}ppm 前置 reset 失敗，未寫 result（下次重跑會自動重試）"
     return 0

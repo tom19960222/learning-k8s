@@ -152,9 +152,7 @@ run_scenario() {
         t0=$(raw_now)
         echo "$t0 inject_${inj}ms baseline_${cur}ms" >> "$sub/events.log"
         $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$inj"
-        set +e
-        wait_convergence "$sub/probe.csv" "$t0" 3600 > "$sub/convergence.json"
-        set -e
+        wait_convergence "$sub/probe.csv" "$t0" 3600 > "$sub/convergence.json" || true
         stop_monitors "$sub"
         log "inject-80ms @ poll=$poll：$(cat "$sub/convergence.json")"
       done
@@ -168,21 +166,17 @@ run_scenario() {
       tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true ;;
     *) die "未知情境 $name（可用：${SCENARIOS[*]}）" ;;
   esac
-  # verdict：inject-80ms 對兩個子目錄各跑一次
-  set +e
+  # verdict：inject-80ms 對兩個子目錄各跑一次（全部用 || 條件語境，不用 set +e）
   if [[ "$name" == inject-80ms ]]; then
     for poll in 256 2048; do
       $PY "$LIB_DIR/analyze.py" soak-verdict --dir "$outdir/poll-$poll" \
-        --expect-steps 1 --step-min-ms 50
-      [[ $? -ne 0 ]] && rc=3
+        --expect-steps 1 --step-min-ms 50 || rc=3
     done
     [[ $rc -eq 0 ]] && echo '{"pass": true}' > "$outdir/verdict.json" \
                     || echo '{"pass": false}' > "$outdir/verdict.json"
   else
-    $PY "$LIB_DIR/analyze.py" soak-verdict --dir "$outdir"
-    rc=$?
+    $PY "$LIB_DIR/analyze.py" soak-verdict --dir "$outdir" || rc=$?
   fi
-  set -e
   [[ $rc -eq 0 ]] && log "scenario $name → PASS" || log "scenario $name → FAIL（看 $outdir/verdict.md）"
   return 0   # FAIL 也繼續跑下一情境，總結看 verdict
 }

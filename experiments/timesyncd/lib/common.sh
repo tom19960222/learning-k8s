@@ -131,14 +131,14 @@ inject_ppm() {  # $1 = ppm（整數；可 0；±100 倍數走 tick，其餘走 f
 
 # ---------- 收斂等待 ----------
 wait_convergence() {  # $1=probe.csv $2=t0_raw $3=timeout_s [$4=hold_s 預設60]；stdout=analyze JSON；rc 0/3
+  # 鐵則：函式內不做 set +e/-e 切換（內部 set -e 全域生效，會廢掉呼叫端的防護——L4 實測教訓）。
+  # 可失敗指令一律用 `cmd || rc=$?` 條件語境。
   local csv=$1 t0=$2 timeout=$3 hold=${4:-60} t_start elapsed out rc
   t_start=$(raw_now)
   while true; do
     sleep 15
-    set +e
-    out="$($PY "$LIB_DIR/analyze.py" convergence --csv "$csv" --t0-raw "$t0" --hold-s "$hold" 2>/dev/null)"
-    rc=$?
-    set -e
+    rc=0
+    out="$($PY "$LIB_DIR/analyze.py" convergence --csv "$csv" --t0-raw "$t0" --hold-s "$hold" 2>/dev/null)" || rc=$?
     if [[ $rc -eq 0 ]]; then echo "$out"; return 0; fi
     elapsed=$($PY -c "print($(raw_now) - $t_start)")
     if $PY -c "import sys; sys.exit(0 if $elapsed > $timeout else 1)"; then
@@ -182,10 +182,8 @@ run_recovery_cell() {
   sleep 2  # 讓 probe 先記到注入後、timesyncd 啟動前的基線
   t0=$(raw_now)
   systemctl start systemd-timesyncd
-  set +e
-  wait_convergence "$outdir/probe.csv" "$t0" "$timeout_s" "$hold_s" > "$outdir/convergence.json"
-  rc=$?
-  set -e
+  # || 條件語境：wait_convergence 的 return 3（timeout）不得引爆 errexit
+  wait_convergence "$outdir/probe.csv" "$t0" "$timeout_s" "$hold_s" > "$outdir/convergence.json" || rc=$?
   echo "$t0" > "$outdir/t0_raw"
   return $rc
 }
