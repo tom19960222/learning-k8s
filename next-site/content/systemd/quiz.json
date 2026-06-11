@@ -4,12 +4,12 @@
     "section": "📈 timesyncd + Prometheus 監控",
     "question": "為什麼 node_exporter 的 timex collector 對 systemd-timesyncd 是可靠的同步狀態來源？",
     "options": [
-      "timesyncd 每次成功校正都把 status 設成 STA_PLL 並清掉 STA_UNSYNC（RTC 非 local time 時），kernel 因此回報已同步，node_timex_sync_status=1",
-      "timesyncd 內建一個 /metrics endpoint，timex collector 直接抓它",
       "timex collector 會主動發 NTP 封包去量 offset，不依賴 timesyncd",
+      "timesyncd 內建一個 /metrics endpoint，timex collector 直接抓它",
+      "timesyncd 每次成功校正都把 status 設成 STA_PLL 並清掉 STA_UNSYNC（RTC 非 local time 時），kernel 因此回報已同步，node_timex_sync_status=1",
       "因為 timesyncd 會把 offset 寫進 /proc/timesync 讓 collector 讀"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "manager_adjust_clock（timesyncd-manager.c:247）slew 路徑設 status=STA_PLL，且 STA_UNSYNC 只在 RTC 跑 local time 時才被設（line 275）。正常情況 timesyncd 清掉 STA_UNSYNC，kernel 標記為已同步，adjtimex 不回 TIME_ERROR，所以 node_timex_sync_status=1。timesyncd 本身沒有 metrics endpoint；timex collector 是讀 kernel 的 adjtimex 狀態，不自己發 NTP 封包。"
   },
   {
@@ -17,12 +17,12 @@
     "section": "📈 timesyncd + Prometheus 監控",
     "question": "node_exporter 官方 docs 建議用哪一組 metric 判斷 systemd-timesyncd 有沒有在做事？",
     "options": [
-      "timex collector 的 sync_status 與 offset 的組合",
-      "ntp collector 的 node_ntp_stratum",
       "systemd_exporter 的 unit_state",
+      "ntp collector 的 node_ntp_stratum",
+      "timex collector 的 sync_status 與 offset 的組合",
       "process collector 的 CPU 使用率"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "node_exporter docs/TIME.md 明寫：『the combination of sync_status and offset exported by timex module is the way to monitor if systemd-timesyncd does its job.』ntp collector 已被標記 deprecated 且針對本地 NTP daemon；systemd_exporter 的 unit_state 只能看 daemon 是否存活，無法看時間偏移。"
   },
   {
@@ -30,12 +30,12 @@
     "section": "📈 timesyncd + Prometheus 監控",
     "question": "3-node ceph cluster 跨 node 時間差超過 50ms 時，Prometheus 從 ceph-mgr prometheus module 會看到什麼？",
     "options": [
-      "ceph_health_detail{name=\"MON_CLOCK_SKEW\"} 變 1，但只有 0/1、不含實際 ms 數值",
       "一個 ceph_clock_skew_seconds gauge，精確到每對 mon 的毫秒差",
+      "node_timex_offset_seconds 會自動同步成跨 node 的差值",
       "什麼都看不到，ceph 不把 clock skew 暴露給 Prometheus",
-      "node_timex_offset_seconds 會自動同步成跨 node 的差值"
+      "ceph_health_detail{name=\"MON_CLOCK_SKEW\"} 變 1，但只有 0/1、不含實際 ms 數值"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "prometheus module 把每個 active health check 設成 health_detail gauge（module.py:742、932），所以 MON_CLOCK_SKEW 會以 ceph_health_detail{name=\"MON_CLOCK_SKEW\"}=1 出現。它是 0/1 的判決（門檻 mon_clock_drift_allowed 預設 0.05s=50ms），實際偏移量級在 ceph time-sync-status 文字輸出、預設不進 Prometheus。"
   },
   {
@@ -43,12 +43,12 @@
     "section": "📈 timesyncd + Prometheus 監控",
     "question": "為什麼「每台 node 維持 |node_timex_offset_seconds| < 25ms」只能當 ceph 50ms 門檻的早期 proxy，而不是權威判決？",
     "options": [
-      "因為三角不等式需要同一時間參考與新鮮 residual offset 前提；node_timex_offset_seconds 不是跨 node 即時量測，權威判決仍是 ceph timecheck",
-      "因為 node_exporter 會自動把所有 node 的 offset 平均掉",
+      "因為 25ms 是 ceph 的硬性下限，低於它 ceph 不會比較",
       "因為 timesyncd 保證所有 node 的 offset 一定同號",
-      "因為 25ms 是 ceph 的硬性下限，低於它 ceph 不會比較"
+      "因為三角不等式需要同一時間參考與新鮮 residual offset 前提；node_timex_offset_seconds 不是跨 node 即時量測，權威判決仍是 ceph timecheck",
+      "因為 node_exporter 會自動把所有 node 的 offset 平均掉"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "三角不等式 |X−Y| ≤ |X|+|Y| 只有在 X/Y 可比較且足夠新鮮時才成立。node_timex_offset_seconds 是 kernel residual offset，不是每次 scrape 主動量測跨 node 差；它適合當早期 proxy，ceph_health_detail{name=\"MON_CLOCK_SKEW\"} 才是跨 mon 50ms 的權威判決。"
   },
   {
@@ -56,12 +56,12 @@
     "section": "📈 timesyncd + Prometheus 監控",
     "question": "只用 timesyncd + Prometheus 時，下列哪個 exporter 不建議採用？",
     "options": [
-      "dmitry-ee/time_exporter — 最後更新停在 2021，已停更",
       "prometheus/node_exporter — timex collector 預設開、持續維護",
-      "prometheus-community/systemd_exporter — 用來看 timesyncd service 是否 active",
-      "以上都該用，沒有不建議的"
+      "以上都該用，沒有不建議的",
+      "dmitry-ee/time_exporter — 最後更新停在 2021，已停更",
+      "prometheus-community/systemd_exporter — 用來看 timesyncd service 是否 active"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "time_exporter 最後 push 在 2021-11、僅 6 star，屬停更專案，不建議用於生產。主力是活躍維護的 node_exporter（timex collector），輔以 systemd_exporter 看 daemon 存活。timesyncd 沒有還在維護的專屬 exporter，官方也建議走 node_exporter timex collector。"
   },
   {
@@ -69,12 +69,12 @@
     "section": "🕒 timesyncd restart impact",
     "question": "systemd-timesyncd 啟動時 `load_clock_timestamp()` 對 `CLOCK_REALTIME` 的核心限制是什麼？",
     "options": [
-      "只會在 now 不大於 timestamp file / TIME_EPOCH 時往前 bump 到 epoch+1us，不會往後調",
       "每次 restart 都會強制往後校正到 NTP server time",
       "只要 timestamp file 存在就一定會跳 60 秒",
-      "它不碰 CLOCK_REALTIME，只更新 /run/systemd/timesync/synchronized"
+      "它不碰 CLOCK_REALTIME，只更新 /run/systemd/timesync/synchronized",
+      "只會在 now 不大於 timestamp file / TIME_EPOCH 時往前 bump 到 epoch+1us，不會往後調"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "timesyncd.c:118-130 先取 current realtime；若 ct > epoch 就 return。只有 current time 不大於 epoch 時才 clock_settime 到 epoch+1us，並記錄 DIRECTION=forwards。往後跳是 PID 1 clock_apply_epoch 或後續 NTP jump 的其他路徑，不是 daemon-side load_clock_timestamp。"
   },
   {
@@ -82,12 +82,12 @@
     "section": "🌐 outage / server failure",
     "question": "NTP server 有回應但 root distance 超過 `RootDistanceMaxSec=` 時，timesyncd 會怎麼做？",
     "options": [
-      "記錄 server root distance 太大，disconnect 並透過 manager_connect() 換下一個 server/address",
       "照樣接受 sample，因為 root distance 只影響 log 顯示",
       "立刻把系統時間往前跳到 root distance 對應的秒數",
+      "記錄 server root distance 太大，disconnect 並透過 manager_connect() 換下一個 server/address",
       "把 PollIntervalMaxSec 永久改成 32 秒"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "manager_receive_response 在 timesyncd-manager.c:493-497 用 root_delay/2 + root_dispersion 算 root distance，超過 m->root_distance_max_usec 就 log_info 並 return manager_connect(m)。這是 server selection 問題，不是 clock adjustment。"
   },
   {
@@ -97,8 +97,8 @@
     "options": [
       "因為 `adjust (slew)` / `adjust (jump)` 與 NTP response dump 都是 LOG_DEBUG，預設 log level 只看到 INFO 以上",
       "因為 timesyncd 根本不記錄任何 NTP response",
-      "因為 offset 只寫進 /proc/timesync，journalctl 不能讀",
-      "因為只有 chrony 才會在 log 裡寫 offset"
+      "因為只有 chrony 才會在 log 裡寫 offset",
+      "因為 offset 只寫進 /proc/timesync，journalctl 不能讀"
     ],
     "answer": 0,
     "explanation": "timesyncd-manager.c:255/272 的 adjust log 是 log_debug，完整 NTP response dump 也是 log_debug。預設可見的是 Contacted time server、Initial clock synchronization、root distance 太大等 INFO。要看 offset 細節要開 DEBUG。"
@@ -109,9 +109,9 @@
     "question": "`manager_sample_spike_detection()` 裡 `if (fabs(offset) > delay) return false;` 的意思是什麼？",
     "options": [
       "offset 比本輪 round-trip delay 還大時，timesyncd 認為比較像真偏移，所以不當 spike、接受 sample",
+      "這行代表 timesyncd 會立刻切換 NTP server",
       "offset 比 delay 大時，timesyncd 永遠把 sample 當 spike 並丟掉",
-      "delay 只用來顯示，不參與 spike detection",
-      "這行代表 timesyncd 會立刻切換 NTP server"
+      "delay 只用來顯示，不參與 spike detection"
     ],
     "answer": 0,
     "explanation": "timesyncd-manager.c:348-350 的註解寫明 always accept offset if we are farther off than the round-trip delay，return false 代表不是 spike。這修正了把 50ms/250ms 真偏移誤判成永遠 spike 的錯誤讀法。"
@@ -123,8 +123,8 @@
     "options": [
       "穩態下最晚 256 秒拿到下一筆 NTP sample，跟 ceph 5 分鐘 timecheck 同量級，同時保留比 max=64 更好的 noise filter",
       "source 保證 max=256 時所有 50ms 偏移都會在 10 分鐘內完全收斂",
-      "max=256 會讓 timesyncd 改用 chrony driftfile",
-      "max=256 會停用 spike detection，避免 sample 被忽略"
+      "max=256 會停用 spike detection，避免 sample 被忽略",
+      "max=256 會讓 timesyncd 改用 chrony driftfile"
     ],
     "answer": 0,
     "explanation": "source 能保證的是下一筆 sample 的最壞等待與 poll/PLL 決策，不保證 kernel slew 固定幾分鐘收斂。max=256 讓 sample 新鮮度接近 ceph timecheck，packet/day 仍合理，PLL constant=4 也比 max=64 的 constant=2 更不容易放大 jitter。"
@@ -135,8 +135,8 @@
     "question": "對需要準確時間的 workload，為什麼只寫 `After=time-set.target` 不夠？",
     "options": [
       "`time-set.target` 只代表本機時間已被 timestamp file / epoch 等 local source 推到粗略單調；要等遠端同步需用 `time-sync.target` 搭配 systemd-time-wait-sync 或等價機制",
-      "`time-set.target` 永遠不會被 systemd-timesyncd pull in",
       "`time-set.target` 只跟 timezone 設定有關，與 CLOCK_REALTIME 無關",
+      "`time-set.target` 永遠不會被 systemd-timesyncd pull in",
       "`time-sync.target` 是給 container 用的，bare-metal 不支援"
     ],
     "answer": 0,
@@ -147,12 +147,12 @@
     "section": "🧪 drift lab 方法論",
     "question": "為什麼「NTP 失聯 24 小時」可以數學折疊成初始條件一次注入，而不用等 24 小時或做時間加速？",
     "options": [
+      "因為 PVE 的 kvm-clock 會在 guest 失聯時凍結 CLOCK_REALTIME",
       "因為沒有有效 NTP reply 時 timesyncd 完全不碰系統時鐘，失聯階段是確定性 free-run：累積 offset = 失聯時長 × 頻率誤差",
-      "因為 kernel 會把失聯期間的漂移自動記在 time_offset 暫存器，恢復時一次補回",
       "因為 timesyncd 失聯時會以最後一次測得的 drift 繼續修正，所以漂移近似為零",
-      "因為 PVE 的 kvm-clock 會在 guest 失聯時凍結 CLOCK_REALTIME"
+      "因為 kernel 會把失聯期間的漂移自動記在 time_offset 暫存器，恢復時一次補回"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "timesyncd-outage-and-maintenance 篇已從 source 證明：沒有有效 reply 時 timesyncd 不做任何 clock 調整，時鐘以硬體 ppm 純 free-run。漂移因此是確定性的 T×F，可在恢復實驗開始前用 ADJ_SETOFFSET + 殘留 ppm 一次注入，比 10x/100x 時間加速更準（不是近似）也更快（失聯階段 0 秒）。"
   },
   {
@@ -160,12 +160,12 @@
     "section": "🧪 drift lab 方法論",
     "question": "模擬 ±100ppm 以上的晶振誤差時，為什麼選 ADJ_TICK 而不是 ADJ_FREQUENCY？",
     "options": [
-      "tick 是 timesyncd 與 kernel PLL 都不會改寫的暫存器，注入後如真實晶振誤差般持續存在，NTP 迴路必須真的學會補償",
+      "tick 改變對 CLOCK_MONOTONIC_RAW 也生效，量測比較一致",
       "ADJ_TICK 的解析度比 ADJ_FREQUENCY 高，可以注入小數 ppm",
-      "ADJ_FREQUENCY 需要 root 權限而 ADJ_TICK 不用",
-      "tick 改變對 CLOCK_MONOTONIC_RAW 也生效，量測比較一致"
+      "tick 是 timesyncd 與 kernel PLL 都不會改寫的暫存器，注入後如真實晶振誤差般持續存在，NTP 迴路必須真的學會補償",
+      "ADJ_FREQUENCY 需要 root 權限而 ADJ_TICK 不用"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "freq register（time_freq）是 PLL 的輸出，timesyncd 同步後會逐步把它改寫掉，注入值不會持續；tick 則只有人為 adjtimex 會動。tick 粒度 100ppm（10000µs ± 1µs/100ppm，範圍 9000–11000 見 timekeeping.c:2360），所以 ±10ppm 的細粒度 cell 才退而用 ADJ_FREQUENCY（動力學等價）。ADJ_TICK 不影響 MONOTONIC_RAW——這正是 RAW 能當獨立基準的原因。"
   },
   {
@@ -173,12 +173,12 @@
     "section": "🧪 drift lab 方法論",
     "question": "「Linux kernel 修時鐘最多只能 slew 500ppm」這句 lore 的真實出處是哪個機制？",
     "options": [
-      "古典 adjtime()（ADJ_OFFSET_SINGLESHOT）的固定速率：MAX_TICKADJ = 500µs/s，恰好 500ppm——而 timesyncd 根本不走這條路",
       "PLL 相位滑動（ADJ_OFFSET + STA_PLL）的每秒修正上限",
+      "kvm-clock 對 guest 時鐘調整速率的硬體限制",
       "NTP_MAX_ADJUST = 0.4s 換算成 ppm 的結果",
-      "kvm-clock 對 guest 時鐘調整速率的硬體限制"
+      "古典 adjtime()（ADJ_OFFSET_SINGLESHOT）的固定速率：MAX_TICKADJ = 500µs/s，恰好 500ppm——而 timesyncd 根本不走這條路"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "三種機制三個上限：PLL 相位滑動每秒修剩餘 offset 的 1/2^(SHIFT_PLL+tc)（ntp.c:130），無 ppm 形式上限（offset 進場被 MAXPHASE ±500ms clamp，有效上限 ~62,500ppm）；time_freq 頻率補償被 MAXFREQ 硬 clamp ±500ppm（timex.h:136）；古典 adjtime() 固定 500µs/s（ntp.c:43 MAX_TICKADJ）。lore 把第三條（timesyncd 不用）誤套到第一條上。"
   },
   {
@@ -186,12 +186,12 @@
     "section": "🧪 drift lab 方法論",
     "question": "單一 VM 上要端到端驗證整套實驗 rig（注入、probe、收斂判定），假 NTP server 為什麼要錨定 CLOCK_MONOTONIC_RAW？",
     "options": [
-      "MONOTONIC_RAW 不受 adjtimex 影響：同一顆 kernel 上不管 REALTIME 被注入什麼誤差，server 回的都是未被打亂的時間線",
+      "MONOTONIC_RAW 在 VM 裡不受 host 排程延遲影響",
       "MONOTONIC_RAW 的解析度比 REALTIME 高一個數量級",
-      "timesyncd 規定 NTP server 必須以 MONOTONIC_RAW 回應",
-      "MONOTONIC_RAW 在 VM 裡不受 host 排程延遲影響"
+      "MONOTONIC_RAW 不受 adjtimex 影響：同一顆 kernel 上不管 REALTIME 被注入什麼誤差，server 回的都是未被打亂的時間線",
+      "timesyncd 規定 NTP server 必須以 MONOTONIC_RAW 回應"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "clock_adjtime 的 offset/freq/tick 調整全部只作用在 CLOCK_REALTIME（與 MONOTONIC），MONOTONIC_RAW 永遠以硬體原始速率走。fake server 啟動時記 anchor_wall + anchor_raw，之後回 anchor_wall + (raw_now − anchor_raw)——等於一台「時鐘沒被動過的第二台機器」，但不需要第二顆 kernel。唯一前提：要在注入誤差前啟動。"
   },
   {
@@ -199,12 +199,12 @@
     "section": "🧪 drift lab 實驗",
     "question": "失聯恢復矩陣中，±1000ppm 的 cells 預測「永不穩定收斂」，依據是什麼？",
     "options": [
+      "PLL 相位滑動的 τ≈7.5s 對 1000ppm 來說太慢",
       "kernel 頻率補償被 MAXFREQ clamp 在 ±500ppm：晶振誤差 1000ppm 時淨漂移仍 ≥ 500ppm，offset 永遠追不平",
       "1000ppm 超過 ADJ_TICK 的注入範圍，實驗根本做不出來",
-      "timesyncd 會在誤差超過 500ppm 時自動退出",
-      "PLL 相位滑動的 τ≈7.5s 對 1000ppm 來說太慢"
+      "timesyncd 會在誤差超過 500ppm 時自動退出"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "time_freq 最多補 ±500ppm（timex.h:136）。殘留 ≥500ppm 的淨漂移讓 offset 持續累積：poll 短時在十幾 ms 徘徊、poll 拉長後跨 poll 漂移超過 0.4s 反覆觸發跳錶。timeout 1800s 記 non-convergent 本身就是 finding——生產上看到這個 signature 代表晶振故障或 VM 計時異常，不是 NTP 設定問題。tick 注入範圍 ±10%（9000–11000µs）≈ ±100,000ppm，1000ppm 完全做得出來。"
   },
   {
@@ -213,9 +213,9 @@
     "question": "399ms 與 401ms 兩個 cell 的預測收斂時間都是「秒級到十幾秒」，那這組對照實驗到底在量什麼？",
     "options": [
       "連續性：399ms 走 PLL 滑動（step detector 看到一串遞減小事件、時間軸連續），401ms 走 ADJ_SETOFFSET 跳錶（單一 ≈400ms 不連續事件）",
-      "量 NTP_MAX_ADJUST 的精確值是不是真的 0.4s",
       "量 kernel 在 400ms 附近的 slew 速率拐點",
-      "量 timesyncd 重啟後的首次 poll 延遲"
+      "量 timesyncd 重啟後的首次 poll 延遲",
+      "量 NTP_MAX_ADJUST 的精確值是不是真的 0.4s"
     ],
     "answer": 0,
     "explanation": "timesyncd-manager.c:247 以 fabs(offset) < NTP_MAX_ADJUST(0.4s) 分流：slew 走 ADJ_OFFSET+STA_PLL（指數衰減 τ≈7.5s，ln(399/50)×7.5≈16s），step 走 ADJ_SETOFFSET（瞬間）。對 ceph mon lease、TLS、資料庫 timestamp 而言，風險不在收斂快慢而在時間軸是否不連續——這 1ms 之差正好跨在懸崖兩側。"
@@ -225,12 +225,12 @@
     "section": "🧪 drift lab 實驗",
     "question": "exp4 用什麼判準回答「PollIntervalMaxSec=256 在生產關鍵環境安不安全」？",
     "options": [
-      "100Hz ping 0 丟包、REALTIME 對 RAW 無 >1ms 跳變、5 秒 deadline 哨兵 0 miss、journal 0 error——六情境（含 restart、30 分鐘失聯、80ms 注入、netem jitter）全程監測",
       "只比較 256s 與 2048s 兩種設定下的平均 offset 大小",
       "看 timesyncd 的 CPU 使用率有沒有超過 1%",
-      "讓 ceph cluster 實際跑在上面看 HEALTH_WARN 出不出現"
+      "讓 ceph cluster 實際跑在上面看 HEALTH_WARN 出不出現",
+      "100Hz ping 0 丟包、REALTIME 對 RAW 無 >1ms 跳變、5 秒 deadline 哨兵 0 miss、journal 0 error——六情境（含 restart、30 分鐘失聯、80ms 注入、netem jitter）全程監測"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "判準從環境需求倒推：「連 2 個 ping 封包都不能掉、5 秒 downtime 不可接受」→ 連續性監測（step detector）、可用性監測（100Hz ping）、lease 語意監測（5s 哨兵，模擬 ceph mon lease watchdog）三者全程開著，再加資源與封包計數。預測唯一可量到的差異是 inject-80ms 情境的偵測延遲上界（256s vs 2048s）——這是低 max poll 的實際效益所在。"
   },
   {
@@ -239,9 +239,9 @@
     "question": "實驗為什麼不直接讀 timesyncd 自己回報的 offset（timedatectl timesync-status），而要自建 1Hz SNTP probe？",
     "options": [
       "量測必須獨立於受測物：timesyncd 的自報值只在它自己 poll 的時刻更新、且反映它自己的演算法視角，無法當收斂判定的 ground truth",
+      "自報 offset 只有 root 看得到",
       "timedatectl 需要 DBus，實驗 VM 上不可用",
-      "timesyncd 的 offset 單位是 NTP 時間戳，換算誤差太大",
-      "自報 offset 只有 root 看得到"
+      "timesyncd 的 offset 單位是 NTP 時間戳，換算誤差太大"
     ],
     "answer": 0,
     "explanation": "受測物自報數據有兩個問題：更新頻率綁在 poll interval（32–2048s，遠粗於收斂判定需要的 1Hz）、且它是演算法內部狀態而非外部真值。probe 直接對 server 做 SNTP query（offset = ((T2−T1)+(T3−T4))/2 = server − client），LAN RTT sub-ms 對 50ms 判準綽綽有餘，並把 raw_s（MONOTONIC_RAW）一起落檔讓注入時刻可對齊。"

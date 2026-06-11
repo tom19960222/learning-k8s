@@ -3,36 +3,36 @@
     "id": 1,
     "question": "Day 1 你 ssh 到 control plane node 後發現 kube-apiserver 是 static Pod。下列哪個敘述正確？",
     "options": [
-      "kubelet 從本機 /etc/kubernetes/manifests/ 直接讀 yaml 起 Pod，不經過 API server",
       "kubelet 透過 API server 建立 kube-apiserver Pod",
+      "kubelet 從本機 /etc/kubernetes/manifests/ 直接讀 yaml 起 Pod，不經過 API server",
       "systemd 直接管理 kube-apiserver 這個 process",
       "kube-controller-manager 啟動 kube-apiserver"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Static Pod 的特色就是「不需要 API server」— kubelet watch 本機目錄，看到 yaml 就直接起 Pod。這是 bootstrapping 的解：kube-apiserver 自己也是 static Pod，所以 cluster 在還沒有 API server 時就能讓 kubelet 把它拉起來。"
   },
   {
     "id": 2,
     "question": "Day 3 你 apply 一個 Pod 但沒指定 nodeSelector，幾秒後 Pod 就 Running。誰決定它跑在哪個 node？",
     "options": [
+      "kube-controller-manager 直接呼叫 docker run",
       "kube-scheduler watch spec.nodeName=='' 的 Pod，跑 predicate + score 後寫回 spec.nodeName 完成 Bind",
       "kubelet 自己投票決定要不要接 Pod",
-      "kube-controller-manager 直接呼叫 docker run",
       "API server 隨機 round-robin 分配到 node"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Scheduler 是獨立 process，watch 還沒指派 node 的 Pod，跑 predicate（過濾不可行的 node）→ priority/score（排序）→ Bind（寫 spec.nodeName）。寫入後 kubelet 才接手 Pod 的實際啟動。"
   },
   {
     "id": 3,
     "question": "Day 4 你刪掉一個 ReplicaSet 的 Pod，2 秒後新 Pod 就出現。informer / work queue 機制中下列哪個敘述正確？",
     "options": [
-      "informer 把 watch event 放進 work queue，work queue 做 dedup 與 rate limit，所以 1 秒內 100 次 event 不會觸發 100 次 Reconcile",
-      "每個 watch event 都會立刻同步呼叫 Reconcile，所以越多 event 越快",
+      "work queue 是 kubelet 在維護的",
       "informer 直接呼叫 kubelet 重啟 Pod，跳過 controller",
-      "work queue 是 kubelet 在維護的"
+      "informer 把 watch event 放進 work queue，work queue 做 dedup 與 rate limit，所以 1 秒內 100 次 event 不會觸發 100 次 Reconcile",
+      "每個 watch event 都會立刻同步呼叫 Reconcile，所以越多 event 越快"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "informer + work queue 是 controller-runtime 的核心模式：informer 把 watch 事件丟進 work queue，queue 做 dedup（同 key 多次合併）與 rate limit（exponential backoff 防 storm）。Reconcile 是 work queue worker 取出來時被呼叫，跟 event 數量解耦。"
   },
   {
@@ -40,8 +40,8 @@
     "question": "Day 9 你看到 cilium-agent 有大量 BPF map。下列哪個敘述最精確？",
     "options": [
       "cilium-agent 編譯 eBPF program 並維護 BPF map（policy / endpoint / service backends），datapath 完全在 kernel 跑",
-      "cilium-agent 是個 user-space proxy，所有 packet 都先送進 agent 處理",
       "BPF map 由 kubelet 維護，cilium 只是讀者",
+      "cilium-agent 是個 user-space proxy，所有 packet 都先送進 agent 處理",
       "eBPF program 跑在 cilium-agent 行程內"
     ],
     "answer": 0,
@@ -51,24 +51,24 @@
     "id": 5,
     "question": "Day 10 你寫了一個 CiliumNetworkPolicy 限制 b → a 只能存取 /healthz。L7 enforcement 在哪裡發生？",
     "options": [
-      "Cilium 注入 envoy proxy 到 Pod 的 network namespace，HTTP 流量先進 envoy 解析 path 後才 forward",
-      "在 cilium-agent 內 buffer 整個 request 解析 HTTP",
       "在 BPF program 直接 parse HTTP（kernel 內）",
-      "kube-proxy 加 iptables rule 比對 HTTP path"
+      "Cilium 注入 envoy proxy 到 Pod 的 network namespace，HTTP 流量先進 envoy 解析 path 後才 forward",
+      "kube-proxy 加 iptables rule 比對 HTTP path",
+      "在 cilium-agent 內 buffer 整個 request 解析 HTTP"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "L3/L4 規則 cilium 用 BPF map 在 kernel 直接判；L7（HTTP/Kafka/DNS）需要解析 application protocol，這超出 BPF 的能力，所以 cilium 注入 envoy proxy 到對應 Pod 的 namespace，L7 traffic redirect 進 envoy 處理。BPF 還是在外層做 L3/L4 把 HTTP 流量導進 envoy。"
   },
   {
     "id": 6,
     "question": "Day 14 你讀完 multus cmdAdd() 原始碼。下列哪個流程描述最精確？",
     "options": [
+      "Multus 只支援單一附加網路",
       "Multus 解析 Pod annotation 取得 networks 列表 → 呼叫 main delegate (cilium) 的 Add → 對每個附加網路呼叫 delegate Add → 合併所有結果回 kubelet",
       "Multus 自己實作所有 CNI plugin，不需要呼叫其他 plugin",
-      "Multus 只支援單一附加網路",
       "Multus 直接修改 Pod 的網路設定，不透過 CNI 介面"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Multus 是 meta-plugin：自己不做網路 plumbing，而是「攔截 + 委派 + 合併」。它依次呼叫 main CNI（給主介面）跟每個 NAD 對應的 delegate plugin，然後把所有 plugin 回的 interfaces / IPs 合併成一個 CNI result 回給 kubelet。這也是為什麼 multus 自身只有約 1500 行 Go。"
   },
   {
@@ -76,9 +76,9 @@
     "question": "Day 16 你看 CRUSH map。一個 PG 對應到 OSD 的決定方式是？",
     "options": [
       "CRUSH 用 cluster map + rule + PG id 做 deterministic 計算，得到 OSD 列表；同樣 input 永遠出同樣 output，不需要查表",
+      "MDS 動態決定 PG 該放哪個 OSD",
       "Monitor 維護一份 PG → OSD 對應表，寫入 etcd",
-      "OSD 自己投票決定要不要接 PG",
-      "MDS 動態決定 PG 該放哪個 OSD"
+      "OSD 自己投票決定要不要接 PG"
     ],
     "answer": 0,
     "explanation": "CRUSH 的核心發明就是「不查表」 — 用 hash + bucket selection algorithm 從 cluster map 與 rule 算出 OSD 列表。所有 client / OSD 都能獨立計算同樣結果，不需要中央目錄服務。Cluster map 變動（OSD 上下線）會讓計算結果跟著動，rebalance 也是用同樣 function 算出新位置。"
@@ -87,12 +87,12 @@
     "id": 8,
     "question": "Day 18 你在 k8s 裝 ceph-csi-rbd。controller plugin 跟 node plugin 各自負責什麼？",
     "options": [
-      "controller plugin 跟 ceph API 對話建/刪 RBD volume；node plugin 在 Pod 排到的 node 把 RBD 映射成 /dev/rbdX 並 mount 到 Pod",
       "controller plugin 在每個 node 跑；node plugin 集中在一個 node",
-      "兩者沒差，都做一樣的事",
-      "controller plugin 直接 mount 到 Pod；node plugin 只做 metrics"
+      "controller plugin 跟 ceph API 對話建/刪 RBD volume；node plugin 在 Pod 排到的 node 把 RBD 映射成 /dev/rbdX 並 mount 到 Pod",
+      "controller plugin 直接 mount 到 Pod；node plugin 只做 metrics",
+      "兩者沒差，都做一樣的事"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "CSI 規範把 driver 切成兩部分：controller plugin（Deployment）負責跟 storage backend API 對話做 provisioning；node plugin（DaemonSet 每 node 一個）負責 Pod 落在該 node 時的 stage/mount 動作。這個 split 讓 controller 不必在每 node 跑一份，省資源。"
   },
   {
@@ -111,36 +111,36 @@
     "id": 10,
     "question": "Day 25 你進 virt-launcher Pod 看到 qemu-system-x86_64 process。為什麼每個 VM 一個獨立 launcher Pod，而不是 node 上共用一個 libvirtd？",
     "options": [
-      "獨立 Pod 讓 cgroup / namespace / capability / network 限制可以繼承 Pod 設定，並讓 VM 享有 k8s scheduling、network policy、storage mount 同樣的 lifecycle",
-      "libvirt 不支援同一個 daemon 管多個 domain",
       "為了讓 qemu 跑得更快",
-      "歷史包袱，未來會改成共享"
+      "歷史包袱，未來會改成共享",
+      "libvirt 不支援同一個 daemon 管多個 domain",
+      "獨立 Pod 讓 cgroup / namespace / capability / network 限制可以繼承 Pod 設定，並讓 VM 享有 k8s scheduling、network policy、storage mount 同樣的 lifecycle"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "把每個 VM 包成獨立 Pod 讓 KubeVirt 能直接複用 k8s 既有的所有控制機制：cgroup（CPU / mem limit）、namespace 隔離、ServiceAccount、CNI / CSI、scheduling。如果共用一個 node-level libvirtd，就要重新發明這些機制 + 處理 multi-tenant 的安全邊界。Pod 隔離是更乾淨的選擇。"
   },
   {
     "id": 11,
     "question": "Day 27 你做 live migration，VM 在不停機狀態下被搬到另一個 node。cutover 那段 downtime 主要由什麼決定？",
     "options": [
-      "memory dirty page 收斂速度 — source 不斷 copy 變動的 page 給 target，當 dirty rate < 閾值才能 cutover；高負載 VM 收斂慢，downtime 長",
-      "VM 磁碟大小，磁碟越大 downtime 越久",
+      "kube-apiserver 處理 migration request 的速度",
       "Pod scheduling 時間",
-      "kube-apiserver 處理 migration request 的速度"
+      "memory dirty page 收斂速度 — source 不斷 copy 變動的 page 給 target，當 dirty rate < 閾值才能 cutover；高負載 VM 收斂慢，downtime 長",
+      "VM 磁碟大小，磁碟越大 downtime 越久"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "Live migration 的 downtime 不是花在「複製記憶體」(那一直在背景跑)，而是 cutover 那一刻：source 暫停、傳最後一輪 dirty page、target 解除暫停。所以 downtime ≈ 最後一輪 dirty page 量 / 網路頻寬。Memory write-heavy 的 VM 永遠收斂不了（dirty rate 大於 copy rate），KubeVirt 預設會 abort。"
   },
   {
     "id": 12,
     "question": "Day 30 整合 demo 中，VM 從 cluster 內走 ClusterIP service 跟從 LAN 走 192.168.1.100 為什麼是兩條完全不同的封包路徑？",
     "options": [
-      "ClusterIP 走主介面 (cilium pod network) 經過 NAT 與 eBPF datapath；192.168.1.100 走第二介面 (multus bridge) 直連 vmbr0 物理橋接，繞過 cilium 完全不同的 datapath",
       "兩條路徑底層其實一樣，只是 IP 不同",
-      "ClusterIP 走 multus，bridge IP 走 cilium",
-      "VM 內 kernel 自動 merge 兩條路徑"
+      "VM 內 kernel 自動 merge 兩條路徑",
+      "ClusterIP 走主介面 (cilium pod network) 經過 NAT 與 eBPF datapath；192.168.1.100 走第二介面 (multus bridge) 直連 vmbr0 物理橋接，繞過 cilium 完全不同的 datapath",
+      "ClusterIP 走 multus，bridge IP 走 cilium"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "multus 給 VM 加的第二介面跟主介面（CNI / cilium）是分開的 datapath。主介面走 Pod network 經過 cilium eBPF；第二介面走 multus 注入的 bridge 直連物理 vmbr0，不經 cilium。這也代表 cilium NetworkPolicy 不適用第二介面，安全策略要靠物理 firewall 或 nftables 在外層做。"
   },
   {
@@ -149,8 +149,8 @@
     "options": [
       "etcd 裡 resource 是用 protobuf 序列化儲存，API server 拿到後才反序列化再轉成 JSON / YAML 回給 client",
       "etcdctl 必須加 --output=json 才會解出原始 JSON 內容",
-      "etcd 為了節省空間會自動 gzip，所以看起來是亂碼",
-      "kubectl 寫進去就是 binary blob，etcd 沒有 schema 概念"
+      "kubectl 寫進去就是 binary blob，etcd 沒有 schema 概念",
+      "etcd 為了節省空間會自動 gzip，所以看起來是亂碼"
     ],
     "answer": 0,
     "explanation": "Day 2 的 lab 親眼看到 etcd value 是 protobuf binary（非 JSON）— 這是為了讀寫速度與省空間。API server 在 storage 層用 protobuf 編碼寫入 etcd，client 收到時才透過 OpenAPI schema 反序列化成 JSON / YAML。kubectl explain 的型別資訊也是來自 API server 內嵌的 OpenAPI schema。"
@@ -159,36 +159,36 @@
     "id": 14,
     "question": "Day 5 你在 worker node 用 crictl pods 找到 nginx Pod 的 sandbox。為什麼 Pod 一定要有 sandbox container（pause）？",
     "options": [
-      "sandbox 持有 network / IPC namespace；application container 加入 sandbox 既有的 namespace，所以 application container crash 重啟時 Pod IP 不變",
+      "sandbox 負責 image pull，application container 只負責執行",
       "sandbox 是真正跑 nginx process 的 container，application container 只是裝飾",
       "CRI 規範要求每個 container 配一個 sandbox 才能 mount volume",
-      "sandbox 負責 image pull，application container 只負責執行"
+      "sandbox 持有 network / IPC namespace；application container 加入 sandbox 既有的 namespace，所以 application container crash 重啟時 Pod IP 不變"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 5 觀察到一個 Pod = 1 個 sandbox + N 個 application container。sandbox（pause image）幾乎不做事，但只要它存在 network namespace 就不會消失；application container 用 --network=container:<sandbox> 加入 sandbox 的 namespace，共用同一個 eth0 / Pod IP。這就是為什麼某個 container crash 重啟後 Pod IP 不變。"
   },
   {
     "id": 15,
     "question": "Day 6 你在 node 上用 iptables-save 看 kube-proxy 寫的 KUBE-SVC chain，看到三條 --probability 規則。kube-proxy 在資料路徑上扮演什麼角色？",
     "options": [
-      "kube-proxy 不在資料路徑上，只 watch Service / EndpointSlice 變動後寫 iptables / IPVS 規則；封包轉發完全由 kernel netfilter 做",
-      "每個進入 ClusterIP 的封包都會送進 kube-proxy process 做 user-space 轉發",
       "kube-proxy 是 sidecar，注入到每個 backend Pod 內處理 NAT",
-      "kube-proxy 只負責 health check，DNAT 是 kubelet 寫的"
+      "kube-proxy 只負責 health check，DNAT 是 kubelet 寫的",
+      "每個進入 ClusterIP 的封包都會送進 kube-proxy process 做 user-space 轉發",
+      "kube-proxy 不在資料路徑上，只 watch Service / EndpointSlice 變動後寫 iptables / IPVS 規則；封包轉發完全由 kernel netfilter 做"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 6 觀察 KUBE-SERVICES → KUBE-SVC → KUBE-SEP → DNAT 鏈時的關鍵 takeaway：kube-proxy 是 per-node DaemonSet，但它「不在資料路徑上」。它的工作只是把 Service / EndpointSlice 翻成 iptables（或 IPVS）規則寫進 kernel，實際 packet 由 netfilter / IPVS 模組在 kernel space 完成 DNAT。這也是 cilium eBPF kube-proxy replacement 想取代的點。"
   },
   {
     "id": 16,
     "question": "Day 7 你用 kubebuilder 寫 ConfigMapWatcher operator，SetupWithManager 用 .For(&ConfigMapWatcher{}).Watches(&ConfigMap{}, ...)。.Watches() 與 .For() 的區別是？",
     "options": [
-      ".For() 登記主要 reconcile 對象（CR）；.Watches() 登記次要對象（ConfigMap），需要 MapFunc 把次要對象變動轉成要 reconcile 的 CR key",
-      ".For() 與 .Watches() 是 alias，可以互換",
       ".For() 只 watch create event，.Watches() watch 全部 event",
-      ".For() 跑在 controller-manager，.Watches() 跑在 kubelet"
+      ".For() 登記主要 reconcile 對象（CR）；.Watches() 登記次要對象（ConfigMap），需要 MapFunc 把次要對象變動轉成要 reconcile 的 CR key",
+      ".For() 跑在 controller-manager，.Watches() 跑在 kubelet",
+      ".For() 與 .Watches() 是 alias，可以互換"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Day 7 的關鍵實作細節：.For() 宣告 controller 主要 reconcile 的 CRD 類型（每個 controller 必填一次）；.Watches() 加上其他 informer，並用 MapFunc 把次要對象的事件「翻譯」成主對象的 reconcile.Request。例如 ConfigMap 變動時，要把所有 ConfigMapWatcher 都 enqueue。這跟 .Owns() 又不一樣，.Owns() 是 .Watches() 的便利寫法（自動透過 ownerRef 找 parent）。"
   },
   {
@@ -196,9 +196,9 @@
     "question": "Day 8 你用 helm install cilium --set kubeProxyReplacement=false。這個設定的含義是？",
     "options": [
       "保留 kube-proxy 處理 Service NAT，cilium 只負責 Pod-to-Pod 網路（CNI plugin）",
-      "完全停用 cilium 的 datapath，cluster 退回 flannel",
+      "用 cilium 完全取代 kube-proxy（包含 ClusterIP / NodePort / LoadBalancer）",
       "把 kube-proxy 跑成 cilium 的 sidecar，共用 BPF map",
-      "用 cilium 完全取代 kube-proxy（包含 ClusterIP / NodePort / LoadBalancer）"
+      "完全停用 cilium 的 datapath，cluster 退回 flannel"
     ],
     "answer": 0,
     "explanation": "Day 8 安裝 cilium 時刻意選 kubeProxyReplacement=false，是因為要先讓 cilium 跟 kube-proxy 共存，先把 Pod 網路換掉。設成 true 才會讓 cilium 用 eBPF 完整接管 Service NAT，不再需要 kube-proxy。學習路徑上先 false 再 true 比較好排查問題。ipam.mode=kubernetes 則表示 cilium 沿用 cluster 配置的 Pod CIDR 而不自行管理 IP 池。"
@@ -207,12 +207,12 @@
     "id": 18,
     "question": "Day 11 你用 hubble observe --follow 看到跨 node Pod 間 flow。為什麼 hubble CLI 連的是 hubble-relay，而不是直接連 cilium-agent？",
     "options": [
-      "Hubble Relay 透過 Unix socket 連到每個 node 上 cilium-agent 的 Hubble gRPC server，把所有 node 的 flow 聚合在一起，CLI 才能看到跨 node 統一視圖",
       "cilium-agent 不對外暴露 flow API，只能透過 Relay 讀",
+      "Hubble Relay 透過 Unix socket 連到每個 node 上 cilium-agent 的 Hubble gRPC server，把所有 node 的 flow 聚合在一起，CLI 才能看到跨 node 統一視圖",
       "Relay 把 flow 寫進 etcd，hubble CLI 從 etcd 讀",
       "Relay 是 user-space 的 Hubble dataplane，cilium-agent 只負責 control plane"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Day 11 的概念深化：cilium-agent 在 eBPF program 內把 flow 寫進 perf event ring buffer，agent user-space 部分把它存進 in-memory circular buffer（每個 node 自己一份）。hubble-relay 是聚合層，連到每個 node 的 Hubble gRPC server 把多 node 的 flow 合成一份串流給 CLI 與 UI。沒有 Relay 你只能看到單一 node 的 flow。"
   },
   {
@@ -220,8 +220,8 @@
     "question": "Day 12 你啟用 cilium WireGuard 後，在 node 上看到 cilium_wg0 介面與其他 node 的公鑰。每個 cilium-agent 怎麼知道 peer 的公鑰？",
     "options": [
       "agent 把自己的 WireGuard 公鑰寫進 CiliumNode CR 的 annotation，其他 node 的 agent watch 這個欄位後自動加進 WireGuard peer 設定",
-      "管理員必須手動在每個 node 上跑 wg set peer",
       "WireGuard 預先共享一把 cluster-wide 的金鑰，所有 node 共用",
+      "管理員必須手動在每個 node 上跑 wg set peer",
       "公鑰透過 multicast 廣播在 cluster 內所有 node 之間"
     ],
     "answer": 0,
@@ -231,24 +231,24 @@
     "id": 20,
     "question": "Day 13 你建一個帶 k8s.v1.cni.cncf.io/networks: bridge-nad annotation 的 Pod，kubectl exec ip addr 看到 eth0 + net1 兩張介面。Multus 怎麼決定哪張是 eth0、哪張是 net1？",
     "options": [
-      "主 delegate（00-multus.conf 的 delegates[0]，通常是 cilium）建立的介面命名為 eth0；附加 NAD 依 annotation 順序命名為 net1, net2…",
-      "Multus 隨機分配介面名稱",
       "kubelet 直接指定，跟 Multus 無關",
-      "由 NAD 的 spec.config 內 ifName 欄位決定，沒設定就 fallback 成 eth0"
+      "主 delegate（00-multus.conf 的 delegates[0]，通常是 cilium）建立的介面命名為 eth0；附加 NAD 依 annotation 順序命名為 net1, net2…",
+      "由 NAD 的 spec.config 內 ifName 欄位決定，沒設定就 fallback 成 eth0",
+      "Multus 隨機分配介面名稱"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Day 13 親眼看到 eth0 是 cilium 主介面、net1 是 bridge 附加介面，這就是 Multus 的命名慣例：先呼叫主 delegate（建立主介面 eth0）、再依 annotation 順序逐一呼叫附加 plugin，附加介面預設命名為 net1, net2...。如果想自訂名稱可以在 annotation JSON 加 'interface' 欄位（Day 26 用了這招把 bridge NIC 命名為 eth1）。"
   },
   {
     "id": 21,
     "question": "Day 15 你用 ceph -s 看到 mon: 3 daemons, quorum node1,node2,node3。MON 在 ceph 裡的職責是？",
     "options": [
-      "MON 儲存 cluster map（OSD map / CRUSH map / PG map）並用 Paxos 達成 quorum；client 必須先聯絡 MON 取得 cluster map 才知道資料在哪，但 MON 不存使用者資料",
       "MON 是 metadata server，存 CephFS 的 inode 跟 dentry",
+      "MON 是 ceph dashboard 的後端，純粹做 UI",
       "MON 是 RADOS object 的儲存節點，負責三副本複製",
-      "MON 是 ceph dashboard 的後端，純粹做 UI"
+      "MON 儲存 cluster map（OSD map / CRUSH map / PG map）並用 Paxos 達成 quorum；client 必須先聯絡 MON 取得 cluster map 才知道資料在哪，但 MON 不存使用者資料"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 15 的 daemon 巡禮：MON / OSD / MGR / MDS / RGW 各司其職。MON 用 Paxos 保管 cluster map（含 OSD up/down 狀態、CRUSH 規則），3 個 MON 容許 1 個 crash；OSD 才是實際儲存 RADOS object 的 daemon；MDS 只服務 CephFS 的 metadata；MGR 收 metrics + 跑管理模組（balancer、pg_autoscaler）。"
   },
   {
@@ -267,36 +267,36 @@
     "id": 23,
     "question": "Day 19 你建一個 ReadWriteMany PVC 用 ceph-fs，兩個 Pod 在不同 node 同時掛同一份。為什麼 RWX 需要 MDS 但 RBD 的 RWO 不需要？",
     "options": [
-      "CephFS 是 multi-client filesystem，需要 MDS 集中處理 inode lock 與 capability lease；RBD 是 single-client block device，不需要協調 metadata",
-      "MDS 才是 RBD 的真正 backend，CephFS 反而沒用到 MDS",
+      "MDS 在 RBD 模式下會自動隱藏，hint 是性能優化",
       "RBD 沒有 metadata 概念，所有 operation 都直接透過 OSD",
-      "MDS 在 RBD 模式下會自動隱藏，hint 是性能優化"
+      "CephFS 是 multi-client filesystem，需要 MDS 集中處理 inode lock 與 capability lease；RBD 是 single-client block device，不需要協調 metadata",
+      "MDS 才是 RBD 的真正 backend，CephFS 反而沒用到 MDS"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "Day 19 的核心觀念：RBD 是 single-client（一個 Pod 的 kernel module 直接讀寫 RADOS object），不需要協調，所以沒 MDS。CephFS 是 POSIX filesystem，多個 client 同時讀寫需要協調 inode lock、檔名 namespace、capability lease（誰能 cache write、誰要 flush），這是 active MDS daemon 的工作。data 還是落 RADOS pool，只是 metadata 走 MDS。"
   },
   {
     "id": 24,
     "question": "Day 20 你在 kind cluster 裝 Rook + 最小 CephCluster CR，幾分鐘後 mon / mgr / osd Pod 自動長出來。Rook operator 跟 ceph 自身的關係是？",
     "options": [
-      "Rook 不重寫 ceph，而是把 upstream ceph binary 包成 container，operator 只負責把 CephCluster CR 翻成 Pod / Deployment / DaemonSet 並做 lifecycle 編排",
-      "Rook 是 ceph 的 fork，重新實作了 MON / OSD",
       "Rook 是 ceph 的 client library，只做 PVC mount 不部署 daemon",
-      "Rook 取代 cephadm 後 ceph 不再需要 MON daemon"
+      "Rook 取代 cephadm 後 ceph 不再需要 MON daemon",
+      "Rook 是 ceph 的 fork，重新實作了 MON / OSD",
+      "Rook 不重寫 ceph，而是把 upstream ceph binary 包成 container，operator 只負責把 CephCluster CR 翻成 Pod / Deployment / DaemonSet 並做 lifecycle 編排"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 20 在 kind 上跑 Rook 的 takeaway：Rook 是 lifecycle operator pattern 的代表 — 把 domain knowledge（怎麼部署 ceph）寫成 reconcile 邏輯，但跑的還是 upstream ceph image (quay.io/ceph/ceph)。Rook 內含多個 sub-controller（cluster / mon / mgr / osd / pool / object / file），每個 watch 自己的 CRD。對比 ceph-csi（CSI driver，提供 PVC mount），兩者完全互補：Rook 部署 ceph，ceph-csi 提供 volume。"
   },
   {
     "id": 25,
     "question": "Day 22 你裝 KubeVirt 後在 kubevirt namespace 看到 4 種 Pod：virt-operator / virt-api / virt-controller / virt-handler。哪個是 DaemonSet 而其他是 Deployment？為什麼？",
     "options": [
-      "virt-handler 是 DaemonSet，因為它必須在每個 node 上跟本機 libvirt / qemu 對話，類似 kubelet 的角色；其他三個是 cluster-wide 邏輯，跑成 Deployment 即可",
-      "virt-api 是 DaemonSet，因為 admission webhook 要每個 node 一份",
+      "virt-controller 是 DaemonSet，因為它要 watch node 上的 Pod",
       "virt-operator 是 DaemonSet，每個 node 都要做 lifecycle 編排",
-      "virt-controller 是 DaemonSet，因為它要 watch node 上的 Pod"
+      "virt-api 是 DaemonSet，因為 admission webhook 要每個 node 一份",
+      "virt-handler 是 DaemonSet，因為它必須在每個 node 上跟本機 libvirt / qemu 對話，類似 kubelet 的角色；其他三個是 cluster-wide 邏輯，跑成 Deployment 即可"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 22 的元件分工表：virt-operator（lifecycle）、virt-api（API extension + admission，類比 kube-apiserver subresource）、virt-controller（VM/VMI/Pod reconcile，類比 kube-controller-manager）都是 cluster-wide Deployment。virt-handler 必須跟本機 libvirt / qemu daemon 對話（類比 kubelet 對 container runtime），所以是 DaemonSet 每 node 一個 Pod。"
   },
   {
@@ -305,8 +305,8 @@
     "options": [
       "VirtualMachine 是持久定義（類似 Deployment），VirtualMachineInstance 是當下在跑的實例（類似 Pod）；stop 時 VMI 消失但 VM 留著，下次 start 重新建 VMI",
       "VM 跟 VMI 是同一個物件的別名，stop 是 bug",
-      "VMI 是 VM 的 snapshot，跟 lifecycle 無關",
-      "VM 是 cluster-scoped，VMI 是 namespace-scoped，兩者沒從屬關係"
+      "VM 是 cluster-scoped，VMI 是 namespace-scoped，兩者沒從屬關係",
+      "VMI 是 VM 的 snapshot，跟 lifecycle 無關"
     ],
     "answer": 0,
     "explanation": "Day 23 親身觀察 stop / start 行為驗證的關係：VM ↔ VMI 類比 Deployment ↔ Pod，但 VM 永遠最多一個 VMI（不是 N replicas）。VM 的 runStrategy（Always / RerunOnFailure / Manual / Halted）控制何時建 VMI。disk 內容存在 PVC（Day 24），所以 VMI 死後 disk 留著；但 RAM 不保留，重啟就是 cold boot — 要保留 RAM 必須走 live migration（Day 27）。"
@@ -315,12 +315,12 @@
     "id": 27,
     "question": "Day 24 你用 DataVolume 從 HTTP URL 把 Fedora cloud image 灌進 ceph-csi PVC 給 VM 當 root disk。CDI 在這個過程中扮演什麼角色？",
     "options": [
-      "CDI controller watch DataVolume CR，建對應 PVC + 起一個 importer Pod 下載 qcow2 並用 qemu-img convert 寫進 PVC，完成後標記 Succeeded 讓 VM 啟動",
       "CDI 直接把 URL 寫進 VM YAML，VM 啟動時自己下載 image",
       "CDI 是 ceph-csi 的 sidecar，只負責 RBD snapshot",
-      "CDI 把 image 存進 etcd 給 kubelet 拉"
+      "CDI 把 image 存進 etcd 給 kubelet 拉",
+      "CDI controller watch DataVolume CR，建對應 PVC + 起一個 importer Pod 下載 qcow2 並用 qemu-img convert 寫進 PVC，完成後標記 Succeeded 讓 VM 啟動"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "Day 24 看到 DataVolume Phase: ImportInProgress → Succeeded 的轉換。CDI 是 KubeVirt 的 Containerized Data Importer：cdi-controller watch DataVolume CR，依 source 類型（http / pvc / registry / blank / upload）決定動作。HTTP source 會建立 importer Pod，下載 qcow2 → qemu-img convert → 寫進 PVC（同名）。完成後 PVC 才 Bound，VM 啟動時自動等 DataVolume Succeeded。"
   },
   {
@@ -328,9 +328,9 @@
     "question": "Day 26 你給 KubeVirt VM 加第二張 NIC 走 multus bridge NAD，VM 內看到 eth0（cilium）+ eth1（bridge）。為什麼 cilium NetworkPolicy 對 eth1 流量無效？",
     "options": [
       "eth1 走 multus 注入的 bridge 直連物理 vmbr0，繞過 cilium eBPF datapath；cilium NetworkPolicy 只 enforce 在 cilium 自己管的 endpoint 上，eth1 對 cilium 不可見",
-      "cilium NetworkPolicy 對 eth1 有效，題目錯了",
+      "需要在 NAD 設定 enableCiliumPolicy: true 就會生效",
       "eth1 流量會回流到 eth0 再給 cilium 處理",
-      "需要在 NAD 設定 enableCiliumPolicy: true 就會生效"
+      "cilium NetworkPolicy 對 eth1 有效，題目錯了"
     ],
     "answer": 0,
     "explanation": "Day 26 的關鍵踩雷點：multus 的第二介面跟主介面是「兩條獨立 datapath」。eth0 走 cilium eBPF（masquerade NAT 出 cluster），eth1 走 multus bridge plugin 直接接到 host 的 vmbr0 物理 bridge。cilium 沒看到 eth1 的封包就無法套用 CiliumNetworkPolicy / NetworkPolicy。要做安全隔離只能靠物理層 firewall（Proxmox firewall / nftables on host bridge）。"
@@ -352,9 +352,9 @@
     "question": "Day 29 你 kubectl describe vmi 看到 Phase: Running 但 VM 內 sshd 連不上。要從哪一層開始排查最有效率？",
     "options": [
       "由上往下：先看 vmi conditions / events → KubeVirt Prometheus metrics（kubevirt_vmi_*）→ virt-handler log → 進 launcher Pod 跑 virsh domstate → node dmesg；99% 問題在前兩層找到",
-      "立刻 ssh 進 node 跑 strace 接 qemu process",
+      "去 etcd 直接 dump VMI object 找線索",
       "刪掉 VMI 重建一次，能不能重現再說",
-      "去 etcd 直接 dump VMI object 找線索"
+      "立刻 ssh 進 node 跑 strace 接 qemu process"
     ],
     "answer": 0,
     "explanation": "Day 29 的觀察 surface 分層：最高層 kubectl describe vmi → 中層 Prometheus metrics + virt-handler / virt-controller log → 低層 launcher Pod virsh / libvirt → 最底 node dmesg / journal。排查 SOP 是「由上往下」，先看 VMI condition 跟 events 再往下挖，因為 99% 問題在前兩層就解掉。virtctl vnc 也是強力工具：能直接看到 VM boot 訊息，找出 cloud-init 卡住或 sshd 沒起的根因。"

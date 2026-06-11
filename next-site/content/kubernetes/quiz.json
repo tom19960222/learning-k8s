@@ -17,8 +17,8 @@
     "options": [
       "apiserver 內建 cacher：自己對 etcd 維持單一 watch，把 event 寫進 in-memory ring buffer fan-out 給所有 client",
       "apiserver 對 etcd 開 100 條 watch connection，由 etcd 自己 fan-out",
-      "client 分別連到不同的 apiserver replica",
-      "apiserver 把所有 watch request 排隊，一個一個處理"
+      "apiserver 把所有 watch request 排隊，一個一個處理",
+      "client 分別連到不同的 apiserver replica"
     ],
     "answer": 0,
     "explanation": "apiserver 的 storage cacher 對 etcd 維持單一 watch、用 in-memory ring buffer 多工分送給所有 client。這就是為什麼 1000 個 client watch 也只在 etcd 端產生 1 個 watcher。code 在 staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go。"
@@ -28,9 +28,9 @@
     "question": "你 kubectl delete 一個 ReplicaSet 管的 Pod，2 秒後新 Pod 出現。觸發 ReplicaSet controller 跑 syncReplicaSet 的機制是什麼？",
     "options": [
       "informer watch 到 Pod 的 delete event，把對應的 RS key enqueue 進 work queue，worker goroutine 取出 key 後呼叫 syncReplicaSet",
-      "ReplicaSet controller 每 5 秒 polling apiserver 一次，檢查所有 RS",
+      "etcd 主動推 push 給 ReplicaSet controller",
       "kubelet 直接通知 ReplicaSet controller 有 Pod 死掉",
-      "etcd 主動推 push 給 ReplicaSet controller"
+      "ReplicaSet controller 每 5 秒 polling apiserver 一次，檢查所有 RS"
     ],
     "answer": 0,
     "explanation": "所有 k8s controller 都用同一套 informer + work queue 模式。Informer 對 apiserver 做 list+watch，event 觸發 enqueue (用 ownerReferences 找出對應的父資源 key)，worker goroutine 從 queue 拿 key 跑 reconcile。這是 client-go 的 cache package 實作。"
@@ -39,36 +39,36 @@
     "id": 4,
     "question": "scheduler 決定把 Pod 放到 node B。它怎麼把這個決定告訴 cluster？",
     "options": [
-      "對 apiserver 發 Bind request 寫 Pod 的 spec.nodeName=node-B；後續由 node-B 上的 kubelet watch 到 Pod 接手",
-      "scheduler 直接 ssh 到 node-B 啟動 container",
       "scheduler 直接呼叫 node-B 的 kubelet API",
-      "scheduler 改 etcd 裡 Pod 的 status.assigned"
+      "scheduler 改 etcd 裡 Pod 的 status.assigned",
+      "對 apiserver 發 Bind request 寫 Pod 的 spec.nodeName=node-B；後續由 node-B 上的 kubelet watch 到 Pod 接手",
+      "scheduler 直接 ssh 到 node-B 啟動 container"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "scheduler 的工作只到「寫 spec.nodeName 回 apiserver」就結束了，不直接接觸任何 node。BindingCycle 對 /api/v1/namespaces/<ns>/pods/<name>/binding 發 POST。寫完之後 node-B 的 kubelet 自己 watch 到「我這個 node 多一個 Pod」就會接手 pull image 起 container。"
   },
   {
     "id": 5,
     "question": "為什麼每個 Pod 多一個叫 pause 的 container？",
     "options": [
+      "pause 是 Pod 的 main process，application container 是它的 child",
       "pause 持有 Pod 的 network/IPC/PID namespace；application container 死掉重啟時 namespace 還在，IP 不變",
-      "pause 提供 init system 給 application container 用",
       "pause 跑 health check probe",
-      "pause 是 Pod 的 main process，application container 是它的 child"
+      "pause 提供 init system 給 application container 用"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Pod 是「N 個 container 共用 namespace」。如果 application container 自己當 namespace 持有者，container 重啟時 namespace 與 IP 也消失。pause container 永遠不死 (除非 Pod 整個被砍)，由它持有 namespace；application container 加入它的 namespace。這也是為什麼你 ssh 到 node 跑 crictl ps 會看到比預期多很多 container — 每個 Pod 多一個 pause。"
   },
   {
     "id": 6,
     "question": "Kubernetes 把 runtime、network、storage 抽成 CRI/CNI/CSI 的主要原因是什麼？",
     "options": [
-      "讓 Kubernetes core 專注 API 與期望狀態，底層實作由第三方按介面獨立演進",
       "讓所有 plugin 都必須跟 Kubernetes 同一個 release 週期",
+      "讓 Kubernetes core 專注 API 與期望狀態，底層實作由第三方按介面獨立演進",
       "讓 kube-apiserver 直接管理每張網卡與每顆磁碟",
       "避免 kubelet 參與 node 上的任何整合工作"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "CRI/CNI/CSI/Device Plugin 的價值是把高變動、強硬體相依的能力外部化。Kubernetes core 維持 API、reconcile 與調度語義，第三方元件只要遵守介面即可獨立 release。"
   },
   {
@@ -87,144 +87,144 @@
     "id": 8,
     "question": "Kubernetes 1.24 之後，為什麼不能再假設 kubelet 直接使用 Docker Engine？",
     "options": [
+      "kubelet 改成只能直接呼叫 runc",
       "dockershim 已從 Kubernetes 移除；kubelet 需要 CRI-compatible runtime，例如 containerd 或 CRI-O",
       "Docker image 格式已被 Kubernetes 禁止",
-      "kubelet 改成只能直接呼叫 runc",
       "Pod 不再需要 container runtime"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Kubernetes 1.24 移除了 kubelet 內建 dockershim。現代 cluster 應使用 CRI-compatible runtime；若要搭 Docker Engine，需額外 CRI adapter，而不是 kubelet 直接講 Docker API。"
   },
   {
     "id": 9,
     "question": "想讓部分 Pod 用 Kata 或 gVisor 這類 alternate runtime，現代 Kubernetes 應優先使用哪個 API？",
     "options": [
-      "RuntimeClass，讓 Pod 透過 runtimeClassName 選擇 runtime handler",
+      "ConfigMap，讓 apiserver 動態替換 kubelet binary",
       "Service，讓 kube-proxy 選 runtime",
-      "IngressClass，讓 Ingress controller 選 runtime",
-      "ConfigMap，讓 apiserver 動態替換 kubelet binary"
+      "RuntimeClass，讓 Pod 透過 runtimeClassName 選擇 runtime handler",
+      "IngressClass，讓 Ingress controller 選 runtime"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "RuntimeClass 是穩定 API，用來選擇 container runtime configuration。cluster admin 在 node runtime 設好 handler 後，Pod 可用 spec.runtimeClassName 指定。"
   },
   {
     "id": 10,
     "question": "現代 Kubernetes 中，一般 Pod 的 CNI ADD 主要是誰觸發的？",
     "options": [
-      "CRI runtime 在 RunPodSandbox 流程中建立 sandbox network namespace 後呼叫 CNI plugin",
       "kube-apiserver 收到 Pod POST 後直接執行 CNI binary",
+      "etcd watch 到 Pod 後呼叫 /opt/cni/bin",
       "scheduler bind Pod 後直接寫 Linux route",
-      "etcd watch 到 Pod 後呼叫 /opt/cni/bin"
+      "CRI runtime 在 RunPodSandbox 流程中建立 sandbox network namespace 後呼叫 CNI plugin"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "kubelet 透過 CRI 呼叫 RunPodSandbox，containerd/CRI-O 這類 runtime 在 sandbox 建立流程中呼叫 CNI。dockershim 時代 kubelet 有直接 CNI integration，但 Kubernetes 1.24 後這不是現代主線。"
   },
   {
     "id": 11,
     "question": "CNI plugin 最需要 CNI_NETNS 的原因是什麼？",
     "options": [
-      "它要進入目標 network namespace 建 interface、設定 IP 與 route",
+      "它要更新 Deployment replica 數量",
       "它要查詢 apiserver 裡 Pod 的 labels",
       "它要讓 scheduler 決定 Pod 放在哪台 node",
-      "它要更新 Deployment replica 數量"
+      "它要進入目標 network namespace 建 interface、設定 IP 與 route"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "CNI 是 node-local network 操作。CNI_NETNS 指向 sandbox 的 network namespace，plugin 會在那個 namespace 裡建立 eth0、設定 IP、route 等 Linux network state。"
   },
   {
     "id": 12,
     "question": "host-local IPAM 為什麼不能單獨保證整個 cluster 的 Pod IP 不重複？",
     "options": [
+      "它只支援 IPv6，不支援 IPv4",
       "它把分配狀態存在本機檔案系統，只能保證同一台 node 內不重複",
       "它完全不會記錄已分配 IP",
-      "它只支援 IPv6，不支援 IPv4",
       "它必須直接連到 etcd 才能分配 IP"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "host-local 的狀態是 node-local，例如 /var/lib/cni/networks。flannel 這類方案會先讓每台 node 拿不同 PodCIDR，再把該 subnet 給 host-local，讓單 node 內的分配不重複。"
   },
   {
     "id": 13,
     "question": "flannel VXLAN 模式中，跨 node Pod-to-Pod 流量的 outer packet 目的 IP 是誰？",
     "options": [
-      "目的 Pod 所在 node 的 underlay IP",
       "目的 Pod IP",
-      "kube-apiserver ClusterIP",
-      "Service ClusterIP"
+      "Service ClusterIP",
+      "目的 Pod 所在 node 的 underlay IP",
+      "kube-apiserver ClusterIP"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "VXLAN overlay 會把 Pod-to-Pod original packet 包進 Node-to-Node outer packet。underlay 網路看到的是 node IP 之間的傳輸，不需要知道 PodCIDR。"
   },
   {
     "id": 14,
     "question": "在 flannel VXLAN 中，route、ARP、FDB 三者共同解決什麼問題？",
     "options": [
-      "讓 kernel 知道 remote PodCIDR 要走哪個 VXLAN device、next-hop VTEP MAC 是誰、該 VTEP MAC 對應哪個 underlay node IP",
       "讓 kubelet 知道 Deployment 要幾個 replicas",
-      "讓 CoreDNS 決定 Service 名稱怎麼解析",
-      "讓 apiserver 直接把封包轉發到另一台 node"
+      "讓 apiserver 直接把封包轉發到另一台 node",
+      "讓 kernel 知道 remote PodCIDR 要走哪個 VXLAN device、next-hop VTEP MAC 是誰、該 VTEP MAC 對應哪個 underlay node IP",
+      "讓 CoreDNS 決定 Service 名稱怎麼解析"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "flanneld watch subnet lease 後，會在 kernel 寫 route、neighbor/ARP 與 bridge FDB。封包 fast path 由 Linux kernel VXLAN device 處理，不是每顆 packet 都進 flanneld。"
   },
   {
     "id": 15,
     "question": "CSI 引入 Kubernetes 的核心目的最接近哪個說法？",
     "options": [
-      "把 vendor-specific storage integration 從 Kubernetes core 移出去，讓儲存廠商用標準 gRPC 介面獨立實作與發布 driver",
       "讓 kube-apiserver 直接格式化每顆硬碟",
       "讓所有 Pod 都不再需要 PVC",
-      "讓 CNI plugin 同時負責磁碟掛載"
+      "讓 CNI plugin 同時負責磁碟掛載",
+      "把 vendor-specific storage integration 從 Kubernetes core 移出去，讓儲存廠商用標準 gRPC 介面獨立實作與發布 driver"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "CSI 的價值是把第三方 storage implementation 從 in-tree volume plugin 移到 out-of-tree driver。Kubernetes 保留 PV/PVC/StorageClass 與 volume lifecycle 語義，driver 負責後端儲存能力。"
   },
   {
     "id": 16,
     "question": "CSI dynamic provisioning 中，現代 Kubernetes 通常是誰真正呼叫 CreateVolume？",
     "options": [
-      "external-provisioner sidecar watch PVC 後呼叫 CSI Controller 的 CreateVolume",
-      "kube-apiserver 在儲存 PVC 時直接呼叫 CreateVolume",
       "scheduler 在 bind Pod 時直接建立 volume",
-      "node-driver-registrar 在註冊 socket 時建立 volume"
+      "node-driver-registrar 在註冊 socket 時建立 volume",
+      "kube-apiserver 在儲存 PVC 時直接呼叫 CreateVolume",
+      "external-provisioner sidecar watch PVC 後呼叫 CSI Controller 的 CreateVolume"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "PV controller 會在 PVC 上標記 external provisioner 並等待。external-provisioner 才是 watch PVC、組 CreateVolumeRequest、呼叫 CSI driver、再建立 PV 的 controller。"
   },
   {
     "id": 17,
     "question": "VolumeAttachment 在 CSI 流程中的角色是什麼？",
     "options": [
-      "Kubernetes API object，用來表達某個 volume 應 attach 到某個 node，並由 external-attacher 更新 attached 狀態",
-      "CSI spec 定義的 protobuf message，用來取代 PersistentVolume",
       "NFS server 上的真實目錄",
-      "kubelet 用來存放 Pod log 的本機檔案"
+      "Kubernetes API object，用來表達某個 volume 應 attach 到某個 node，並由 external-attacher 更新 attached 狀態",
+      "kubelet 用來存放 Pod log 的本機檔案",
+      "CSI spec 定義的 protobuf message，用來取代 PersistentVolume"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "Kubernetes CSI attacher 建立 storage.k8s.io/v1 VolumeAttachment；external-attacher watch 它，呼叫 ControllerPublishVolume，成功後更新 status.attached。"
   },
   {
     "id": 18,
     "question": "NodeStageVolume 和 NodePublishVolume 的差異是什麼？",
     "options": [
-      "NodeStageVolume 在 node 上準備可重用的 staging path；NodePublishVolume 把 volume 放到特定 Pod 的 target path",
       "NodeStageVolume 是 scheduler 呼叫；NodePublishVolume 是 apiserver 呼叫",
       "NodeStageVolume 只負責刪除 volume；NodePublishVolume 只負責建立 PV",
-      "兩者都是 CNI plugin 設定 Pod IP 的步驟"
+      "兩者都是 CNI plugin 設定 Pod IP 的步驟",
+      "NodeStageVolume 在 node 上準備可重用的 staging path；NodePublishVolume 把 volume 放到特定 Pod 的 target path"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "支援 STAGE_UNSTAGE_VOLUME 的 driver 會先讓 kubelet 呼叫 NodeStageVolume 準備 global path，再呼叫 NodePublishVolume mount/bind 到 Pod 專屬路徑。NFS 這類 mountable volume 可能直接在 NodePublishVolume 完成。"
   },
   {
     "id": 19,
     "question": "CSI Node DaemonSet 為什麼常需要 mountPropagation: Bidirectional？",
     "options": [
+      "讓 kube-proxy 把 Service 流量導到 NFS server",
       "driver container 內建立的 mount 必須傳回 host/kubelet 可見，host 新 mount 也可能要被 container 看見",
       "讓 Pod 可以跨 namespace 讀取 Secret",
-      "讓 kube-proxy 把 Service 流量導到 NFS server",
       "讓 scheduler 可以修改 PVC capacity"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "CSI Node driver 常在 container 內執行 mount，但 target path 位於 host 的 /var/lib/kubelet/pods。Bidirectional mount propagation 對應 Linux rshared，能讓後續 mount event 在 host 與 container 之間傳播。"
   },
   {
@@ -232,12 +232,12 @@
     "feature": "runtime-learning-map",
     "question": "整理 9 篇 runtime 文章後，本專案歸納 Kubernetes 介面化（CRI/CNI/CSI/Device Plugin）的核心理由是什麼？",
     "options": [
-      "把高變動、強硬體相依的部分外部化，讓核心 control plane 只管 API、reconcile 與調度，第三方 plugin 可獨立 release",
-      "讓 kube-apiserver 能直接管理每張網卡、每顆磁碟、每個 GPU",
       "強制所有 plugin 都跟 Kubernetes 用同一個 release cycle，避免版本漂移",
+      "讓 kube-apiserver 能直接管理每張網卡、每顆磁碟、每個 GPU",
+      "把高變動、強硬體相依的部分外部化，讓核心 control plane 只管 API、reconcile 與調度，第三方 plugin 可獨立 release",
       "讓 kubelet 自己內建所有 runtime / network / storage 實作，減少外部依賴"
     ],
-    "answer": 0,
+    "answer": 2,
     "explanation": "見 features/runtime-learning-map.mdx 的「9 篇共同主軸」段：第一層強調 Kubernetes core 不直接處理底層差異，CRI/CNI/CSI/Device Plugin 把高變動、硬體相依的部分外部化，讓第三方按介面獨立演進。"
   },
   {
@@ -245,12 +245,12 @@
     "feature": "cni-learning-map",
     "question": "本專案的 CNI 知識地圖把 Kubernetes Pod network 拆成兩條主線。下列哪組描述最符合該地圖的責任邊界？",
     "options": [
+      "CNI plugin 是長駐 daemon，kubelet 透過 gRPC 呼叫；datapath 由 etcd 直接寫入 Linux kernel",
       "Kubernetes 把「Pod 要有 network namespace 與 IP」抽成 CNI contract；真正 datapath 仍是 Linux network stack（veth、bridge、route、iptables、ARP、FDB、VXLAN、netlink）",
       "Kubernetes apiserver 直接轉發 Pod-to-Pod 封包；CNI 只負責回報 metric",
-      "CNI plugin 是長駐 daemon，kubelet 透過 gRPC 呼叫；datapath 由 etcd 直接寫入 Linux kernel",
       "scheduler 決定 route，CNI 負責 NetworkPolicy；kube-proxy 負責 Pod IP 分配"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "見 features/cni-learning-map.mdx 開頭「場景」段：兩條主線分別是 (1) CNI contract 把 namespace + IP 抽象化，(2) 真正 datapath 仍由 Linux network stack 完成；CNI 是 binary execution protocol，不是 daemon API。"
   },
   {
@@ -259,9 +259,9 @@
     "question": "本專案 CSI 知識地圖把 CSI 拆成三個世界。下列哪一組正確列出這三個世界？",
     "options": [
       "Kubernetes API（PV/PVC/StorageClass/CSIDriver/CSINode/VolumeAttachment）、CSI gRPC contract（Identity/Controller/Node）、Linux storage/mount 現實（block/filesystem/NFS/bind mount/mount namespace）",
+      "etcd、apiserver、kubelet 三層儲存責任",
       "kube-apiserver、kube-scheduler、kube-controller-manager 三個 control plane process",
-      "CRI、CNI、CSI 三個介面，各自由 kubelet 直接呼叫",
-      "etcd、apiserver、kubelet 三層儲存責任"
+      "CRI、CNI、CSI 三個介面，各自由 kubelet 直接呼叫"
     ],
     "answer": 0,
     "explanation": "見 features/csi-learning-map.mdx 開頭「場景」段：CSI 橫跨三個世界 — Kubernetes API object、CSI gRPC service（Identity/Controller/Node）、Linux storage/mount 現實。Kubernetes 只標準化接線方式，耐久性等仍由 storage backend 負責。"
@@ -271,12 +271,12 @@
     "feature": "pod-network-lifecycle",
     "question": "在現代 Kubernetes（1.24+）裡，當 kubelet 為 Pod 建立 network 時，CNI ADD 是被誰直接觸發的？",
     "options": [
-      "kubelet 透過 CRI 呼叫 RunPodSandbox，由 containerd / CRI-O 在建立 sandbox 過程中執行 /opt/cni/bin/ 下的 plugin",
       "kubelet 自己直接執行 /opt/cni/bin/ 下的 CNI binary，並把 result 寫回 apiserver",
+      "scheduler 在 bind Pod 時順便呼叫 CNI plugin 配 IP",
       "kube-controller-manager watch Pod 後直接呼叫 CNI plugin",
-      "scheduler 在 bind Pod 時順便呼叫 CNI plugin 配 IP"
+      "kubelet 透過 CRI 呼叫 RunPodSandbox，由 containerd / CRI-O 在建立 sandbox 過程中執行 /opt/cni/bin/ 下的 plugin"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "見 features/pod-network-lifecycle.mdx「從 Kubernetes source 看 kubelet 邊界」段：kubelet 不直接執行 CNI binary，而是呼叫 CRI 的 RunPodSandbox；containerd / CRI-O 在 sandbox 建立過程中才執行 CNI plugin。dockershim 已在 1.24 移除。"
   },
   {
@@ -284,12 +284,12 @@
     "feature": "node-ipam-and-flannel",
     "question": "flannel 部署中，flanneld（DaemonSet 長駐 process）與 flannel CNI binary 的職責邊界是什麼？",
     "options": [
-      "flanneld 長駐 watch Node、註冊 subnet lease、寫 kernel route/ARP/FDB 並產出 /run/flannel/subnet.env；flannel CNI binary 是 runtime 觸發的短命 binary，讀 subnet.env 後 delegate 到 bridge + host-local",
       "flanneld 每次 Pod 建立時都被 runtime 直接呼叫；flannel CNI binary 是長駐 daemon",
       "flanneld 直接呼叫 kube-apiserver 為每個 Pod 分配 IP；flannel CNI binary 只負責 log",
-      "flanneld 與 flannel CNI binary 是同一個 process 的兩個 thread，沒有檔案層的交接"
+      "flanneld 與 flannel CNI binary 是同一個 process 的兩個 thread，沒有檔案層的交接",
+      "flanneld 長駐 watch Node、註冊 subnet lease、寫 kernel route/ARP/FDB 並產出 /run/flannel/subnet.env；flannel CNI binary 是 runtime 觸發的短命 binary，讀 subnet.env 後 delegate 到 bridge + host-local"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "見 features/node-ipam-and-flannel.mdx「flanneld 讀 Node PodCIDR」與「subnet.env 是 flanneld 與 CNI binary 的交接點」段：flanneld 是長駐 daemon、flannel CNI 是短命 binary，兩者透過 host filesystem 上的 subnet.env 交接。"
   },
   {
@@ -297,12 +297,12 @@
     "feature": "pod-to-pod-datapath",
     "question": "Pod A（10.244.0.5 在 node-a）跨 node 送封包給 Pod B（10.244.2.7 在 node-c）。在 flannel VXLAN 中，封包經 VXLAN 封裝後 outer packet 的 source/destination IP 是什麼？",
     "options": [
-      "outer src = node-a underlay IP，outer dst = node-c underlay IP；underlay 看不到 PodCIDR",
       "outer src = 10.244.0.5，outer dst = 10.244.2.7；跟 original packet 一樣",
-      "outer src = kube-apiserver ClusterIP，outer dst = Pod B IP",
-      "outer src = node-a underlay IP，outer dst = Service ClusterIP"
+      "outer src = node-a underlay IP，outer dst = node-c underlay IP；underlay 看不到 PodCIDR",
+      "outer src = node-a underlay IP，outer dst = Service ClusterIP",
+      "outer src = kube-apiserver ClusterIP，outer dst = Pod B IP"
     ],
-    "answer": 0,
+    "answer": 1,
     "explanation": "見 features/pod-to-pod-datapath.mdx「先分清楚 original packet 與 outer packet」段：VXLAN 把 Pod-to-Pod original packet 包進 Node-to-Node outer packet，underlay 只需 node IP 互通，不需要知道 PodCIDR。"
   },
   {
@@ -310,12 +310,12 @@
     "feature": "storage-api-and-binding",
     "question": "使用 CSI driver 的 dynamic provisioning 中，PVC Pending 時 Kubernetes PV controller 會怎麼處理？",
     "options": [
-      "走 provisionClaimOperationExternal()：根據 StorageClass.provisioner 在 PVC 加 annotation、發 event，等 external-provisioner sidecar watch 到後才呼叫 CSI CreateVolume",
-      "PV controller 直接用 in-tree code 呼叫 CSI CreateVolume，並建立 PV",
       "kube-apiserver 在儲存 PVC 時直接呼叫 driver 的 CreateVolume RPC",
-      "scheduler 在 bind Pod 時順便建立 volume"
+      "scheduler 在 bind Pod 時順便建立 volume",
+      "PV controller 直接用 in-tree code 呼叫 CSI CreateVolume，並建立 PV",
+      "走 provisionClaimOperationExternal()：根據 StorageClass.provisioner 在 PVC 加 annotation、發 event，等 external-provisioner sidecar watch 到後才呼叫 CSI CreateVolume"
     ],
-    "answer": 0,
+    "answer": 3,
     "explanation": "見 features/storage-api-and-binding.mdx「Dynamic provisioning 的分工」段：modern CSI 路徑下 PV controller 不直接呼叫 CreateVolume，而是走 provisionClaimOperationExternal()，由 external-provisioner sidecar 接手。"
   },
   {
@@ -324,9 +324,9 @@
     "question": "kubelet volume manager 處理 Pod CSI volume 時，下列哪個流程順序符合 GenerateMountVolumeFunc() 的 source 行為？",
     "options": [
       "WaitForAttach -> MountDevice (對應 NodeStageVolume，若 driver 支援) -> SetUp (對應 NodePublishVolume)",
+      "kubelet 直接把 PV YAML 透過 gRPC 傳給 driver，driver 自行決定 mount 順序",
       "NodePublishVolume -> NodeStageVolume -> ControllerPublishVolume",
-      "ControllerPublishVolume -> NodePublishVolume -> NodeStageVolume",
-      "kubelet 直接把 PV YAML 透過 gRPC 傳給 driver，driver 自行決定 mount 順序"
+      "ControllerPublishVolume -> NodePublishVolume -> NodeStageVolume"
     ],
     "answer": 0,
     "explanation": "見 features/kubelet-csi-mount-path.mdx「MountVolume 會先等 attach」段：operation_generator.go 的 GenerateMountVolumeFunc() 先 WaitForAttach、再 MountDevice（CSI 對應 NodeStageVolume）、最後 SetUp（CSI 對應 NodePublishVolume）。"
