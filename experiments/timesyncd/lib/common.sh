@@ -81,8 +81,8 @@ reset_clock_state() {
   systemctl stop systemd-timesyncd 2>/dev/null || true
   unblock_ntp
   $PY "$LIB_DIR/clock_inject.py" reset
-  local i off
-  for i in 1 2 3 4 5; do
+  local off
+  for _ in 1 2 3 4 5; do
     off="$(ntp_offset_ms)" || { log "ERROR reset_clock_state: 量不到 server offset"; return 1; }
     # off = server - client；把 client 撥 +off 就對齊 server
     if $PY -c "import sys; sys.exit(0 if abs(float('$off')) < 5 else 1)"; then
@@ -143,9 +143,9 @@ wait_convergence() {  # $1=probe.csv $2=t0_raw $3=timeout_s；stdout=analyze JSO
 }
 
 wait_synced() {  # 啟動 timesyncd 並等 |offset| < $1 ms（預設 5），最多 $2 秒（預設 300）
-  local thr=${1:-5} max=${2:-300} i off
+  local thr=${1:-5} max=${2:-300} off
   systemctl start systemd-timesyncd
-  for i in $(seq 1 $((max / 5))); do
+  for _ in $(seq 1 $((max / 5))); do
     sleep 5
     off="$(ntp_offset_ms)" || continue
     if $PY -c "import sys; sys.exit(0 if abs(float('$off')) < $thr else 1)"; then

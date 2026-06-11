@@ -46,11 +46,11 @@ if [[ ! -f "$RESULTS_DIR/calibration.json" ]]; then
   mark calibrate running
   "$RUN_DIR/../setup/calibrate.sh" --minutes 30
 fi
-mark calibrate done
+mark calibrate "done"
 
-mark exp1 running; "$RUN_DIR/exp1-drift-recovery.sh" --all;                 mark exp1 done
-mark exp2 running; "$RUN_DIR/exp2-slew-399ms.sh";                           mark exp2 done
-mark exp3 running; "$RUN_DIR/exp3-restart-sync.sh" --all;                   mark exp3 done
-mark exp4 running; "$RUN_DIR/exp4-poll256-soak.sh" --all --hours "$SOAK_HOURS"; mark exp4 done
+mark exp1 running; "$RUN_DIR/exp1-drift-recovery.sh" --all;                 mark exp1 "done"
+mark exp2 running; "$RUN_DIR/exp2-slew-399ms.sh";                           mark exp2 "done"
+mark exp3 running; "$RUN_DIR/exp3-restart-sync.sh" --all;                   mark exp3 "done"
+mark exp4 running; "$RUN_DIR/exp4-poll256-soak.sh" --all --hours "$SOAK_HOURS"; mark exp4 "done"
 
 log "全套完成。結果都在 $RESULTS_DIR；scp 回 repo 後 commit。"
