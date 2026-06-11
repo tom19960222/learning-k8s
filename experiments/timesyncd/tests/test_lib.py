@@ -291,6 +291,27 @@ class TestAnalyze(unittest.TestCase):
             self.assertEqual(p.returncode, 3)
             self.assertIn("FAIL", p.stdout)
 
+    def test_soak_verdict_step_min_filter(self):
+        # inject 情境：1 筆 ≈80ms 注入 step（預期）+ 9 筆 ~1ms slew 痕跡（不算 step）
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "ping.txt"), "w") as f:
+                f.write("100 packets transmitted, 100 received, 0% packet loss, time 1000ms\n")
+            with open(os.path.join(d, "steps.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,jump_ms\n")
+                f.write("10.0,0,jump,79.9\n")
+                for i in range(9):
+                    f.write(f"1{i}.5,0,jump,-1.06\n")
+            with open(os.path.join(d, "sentinel.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,wall_elapsed_ms,raw_elapsed_ms\n")
+            with open(os.path.join(d, "journal-errors.txt"), "w") as f:
+                f.write("")
+            p = self._run("soak-verdict", "--dir", d,
+                          "--expect-steps", "1", "--step-min-ms", "50")
+            self.assertIn("PASS", p.stdout)
+            # 預設 step-min-ms=0：10 筆全算 → FAIL
+            p = self._run("soak-verdict", "--dir", d, ok=False)
+            self.assertEqual(p.returncode, 3)
+
     def test_convergence_resets_on_probe_gap(self):
         # 50 筆好樣本 → probe 斷流 10s → 再 65 筆好樣本：第一段作廢，從第二段起算
         with tempfile.TemporaryDirectory() as d:

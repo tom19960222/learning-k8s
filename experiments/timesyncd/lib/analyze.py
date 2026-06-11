@@ -8,7 +8,7 @@ Subcommands:
                取首次進入時刻（相對 t0-raw，單位秒）。樣本斷流 > 5s 視為 run 中斷。
   calibrate    --csv F --out calibration.json
                最小平方法斜率 → client_ppm = -slope_ms_per_s * 1000。
-  soak-verdict --dir D [--expect-steps 0]
+  soak-verdict --dir D [--expect-steps 0] [--step-min-ms 0]
                讀 ping.txt / steps.csv / sentinel.csv / journal-errors.txt
                → verdict.md + verdict.json；exit 0 PASS / 3 FAIL。
   exp1-summary --results-dir D
@@ -107,6 +107,24 @@ def count_csv_kind(path, kind):
     return cnt
 
 
+def count_jumps(path, min_ms=0.0):
+    """steps.csv 的 jump 事件數；只計 |jump| >= min_ms（區分真 step 與快速 slew 痕跡）。"""
+    if not os.path.exists(path):
+        return None
+    cnt = 0
+    with open(path) as f:
+        next(f, None)
+        for line in f:
+            parts = line.rstrip("\n").split(",")
+            if len(parts) >= 4 and parts[2] == "jump":
+                try:
+                    if abs(float(parts[3])) >= min_ms:
+                        cnt += 1
+                except ValueError:
+                    pass
+    return cnt
+
+
 def cmd_soak_verdict(args):
     d = args.dir
     checks = []  # (name, value_desc, ok)
@@ -121,8 +139,11 @@ def cmd_soak_verdict(args):
             checks.append(("ping 0 丟包", "ping.txt 沒有 summary（被 kill -9?）", False))
     else:
         checks.append(("ping 0 丟包", "ping.txt 不存在", False))
-    steps = count_csv_kind(os.path.join(d, "steps.csv"), "jump")
-    checks.append((f"step 事件 ≤ {args.expect_steps}",
+    steps = count_jumps(os.path.join(d, "steps.csv"), args.step_min_ms)
+    label = f"step 事件 ≤ {args.expect_steps}"
+    if args.step_min_ms > 0:
+        label += f"（只計 |jump| ≥ {args.step_min_ms:g}ms）"
+    checks.append((label,
                    f"{steps} 筆" if steps is not None else "steps.csv 不存在",
                    steps is not None and steps <= args.expect_steps))
     miss = count_csv_kind(os.path.join(d, "sentinel.csv"), "miss")
@@ -196,6 +217,7 @@ def main():
     s = sub.add_parser("soak-verdict")
     s.add_argument("--dir", required=True)
     s.add_argument("--expect-steps", type=int, default=0)
+    s.add_argument("--step-min-ms", type=float, default=0.0)
     s.set_defaults(fn=cmd_soak_verdict)
     s = sub.add_parser("exp1-summary")
     s.add_argument("--results-dir", required=True)

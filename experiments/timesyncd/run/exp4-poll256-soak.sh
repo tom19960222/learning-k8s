@@ -60,7 +60,7 @@ start_monitors() {  # $1 = outdir
 stop_monitors() {  # $1 = outdir
   local d=$1 p
   for f in resources.pid sentinel.pid; do
-    [[ -f "$d/$f" ]] && { kill "$(cat "$d/$f")" 2>/dev/null || true; rm -f "$d/$f"; }
+    [[ -f "$d/$f" ]] && { kill "$(cat "$d/$f")" 2>/dev/null || true; rm -f "$d/$f"; } || true
   done
   if [[ -f "$d/ping.pid" ]]; then
     p="$(cat "$d/ping.pid")"
@@ -71,13 +71,14 @@ stop_monitors() {  # $1 = outdir
   stop_step_detector "$d/steps.csv"
   stop_probe "$d/probe.csv"
   ntp_counter_del
-  journalctl -u systemd-timesyncd --after-cursor "$JCURSOR" -p err --no-pager \
+  # -q：空結果時不要印 "-- No entries --"（會被 verdict 當成一行 error）
+  journalctl -q -u systemd-timesyncd --after-cursor "$JCURSOR" -p err --no-pager \
     > "$d/journal-errors.txt" 2>/dev/null || true
 }
 
 soak() {  # $1 = outdir, $2 = 秒數, $3 = 中途動作（函式名，可空）
   local d=$1 secs=$2 action=${3:-}
-  trap 'stop_monitors "$d"; unblock_ntp; tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true; set_poll_max default' RETURN
+  trap 'stop_monitors "$d"; unblock_ntp; tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true; set_poll_max default || true' RETURN
   wait_synced 50 600 || { log "ERROR: baseline 收斂失敗，中止此情境（環境異常，請檢查 server）"; return 1; }
   start_monitors "$d"
   if [[ -n "$action" ]]; then
@@ -132,27 +133,32 @@ run_scenario() {
       soak "$outdir" "$((HOURS * 3600))" action_outage \
         || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; } ;;
     inject-80ms)
-      local poll sub t0 warm
+      local poll sub t0 warm cur inj
       for poll in 256 2048; do
         sub="$outdir/poll-$poll"
         mkdir -p "$sub"
         if [[ "$poll" == 2048 ]]; then set_poll_max default; else set_poll_max 256; fi
-        trap 'stop_monitors "$sub"; set_poll_max default' RETURN
+        trap 'stop_monitors "$sub"; set_poll_max default || true' RETURN
         wait_synced 50 600 || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; }
         start_monitors "$sub"
         warm=600
         [[ "$poll" == 2048 ]] && warm=2400  # 32→2048 的 poll 倍增需 ~2016s，2400s 保證注入時已在 max poll
         sleep "$warm"
+        # 高 poll 下基線 offset 可達 ±50ms（L3 實測 +34.8ms）：注入方向必須遠離 0，
+        # 否則 80ms 會跟既有 offset 對沖、|offset| 進不了量測窗（門檻 50ms）
+        cur="$(ntp_offset_ms)" || cur=0
+        inj=80
+        if $PY -c "import sys; sys.exit(0 if float('$cur') >= 0 else 1)"; then inj=-80; fi
         t0=$(raw_now)
-        echo "$t0 inject_80ms" >> "$sub/events.log"
-        $PY "$LIB_DIR/clock_inject.py" set-offset --ms 80
+        echo "$t0 inject_${inj}ms baseline_${cur}ms" >> "$sub/events.log"
+        $PY "$LIB_DIR/clock_inject.py" set-offset --ms "$inj"
         set +e
         wait_convergence "$sub/probe.csv" "$t0" 3600 > "$sub/convergence.json"
         set -e
         stop_monitors "$sub"
         log "inject-80ms @ poll=$poll：$(cat "$sub/convergence.json")"
       done
-      # 80ms < 0.4s → 全程 slew，不准有 step
+      # 注入本身是 1 筆預期 step；修正過程必須是 slew（不得出現 ≥50ms 的跳變）
       ;;
     jitter)
       set_poll_max 256
@@ -166,7 +172,8 @@ run_scenario() {
   set +e
   if [[ "$name" == inject-80ms ]]; then
     for poll in 256 2048; do
-      $PY "$LIB_DIR/analyze.py" soak-verdict --dir "$outdir/poll-$poll"
+      $PY "$LIB_DIR/analyze.py" soak-verdict --dir "$outdir/poll-$poll" \
+        --expect-steps 1 --step-min-ms 50
       [[ $? -ne 0 ]] && rc=3
     done
     [[ $rc -eq 0 ]] && echo '{"pass": true}' > "$outdir/verdict.json" \

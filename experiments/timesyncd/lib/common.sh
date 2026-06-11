@@ -101,17 +101,21 @@ start_probe() {  # $1 = csv 路徑；pid 落同目錄 probe.pid
   $PY "$LIB_DIR/ntp_probe.py" run --server "$SERVER_IP" --port "$NTP_PORT" --csv "$1" &
   echo $! > "$(dirname "$1")/probe.pid"
 }
-stop_probe() {  # $1 = csv 路徑
+stop_probe() {  # $1 = csv 路徑；冪等且永遠回 0（會在 trap 內被二次呼叫，回 1 會引爆 set -e）
   local pidfile; pidfile="$(dirname "$1")/probe.pid"
-  [[ -f "$pidfile" ]] && { kill "$(cat "$pidfile")" 2>/dev/null || true; rm -f "$pidfile"; }
+  [[ -f "$pidfile" ]] || return 0
+  kill "$(cat "$pidfile")" 2>/dev/null || true
+  rm -f "$pidfile"
 }
 start_step_detector() {  # $1 = csv
   $PY "$LIB_DIR/step_detector.py" --csv "$1" &
   echo $! > "$(dirname "$1")/steps.pid"
 }
-stop_step_detector() {
+stop_step_detector() {  # 同 stop_probe：冪等、永遠回 0
   local pidfile; pidfile="$(dirname "$1")/steps.pid"
-  [[ -f "$pidfile" ]] && { kill "$(cat "$pidfile")" 2>/dev/null || true; rm -f "$pidfile"; }
+  [[ -f "$pidfile" ]] || return 0
+  kill "$(cat "$pidfile")" 2>/dev/null || true
+  rm -f "$pidfile"
 }
 
 # ---------- 注入 ----------
