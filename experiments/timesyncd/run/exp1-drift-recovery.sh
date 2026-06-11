@@ -64,13 +64,15 @@ case "${1:-}" in
       run_cell $cell
     done
     $PY "$LIB_DIR/analyze.py" exp1-summary --results-dir "$EXP_DIR"
+    systemctl start systemd-timesyncd 2>/dev/null || true   # 收尾：別讓 timesyncd 停著
     log "exp1 全部完成 → $EXP_DIR/summary.md" ;;
   --duration-h)
     [[ "${3:-}" == "--ppm" ]] || die "用法：--duration-h X --ppm Y"
     require_root
     preflight
     mkdir -p "$EXP_DIR"
-    run_cell "$2" "$4" ;;
+    run_cell "$2" "$4"
+    systemctl start systemd-timesyncd 2>/dev/null || true ;;
   *)
     die "用法見檔頭註解（--all / --duration-h X --ppm Y / --status / --detach）" ;;
 esac

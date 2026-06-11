@@ -48,4 +48,5 @@ for ms in 399 401; do
   log "cell ${ms}ms：step 事件 ${jumps} 筆，最大單筆 ${maxjump}ms（預期：399ms=一串小事件、401ms=單筆≈400ms）"
   [[ $rc -eq 3 ]] && log "警告：${ms}ms 未在 ${TIMEOUT_S}s 內收斂，違反預測，檢查 probe.csv"
 done
+systemctl start systemd-timesyncd 2>/dev/null || true   # 收尾：別讓 timesyncd 停著
 log "exp2 完成 → $EXP_DIR"

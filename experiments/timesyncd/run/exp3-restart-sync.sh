@@ -69,10 +69,12 @@ case "${1:-}" in
   --all)
     require_root; preflight; mkdir -p "$EXP_DIR"
     for ms in "${CELLS[@]}"; do run_cell "$ms"; done
+    systemctl start systemd-timesyncd 2>/dev/null || true   # 收尾：別讓 timesyncd 停著
     log "exp3 全部完成 → $EXP_DIR" ;;
   --offset-ms)
     require_root; preflight; mkdir -p "$EXP_DIR"
-    run_cell "$2" ;;
+    run_cell "$2"
+    systemctl start systemd-timesyncd 2>/dev/null || true ;;
   *)
     die "用法見檔頭註解（--all / --offset-ms N / --status / --detach）" ;;
 esac
