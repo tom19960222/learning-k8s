@@ -103,19 +103,19 @@ preflight（擋 NTP、驗 clocksource、偵 qemu-guest-agent）
 | 24h_0ppm | 0 | 0 / +60.93 | ✅ | 0.0 |
 | 24h_10ppm | 864 | 10 / +70.93 | ✅ | 1.0 |
 | 24h_100ppm | 8640 | 100 / +160.93 | ✅ | 1.0 |
-| 24h_1000ppm | 86400 | 1000 / +1060.93 | ✅→❌ timeout | — |
+| 24h_1000ppm | 86400 | 1000 / +1060.93 | ❌ timeout | — |
 
 預測 vs 實測，逐 band 對照（與上面預測表同一組數字，這裡講機制）：
 
 - **50–400ms 帶 slew 命中**：360ms 預測 `≈15s` → 實測 `15.3s` / `16.7s`；144ms 預測 `≈8s` → 實測 `8.9s` / `9.1s`。PLL `τ≈7.5s` 的指數衰減模型站得住。
 - **`> 400ms` 跳錶秒級命中**：所有大 offset cell `t=1.0s`，連 86.4s 的極端 cell 也一樣——step 不在乎幅度，只在乎「跳一次」。
-- **±1000（eff ±939 / ±1061）永不穩定收斂命中，且機制被拍到**：cleanup 時 `clock_inject status` 抓到 `tick=10010, freq_ppm=-500.0`——kernel freq register 頂死 `MAXFREQ` 反向對抗注入，淨漂移 = `|eff| − 500`，offset 反覆破界。這是「晶振故障 / VM 計時異常」signature 在實驗裡的複現。
+- **±1000（eff ±939 / ±1061）永不穩定收斂命中，且機制被拍到**：實驗 session 中手動以 `clock_inject status` 抓到 `tick=10010, freq_ppm=-500.0`（原始輸出與出處在 `results/l4/exp1/freq-clamp-observation.json`）——kernel freq register 頂死 `MAXFREQ` 反向對抗注入，淨漂移 = `|eff| − 500`，offset 反覆破界。這是「晶振故障 / VM 計時異常」signature 在實驗裡的複現。probe 資料顯示六個 ±1000 cells 都反覆短暫跌進 `< 50ms`（step 把 offset 一次撥近 0）又被淨漂移帶出去，沒有任何一個撐滿 660s 穩定窗。
 
 **邊界帶的細緻結果（這段是機制推論，不是純讀數）**：
 
 - eff −439.07（注入 −500）鎖定耗時 **500.1s**、eff +460.93（注入 +400）**504.0s**——freq register 走到位需要**數百秒**，鎖定不是瞬間的。step 把 offset 一次撥掉只要 1s，但要讓殘留 ppm 被 freq register 真正吃掉、進入持續 660s 穩定窗，得等 PLL 把 freq 學到位。
 - eff +560.93（注入 +500，超 clamp 60.9ppm）反而在 **229.0s** 就進 660s 穩定窗——freq register 頂死 `MAXFREQ` 後，淨殘餘恰好 ≈ 60.9ppm，與**此機天然漂移同量級**；poll 自適應把 poll 卡在低檔，鋸齒（poll × 殘餘 ppm）壓在 50ms 內。
-- 這就是 spec 預測的「**脆弱鎖定**」實證形態：offset 看似受控（進得了穩定窗），但 **freq register 已無 headroom**，殘餘全靠 PLL 的 offset 修正逐 poll 吸收。一旦 poll 爬高、或殘餘 ppm 再大一點，鋸齒就破界——這正是它「脆弱」之處。24h_1000ppm 一度進窗、隨後又 timeout，就是這個脆弱性在最極端 cell 上的破裂。
+- 這就是 spec 預測的「**脆弱鎖定**」實證形態：offset 看似受控（進得了穩定窗），但 **freq register 已無 headroom**，殘餘全靠 PLL 的 offset 修正逐 poll 吸收。一旦 poll 爬高、或殘餘 ppm 再大一點，鋸齒就破界——這正是它「脆弱」之處。±1000 cells（淨殘餘 439–561ppm）反覆跌進 `< 50ms` 又被帶出去、永遠撐不滿穩定窗，就是同一個機制越過臨界後的樣子。
 
 ### 指令
 

@@ -1,0 +1,13 @@
+{
+  "_provenance": "手動量測：2026-06-11T18:16Z，cell-1h_1000ppm 第二次 run 因 errexit bug 中斷後、清理殘留狀態前，在 client VM 上執行 `sudo python3 lib/clock_inject.py status` 的原始輸出。當時 tick 仍掛著 +1000ppm 注入（10010µs）、timesyncd 已把 freq register 推到 MAXFREQ 下限 −500ppm 對抗，淨漂移 ≈ +500ppm——±1000ppm cells 永不收斂的機制現場。",
+  "modes": 0,
+  "modes_names": [],
+  "offset": -14959695,
+  "freq": -32768000,
+  "status": 8193,
+  "tick": 10010,
+  "time_tv_sec": 1781201821,
+  "time_tv_usec": 577463773,
+  "freq_ppm": -500.0,
+  "kernel_state": 0
+}
