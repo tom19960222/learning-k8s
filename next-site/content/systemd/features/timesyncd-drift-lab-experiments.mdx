@@ -111,11 +111,19 @@ preflight（擋 NTP、驗 clocksource、偵 qemu-guest-agent）
 - **`> 400ms` 跳錶秒級命中**：所有大 offset cell `t=1.0s`，連 86.4s 的極端 cell 也一樣——step 不在乎幅度，只在乎「跳一次」。
 - **±1000（eff ±939 / ±1061）永不穩定收斂命中，且機制被拍到**：實驗 session 中手動以 `clock_inject status` 抓到 `tick=10010, freq_ppm=-500.0`（原始輸出與出處在 `results/l4/exp1/freq-clamp-observation.json`）——kernel freq register 頂死 `MAXFREQ` 反向對抗注入，淨漂移 = `|eff| − 500`，offset 反覆破界。這是「晶振故障 / VM 計時異常」signature 在實驗裡的複現。probe 資料顯示六個 ±1000 cells 都反覆短暫跌進 `< 50ms`（step 把 offset 一次撥近 0）又被淨漂移帶出去，沒有任何一個撐滿 660s 穩定窗。
 
+±1000ppm 的鋸齒長這樣——step 先把 offset 一次撥近 0，淨漂移（`|eff| − 500` ≈ 561ppm）再把它帶出去，每個 poll 週期重演一次，振盪帶橫跨 `±50ms` 紅線、永遠撐不滿穩定窗：
+
+![exp1 1h×1000ppm cell 的 probe offset 時間序列：t=0 跳錶把 -3.6s 的 offset 一次撥近 0，之後 offset 以鋸齒形在約 -73ms 到 -45ms 之間振盪 1800 秒，每個週期都跨過 -50ms 門檻線，從未進入穩定收斂](/diagrams/systemd/exp1-1000ppm-sawtooth.png)
+
 **邊界帶的細緻結果（這段是機制推論，不是純讀數）**：
 
 - eff −439.07（注入 −500）鎖定耗時 **500.1s**、eff +460.93（注入 +400）**504.0s**——freq register 走到位需要**數百秒**，鎖定不是瞬間的。step 把 offset 一次撥掉只要 1s，但要讓殘留 ppm 被 freq register 真正吃掉、進入持續 660s 穩定窗，得等 PLL 把 freq 學到位。
 - eff +560.93（注入 +500，超 clamp 60.9ppm）反而在 **229.0s** 就進 660s 穩定窗——freq register 頂死 `MAXFREQ` 後，淨殘餘恰好 ≈ 60.9ppm，與**此機天然漂移同量級**；poll 自適應把 poll 卡在低檔，鋸齒（poll × 殘餘 ppm）壓在 50ms 內。
 - 這就是 spec 預測的「**脆弱鎖定**」實證形態：offset 看似受控（進得了穩定窗），但 **freq register 已無 headroom**，殘餘全靠 PLL 的 offset 修正逐 poll 吸收。一旦 poll 爬高、或殘餘 ppm 再大一點，鋸齒就破界——這正是它「脆弱」之處。±1000 cells（淨殘餘 439–561ppm）反覆跌進 `< 50ms` 又被帶出去、永遠撐不滿穩定窗，就是同一個機制越過臨界後的樣子。
+
+邊界兩側的曲線把這個對比畫出來——上圖（clamp 內 61ppm）前 500 秒 offset 一路被殘餘漂移頂著走、freq 學到位後才壓回 `< 50ms`；下圖（超 clamp 61ppm）靠 poll 卡低檔把鋸齒壓在門檻內，但 freq 已經頂死、毫無餘裕：
+
+![exp1 MAXFREQ 邊界兩側對照圖（上下兩個 panel）：上為 eff -439ppm cell，offset 在前 480 秒爬升至 +63ms 後回落，t_converge=500.1s 處標記垂直線，之後穩定在 +25 到 +40ms；下為 eff +561ppm cell，offset 在 -20 到 -53ms 間緩慢波動，t_converge=229.0s 後維持在 -50ms 內但貼著門檻](/diagrams/systemd/exp1-boundary-lock.png)
 
 ### 指令
 
@@ -154,6 +162,10 @@ sudo ./run/exp1-drift-recovery.sh --detach
 `exp2` 會自動統計兩個 cell 的 step 事件數與最大單筆跳幅（`steps.csv`），預期 399ms 是多筆小事件、401ms 是單筆 `≈ 400ms`。
 
 **實測 signature 完全如預測**（資料源 `experiments/timesyncd/results/l4/exp2/`）：399ms 跑出 **130 筆遞減小事件、最大單筆只有 5.27ms**——每一步都 `< 10ms`、單調遞減、絕不倒退，首段速率 `≈52.6ms/s` 對上理論 `399ms×ln(8/7)≈53ms/s`；401ms 跑出**單一 `-401.18ms` 事件**，一次跳錶搞定。0.4s 懸崖兩側差 1ms，連續 vs 不連續的本質差異被乾淨地拍下來。
+
+兩條曲線疊在同一張圖上，再把理論衰減 `-399·e^(-t/7.5)` 用虛線畫進去——實測 slew 幾乎貼著理論走：
+
+![exp2 對照圖：399ms cell（藍）從 -399ms 沿指數曲線平滑滑回 0，與理論虛線 -399·e^(-t/7.5) 幾乎重合，約 15 秒跨過 -50ms 門檻；401ms cell（橘）在 t≈1s 垂直跳到 0，是一面懸崖](/diagrams/systemd/exp2-slew-vs-step.png)
 
 ### 指令
 
@@ -256,6 +268,12 @@ sudo ./run/exp3-restart-sync.sh --detach
 
 資料源 `experiments/timesyncd/results/l4/exp4/`。六情境 soak 各 4 小時，verdict 表如上：四個無擾動情境（baseline / soak-256 / restart / outage-30m）與 inject-80ms 全 **PASS**，jitter 按字面判準記 **FAIL**。下面三段是這實驗最有價值的部分。
 
+先看兩個基準 soak 的 offset 全程對比——在這台天然漂移 +61ppm 的 VM 上，max poll 2048 的設定在前 1.5 小時（freq 還在長 poll 下慢慢學）漂到 −29ms 才收緊；max poll 256 從頭到尾貼著 0：
+
+![exp4 兩個 4 小時 soak 的 probe offset 對比：PollIntervalMaxSec=2048（橘）在前 1.5 小時漂移至 -29ms 後逐漸收斂貼 0，PollIntervalMaxSec=256（藍）全程維持在 0±1ms；±50ms 門檻線遠未被觸及](/diagrams/systemd/exp4-poll-soak-offset.png)
+
+兩條線都離 `±50ms` 紅線很遠——這就是 verdict 全 PASS 的視覺版。但 2048 那條的學習期漂移也提醒：**poll 越長，freq 修正的回授迴路越慢**，任何擾動後的恢復都拖得更久。
+
 **重磅發現：step 型擾動的偵測是「通知驅動、瞬時」，與 poll 間隔無關。** `inject-80ms` 量到的偵測延遲——poll-256 子跑 **3.8s**、poll-2048 子跑 **5.7s**——**兩者都是秒級**。這直接推翻了「256 vs 2048 偵測延遲對比」的設計前提（輪詢驅動）。原因在 source：timesyncd 用 `TFD_TIMER_CANCEL_ON_SET` 的 timerfd 監聽「`CLOCK_REALTIME` 被外部 set」這個 kernel 事件。底層鏈是：
 
 - `manager_clock_watch`（`systemd/src/timesync/timesyncd-manager.c:206`）收到通知就 log `"System time changed. Resyncing."` 並立刻 `manager_send_request`——`m->jumped` 只用來略過 timesyncd 自己造成的跳變。
@@ -263,7 +281,7 @@ sudo ./run/exp3-restart-sync.sh --detach
 
 `TFD_TIMER_CANCEL_ON_SET` 的語意是：只要 `CLOCK_REALTIME` 相對 `CLOCK_MONOTONIC` 發生跳變，這個 timerfd 就被 kernel 標記取消、event loop 立刻醒。所以**clock 被 set（step 型擾動）的偵測是通知驅動、瞬時的**，根本不需要等下一個 poll。
 
-**結論：`PollIntervalMaxSec` 的「偵測延遲上界」只適用於 drift 型誤差（晶振漂移），不適用於跳變。** 晶振漂移沒有 kernel 通知，只能靠下一次 poll 量出來，那才受 max poll 上界約束；而 SETOFFSET / `clock_settime` 這種跳變會即時觸發 timerfd。原本「壓低 max poll → 偵測更快」的效益論點，對 step 型擾動不成立——這本身就是這套實驗最有價值的修正之一。（引用上述行號前請自行 `read` submodule 再確認；本文行號已逐一驗證對齊 systemd v1.8.2 對應的 source。）
+**結論：`PollIntervalMaxSec` 的「偵測延遲上界」只適用於 drift 型誤差（晶振漂移），不適用於跳變。** 晶振漂移沒有 kernel 通知，只能靠下一次 poll 量出來，那才受 max poll 上界約束；而 SETOFFSET / `clock_settime` 這種跳變會即時觸發 timerfd。原本「壓低 max poll → 偵測更快」的效益論點，對 step 型擾動不成立——這本身就是這套實驗最有價值的修正之一。（引用上述行號前請自行讀 submodule 再確認；本文行號已逐一驗證對齊 systemd v260.1 的 source。）
 
 **`jitter` 的誠實分析（為什麼 FAIL 不該歸咎 timesyncd）。** jitter 唯一掉的那 1 發 ping，發生在 `tc netem` 5ms±3ms 注入窗內；同一時間 timesyncd 側所有指標全綠——0 step、0 lease miss、offset 平滑。這 1 發掉包**無法歸因於時間同步**，而是 netem 人為注入的網路延遲抖動造成的；生產環境沒有 netem。按「連 2 個 ping 都不能掉」的字面判準，它記 FAIL；按因果歸因，它不是 timesyncd 的問題。**這正是嚴格判準該有的樣子**：它逼你解釋每一個異常，而不是讓你把它掃到地毯下。
 
@@ -295,7 +313,7 @@ sudo ./run/all.sh --detach --soak-hours 24
 
 ## 結果回填總結
 
-L4 完整實驗套件已跑完，上面每張表的實測欄都已填入測得值。這節是跨四組實驗的總結：環境事實、解讀軸、三個最有價值的發現。**所有數字的資料源是 `experiments/timesyncd/results/l4/`**（已 commit 進 repo）。
+L4 完整實驗套件已跑完，上面每張表的實測欄都已填入測得值。這節是跨四組實驗的總結：環境事實、解讀軸、三個最有價值的發現。**所有數字的資料源是 `experiments/timesyncd/results/l4/`**（已 commit 進 repo）；文中四張曲線圖由 `experiments/timesyncd/lib/plot_results.py` 從同一份 CSV 生成，可重現。
 
 **環境欄**（`preflight.json` + `calibration.json`）：
 
