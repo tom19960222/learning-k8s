@@ -1,0 +1,11 @@
+{
+ "converged": true,
+ "t_converge_s": 1.0,
+ "threshold_ms": 50.0,
+ "hold_s": 60.0,
+ "samples": 78,
+ "last_offset_ms": 0.98,
+ "cell": "restart_10ms",
+ "injected_offset_ms": 10.0,
+ "contact_latency_s": 0.052
+}

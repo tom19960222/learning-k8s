@@ -1,0 +1,5 @@
+PING 192.168.18.163 (192.168.18.163) 56(84) bytes of data.
+
+--- 192.168.18.163 ping statistics ---
+154723 packets transmitted, 154723 received, 0% packet loss, time 2475618ms
+rtt min/avg/max/mdev = 0.053/0.244/1.279/0.040 ms

@@ -1,0 +1,25 @@
+{
+ "pass": true,
+ "checks": [
+  {
+   "name": "ping 0 丟包",
+   "value": "154723 tx / 154723 rx / lost 0",
+   "ok": true
+  },
+  {
+   "name": "step 事件 ≤ 1（只計 |jump| ≥ 50ms）",
+   "value": "1 筆",
+   "ok": true
+  },
+  {
+   "name": "lease sentinel 0 miss/backward",
+   "value": "miss=0 backward=0",
+   "ok": true
+  },
+  {
+   "name": "journal 無 error",
+   "value": "0 行",
+   "ok": true
+  }
+ ]
+}

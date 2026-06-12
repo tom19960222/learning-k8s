@@ -1,0 +1,14 @@
+{
+ "converged": false,
+ "t_converge_s": null,
+ "threshold_ms": 50.0,
+ "hold_s": 660.0,
+ "samples": 1811,
+ "last_offset_ms": 49.37,
+ "cell": "1h_-1000ppm",
+ "duration_h": 1.0,
+ "ppm": -1000.0,
+ "injected_offset_ms": -3600.0,
+ "client_ppm": 60.926,
+ "effective_ppm": -939.074
+}

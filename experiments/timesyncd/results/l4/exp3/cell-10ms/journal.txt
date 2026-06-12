@@ -1,0 +1,6 @@
+[12642.566414] timesyncd-lab-client systemd[1]: Stopping Network Time Synchronization...
+[12642.566978] timesyncd-lab-client systemd[1]: systemd-timesyncd.service: Deactivated successfully.
+[12642.567195] timesyncd-lab-client systemd[1]: Stopped Network Time Synchronization.
+[12642.569332] timesyncd-lab-client systemd[1]: Starting Network Time Synchronization...
+[12642.613778] timesyncd-lab-client systemd[1]: Started Network Time Synchronization.
+[12642.614483] timesyncd-lab-client systemd-timesyncd[10240]: Initial synchronization to time server 192.168.18.163:123 (192.168.18.163).
