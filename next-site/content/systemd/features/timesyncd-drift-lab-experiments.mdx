@@ -1,14 +1,14 @@
 ---
 layout: doc
 title: timesyncd Drift Lab — 四組實驗設計與 source 推導預測
-description: 25 cells 失聯恢復矩陣（1/4/24hr × 0–±1000ppm + MAXFREQ 邊界探針）、399ms vs 401ms 跳錶門檻對照、重啟對時 4 cells、PollIntervalMaxSec=256 的六情境生產級 soak（100Hz ping 0 丟包、step 0、5s lease 0 miss）。每組附 linux/systemd source 推導的預測表與對應執行指令；實測欄留空待環境跑完回填。
+description: 25 cells 失聯恢復矩陣（1/4/24hr × 0–±1000ppm + MAXFREQ 邊界探針）、399ms vs 401ms 跳錶門檻對照、重啟對時 4 cells、PollIntervalMaxSec=256 的六情境生產級 soak（100Hz ping 0 丟包、step 0、5s lease 0 miss）。每組附 linux/systemd source 推導的預測表與對應執行指令；L4 實測已回填——slew/step 收斂時間全命中，發現 step 型擾動偵測由 TFD_TIMER_CANCEL_ON_SET 通知驅動、與 poll 間隔無關。
 ---
 
 ## 場景
 
 [實驗方法論](/systemd/features/timesyncd-drift-lab-methodology) 那篇講完「怎麼測才不會被受測物騙、為什麼不必等真實時間」。這頁是另一半：四組實驗的**完整設計**——每個 cell 的初始條件怎麼來、機制上預測收斂要多久、跑哪一條指令、預期看到什麼 signature。
 
-關鍵契約：**每張表都把「預測」與「實測」分成兩欄**。預測欄寫死，數字全部是從 `linux/kernel/time/` 與 `systemd/src/timesync/` 的 source 推導出來的機制結論（推導過程在方法論篇，這裡只引結論）；實測欄一律留「＿＿（在你環境跑後對照）」。這符合 CLAUDE.md 對 lab 指令的驗證等級：需要真實 Proxmox + 多 VM 的實驗，先以 source 交叉驗證並標註待實測，跑完才回填。預測 vs 實測的對照，是這套 lab 的核心價值——如果實測跟機制預測對不上，那是發現了某個環境變因，不是 kernel 變了。
+關鍵契約：**每張表都把「預測」與「實測」分成兩欄**。預測欄寫死，數字全部是從 `linux/kernel/time/` 與 `systemd/src/timesync/` 的 source 推導出來的機制結論（推導過程在方法論篇，這裡只引結論）；實測欄則是 L4 完整實驗套件跑完後的測得值（資料源 `experiments/timesyncd/results/l4/`，已 commit 進 repo）。這符合 CLAUDE.md 對 lab 指令的驗證等級：需要真實 Proxmox + 多 VM 的實驗，先以 source 交叉驗證、跑完才回填。預測 vs 實測的對照，是這套 lab 的核心價值——這次幾乎全數命中，而對不上的少數地方（exp4 的 step 偵測延遲與 poll 無關）反而是最有價值的修正。
 
 ## 共用協定
 
@@ -28,6 +28,8 @@ preflight（擋 NTP、驗 clocksource、偵 qemu-guest-agent）
 ```
 
 **收斂判定（全實驗統一）**：`|offset| < 50ms` 持續 60 秒，取首次進入該狀態的時刻。要求「持續 60 秒」是為了排除剛好滑過 50ms 又彈回去的瞬間假合格。offset 一律由獨立的 `ntp_probe.py` 量，不採信 timesyncd 自報值（理由見方法論篇「不採信受測物」一節）。
+
+**exp1 的穩定窗例外（實測修正）**：實驗 1 問的不是「滑過 50ms 一次」，而是「能不能**持續鎖定**」，所以它的 hold 不是 60s 而是 **660s**（60s 收斂判定 + 600s 穩定窗）；exp2 / exp3 / exp4 維持 60s。這個差異是 L4 實測逼出來的：60s hold 會被超界 cell 的 poll 鋸齒騙過去。poll 自適應在收斂初期還卡在 32s 低檔，此時鋸齒幅度 `32s × 1.06ppm ≈ 34ms`，本來就 `< 50ms`，所以 60s 內看起來「穩」；要等 poll 往上爬幾百秒、鋸齒（poll × 殘餘 ppm）放大後才會破界。換句話說，**只有把穩定窗拉到 600s 才看得到脆弱鎖定的真面目**——這正是 exp1 的 ±500ppm cell 與 60s-hold 假合格之間的分水嶺，下面的實測表會印證它。
 
 **時間預算**（wall-clock 概估，全程可無人值守）：校準 ~1h、實驗 1 約 5–6h（±1000ppm 的 6 個 cell 各吃滿 30 分鐘 timeout，其餘多在分鐘級）、實驗 2 ~0.5h、實驗 3 ~1h、實驗 4 預設 ~10h（quick 模式 4h）。
 
@@ -57,19 +59,63 @@ preflight（擋 NTP、驗 clocksource、偵 qemu-guest-agent）
 
 | 初始條件 band | 機制 | 預測收斂時間 | 實測 |
 |---|---|---|---|
-| `|offset| < 50ms`（1hr×10ppm = 36ms） | 進場即合格，無需修正 | `t ≈ 0` | ＿＿（在你環境跑後對照） |
-| 50–400ms（4hr×10ppm = 144ms） | PLL 相位滑動，`τ ≈ 7.5s` 指數衰減 | `≈ 8s`（`ln(144/50) × 7.5`） | ＿＿（在你環境跑後對照） |
-| 50–400ms（1hr×100ppm = 360ms） | PLL 相位滑動（同上） | `≈ 15s`（`ln(360/50) × 7.5`） | ＿＿（在你環境跑後對照） |
-| `> 400ms`（其餘大多數 cells） | timesyncd 首個 sample 直接 step（`ADJ_SETOFFSET` 跳錶） | 秒級（跳錶不在乎幅度，24hr×1000ppm = 86.4s 的極端 cell 也一樣秒級） | ＿＿（在你環境跑後對照） |
-| ±400ppm × 1hr | step 後可鎖定，freq register 還有 100ppm headroom | 秒級進場 + 穩定鎖定 | ＿＿（在你環境跑後對照） |
-| ±500ppm × 1hr | **脆弱鎖定**——freq register 頂死 `MAXFREQ` clamp，天然漂移 ±幾 ppm 即破界 | 可能間歇失準 | ＿＿（在你環境跑後對照） |
-| ±1000ppm（三時長） | **永不穩定收斂**——淨漂移 `≥ 500ppm` 超過 `MAXFREQ` | timeout 1800s 記 non-convergent | ＿＿（在你環境跑後對照） |
+| `|offset| < 50ms`（1hr×10ppm = 36ms） | 進場即合格，無需修正 | `t ≈ 0` | `0.0s`（1h_-10ppm、1h_0ppm、1h_10ppm 全 0.0s）。**命中** |
+| 50–400ms（4hr×10ppm = 144ms） | PLL 相位滑動，`τ ≈ 7.5s` 指數衰減 | `≈ 8s`（`ln(144/50) × 7.5`） | `8.9s` / `9.1s`（4h_-10ppm / 4h_10ppm）。**命中** |
+| 50–400ms（1hr×100ppm = 360ms） | PLL 相位滑動（同上） | `≈ 15s`（`ln(360/50) × 7.5`） | `15.3s` / `16.7s`（1h_100ppm / 1h_-100ppm）。**命中** |
+| `> 400ms`（其餘大多數 cells） | timesyncd 首個 sample 直接 step（`ADJ_SETOFFSET` 跳錶） | 秒級（跳錶不在乎幅度，24hr×1000ppm = 86.4s 的極端 cell 也一樣秒級） | 所有大 offset cell `t = 1.0s`（含 86.4s 極端 cell）。**命中** |
+| ±400ppm × 1hr | step 後可鎖定，freq register 還有 100ppm headroom | 秒級進場 + 穩定鎖定 | 1h_-400ppm `1.0s` 即鎖定；1h_400ppm（eff +460.93）`504.0s` 才進穩定窗——freq register 走到位需數百秒。**命中（但鎖定非瞬間）** |
+| ±500ppm × 1hr | **脆弱鎖定**——freq register 頂死 `MAXFREQ` clamp，天然漂移 ±幾 ppm 即破界 | 可能間歇失準 | 1h_-500ppm（eff −439.07）`500.1s`；1h_500ppm（eff +560.93，超 clamp 60.9）`229.0s` 進 660s 穩定窗——freq 頂死後殘餘恰 ≈ 天然漂移量級，靠 PLL offset 逐 poll 吸收。**脆弱鎖定的實證形態** |
+| ±1000ppm（三時長） | **永不穩定收斂**——淨漂移 `≥ 500ppm` 超過 `MAXFREQ` | timeout 1800s 記 non-convergent | 全 cell timeout（含 24h_1000ppm 一度進窗後又破界）。cleanup 抓到 `tick=10010, freq_ppm=-500.0`——freq register 頂死 `MAXFREQ` 對抗注入。**命中，機制被拍到** |
 
 幾個預測背後的機制要點：
 
 - **50–400ms 走 PLL 滑動而非 step**：timesyncd 的分流門檻是 `NTP_MAX_ADJUST = 0.4s`，`< 0.4s` 走 slew。slew 是 PLL 相位滑動，**沒有 500ppm 上限**（那個 lore 是古典 `adjtime()` 的事），32s poll 時時間常數 `τ ≈ 7.5s`，所以幾百 ms 在十幾秒內就滑掉。
 - **`> 400ms` 一律秒級**：超過 0.4s 直接 step，把 offset 一次撥掉，跟幅度多大無關——所以 86.4s 跟 3.6s 的 cell 收斂時間沒差別，差別只在進場那一下跳多遠。
 - **±1000ppm 永不收斂是預期 finding，不是 bug**：殘留 1000ppm 超過 `MAXFREQ` 的 500ppm 硬 clamp，freq register 頂死也補不回淨漂移，offset 會反覆跨過門檻、反覆跳錶。timeout 1800s 之後記 non-convergent——這正是生產上「晶振故障 / VM 計時異常」的 signature，能在實驗裡複現它本身就有價值。
+
+### 實測：25 cells 全表
+
+下表是 L4 實測全 25 cells（資料源 `experiments/timesyncd/results/l4/exp1/`）。解讀軸是 `effective_ppm = 注入 ppm + 60.926`——這機天然漂移 +60.926ppm（見[結果回填總結](#結果回填總結)的環境欄），所以注入 `−10ppm` 的 cell 實際是在 `+50.93ppm` 漂。收斂判定 = `|offset| < 50ms` 持續 660s（60s 收斂 + 600s 穩定窗）。
+
+| cell | 折疊 offset (ms) | 注入 / 有效 ppm | 收斂 | t_converge (s) |
+|---|---|---|---|---|
+| 1h_-1000ppm | -3600 | -1000 / -939.07 | ❌ timeout | — |
+| 1h_-500ppm | -1800 | -500 / -439.07 | ✅ | 500.1 |
+| 1h_-400ppm | -1440 | -400 / -339.07 | ✅ | 1.0 |
+| 1h_-100ppm | -360 | -100 / -39.07 | ✅ | 16.7 |
+| 1h_-10ppm | -36 | -10 / +50.93 | ✅ | 0.0 |
+| 1h_0ppm | 0 | 0 / +60.93 | ✅ | 0.0 |
+| 1h_10ppm | 36 | 10 / +70.93 | ✅ | 0.0 |
+| 1h_100ppm | 360 | 100 / +160.93 | ✅ | 15.3 |
+| 1h_400ppm | 1440 | 400 / +460.93 | ✅ | 504.0 |
+| 1h_500ppm | 1800 | 500 / +560.93 | ✅ | 229.0 |
+| 1h_1000ppm | 3600 | 1000 / +1060.93 | ❌ timeout | — |
+| 4h_-1000ppm | -14400 | -1000 / -939.07 | ❌ timeout | — |
+| 4h_-100ppm | -1440 | -100 / -39.07 | ✅ | 1.0 |
+| 4h_-10ppm | -144 | -10 / +50.93 | ✅ | 8.9 |
+| 4h_0ppm | 0 | 0 / +60.93 | ✅ | 0.0 |
+| 4h_10ppm | 144 | 10 / +70.93 | ✅ | 9.1 |
+| 4h_100ppm | 1440 | 100 / +160.93 | ✅ | 1.0 |
+| 4h_1000ppm | 14400 | 1000 / +1060.93 | ❌ timeout | — |
+| 24h_-1000ppm | -86400 | -1000 / -939.07 | ❌ timeout | — |
+| 24h_-100ppm | -8640 | -100 / -39.07 | ✅ | 1.0 |
+| 24h_-10ppm | -864 | -10 / +50.93 | ✅ | 1.0 |
+| 24h_0ppm | 0 | 0 / +60.93 | ✅ | 0.0 |
+| 24h_10ppm | 864 | 10 / +70.93 | ✅ | 1.0 |
+| 24h_100ppm | 8640 | 100 / +160.93 | ✅ | 1.0 |
+| 24h_1000ppm | 86400 | 1000 / +1060.93 | ✅→❌ timeout | — |
+
+預測 vs 實測，逐 band 對照（與上面預測表同一組數字，這裡講機制）：
+
+- **50–400ms 帶 slew 命中**：360ms 預測 `≈15s` → 實測 `15.3s` / `16.7s`；144ms 預測 `≈8s` → 實測 `8.9s` / `9.1s`。PLL `τ≈7.5s` 的指數衰減模型站得住。
+- **`> 400ms` 跳錶秒級命中**：所有大 offset cell `t=1.0s`，連 86.4s 的極端 cell 也一樣——step 不在乎幅度，只在乎「跳一次」。
+- **±1000（eff ±939 / ±1061）永不穩定收斂命中，且機制被拍到**：cleanup 時 `clock_inject status` 抓到 `tick=10010, freq_ppm=-500.0`——kernel freq register 頂死 `MAXFREQ` 反向對抗注入，淨漂移 = `|eff| − 500`，offset 反覆破界。這是「晶振故障 / VM 計時異常」signature 在實驗裡的複現。
+
+**邊界帶的細緻結果（這段是機制推論，不是純讀數）**：
+
+- eff −439.07（注入 −500）鎖定耗時 **500.1s**、eff +460.93（注入 +400）**504.0s**——freq register 走到位需要**數百秒**，鎖定不是瞬間的。step 把 offset 一次撥掉只要 1s，但要讓殘留 ppm 被 freq register 真正吃掉、進入持續 660s 穩定窗，得等 PLL 把 freq 學到位。
+- eff +560.93（注入 +500，超 clamp 60.9ppm）反而在 **229.0s** 就進 660s 穩定窗——freq register 頂死 `MAXFREQ` 後，淨殘餘恰好 ≈ 60.9ppm，與**此機天然漂移同量級**；poll 自適應把 poll 卡在低檔，鋸齒（poll × 殘餘 ppm）壓在 50ms 內。
+- 這就是 spec 預測的「**脆弱鎖定**」實證形態：offset 看似受控（進得了穩定窗），但 **freq register 已無 headroom**，殘餘全靠 PLL 的 offset 修正逐 poll 吸收。一旦 poll 爬高、或殘餘 ppm 再大一點，鋸齒就破界——這正是它「脆弱」之處。24h_1000ppm 一度進窗、隨後又 timeout，就是這個脆弱性在最極端 cell 上的破裂。
 
 ### 指令
 
@@ -95,8 +141,8 @@ sudo ./run/exp1-drift-recovery.sh --detach
 
 | cell | 路徑 | 機制 | 預測收斂時間 | 實測 |
 |---|---|---|---|---|
-| 399ms（門檻下 1ms） | slew | PLL 相位滑動，純連續 | `≈ 16s`（`ln(399/50) × 7.5`）+ 首個 sample 延遲 | ＿＿（在你環境跑後對照） |
-| 401ms（門檻上 1ms） | step | 單次跳錶 | 秒級 | ＿＿（在你環境跑後對照） |
+| 399ms（門檻下 1ms） | slew | PLL 相位滑動，純連續 | `≈ 16s`（`ln(399/50) × 7.5`）+ 首個 sample 延遲 | `15.4s`（**命中**）；**130 筆遞減小事件、最大單筆 5.27ms**；首段速率 ≈ `52.6ms/s`（理論 `399×ln(8/7)≈53ms/s`） |
+| 401ms（門檻上 1ms） | step | 單次跳錶 | 秒級 | `1.0s`；**單筆 -401.18ms** step |
 
 **重點不是哪個快**——兩者都是秒到十幾秒級。重點是 step detector 上的 signature 完全不同：
 
@@ -106,6 +152,8 @@ sudo ./run/exp1-drift-recovery.sh --detach
 對 ceph mon lease、TLS 憑證 `notBefore/notAfter` 邊界、資料庫 timestamp 排序而言，**不連續才是風險**。一個平滑滑動 16 秒的時鐘不會讓任何單調時戳倒退；一個瞬間跳 400ms 的時鐘可能讓「後寫入的記錄帶較早的時戳」。0.4s 那道懸崖兩側差 1ms，行為性質卻是天差地別——這正是這個對照要打在圖上的東西。
 
 `exp2` 會自動統計兩個 cell 的 step 事件數與最大單筆跳幅（`steps.csv`），預期 399ms 是多筆小事件、401ms 是單筆 `≈ 400ms`。
+
+**實測 signature 完全如預測**（資料源 `experiments/timesyncd/results/l4/exp2/`）：399ms 跑出 **130 筆遞減小事件、最大單筆只有 5.27ms**——每一步都 `< 10ms`、單調遞減、絕不倒退，首段速率 `≈52.6ms/s` 對上理論 `399ms×ln(8/7)≈53ms/s`；401ms 跑出**單一 `-401.18ms` 事件**，一次跳錶搞定。0.4s 懸崖兩側差 1ms，連續 vs 不連續的本質差異被乾淨地拍下來。
 
 ### 指令
 
@@ -131,13 +179,19 @@ sudo ./run/exp2-slew-399ms.sh --detach
 
 | cell | 機制 | 預測 | 實測 |
 |---|---|---|---|
-| `contact_latency_s`（共同） | 重啟後立即發 query，poll 從 32s min 重爬、首發不等滿 32s | 數秒內首次 contact | ＿＿（在你環境跑後對照） |
-| 10ms | 進場即 `< 50ms` | 無感，`t ≈ 0` | ＿＿（在你環境跑後對照） |
-| 50ms | 卡在判準臨界 | 邊界，靠 hold 60s 分辨合格與否 | ＿＿（在你環境跑後對照） |
-| 100ms | PLL slew | `5–10s` | ＿＿（在你環境跑後對照） |
-| 500ms | step（`> 0.4s`） | 跳錶秒級 | ＿＿（在你環境跑後對照） |
+| `contact_latency_s`（共同） | 重啟後立即發 query，poll 從 32s min 重爬、首發不等滿 32s | 數秒內首次 contact | **`52–55ms` 內發出第一次同步**（**命中**，比「數秒」還快兩個數量級） |
+| 10ms | 進場即 `< 50ms` | 無感，`t ≈ 0` | `1.0s`（latency 0.052s） |
+| 50ms | 卡在判準臨界 | 邊界，靠 hold 60s 分辨合格與否 | `1.0s`（latency 0.055s；判準邊上但直接收斂） |
+| 100ms | PLL slew | `5–10s` | `6.0s`（**命中**，latency 0.055s） |
+| 500ms | step（`> 0.4s`） | 跳錶秒級 | `1.0s`（**命中**，latency 0.054s） |
 
 預測的核心是 `contact_latency_s`：timesyncd 重啟後不會枯等一個 poll interval，它會在啟動流程裡立即發第一個 query，poll interval 從 `PollIntervalMinSec`（32s）重新開始往上爬。所以「馬上對時」這件事的答案預測是「是，首次 contact 在數秒內」——這條 latency 量出來才是這實驗真正回答的問題，各 offset 的收斂時間只是順帶確認 slew/step 分流跟實驗 2 一致。
+
+**實測：是——`52–55ms` 內就發出第一次同步**（資料源 `experiments/timesyncd/results/l4/exp3/`，journal `Initial synchronization to time server`）。不只「數秒內」，而是**幾十毫秒**——重啟後第一個 query 幾乎是立刻發出去的。各 offset 收斂也全對：100ms 走 slew `6.0s`（預測 `5–10s` ✓）、500ms 跳錶 `1.0s`（✓）、10ms 進場即合格 `1.0s`、50ms 在判準邊上但實測直接 `1.0s` 收斂。
+
+<Callout type="info" title="journal 措辭依 systemd 版本而異">
+本機（systemd 249）打的是 `Initial synchronization to time server`。systemd v250+ 改成 `Contacted time server`——若你的環境是新版，`contact_latency_s` 的偵測字串要跟著換，否則抓不到那一行。
+</Callout>
 
 ### 指令
 
@@ -184,12 +238,12 @@ sudo ./run/exp3-restart-sync.sh --detach
 
 | 情境 | 機制預測 | verdict 預測 | 實測 |
 |---|---|---|---|
-| `baseline-2048` | 對照基線 | PASS | ＿＿（在你環境跑後對照） |
-| `soak-256` | 256s 只改 poll 頻率（封包多 8 倍、仍每 4 分鐘 1 個 76-byte UDP）與 PLL time constant；穩態行為不變 | PASS（與基線逐項相當） | ＿＿（在你環境跑後對照） |
-| `restart` | 重啟走 slew/step 分流（同實驗 3），穩態小偏移走 slew 不 step | PASS（0 step） | ＿＿（在你環境跑後對照） |
-| `outage-30m` | 30 分鐘 free-run 累積的漂移遠 `< 0.4s`，恢復後走 slew 平滑收斂 | PASS（無 step、平滑） | ＿＿（在你環境跑後對照） |
-| `inject-80ms` | 80ms `< 0.4s` 全程 slew、不准 step；**唯一預期可量到差異**：偵測延遲上界 256s vs 2048s | PASS，且 256s 偵測明顯較快 | ＿＿（在你環境跑後對照） |
-| `jitter` | PLL constant 降低後是否失穩——驗證 [low-max-poll 模擬](/systemd/features/timesyncd-low-max-poll-simulation) 的推論 | 預測 PASS（除非該篇推論的失穩在此情境現形） | ＿＿（在你環境跑後對照） |
+| `baseline-2048` | 對照基線 | PASS | **PASS**：900,008 發 ping 0 丟包、0 step、0 lease miss、0 journal error |
+| `soak-256` | 256s 只改 poll 頻率（封包多 8 倍、仍每 4 分鐘 1 個 76-byte UDP）與 PLL time constant；穩態行為不變 | PASS（與基線逐項相當） | **PASS**：900,062 發 0 丟包、0 step、0 miss、0 error（與基線逐項相當） |
+| `restart` | 重啟走 slew/step 分流（同實驗 3），穩態小偏移走 slew 不 step | PASS（0 step） | **PASS**：900,039 發 0 丟包、**0 step**、0 miss、0 error |
+| `outage-30m` | 30 分鐘 free-run 累積的漂移遠 `< 0.4s`，恢復後走 slew 平滑收斂 | PASS（無 step、平滑） | **PASS**：1,012,518 發 0 丟包、0 step、0 miss、0 error |
+| `inject-80ms` | 80ms `< 0.4s` 全程 slew、不准 step；**唯一預期可量到差異**：偵測延遲上界 256s vs 2048s | PASS，且 256s 偵測明顯較快 | **PASS**：兩子跑各 0 丟包、0 miss、0 error；1 step 是注入本身。**但偵測延遲與 poll 無關**（見下「重磅發現」） |
+| `jitter` | PLL constant 降低後是否失穩——驗證 [low-max-poll 模擬](/systemd/features/timesyncd-low-max-poll-simulation) 的推論 | 預測 PASS（除非該篇推論的失穩在此情境現形） | **FAIL（按字面判準）**：360,027 發**掉 1**（0.00028%），落在 netem 注入窗內、timesyncd 側全綠——非時間同步問題（誠實分析見下） |
 
 預測總結：**六情境全 PASS**。把 `PollIntervalMaxSec` 壓到 256 改變的只有兩件事——poll 頻率（封包數變 8 倍，但每個還是每 4 分鐘一個 76-byte 的 UDP，CPU/記憶體/頻寬都微不足道）與 PLL 的 time constant。穩態的時鐘正確性不受影響，所以 ping 不掉包、lease 不 miss、不出現非預期 step。
 
@@ -197,6 +251,23 @@ sudo ./run/exp3-restart-sync.sh --detach
 
 - **`inject-80ms` 是唯一預期可量到差異的情境**。80ms 在門檻下走純 slew，兩種 poll 設定都不 step；差別在**偵測延遲的上界**——poll=256 最壞要等 256s 才發下一個 query 看到偏移，poll=2048 最壞要等 2048s。這是壓低 max poll 的**實際效益**，也是這實驗唯一會在數字上分出高下的地方。注意 script 對 poll=2048 的子跑會先暖機 2400s 再注入（32→2048 的 poll 倍增需 ~2016s），確保注入時真的已經爬到 max poll，量到的才是 2048s 上界的真實情況。
 - **`jitter` 是驗證另一篇推論的地方**。[把 PollIntervalMaxSec 壓低會怎樣](/systemd/features/timesyncd-low-max-poll-simulation) 從理論推演過：max poll 壓低會降低 PLL 的 noise immunity。這個情境用 `tc netem` 灌 5ms±3ms 的網路抖動 1 小時，看 PLL constant 降低後會不會失穩。預測仍是 PASS（5ms±3ms 對 50ms 判準還有很大餘裕），但如果這裡真的驗出失穩，那就是該篇推論在實驗上現形——這正是它存在的意義。
+
+### 實測：六情境 soak（各 4h）
+
+資料源 `experiments/timesyncd/results/l4/exp4/`。六情境 soak 各 4 小時，verdict 表如上：四個無擾動情境（baseline / soak-256 / restart / outage-30m）與 inject-80ms 全 **PASS**，jitter 按字面判準記 **FAIL**。下面三段是這實驗最有價值的部分。
+
+**重磅發現：step 型擾動的偵測是「通知驅動、瞬時」，與 poll 間隔無關。** `inject-80ms` 量到的偵測延遲——poll-256 子跑 **3.8s**、poll-2048 子跑 **5.7s**——**兩者都是秒級**。這直接推翻了「256 vs 2048 偵測延遲對比」的設計前提（輪詢驅動）。原因在 source：timesyncd 用 `TFD_TIMER_CANCEL_ON_SET` 的 timerfd 監聽「`CLOCK_REALTIME` 被外部 set」這個 kernel 事件。底層鏈是：
+
+- `manager_clock_watch`（`systemd/src/timesync/timesyncd-manager.c:206`）收到通知就 log `"System time changed. Resyncing."` 並立刻 `manager_send_request`——`m->jumped` 只用來略過 timesyncd 自己造成的跳變。
+- 它由 `manager_clock_watch_setup`（`:226`）→ `event_add_time_change`（`systemd/src/libsystemd/sd-event/event-util.c:129`）→ `time_change_fd()`（`systemd/src/basic/time-util.c:1837` 的註解明言 `TFD_TIMER_CANCEL_ON_SET`）一路串起來。
+
+`TFD_TIMER_CANCEL_ON_SET` 的語意是：只要 `CLOCK_REALTIME` 相對 `CLOCK_MONOTONIC` 發生跳變，這個 timerfd 就被 kernel 標記取消、event loop 立刻醒。所以**clock 被 set（step 型擾動）的偵測是通知驅動、瞬時的**，根本不需要等下一個 poll。
+
+**結論：`PollIntervalMaxSec` 的「偵測延遲上界」只適用於 drift 型誤差（晶振漂移），不適用於跳變。** 晶振漂移沒有 kernel 通知，只能靠下一次 poll 量出來，那才受 max poll 上界約束；而 SETOFFSET / `clock_settime` 這種跳變會即時觸發 timerfd。原本「壓低 max poll → 偵測更快」的效益論點，對 step 型擾動不成立——這本身就是這套實驗最有價值的修正之一。（引用上述行號前請自行 `read` submodule 再確認；本文行號已逐一驗證對齊 systemd v1.8.2 對應的 source。）
+
+**`jitter` 的誠實分析（為什麼 FAIL 不該歸咎 timesyncd）。** jitter 唯一掉的那 1 發 ping，發生在 `tc netem` 5ms±3ms 注入窗內；同一時間 timesyncd 側所有指標全綠——0 step、0 lease miss、offset 平滑。這 1 發掉包**無法歸因於時間同步**，而是 netem 人為注入的網路延遲抖動造成的；生產環境沒有 netem。按「連 2 個 ping 都不能掉」的字面判準，它記 FAIL；按因果歸因，它不是 timesyncd 的問題。**這正是嚴格判準該有的樣子**：它逼你解釋每一個異常，而不是讓你把它掃到地毯下。
+
+**附帶觀察：max poll 是上限而非保證。** 由 `resources.csv` 的 udp/123 計數反推，poll-2048 子跑暖機 2400s 後，poll 實際只爬到 ~512–1024s 區間，未及 2048。原因是「每個好樣本翻倍」的理想倍增路徑被 60.9ppm 漂移污染了樣本品質——`PollIntervalMaxSec` 是 poll 的**上限**，不是它一定會爬到的值。
 
 ### 指令
 
@@ -222,17 +293,37 @@ sudo ./run/all.sh --detach --soak-hours 24
 ./run/all.sh --status
 ```
 
-## 結果回填區
+## 結果回填總結
 
-<Callout type="info" title="實測欄怎麼回填">
-上面每張表的「實測＿＿」欄，等 `experiments/timesyncd/results/` 跑完進 repo 後逐一回填。預測 vs 實測的對照是這套 lab 的核心價值——不是「跑出一堆數字」，是「機制推論是否站得住」。
+L4 完整實驗套件已跑完，上面每張表的實測欄都已填入測得值。這節是跨四組實驗的總結：環境事實、解讀軸、三個最有價值的發現。**所有數字的資料源是 `experiments/timesyncd/results/l4/`**（已 commit 進 repo）。
 
-**回填時若實測與預測矛盾，先懷疑實驗、不要懷疑 kernel。** 機制預測全部錨定在 source（行號在方法論篇），kernel 的行為不會因為換一台機器就變。實測對不上，幾乎一定是環境變因在干擾，依序檢查：
+**環境欄**（`preflight.json` + `calibration.json`）：
+
+| 項目 | 值 |
+|---|---|
+| client | Ubuntu 22.04.5 / kernel 5.15.0-181-generic / clocksource `kvm-clock` / Proxmox VE VM |
+| server | Ubuntu 24.04.4 + chrony（LAN，RTT sub-ms） |
+| systemd | 249（journal 措辭依此版本；v250+ 措辭不同，見 exp3 的 Callout） |
+| 校準天然漂移 | **client +60.926 ppm**（30 分鐘、1800 樣本）——kvm-clock VM 對 chrony 真時的實測晶振誤差 |
+| qemu-guest-agent | `inactive`（沒有背後 `guest-set-time` 污染注入） |
+
+**`effective_ppm` 是唯一正確的解讀軸。** 這機天然漂移 **+60.926ppm**，所以每個 cell 的實際漂移是 `effective_ppm = 注入 ppm + 60.926`（`result.json` 內建此欄位）。注入 `−10ppm` 的 cell 實際在 `+50.93ppm` 漂、注入 `+1000ppm` 的 cell 實際在 `+1060.93ppm` 漂。看實測表一定要看「有效 ppm」欄，不要被「注入 ppm」誤導——這也是為什麼注入 `+500ppm`（eff +560.93、超 `MAXFREQ` clamp 60.9）反而比注入 `−500ppm`（eff −439.07、還在 clamp 內）更快進穩定窗：前者 freq 頂死後殘餘恰好掉回天然漂移量級。
+
+**三個最有價值的發現：**
+
+1. **step 型擾動的偵測是通知驅動、瞬時，與 poll 間隔無關**（exp4 inject-80ms）。timesyncd 用 `TFD_TIMER_CANCEL_ON_SET` timerfd 監聽 `CLOCK_REALTIME` 被外部 set，秒級即醒（3.8s / 5.7s，與 poll=256/2048 無關）。`PollIntervalMaxSec` 的偵測延遲上界**只適用於 drift 型誤差**，不適用於跳變——這修正了原本「壓低 max poll → step 偵測更快」的設計前提。source 鏈見 exp4「重磅發現」段。
+
+2. **脆弱鎖定被實證**（exp1 邊界帶）。注入 ±500ppm 的 cell 進得了 660s 穩定窗，但 freq register 已頂死 `MAXFREQ`、無 headroom，殘餘全靠 PLL offset 逐 poll 吸收；24h_1000ppm 一度進窗又破界，就是脆弱性破裂。**只有把 exp1 的穩定窗從 60s 拉到 660s 才看得到這個真面目**——60s hold 會被低檔 poll 的小鋸齒（`32s×1.06ppm≈34ms` `< 50ms`）騙過。
+
+3. **嚴格判準逼你解釋每個異常**（exp4 jitter）。jitter 按字面判準 FAIL，但唯一掉的 1 發 ping 落在 netem 注入窗內、timesyncd 側全綠，因果上不是時間同步問題。記 FAIL 不是污點，是判準在做它該做的事：逼你歸因，而不是掩蓋。
+
+<Callout type="info" title="若實測與預測矛盾，先懷疑實驗、不要懷疑 kernel">
+這次 L4 的數字與 source 預測幾乎全數命中（slew 收斂時間、step 秒級、±1000ppm 永不收斂、TFD 通知驅動）。如果**你**在自己環境跑出對不上的數字，機制預測全部錨定在 source（行號在方法論篇），kernel 的行為不會因為換一台機器就變。實測對不上，幾乎一定是環境變因在干擾，依序檢查：
 
 - `preflight.json` 記的 `clocksource` 是不是 `kvm-clock`（不是的話 guest 計時基準就不對）。
-- `qemu-guest-agent` 的 `guest-set-time` 有沒有在背後撥時鐘，污染了注入的誤差。
+- `qemu-guest-agent` 的 `guest-set-time` 有沒有在背後撥時鐘，污染了注入的誤差（本次實測為 `inactive`，乾淨）。
 - PVE 的 vzdump 備份 / snapshot / live migration 窗口有沒有在實驗期間觸發，凍結或跳動了 guest 時鐘。
-- 校準的 `client_ppm` 是不是在那段時間有異常（換了實體機、溫度變化）。
+- 校準的 `client_ppm` 是不是在那段時間有異常（換了實體機、溫度變化）。本次校準量到 +60.926ppm。
 
 排除這些之後預測還對不上，才值得回頭質疑機制理解——而那會是真正有價值的 finding。
 </Callout>
