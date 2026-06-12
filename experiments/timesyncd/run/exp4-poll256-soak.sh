@@ -78,7 +78,7 @@ stop_monitors() {  # $1 = outdir
 
 soak() {  # $1 = outdir, $2 = 秒數, $3 = 中途動作（函式名，可空）
   local d=$1 secs=$2 action=${3:-}
-  trap 'stop_monitors "$d"; unblock_ntp; tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true; set_poll_max default || true' RETURN
+  trap 'trap - RETURN; stop_monitors "$d"; unblock_ntp; tc qdisc del dev "$CLIENT_IFACE" root 2>/dev/null || true; set_poll_max default || true' RETURN
   wait_synced 50 600 || { log "ERROR: baseline 收斂失敗，中止此情境（環境異常，請檢查 server）"; return 1; }
   start_monitors "$d"
   if [[ -n "$action" ]]; then
@@ -138,7 +138,7 @@ run_scenario() {
         sub="$outdir/poll-$poll"
         mkdir -p "$sub"
         if [[ "$poll" == 2048 ]]; then set_poll_max default; else set_poll_max 256; fi
-        trap 'stop_monitors "$sub"; set_poll_max default || true' RETURN
+        trap 'trap - RETURN; stop_monitors "$sub"; set_poll_max default || true' RETURN
         wait_synced 50 600 || { log "WARN: scenario $name 中止，未寫 verdict（重跑會自動重試）"; return 0; }
         start_monitors "$sub"
         warm=600

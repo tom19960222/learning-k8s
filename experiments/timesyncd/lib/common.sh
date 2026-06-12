@@ -171,7 +171,9 @@ run_recovery_cell() {
   local outdir=$1 offset_ms=$2 ppm=$3 timeout_s=$4 hold_s=${5:-60} rc=0 t0
   mkdir -p "$outdir"
   # trap：不管成功失敗都復原（恢復連線、清暫存器、停監視器）
-  trap 'stop_probe "$outdir/probe.csv"; [[ "${WITH_STEP_DETECTOR:-0}" == 1 ]] && stop_step_detector "$outdir/steps.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
+  # one-shot（trap - RETURN 開頭）：函式內設的 RETURN trap 會殘留到呼叫者 return 時再開火，
+  # 屆時 local 變數已出範圍（set -u 擊殺）——L4 實測教訓
+  trap 'trap - RETURN; stop_probe "$outdir/probe.csv"; [[ "${WITH_STEP_DETECTOR:-0}" == 1 ]] && stop_step_detector "$outdir/steps.csv"; reset_clock_state || log "WARN: cell 清理時 reset 失敗，續跑下一 cell"' RETURN
   reset_clock_state || { log "ERROR: cell 前置 reset 失敗，略過此 cell"; return 4; }
   inject_ppm "$ppm"
   if [[ "$offset_ms" != 0 ]]; then
