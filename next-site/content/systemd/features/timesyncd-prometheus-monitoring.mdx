@@ -164,6 +164,8 @@ node_exporter 的 timex collector 是預設開啟的；它輸出的 `node_timex_
 
 這裡有個很容易讀錯的細節：`node_timex_offset_seconds` 不是 node_exporter 每次 scrape 主動向 NTP server 重新量測；它是 kernel 目前還在修的 residual offset。它能告訴你「這台 node 看起來正在偏」，但不能直接替你量「node A 跟 node B 差幾毫秒」。
 
+> 這條 metric 怎麼從 `collector/timex.go` 一路被 `adjtimex(2)` 算出來（含 `STA_NANO` 決定 µs/ns 的 divisor、為什麼是 residual 而非即時量測），有一頁從三層原始碼逐行追完：[node_exporter — node_timex_offset_seconds 是怎麼算出來的](/systemd/features/node-exporter-timex-offset-source)。
+
 ## maxerror 跟 timedatectl 的關係
 
 `node_timex_maxerror_seconds` 不是 offset，而是 kernel 對目前 clock error 上界的估計。timesyncd 成功調整時會帶 `ADJ_MAXERROR | ADJ_ESTERROR`，struct 裡沒有填值，因此會把 maxerror / esterror 歸零；之後 kernel 會讓 maxerror 隨時間變大。
