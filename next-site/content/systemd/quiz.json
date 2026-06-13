@@ -245,5 +245,57 @@
     ],
     "answer": 0,
     "explanation": "受測物自報數據有兩個問題：更新頻率綁在 poll interval（32–2048s，遠粗於收斂判定需要的 1Hz）、且它是演算法內部狀態而非外部真值。probe 直接對 server 做 SNTP query（offset = ((T2−T1)+(T3−T4))/2 = server − client），LAN RTT sub-ms 對 50ms 判準綽綽有餘，並把 raw_s（MONOTONIC_RAW）一起落檔讓注入時刻可對齊。"
+  },
+  {
+    "id": 20,
+    "section": "🔬 推論 vs 實測對帳",
+    "question": "重啟影響那篇從原始碼推論 slew（慢慢修錶）會「在幾秒到幾分鐘內被慢慢吸收」。L4 實測後這個說法要怎麼修正？",
+    "options": [
+      "推論完全正確，slew 確實常常要好幾分鐘",
+      "slew 恆在十幾秒內完成（連最接近 0.4s 上限的 399ms 都只要 15.4s）——「幾分鐘」從不發生，因為只有 < 0.4s 的偏移才走 slew，更大的一律跳錶",
+      "實測發現 slew 比推論更慢，要好幾十分鐘",
+      "slew 跟 step 其實沒有分界，都是幾分鐘"
+    ],
+    "answer": 1,
+    "explanation": "slew 走相位滑動、指數衰減 τ≈7.5s，收斂到 50ms 的時間 ≈ ln(offset/50)×7.5。關鍵在於 timesyncd 只對 |offset| < NTP_MAX_ADJUST(0.4s) 走 slew，而 399ms 實測 15.4s、360ms 15.3s，都在十幾秒內。比 0.4s 大的偏移走 ADJ_SETOFFSET 跳錶（撥針一次到位，殘留 ppm 不大時 1.0s 鎖定）。所以 slew 恢復時間有天花板，「幾分鐘」是純讀原始碼時不確定衰減速度而保守寫大的上界。"
+  },
+  {
+    "id": 21,
+    "section": "🔬 推論 vs 實測對帳",
+    "question": "對「時鐘被外部 date -s / VM live migrate 撥了一下，timesyncd 多久發現」，poll 自適應篇說「即時、毫秒到秒級」，poll 調校篇說「最壞延遲 = 當下 poll interval」。L4 實測判哪邊對、為什麼？",
+    "options": [
+      "poll 調校篇對：要等下一次 poll 才看得到，最壞 2048 秒",
+      "兩篇都錯，實際要好幾分鐘",
+      "無法判定，兩種情況都會發生",
+      "poll 自適應篇對：跳變由 kernel 透過 TFD_TIMER_CANCEL_ON_SET 主動通知即時偵測（實測 3.8s/5.7s、與 poll 間隔無關），跟 poll 巡邏無關"
+    ],
+    "answer": 3,
+    "explanation": "manager_clock_watch（timesyncd-manager.c:206）掛在 TFD_TIMER_CANCEL_ON_SET timerfd 上，CLOCK_REALTIME 一被不連續撥動，kernel 立刻喚醒 timesyncd、它馬上重送 NTP request。實驗 4 注入 80ms 偏移，poll=256 與 poll=2048 兩種設定偵測延遲都是秒級且相當。關鍵區分：時鐘被『撥』（step 型）由 kernel 即時通知；晶振慢慢『漂』（drift 型）才靠 poll 巡邏、受 max poll 上界約束。poll 調校篇把跳變誤套進 poll-bound 模型。"
+  },
+  {
+    "id": 22,
+    "section": "🔬 推論 vs 實測對帳",
+    "question": "實驗 1 的邊界 cell（注入 ±400/±500ppm）顯示「跳錶之後不是立刻就鎖定」。這指的是什麼？",
+    "options": [
+      "跳錶失敗了，偏移根本沒被修掉",
+      "撥針 1 秒就把偏移撥到接近 0，但要讓時鐘『持續』待在 50ms 內（撐過 660s 穩定窗），得等 freq register 慢慢學到正確補償值，需 200–500s",
+      "鎖定需要重啟 timesyncd 才會發生",
+      "邊界 cell 跟一般 cell 的鎖定時間完全一樣"
+    ],
+    "answer": 1,
+    "explanation": "「修好偏移」與「鎖定不再漂」是兩件事。step 把當下偏移一次撥掉只要 1s，但殘留的晶振頻率誤差要靠 freq register 補償，而 PLL 把這個值學到位需數百秒（實測 eff −439ppm 用 500.1s、eff +460ppm 用 504.0s）。這也是實驗 1 判定窗要拉到 660s 的原因：用 60s 判會被『撥針剛到位、freq 還沒學好』的假象騙過去。"
+  },
+  {
+    "id": 23,
+    "section": "🔬 推論 vs 實測對帳",
+    "question": "這次「純讀原始碼推論 vs 實測」對帳，純推論最常見的系統性偏差是什麼？",
+    "options": [
+      "不確定時往悲觀寫：原始碼看得到『會做什麼』、看不到『多快』，於是把上界開大——實測幾乎都比推論的悲觀上界快",
+      "原始碼推論總是過度樂觀，實測都更慢",
+      "原始碼推論的定性結論大多是錯的",
+      "原始碼根本無法推論任何時序行為"
+    ],
+    "answer": 0,
+    "explanation": "對帳結果：定性幾乎全對（slew/step 0.4s 分界、step 秒級、±500ppm 硬牆都精準命中），定量偏悲觀（『幾分鐘』其實十幾秒、『等一輪 poll』對跳變其實即時）。純推論的兩個盲點：一是不知道動態多快只好保守；二是一次只追一條 call path，難發現它跟另一篇的隱含假設衝突（manager_clock_watch 這條 kernel 通知路徑就是兩篇打架才被揪出）。誠實標註『source 推不出固定秒數』的地方，後續實測能乾淨補上數字。"
   }
 ]

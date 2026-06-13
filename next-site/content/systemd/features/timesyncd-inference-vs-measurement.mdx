@@ -1,0 +1,130 @@
+---
+layout: doc
+title: timesyncd — 純讀原始碼的推論，搭 VM 實測後對帳
+description: 前面八篇 timesyncd 文章都只從原始碼推導行為，沒跑過真機。後來真的搭了兩台 Proxmox VM 把四組實驗跑完，這篇是事後對帳：當初從 source 推出的結論，哪些精準命中、哪些要修、哪些根本是邏輯錯。重點放在使用者最在意的「時間偏移後恢復要多久」——答案從含糊的「幾秒到幾分鐘」收斂成「慢慢修錶恆在十幾秒內、直接撥針恆在 1 秒」。也揪出一個兩篇文章互相矛盾、被實測一槌定音的案例。
+---
+
+## 為什麼要對帳
+
+這個 systemd 系列前面有八篇文章，全部是**只讀原始碼**寫出來的——`src/timesync/` 跟 `linux/kernel/time/` 翻到底，推論「timesyncd 遇到 X 會怎樣」。但從頭到尾沒在真機上跑過一次。原始碼能告訴你「程式會呼叫哪個 syscall」，可是「呼叫之後時鐘實際多久才追回來」是 kernel 的時間紀律（time discipline）跑出來的動態結果，光看程式碼推不出精確秒數。
+
+後來真的搭了兩台 Proxmox VM（一台受測、一台當 NTP server），把四組實驗跑完，過程與結果在 [實驗方法論](/systemd/features/timesyncd-drift-lab-methodology) 與 [實驗與結果](/systemd/features/timesyncd-drift-lab-experiments) 兩篇。這篇不重複實驗細節，只做一件事：**把當初純推論的每一條結論，跟實測擺在一起對帳**，老實標出哪些對、哪些錯。
+
+先講幾個名詞，免得後面看不懂（完整版在方法論篇的「背景小教室」）：
+
+- **offset**：你的時鐘跟正確時間差多少。`+50ms` = 你快了 50 毫秒。
+- **slew（慢慢修錶）**：不直接撥針，而是讓時鐘走快或走慢一點點，自己慢慢追上正確時間。時間軸連續、不會倒退。
+- **step（直接撥針）**：一次把時鐘撥到正確時間。時間軸有一個瞬間跳變。
+- **ppm**：晶振走得多不準，百萬分之幾。`100ppm` ≈ 一天快或慢 8.6 秒。
+- **poll**：timesyncd 多久問一次 NTP server「現在幾點」，預設 32 秒到 2048 秒之間自動調。
+
+## 總對帳表
+
+這張表怎麼讀：每一列是一條當初從原始碼推出的結論，中間是預測、右邊是實測，最右是判定。判定分三種——✅ 推論成立、🔧 方向對但要修正、⚠️ 邏輯有錯。
+
+| # | 當初的推論 | 來源文章 | 實測結果 | 判定 |
+|---|---|---|---|---|
+| 1 | 偏移 `< 0.4s` 走 slew、`≥ 0.4s` 走 step | 多篇 | 399ms = 130 筆平滑小步；401ms = 單筆跳錶。分界精準在 0.4s | ✅ |
+| 2 | step「一次把整個 offset 撥掉」，跟幅度無關 | restart-impact / outage | 撥針都是一次到位；殘留 ppm 不大的 step cell 全 `1.0s` 鎖定，offset 從 1.44 秒到 8.64 秒一樣快（撥多遠不影響） | ✅ |
+| 3 | slew「在幾秒到幾分鐘內被慢慢吸收」 | restart-impact | slew 恆在十幾秒內：360ms→`15.3s`、399ms→`15.4s`。**「幾分鐘」從未發生** | 🔧 |
+| 4 | slew 收斂時間「不是 source 能推成固定秒數」 | poll-tuning / outage | 是指數衰減 `τ≈7.5s`，`ln(offset/50)×7.5` 算得出來 | ✅ hedge 對，現補上公式 |
+| 5 | slew 機制是「微調 tick frequency」 | restart-impact | 機制其實是相位滑動（phase slew），不是調晶振走速 | 🔧 機制描述不精確 |
+| 6 | 外部改時鐘 → 立即偵測、毫秒到秒級 | poll-interval-adaptation | 注入後 `3.8s` / `5.7s` 偵測，且**跟 poll 間隔無關** | ✅ |
+| 7 | 「RTC 突然抽一下，最壞延遲 = poll interval」 | poll-tuning | 跳變由 kernel 主動通知即時偵測，**跟 max poll 無關** | ⚠️ 與 #6 自相矛盾，實測判 #6 對 |
+| 8 | kernel 校頻能力上限 ±500ppm | （freq register） | 注入 ±1000ppm 的 cell 永遠收不乾淨，freq 頂死在 `-500.0` | ✅ |
+| 9 | step 之後就鎖定了 | （隱含） | 鎖定不是瞬間的：邊界 cell 要 `200–500s` 讓校頻走到位 | 🔧 |
+| 10 | 低 max poll + jitter 會把時鐘搞到失穩 | low-max-poll-sim | max=256 配 5ms±3ms 抖動：0 次跳變、offset 平滑 | 🔧 沒那麼嚴重 |
+| 11 | 穩定環境 6 輪從 32 爬到 2048 | poll-interval-adaptation | 在天然漂 +61ppm 的 VM 上只爬到 ~512–1024，沒爬滿 | 🔧 |
+
+下面分三組講細節。
+
+## 第一組：推論成立的（source 真的夠用）
+
+**0.4 秒這條分界線，精準到不可思議。** 八篇文章反覆引用 `NTP_MAX_ADJUST = 0.4`（`systemd/src/timesync/timesyncd-manager.c:52`），說偏移絕對值小於它走 slew、大於等於它走 step。實驗 2 就是拿 399ms 跟 401ms 去戳這條線：差 1 毫秒，行為天差地別——399ms 跑出 130 筆單調遞減的小步（每步 `< 6ms`、絕不倒退），401ms 是單獨一筆 `-401ms` 的跳錶。原始碼那行 `if` 判斷怎麼寫的，時鐘就怎麼動，分毫不差。
+
+**step 的「跟幅度無關」，比想像的還乾脆。** 推論說跳錶是「一次把整個 offset 加上去」，撥多遠都一次到位。實測：殘留 ppm 不大的 step cell，不管初始偏移是 1.44 秒還是 8.64 秒，鎖定時間全是 `1.0s`——撥針這個動作確實不在乎要撥多遠。
+
+要小心一個讀數陷阱：這裡講的「`1.0s`」是**偏移小、晶振也不太歪**的 cell。如果晶振歪到逼近 ±500ppm 上限（實驗 1 的邊界 cell），撥針一樣 1 秒把偏移撥掉，但「持續鎖定」要等校頻走到位、得幾百秒（見下面修正三）。還有，注入 ±1000ppm 那種 offset 高達 86.4 秒的極端 cell，是**永遠收不乾淨**的（撥針撥掉後又被淨漂移帶走），不在這條「秒級」結論裡。換句話說：**撥針的「快」只取決於是不是 step，鎖定的「穩」才取決於殘留 ppm。**
+
+**「不要硬寫死收斂秒數」這個謹慎，是對的。** 這點要特別給 [從 metrics 推 poll 設定](/systemd/features/timesyncd-poll-tuning-from-metrics) 那篇記一功。它當時明確寫：「slew 實際多久收斂是 kernel time discipline 的結果，不是這份 source 能直接推成固定秒數」，還說「不能只看 source 就寫出『Case B 一定 10 分鐘修完』這種固定數字」。這個自我克制完全正確——而實驗正好把它沒敢寫的那個數字補上了：slew 是指數衰減，時間常數 `τ ≈ 7.5s`（32 秒 poll 下），收斂到 50ms 以內的時間 `≈ ln(offset/50) × 7.5`。360ms 代進去算 `≈15s`，實測 `15.3s`。當年不寫死是對的；現在能寫死了。
+
+**±500ppm 是真的硬牆。** kernel 用一個叫 freq register 的格子記「要把晶振當成快或慢多少來補償」，這個值被夾在 ±500ppm（`MAXFREQ`，`linux/include/linux/timex.h:136`）。推論說晶振歪超過這個量就補不回來。實驗注入 ±1000ppm，六個 cell 全部跑到 30 分鐘超時、永遠收不乾淨；清理現場時抓到 freq register 頂死在 `-500.0`——它已經用盡全力反向補償，還是輸給注入的漂移。硬牆確實存在。
+
+## 第二組：方向對但要修正的
+
+這組是這篇的重點，尤其第一條正是「**時間偏移後恢復要多久**」這個問題。
+
+**修正一：slew 的恢復時間沒有「幾分鐘」這回事。** [重啟影響](/systemd/features/timesyncd-restart-impact) 那篇寫 slew 是「offset 在幾秒到幾分鐘內被慢慢吸收」。「幾秒」對，「幾分鐘」錯——而且是結構性地錯。原因很簡單：**只有偏移小於 0.4 秒才會走 slew**，而連最接近上限的 399ms 都只花 15.4 秒就修進 50ms。比這更大的偏移一律走跳錶（1 秒搞定），根本輪不到 slew。所以 slew 的恢復時間有個天花板：**永遠在十幾秒內**，不可能拖到幾分鐘。當初寫「幾分鐘」是因為純看程式碼時，不知道相位滑動衰減得多快，只能保守地把上限開大——這正是純推論的典型偏差：不確定就往悲觀寫。
+
+**修正二：slew 的機制不是「微調晶振走速」。** 同一段還寫 slew 是「微調 tick frequency」。這個描述把兩件事混在一起了。kernel 修錶其實有三套獨立機制（方法論篇拆得很細）：相位滑動（slew，改的是「現在差多少」）跟頻率補償（改的是「晶振走多快」）是不同的暫存器、不同的上限。timesyncd 修一個臨時偏移走的是相位滑動，不是去動晶振走速。實務上對「會不會跳、多久好」的結論不受影響，但機制圖像當時畫歪了，方法論篇已經正名。
+
+**修正三：跳錶之後不是立刻就鎖定。** 直覺上「撥針一次就到正確時間，那不就穩了嗎」。實驗 1 的邊界 cell 給了反直覺的答案：撥針確實 1 秒就把偏移撥到接近 0，但要讓時鐘**持續**待在 50ms 內（撐過 660 秒穩定窗），得等 freq register 慢慢學到正確的補償值，這要 `200–500 秒`。換句話說，「修好偏移」跟「鎖定不再漂」是兩件事，後者慢得多。這也是為什麼實驗 1 的判定窗口要拉到 660 秒——用 60 秒判會被「撥針剛到位、但還沒鎖定」的假象騙過去。
+
+**修正四：低 max poll 把時鐘搞失穩，沒那麼容易發生。** [低 max poll 模擬](/systemd/features/timesyncd-low-max-poll-simulation) 那篇擔心：poll 壓太低、PLL 反應變太快，網路 jitter 會被放大進時鐘，偏移變成 sawtooth 波形、偶爾踩到 50ms 門檻。實驗 4 的 jitter 情境就是來驗這個：max poll 壓到 256 秒、人為注入 5ms±3ms 的網路延遲抖動跑一小時。結果時鐘側全綠——0 次跳變、offset 平滑、唯一掉的那 1 個 ping 是 netem 注入的網路抖動造成、跟時鐘無關。那篇最強的警告是針對 max=32/64 的；我測的 256 介於它建議的安全值 512 之下，仍然撐住了。所以結論要收斂一點：**jitter 放大進時鐘的危險區，比模擬文章的語氣要窄**；中等抖動配 256 秒 poll 在時鐘層面是安全的。
+
+**修正五：穩定環境不一定爬得到 max poll。** [poll 自適應](/systemd/features/timesyncd-poll-interval-adaptation) 推論穩定 cluster 會「每輪偏移都小於 50ms → 每次翻倍 → 6 輪從 32 爬到 2048」。實測在這台天然漂 +61ppm 的 VM 上，poll 暖機 2400 秒後只爬到 ~512–1024 秒區間，沒到 2048。原因是「每個好樣本就翻倍」的理想路徑被 61ppm 的漂移污染了樣本品質，偶爾一筆偏移超過門檻就把翻倍打斷。`PollIntervalMaxSec` 是 poll 的**上限**，不是它保證會爬到的值——這對「按 max poll 算偵測延遲」的推算是個提醒：實際 poll 可能比設定的 max 短。
+
+## 第三組：邏輯有錯的（兩篇打架，實測當裁判）
+
+這是最有價值的一條，因為它不是「數字估歪」，是**兩篇文章對同一件事給了相反的說法**，而當初純看原始碼時我沒發現它們矛盾。
+
+爭點是：**時鐘被外部「撥」了一下（例如 `date -s`、VM live migrate、RTC 抽一下），timesyncd 多久發現？**
+
+- [poll 自適應](/systemd/features/timesyncd-poll-interval-adaptation) 說：外部改 `CLOCK_REALTIME` 會走 Branch 1、**立即**把 poll 拉回 min，速度「毫秒到秒級」。
+- [poll 調校](/systemd/features/timesyncd-poll-tuning-from-metrics) 卻說：「RTC 突然抽一下」的「看到異常的最壞延遲 = 當下 poll interval」——也就是要**等到下一次 poll** 才看得到，最壞 256 秒甚至 2048 秒。
+
+一個說即時、一個說要等一輪。差了三個數量級。
+
+實驗 4 的注入測試直接當裁判：穩態下注入 80ms 偏移，量多久被偵測到。兩種 poll 設定（256 跟 2048）的偵測延遲是 `3.8s` 跟 `5.7s`——**都是秒級，而且跟 poll 間隔無關**。`poll 自適應` 那篇對了。
+
+為什麼？追到原始碼才發現關鍵機制：timesyncd 不是只靠定期 poll 去「巡邏」時鐘有沒有被動，它還掛了一個 kernel 通知。當 `CLOCK_REALTIME` 被外部不連續地撥動，kernel 透過一個叫 `TFD_TIMER_CANCEL_ON_SET` 的 timerfd **主動敲門**通知 timesyncd，它收到就立刻重新對時：
+
+先看收到通知後做什麼——log 一行「時間被改了，重新同步」然後馬上送出 NTP request：
+
+```c File: systemd/src/timesync/timesyncd-manager.c:206
+static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        /* rearm timer */
+        manager_clock_watch_setup(m);
+
+        /* skip our own jumps */
+        if (m->jumped) {
+                m->jumped = false;
+                return 0;
+        }
+
+        /* resync */
+        log_debug("System time changed. Resyncing.");
+        m->poll_resync = true;
+
+        return manager_send_request(m);
+}
+```
+
+這個監聽是 `manager_clock_watch_setup`（`:226`）→ `event_add_time_change`（`systemd/src/libsystemd/sd-event/event-util.c:129`）→ `time_change_fd()`（`systemd/src/basic/time-util.c:1837`，註解明寫用 `TFD_TIMER_CANCEL_ON_SET`）一路串起來的。`TFD_TIMER_CANCEL_ON_SET` 的語意就是：只要 `CLOCK_REALTIME` 相對 `CLOCK_MONOTONIC` 跳了一下，這個 fd 立刻被 kernel 標記、event loop 馬上醒。
+
+所以正確的圖像是：
+
+- **時鐘被「撥」一下（step 型擾動）**：kernel 主動通知，**即時**偵測，跟 max poll 完全無關。
+- **晶振慢慢「漂」（drift 型誤差）**：沒有 kernel 通知，只能等下一次 poll 量出來，**這才受 max poll 上界約束**。
+
+`poll 調校` 那篇的錯在於：它把「RTC 突然抽一下」（明明是個跳變）也套進「等下一筆 NTP reply」的 poll-bound 模型。跳變不等 poll，drift 才等 poll。兩篇沒打架的話這個區別不會浮現——是實測逼出來、才回頭在原始碼裡找到 `manager_clock_watch` 這條當初漏看的路徑。
+
+這也連帶修正了一個調校建議：`poll 調校` 把「想盡快偵測 RTC 異常」當成壓低 max poll 的理由之一。但如果那個異常是時鐘被撥（最常見的 RTC 故障型態），它本來就即時被抓到，壓低 max poll 對它沒幫助；壓低 max poll 只加快「晶振慢慢漂」的偵測。理由站得住的是後半句，不是前半句。
+
+## 純讀原始碼，系統性會偏哪邊
+
+把這次對帳的錯誤歸個類，給未來只能讀 source、暫時沒環境實測時一個提醒：
+
+- **不確定就往悲觀寫**：「幾秒到幾分鐘」「最壞 = poll interval」都是把上界開大。實測幾乎都比推論的悲觀上界快。原始碼看得到「會做什麼」，看不到「多快」，於是保守。
+- **看得到單一路徑，看不到路徑之間打架**：`manager_clock_watch` 這條 kernel 通知路徑，每篇文章單獨看都沒寫錯，但兩篇對「RTC 抽一下」的描述放在一起才露出矛盾。一次只追一條 call path，很難發現它跟另一篇的隱含假設衝突。
+- **機制細節容易混**：相位滑動 vs 頻率補償，純看程式碼（兩者都在動 `struct timex`）很容易當成同一件事。要等實驗把「改偏移」跟「改走速」分開注入，才看得出它們上限不同、行為不同。
+
+好消息是：**只要推論時誠實標註「這條 source 推不出固定秒數」，後續實測就能乾淨地把數字補進去**，而不是發現整個結論垮掉。這次八篇裡真正的邏輯錯只有一條（而且是兩篇互相矛盾、本來就該被抓到的），其餘都是方向對、待校準——對「純讀原始碼」這個方法來說，算是相當好的成績單。
+
+## 一句話結論
+
+當初從原始碼推「時間偏移後多久恢復」，**定性全對、定量偏悲觀**：slew/step 的分界、step 的秒級、±500ppm 硬牆都精準命中；而「幾分鐘」其實是「十幾秒」、「等一輪 poll」其實對跳變是「即時」。最值得記住的一課是：**時鐘被撥（step）和晶振漂移（drift）是兩種完全不同的偵測路徑**——前者 kernel 即時敲門、後者才靠 poll 巡邏，這個區別純看單篇原始碼追不出來，是兩篇打架加上實測才釘死的。
+
+延伸閱讀：[實驗方法論](/systemd/features/timesyncd-drift-lab-methodology)、[四組實驗與結果](/systemd/features/timesyncd-drift-lab-experiments)、[重啟影響](/systemd/features/timesyncd-restart-impact)、[失聯與維護](/systemd/features/timesyncd-outage-and-maintenance)、[poll 自適應](/systemd/features/timesyncd-poll-interval-adaptation)、[從 metrics 推 poll 設定](/systemd/features/timesyncd-poll-tuning-from-metrics)。
