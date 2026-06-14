@@ -312,6 +312,57 @@ class TestAnalyze(unittest.TestCase):
             p = self._run("soak-verdict", "--dir", d, ok=False)
             self.assertEqual(p.returncode, 3)
 
+    def test_soak_verdict_jitter_mode(self):
+        # jitter 掛階：netem 注入丟包（ping 必掉，不算 timesyncd 的錯）、
+        # 真問題是時鐘有沒有失穩 → 看 offset 是否守在 50ms 內、0 step、0 lease miss
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "ping.txt"), "w") as f:
+                f.write("10000 packets transmitted, 9500 received, 5% packet loss, time 100000ms\n")
+            with open(os.path.join(d, "steps.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,jump_ms\n")
+            with open(os.path.join(d, "sentinel.csv"), "w") as f:
+                f.write("raw_s,wall_s,kind,wall_elapsed_ms,raw_elapsed_ms\n")
+            with open(os.path.join(d, "journal-errors.txt"), "w") as f:
+                f.write("")
+            write_csv(os.path.join(d, "probe.csv"),
+                      [(100.0 + t, 0, f"{20.0 - 0.0 * t:.3f}", 0.2, "") for t in range(200)])
+            # ignore-ping：5% 丟包不該害它 FAIL；offset 守在 20ms < 50ms → PASS
+            p = self._run("soak-verdict", "--dir", d, "--step-min-ms", "50",
+                          "--ignore-ping", "--offset-max-ms", "50")
+            self.assertIn("PASS", p.stdout)
+            # offset 飆到 80ms（時鐘真失穩）→ FAIL
+            with open(os.path.join(d, "probe.csv"), "a") as f:
+                f.write("400.0,0,80.0,0.2,\n")
+            p = self._run("soak-verdict", "--dir", d, "--step-min-ms", "50",
+                          "--ignore-ping", "--offset-max-ms", "50", ok=False)
+            self.assertEqual(p.returncode, 3)
+            self.assertIn("FAIL", p.stdout)
+
+    def test_soak_verdict_rolling_median_filters_jitter(self):
+        # 時鐘其實穩在 ~3ms，但探針每 8 筆被 jitter 打出一個 ±70ms 尖刺（少數）：
+        # raw peak = 70 > 50（探針雜訊）→ raw 模式 FAIL；滾動中位數濾掉少數尖刺 → window 模式 PASS
+        with tempfile.TemporaryDirectory() as d:
+            for name, hdr in (("ping.txt", None), ("steps.csv", "raw_s,wall_s,kind,jump_ms\n"),
+                              ("sentinel.csv", "raw_s,wall_s,kind,wall_elapsed_ms,raw_elapsed_ms\n"),
+                              ("journal-errors.txt", "")):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write("200 packets transmitted, 200 received, 0% packet loss\n"
+                            if hdr is None else hdr)
+            rows = []
+            for t in range(200):
+                off = 70.0 if t % 8 == 0 else (-70.0 if t % 8 == 4 else 3.0)
+                rows.append((100.0 + t, 0, f"{off:.3f}", 0.2, ""))
+            write_csv(os.path.join(d, "probe.csv"), rows)
+            # raw peak 模式（window 預設 0）：單筆尖刺 70 破 50 → FAIL
+            p = self._run("soak-verdict", "--dir", d, "--step-min-ms", "50",
+                          "--ignore-ping", "--offset-max-ms", "50", ok=False)
+            self.assertEqual(p.returncode, 3)
+            # window=31 滾動中位數：尖刺是少數、被中位數濾掉，剩真實時鐘 ~3ms → PASS
+            p = self._run("soak-verdict", "--dir", d, "--step-min-ms", "50",
+                          "--ignore-ping", "--offset-max-ms", "50", "--offset-window", "31")
+            self.assertIn("PASS", p.stdout)
+            self.assertIn("median", p.stdout)
+
     def test_convergence_resets_on_probe_gap(self):
         # 50 筆好樣本 → probe 斷流 10s → 再 65 筆好樣本：第一段作廢，從第二段起算
         with tempfile.TemporaryDirectory() as d:

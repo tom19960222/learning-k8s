@@ -1,0 +1,98 @@
+---
+layout: doc
+title: timesyncd — PollIntervalMaxSec=256 到底能扛多爛的網路
+description: 不問收斂快慢，只問穩定性：把對時間隔上限壓到 256 秒後，timesyncd 的時鐘在多惡劣的網路下才會失穩。用 IFB 雙向對稱整形隔離出 PLL 對雜訊的真實耐受、用滾動中位數濾掉探針自己的量測雜訊，一階一階加重延遲抖動與丟包，畫出 256s 的網路惡化耐受地圖；並把「不對稱路徑會把時鐘偏掉約延遲一半、且與 poll 無關」這個常被誤判成「256s 不穩」的陷阱單獨拆開。
+---
+
+## 場景
+
+前面 [drift lab 實驗篇](/systemd/features/timesyncd-drift-lab-experiments) 的實驗 4 已經回答過「把 `PollIntervalMaxSec` 從預設 2048 秒壓到 256 秒，在乾淨網路下穩不穩」——答案是穩（4 小時 soak、90 萬個 ping 0 丟包、0 step、0 lease miss）。
+
+但對一個「連 2 個 ping 都不能掉、5 秒 downtime 都不可接受」的 ceph 生產環境，乾淨網路下的全綠還不夠。真正想知道的是：**256s 到底能扛多爛的網路？它從哪裡開始壞？** 這頁專門回答這個——收斂時間的問題前面都有了，這裡只談穩定性的「壓力上限」。
+
+## 名詞速查
+
+- **jitter（抖動）**：網路延遲不固定、忽快忽慢。NTP 最怕這個，因為它靠來回時間估算時鐘差。
+- **netem**：Linux 內建的網路模擬工具，可以人為注入延遲、抖動、丟包來壓測。
+- **offset（偏移）**：時鐘跟正確時間差多少。`< 50ms` 是 ceph 的紅線。
+- **對稱 vs 不對稱整形**：netem 預設只整形「出向」封包（送出去的），造成來回路徑不對稱。要模擬真實的對稱壞網路，得用 **IFB** 這個技巧把「進來」的封包也一起整形（下面方法論會解釋為什麼這很關鍵）。
+- **滾動中位數**：把一串忽高忽低的量測值，取每段的中位數，濾掉零星尖刺、留下真正的趨勢。
+
+## 256s 相對 2048s，只改了兩件事
+
+從原始碼看，把 `PollIntervalMaxSec` 壓到 256 只動兩個東西：
+
+1. **問 NTP 的頻率**：封包量 ×8（每 ~4 分鐘一個 76-byte UDP）。微不足道，**不可能造成不穩**。
+2. **PLL 的 time constant**：poll 越短、修錶迴路反應越快，但對單筆網路雜訊越敏感。**這是唯一講得出來的穩定性風險**——也正是這次要壓測的對象。
+
+[把 PollIntervalMaxSec 壓低會怎樣](/systemd/features/timesyncd-low-max-poll-simulation) 那篇從理論推演過：壓低 max poll 會降低抗雜訊能力，擔心 jitter 被放大進時鐘、offset 變成 sawtooth 踩穿 50ms。這頁就是來實測這個擔憂到底成不成立、在多大的 jitter 下才成立。
+
+## 量測方法論：兩個非做不可的修正
+
+這次實驗最花工夫的不是跑，是**確保量到的是「時鐘穩不穩」，而不是量測工具自己的假象**。煙霧測試一開始就踩到兩個坑，都修掉了：
+
+### 坑一：netem 只整形出向 → 路徑不對稱 → 時鐘被偏掉，但與 poll 無關
+
+`tc netem` 掛在預設的 root qdisc 上，**只延遲送出去的封包**，回來的不延遲。這讓 NTP 的來回路徑不對稱，offset 估計被系統性偏掉約「延遲的一半」。煙霧實測：
+
+| 注入 | probe 量到的 offset |
+|---|---|
+| 無 | 1.9ms |
+| 只延遲出向 80ms | **42.0ms**（≈ 80÷2 的偏移） |
+| 雙向對稱 80ms（IFB） | **1.9ms**（offset 不被偏） |
+
+這個偏移很重要但**容易被誤讀**：它在任何 poll interval 都會發生（是 NTP「來回路徑對稱」這個假設破裂，不是 256s 的鍋）。如果照「只整形出向」去跑，會得到「256s 在 80ms 抖動就快爆了」的錯誤結論。所以要測「256s 的 PLL 耐受」，延遲必須**對稱**——用 IFB 把進向封包也導去整形。本實驗因此分兩種模式：
+
+- **sym（對稱，IFB 雙向）**：來回都延遲，offset 不被偏，純粹隔離「PLL 對雜訊／樣本被餓死」的耐受——這才是 256s 真正的問題。
+- **asym（不對稱，只整形出向）**：當對照，量化「路徑不對稱 → 偏移 ≈ 延遲/2」這個 poll 無關的效應，順便標出它的膝點。
+
+### 坑二：重 jitter 下，單發探針自己就會跳 ±幾十毫秒
+
+獨立探針是「單發 SNTP 查詢」，每筆的誤差 ≈ `(出向抖動 − 回向抖動)/2`。在 ±40ms 抖動下，**單筆 offset 讀數就能跳到 ±40ms，即使時鐘本身穩如泰山**。煙霧實測 j40（對稱 40±40ms）：raw 單筆 peak 53ms，但全程中位數只有 −1.1ms、滾動中位數 peak 6.2ms——時鐘其實準到 1ms，那 53ms 全是探針自己的封包被打到的雜訊。
+
+所以判準改用**滾動中位數**（視窗 31 秒）：零均值的量測雜訊被濾掉，留下時鐘真正的慢變偏移。這也跟 ceph 的實際感受一致——ceph 的 timecheck 看的是持續性偏移，不會被單筆網路尖刺觸發。
+
+## 階梯設計
+
+全程 `PollIntervalMaxSec=256`。每階獨立判準（jitter 模式）：**offset 滾動中位數全程 `< 50ms`、0 次非預期 step、0 次 5 秒 lease miss**；ping 因 netem 注入必掉、只當參考不作判準。
+
+這張表怎麼讀：mode 欄 sym=雙向對稱（測 PLL 耐受）、asym=只出向（測路徑不對稱偏移）。由乾淨錨點 → 不對稱延遲找膝點 → 對稱抖動加重 → 對稱丟包加重。
+
+| # | tier | mode | 注入 | 在測什麼 | 時長 |
+|---|---|---|---|---|---|
+| 0 | clean | clean | 無 | 乾淨 256s 錨點 | 1.5h |
+| 1–4 | a40 / a80 / a120 / a200 | asym | 出向延遲 40 / 80 / 120 / 200ms | 路徑不對稱偏移 ≈ 延遲/2 的膝點 | 各 2h |
+| 5–9 | j10…j250 | sym | 對稱延遲抖動 10±10 → 250±250ms | PLL 對抖動的真實耐受 | 各 2.5h |
+| 10–13 | loss10…loss75 | sym | 對稱丟包 10 / 30 / 50 / 75% | 樣本被餓死、靠 freq 補償撐 free-run | 各 2.5h |
+| | **合計** | | | | **≈ 32h** |
+
+## Source 推導預測
+
+預測都標「機制推論」，跑完回填實測對照。
+
+- **對稱抖動（sym jitter）→ 預測一路 PASS，可能到 250±250ms 都不破**。理由：NTP 的 offset 估計 `((T2−T1)+(T3−T4))/2` 對「對稱」延遲大致抵銷；加上 spike rejection 會丟掉雜訊樣本，不讓它污染時鐘。抖動主要灌進 `delay` 與 jitter 統計、觸發 poll 變密，但時鐘本身靠 freq 補償守住。
+- **對稱丟包（sym loss）→ 預測一路 PASS，含 75%**。理由：丟包只是讓有效樣本變稀，樣本空檔時鐘靠 freq 補償 free-run；殘餘 ppm 學會後極小（`< 1ppm`），就算空檔拉長，漂移也遠不到 50ms。
+- **不對稱延遲（asym）→ 預測在 a120 附近破界**。偏移 ≈ 延遲/2：a40→20ms（PASS）、a80→40ms（PASS，貼線）、a120→60ms（**FAIL**）、a200→100ms（FAIL）。**膝點 ≈ 出向延遲 100ms（偏移 50ms）**——但這條是「路徑不對稱」的鍋、**與 256s 無關**，預設 2048 也一樣會破。
+
+**如果預測成立，這頁的結論會是**：256s 對「對稱的網路惡化（抖動、丟包）」異常耐操——因為 NTP 的 offset 估計對對稱延遲免疫、spike rejection 擋雜訊、freq 補償撐丟包；真正能把時鐘推過 50ms 的是**路徑不對稱**，而那跟 poll interval 無關。換句話說，**256s 的穩定性不是問題，網路對稱性才是**。
+
+## 實測結果
+
+> 跑完回填。資料源 `experiments/timesyncd/results/exp5/`，由 `experiments/timesyncd/run/exp5-jitter-sweep.sh` 產生。
+
+＿＿（在你環境跑後對照）
+
+## 指令
+
+```bash
+# 全 14 階耐受地圖（detached、斷點續跑、約 32h）
+sudo ./run/exp5-jitter-sweep.sh --detach
+
+# 部署後煙霧（clean + asym + sym 各 1 階，~90s）
+sudo ./run/exp5-jitter-sweep.sh --smoke
+
+# 隨時查進度（SSH 重連也行）
+./run/exp5-jitter-sweep.sh --status
+```
+
+延伸閱讀：[drift lab 實驗篇](/systemd/features/timesyncd-drift-lab-experiments)（實驗 4 的乾淨 soak 與 inject）、[把 PollIntervalMaxSec 壓低會怎樣](/systemd/features/timesyncd-low-max-poll-simulation)（這頁要驗的理論來源）、[從 metrics 推 poll 設定](/systemd/features/timesyncd-poll-tuning-from-metrics)（256 的取捨）。

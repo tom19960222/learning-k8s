@@ -421,9 +421,9 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: path.join(REPO_ROOT, 'systemd'),
     color: 'sky',
     accentClass: 'border-sky-500 text-sky-400',
-    features: ['timesyncd-restart-impact', 'timesyncd-outage-and-maintenance', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics', 'timesyncd-prometheus-monitoring', 'timesyncd-drift-lab-methodology', 'timesyncd-drift-lab-experiments', 'timesyncd-inference-vs-measurement', 'node-exporter-timex-offset-source'],
+    features: ['timesyncd-restart-impact', 'timesyncd-outage-and-maintenance', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics', 'timesyncd-prometheus-monitoring', 'timesyncd-drift-lab-methodology', 'timesyncd-drift-lab-experiments', 'timesyncd-inference-vs-measurement', 'timesyncd-poll256-stress', 'node-exporter-timex-offset-source'],
     featureGroups: [
-      { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact', 'timesyncd-outage-and-maintenance', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics', 'timesyncd-drift-lab-methodology', 'timesyncd-drift-lab-experiments', 'timesyncd-inference-vs-measurement'] },
+      { label: '時間同步 (timesyncd)', icon: '🕒', slugs: ['timesyncd-restart-impact', 'timesyncd-outage-and-maintenance', 'timesyncd-log-anatomy', 'timesyncd-poll-interval-adaptation', 'timesyncd-low-max-poll-simulation', 'timesyncd-poll-tuning-from-metrics', 'timesyncd-drift-lab-methodology', 'timesyncd-drift-lab-experiments', 'timesyncd-inference-vs-measurement', 'timesyncd-poll256-stress'] },
       { label: 'Prometheus 監控', icon: '📈', slugs: ['timesyncd-prometheus-monitoring', 'node-exporter-timex-offset-source'] },
     ],
     usecases: [],

@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import statistics
 import sys
 
 
@@ -129,16 +130,24 @@ def cmd_soak_verdict(args):
     d = args.dir
     checks = []  # (name, value_desc, ok)
     ping_path = os.path.join(d, "ping.txt")
+    ignore_ping = getattr(args, "ignore_ping", False)
     if os.path.exists(ping_path):
         m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received",
                       open(ping_path).read())
         if m:
             tx, rx = int(m.group(1)), int(m.group(2))
-            checks.append(("ping 0 丟包", f"{tx} tx / {rx} rx / lost {tx - rx}", tx == rx and tx > 0))
+            if ignore_ping:
+                # jitter/丟包注入下 ping 必掉，僅供參考、不作為 fail 判準
+                checks.append(("ping（jitter 注入下僅供參考）",
+                               f"{tx} tx / {rx} rx / lost {tx - rx}", True))
+            else:
+                checks.append(("ping 0 丟包",
+                               f"{tx} tx / {rx} rx / lost {tx - rx}", tx == rx and tx > 0))
         else:
-            checks.append(("ping 0 丟包", "ping.txt 沒有 summary（被 kill -9?）", False))
+            checks.append(("ping summary",
+                           "ping.txt 沒有 summary（被 kill -9?）", ignore_ping))
     else:
-        checks.append(("ping 0 丟包", "ping.txt 不存在", False))
+        checks.append(("ping.txt", "不存在", ignore_ping))
     steps = count_jumps(os.path.join(d, "steps.csv"), args.step_min_ms)
     label = f"step 事件 ≤ {args.expect_steps}"
     if args.step_min_ms > 0:
@@ -158,6 +167,35 @@ def cmd_soak_verdict(args):
         checks.append(("journal 無 error", f"{nerr} 行", nerr == 0))
     else:
         checks.append(("journal 無 error", "journal-errors.txt 不存在", False))
+
+    # offset 不破界檢查（jitter 掛階的核心：NTP 樣本被網路糟蹋時，時鐘還守不守得住）。
+    # window > 0 時用「滾動中位數」判定，而非單筆 peak——因為重 jitter 下單發 SNTP probe
+    # 每筆誤差 ≈ (出向jitter − 回向jitter)/2，單筆 peak 量到的是探針自己的封包雜訊、不是時鐘。
+    # 滾動中位數把零均值的量測雜訊濾掉，留下時鐘真正的慢變偏移（L3 實測教訓）。
+    offset_max = getattr(args, "offset_max_ms", 0.0)
+    window = int(getattr(args, "offset_window", 0) or 0)
+    if offset_max > 0:
+        probe_path = os.path.join(d, "probe.csv")
+        if os.path.exists(probe_path):
+            samples = read_probe_csv(probe_path)
+            if not samples:
+                checks.append((f"offset 全程 < {offset_max:g}ms", "probe.csv 無有效樣本", False))
+            elif window > 1 and len(samples) >= window:
+                offs = [o for _, o in samples]
+                roll = [statistics.median(offs[i:i + window])
+                        for i in range(0, len(offs) - window + 1)]
+                peak_med = max(abs(x) for x in roll)
+                raw_peak = max(abs(o) for o in offs)
+                checks.append((f"offset 滾動中位數(w={window}) < {offset_max:g}ms",
+                               f"peak |median| = {peak_med:.1f}ms（raw peak {raw_peak:.0f}ms = 探針 jitter 雜訊，{len(samples)} 樣本）",
+                               peak_med < offset_max))
+            else:
+                peak = max(abs(o) for _, o in samples)
+                checks.append((f"offset 全程 < {offset_max:g}ms",
+                               f"peak |offset| = {peak:.1f}ms（{len(samples)} 樣本）",
+                               peak < offset_max))
+        else:
+            checks.append((f"offset 全程 < {offset_max:g}ms", "probe.csv 不存在", False))
 
     verdict = all(ok for _, _, ok in checks)
     lines = [f"# soak verdict: {'PASS' if verdict else 'FAIL'}", "",
@@ -218,6 +256,12 @@ def main():
     s.add_argument("--dir", required=True)
     s.add_argument("--expect-steps", type=int, default=0)
     s.add_argument("--step-min-ms", type=float, default=0.0)
+    s.add_argument("--ignore-ping", action="store_true",
+                   help="jitter/丟包注入下 ping 必掉，不作為 fail 判準（僅供參考）")
+    s.add_argument("--offset-max-ms", type=float, default=0.0,
+                   help=">0 時檢查 probe.csv 的 offset 是否守在此界內")
+    s.add_argument("--offset-window", type=int, default=0,
+                   help=">1 時改用滾動中位數判定（濾掉重 jitter 下的單發探針雜訊）")
     s.set_defaults(fn=cmd_soak_verdict)
     s = sub.add_parser("exp1-summary")
     s.add_argument("--results-dir", required=True)
