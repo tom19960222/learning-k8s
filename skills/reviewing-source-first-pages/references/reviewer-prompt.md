@@ -39,6 +39,26 @@ Stand in for a reader who knows NOTHING about this subsystem. Flag:
 - Sentences so dense they are opaque to a first-timer.
 - Whether the intro/概念 sections actually equip the reader for the source sections.
 
+{MANAGER_BAR}
+← orchestrator: for an experiment / investigation / recommendation page (or when the user asks for
+  "a report a manager can read" / "單看這一頁就完整了解"), PASTE this escalation; otherwise delete
+  this whole block:
+  "THE PRIMARY BAR: a manager who knows none of the details must read THIS PAGE ALONE, top to bottom,
+  and reconstruct ALL FIVE: 1) 緣起 (why/motivation) 2) 來龍去脈 (context / what was known) 3) 要做的事
+  (what) 4) 過程細節 (how, concretely enough to trust the result is not an artifact) 5) 結論 (bottom
+  line + caveats, reachable fast). Background *knowledge* may be delegated to linked pages, but the
+  narrative thread must be self-contained here. If you cannot confidently reconstruct any one of the
+  five from this page alone, the verdict is NEEDS WORK — name which of the five broke and where. A
+  load-bearing term used before definition (e.g. a result-table column the reader can't decode)
+  breaks #4 on its own."
+
+## Already-dismissed false alarms — do NOT re-raise these
+{DISMISSED_FALSE_ALARMS}
+← orchestrator: list findings a prior challenger raised that you verified to be FALSE (e.g. "the
+  results dir IS committed at X — a prior 'data missing' claim was a tooling miss; use the data, do
+  not re-raise"). Use the committed data/source to VERIFY numbers, don't claim they're absent. If
+  this is the first round, write "none".
+
 ## Do NOT flag these — they are project rules, not defects
 - Content is Traditional Chinese, Taiwan vocabulary, on purpose. Never suggest English/simplified.
 - never-translate terms staying in English (node, cluster, Pod, scrape, gauge, kernel, syscall,
@@ -49,7 +69,9 @@ Stand in for a reader who knows NOTHING about this subsystem. Flag:
 ## Output
 1. **Verdict**: `PASS` (ship it) or `NEEDS WORK` (one line).
 2. **🔴 Blocking factual errors** — quote, page location, source truth (file:line), fix direction. If none: "none found, verified against source".
-3. **🔴/🟡 Accessibility blockers** — what genuinely stops a non-expert.
+3. **🔴/🟡 Accessibility blockers** — what genuinely stops a non-expert. If the manager bar above was
+   included: state, for each of the five (緣起/來龍去脈/要做的事/過程細節/結論), whether a clueless
+   reader could reconstruct it from this page alone, and name which broke + where.
 4. **🟡 Should-fix** — weaker claims, imprecise wording, missed definitions.
 5. **💭 Nits**.
 6. **What's strong** — briefly, so the rewriter does not break it.

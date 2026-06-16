@@ -1,6 +1,6 @@
 ---
 name: reviewing-source-first-pages
-description: Use when asked to review, 把關, 挑戰, 校稿, or fact-check an existing learning-k8s MDX feature page before committing — especially when correctness against pinned source AND readability for a non-expert both matter, or when the request mentions devil's advocate, review loop, 讓不懂的人也看得懂, or source-first 對照原始碼.
+description: Use when asked to review, 把關, 挑戰, 校稿, or fact-check an existing learning-k8s MDX feature page before committing — especially when correctness against pinned source AND readability for a non-expert both matter, or when the request mentions devil's advocate, review loop, 讓不懂的人也看得懂, source-first 對照原始碼, or making a page read as a self-contained report a manager can follow (緣起/來龍去脈/過程/結論).
 ---
 
 # Reviewing Source-First Pages
@@ -20,6 +20,9 @@ of truth — docs, memory, and the page's own prose cannot justify a claim by th
 
 - "review / 把關 / 挑戰 / 校稿 this page", "make sure it's correct and readable", before committing a page.
 - A page whose whole premise is source-first (cites `File: path (line N)` blocks) and must stay honest.
+- A report / experiment / decision page that must read as a **self-contained report a manager can
+  read** ("單看這一頁就完整了解 緣起→來龍去脈→要做的事→過程細節→結論") — this invokes the Axis 2
+  escalation below.
 
 When NOT to use: writing a brand-new page (`../source-first-topic-page`), or a pure copy-edit with no
 correctness stakes (just edit it).
@@ -69,6 +72,9 @@ digraph review_loop {
 2. **Challenger (RED).** Dispatch the **Devils Advocate** agent (read-only: Read/Grep/Glob) using
    `references/reviewer-prompt.md`. It must verify every claim against source on Axis 1 and stand in
    for a clueless beginner on Axis 2, then return `PASS`/`NEEDS WORK` with prioritized findings.
+   If the page is a report/experiment/decision page, fill the prompt's `{MANAGER_BAR}` slot (the
+   five-element self-contained bar); otherwise delete it. Fill `{DISMISSED_FALSE_ALARMS}` with any
+   findings you verified false in a prior round (or "none").
    If the Devils Advocate agent is unavailable, use `general-purpose` — the framing is in the prompt.
 
 3. **Writer (GREEN).** If `NEEDS WORK`, dispatch the **Technical Writer** agent using
@@ -106,6 +112,27 @@ digraph review_loop {
 
 A page that is correct but unreadable fails. A page that is readable but wrong fails harder.
 
+### Axis 2 escalation — the self-contained manager bar (report / experiment / decision pages)
+
+When the page reports an **experiment, investigation, or recommendation** (not a pure code
+walkthrough) — or when the user asks for "a report a manager can read", "單看這一頁就完整了解",
+"來龍去脈 + 結論" — 好懂 escalates to a stronger, explicit bar. Pass it to the challenger (the
+reviewer prompt has a slot): **a reader who knows none of the details must read THIS PAGE ALONE,
+top to bottom, and reconstruct all five of:**
+
+1. **緣起 (why / motivation)** — why was this done? what question or risk prompted it?
+2. **來龍去脈 (context)** — how it fits the bigger picture; what was already known going in.
+3. **要做的事 (what)** — what it sets out to do.
+4. **過程細節 (how, concretely)** — enough method/setup that the reader trusts the result isn't an artifact.
+5. **結論 (bottom line + caveats)** — the answer, reachable fast (bottom-line-first).
+
+Background *knowledge* (what jitter / PLL / netem is) MAY be delegated to linked pages — but the
+*narrative thread* (why → context → what → how → result → conclusion) must be self-contained on
+this page. **If the challenger, reading only the page, cannot confidently reconstruct any one of the
+five, the verdict is `NEEDS WORK`** — and it must name which of the five broke and where. A
+load-bearing term used before it is defined (e.g. a result-table column the reader can't decode)
+breaks bar #4 even if everything else is present.
+
 ## Constraints Every Subagent Must Receive
 
 Both prompt templates already carry these — keep them, because a subagent without them will "fix"
@@ -127,6 +154,19 @@ the wrong things:
 - **Same agent re-reviews its own changes.** Use a fresh challenger for independence.
 - **Spawning a full round for a typo.** Apply trivial nits yourself (step 6).
 - **Reviewing only one axis.** Correct-but-opaque and readable-but-wrong both fail.
+- **Acting on a challenger finding without verifying it yourself.** Challengers produce false
+  alarms — e.g. "the data tree is missing" when it is committed (a Glob/tooling miss), or "this
+  number is wrong" when it compared the wrong artifacts. Before you hand a 🔴 to the writer, the
+  orchestrator confirms it against source/data. **Dismiss verified-false findings — and tell the
+  NEXT challenger about each dismissed false alarm** (in its prompt) so it does not re-raise it and
+  burn a round.
+- **Blindly applying a challenger's "should be X."** A numeric correction may be a *different
+  measurement* (e.g. probe-failure-rate vs ping-loss-rate are both "loss" but different instruments).
+  Trace each number to its committed artifact before changing the page; cite both if both are real.
+- **(data / experiment pages) A page number with no committed artifact behind it.** If a figure was
+  hand-computed and lives in no committed file, it is unreproducible — the challenger should flag it,
+  and the fix is to commit the artifact (or a regenerated summary) and cite it. The phrase
+  "已 commit 進 repo" on the page must actually be true; spot-check the cited results path exists.
 
 ## Completion Criteria
 
