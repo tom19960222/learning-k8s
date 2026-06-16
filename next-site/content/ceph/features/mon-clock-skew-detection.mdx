@@ -12,11 +12,13 @@ description: 從「mon 上實際時間漂超過 50ms」那一刻起，到 ceph -
 
 答案不是「立刻」也不是「等下次心跳」。MON 自己有獨立的 timecheck 機制，它跟 ntpd、paxos lease 都無關。下面要追的是：從你 watch 著 stopwatch、看到 mon.2 的 clock 慢慢漂過 50ms 那一秒開始，到 `ceph -s` 那行字出現之前，**程式碼跑了哪些東西、每一段花多少時間**。
 
+（先記兩個角色，下圖就會用到：quorum 裡有一顆 mon 是 **leader**（Paxos 選出的主導者、timecheck 的發起方），其餘都是 **peon**（非 leader 的 mon）。）
+
 ## TL;DR：直接看時間
 
 | 情境 | 平均 | 最壞 |
 |---|---|---|
-| cluster 健康（從沒偵測到 skew） | **~150 秒**（≈ 2.5 分鐘） | **~305 秒**（≈ 5 分 5 秒） |
+| cluster 健康（從沒偵測到 skew） | **~150 秒**（≈ 2.5 分鐘，精算約 152.5） | **~305 秒**（≈ 5 分 5 秒） |
 | cluster 已在 skew 狀態，又漂大一些 | **~17 秒** | **~35 秒** |
 | `mon_timecheck_interval` 調成 60s | ~30 秒 | ~65 秒 |
 | 跨 WAN 部署 RTT > 50ms | **可能永不報**（latency 吸收 abs_delta） | — |
@@ -37,13 +39,11 @@ T1 ┃ leader 的 timer 觸發 timecheck_start_round()
    ┃ ├─ timecheck_skews[self] = 0.0
    ┃ └─ 對每個 peon 送 MTimeCheck2(OP_PING)，戳記 timecheck_waiting[peon] = now
    ┃
-   ┃ ② 網路：PING 到 peon
-   ┃    1 × RTT/2（同 DC 通常 < 5ms）
+   ┃ ② PING / PONG round-trip（一整段，網路來回）
+   ┃    ├─ 網路：PING 到 peon          1 × RTT/2（同 DC 通常 < 5ms）
    ┃
 T2 ┃ peon 收 PING → handle_timecheck_peon() → 回 PONG，戳上自己的 timestamp
-   ┃
-   ┃ ③ 網路：PONG 回 leader
-   ┃    1 × RTT/2
+   ┃    └─ 網路：PONG 回 leader        1 × RTT/2
    ┃
 T3 ┃ leader 收 PONG → handle_timecheck_leader()
    ┃ ├─ latency = ceph_clock_now() − timecheck_waiting[other]  ← 約等於 RTT
@@ -51,8 +51,10 @@ T3 ┃ leader 收 PONG → handle_timecheck_leader()
    ┃ ├─ delta     = m->timestamp − ceph_clock_now()
    ┃ ├─ abs_delta = |delta|
    ┃ ├─ skew_bound = abs_delta − latency  (clip to 0; 帶正負號)
-   ┃ ├─ if timecheck_has_skew(skew_bound):  status = HEALTH_WARN
-   ┃ └─ timecheck_skews[other] = skew_bound   ← 寫入！
+   ┃ └─ if timecheck_has_skew(skew_bound):  status = HEALTH_WARN
+   ┃
+   ┃ ③ 寫入 timecheck_skews[]
+   ┃    timecheck_skews[other] = skew_bound   ← 寫入！（收到 PONG 當下同步）
    ┃
    ┃ ④ 等下一次 Monitor::tick()
    ┃    0 ~ 5s（mon_tick_interval = 5）
@@ -99,6 +101,8 @@ File: `ceph/src/mon/Monitor.h` (line 525)
 /**
  * @defgroup Monitor_h_TimeCheck Monitor Clock Drift Early Warning System
  *
+ *  ...
+ *
  *  - Leader sends out a 'PING' message to each other monitor in the quorum.
  *    The message is timestamped with the leader's current time. The leader's
  *    current time is recorded in a map, associated with each peon's instance.
@@ -112,7 +116,7 @@ File: `ceph/src/mon/Monitor.h` (line 525)
  */
 ```
 
-關鍵設計：**leader 的 skew 永遠是 0**，所有 peon 的偏移都是相對 leader 算的。
+關鍵設計：**leader 的 skew 永遠是 0**，所有 peon（非 leader 的 mon）的偏移都是相對 leader 算的。
 
 File: `ceph/src/mon/Monitor.cc` (line 5042)
 
@@ -214,7 +218,7 @@ if (timecheck_round % 2) {
 
 ## 第 2 段：PING / PONG / skew_bound 計算（< 100ms）
 
-leader timer 到了，跑 `timecheck_start_round()`：
+leader timer 到了，跑 `timecheck_start_round()`，它接著呼叫 `Monitor::timecheck()` 送出 PING（下面這段就是 `timecheck()` 的本體）：
 
 File: `ceph/src/mon/Monitor.cc` (line 5028)
 
@@ -292,7 +296,7 @@ else {
 }
 ```
 
-`latency` 是 EWMA（80% 舊值 + 20% 新值），網路抖動不會單一一輪就翻轉判斷。
+`latency` 是 EWMA（指數加權移動平均，80% 舊值 + 20% 新值），網路抖動不會單一一輪就翻轉判斷。
 
 接著算 skew_bound：
 
@@ -506,6 +510,7 @@ void HealthMonitor::check_for_clock_skew(health_check_map_t *checks)
       }
     }
     if (!warns.empty()) {
+      // ... 組裝 ss / warns / details ...（ss 在這裡拼成 "clock skew detected on mon.X, ..."）
       auto& d = checks->add("MON_CLOCK_SKEW", HEALTH_WARN, ss.str(), details.size());
       d.detail.swap(details);
     }
@@ -644,7 +649,7 @@ void PaxosService::load_health()
 `ceph -s` 走的是 mon command 路徑：
 
 ```
-Monitor::handle_command  (見 Monitor.cc:3079)
+Monitor::get_cluster_status  (見 Monitor.cc:3079)
    └─ healthmon()->get_health_status(detail, formatter, plain)
         └─ gather_all_health_checks(&all)
              └─ for svc in mon.paxos_service:
@@ -699,7 +704,7 @@ ceph config set mon mon_timecheck_interval 60
 
 ### 第一輪 latency 沒被 EWMA 平滑
 
-File: `ceph/src/mon/Monitor.cc` (line 5139)
+File: `ceph/src/mon/Monitor.cc` (line 5118)
 
 ```cpp
 if (timecheck_latencies.count(other) == 0)
@@ -720,7 +725,7 @@ else {
 
 leader 在 `handle_timecheck_leader` 開頭擋掉 `curr_time < timecheck_sent` 的 case：
 
-File: `ceph/src/mon/Monitor.cc` (line 5127)
+File: `ceph/src/mon/Monitor.cc` (line 5106)
 
 ```cpp
 if (curr_time < timecheck_sent) {

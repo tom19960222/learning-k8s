@@ -12,7 +12,7 @@ description: ceph 的 quorum 是 N/2+1，3 mon 容忍 1 死。掛 1 台仍可重
 - 抽 2 台：剩 1 台 mon 還能服務嗎？目前正在寫入的 fsync 會卡住嗎？
 - 抽 3 台：cluster 完全沒 mon，OSD 上的資料怎麼了？client 端的 librbd 會回什麼錯？
 
-直覺答案是「2/3 就好、低於就不行」。但這個直覺對 client I/O 的時間軸**不準** — 因為 client I/O 的 critical path 不直接走 mon。下面從 v19.2.3 原始碼追三個維度：quorum 數學、Paxos lease 時序、cephx ticket 過期、與哪些 I/O 真的依賴 mon 才能繼續。
+直覺答案是「2/3 就好、低於就不行」。但這個直覺對 client I/O 的時間軸**不準** — 因為 client I/O 的 critical path 不直接走 mon。整頁的關鍵分界是 dataplane（實際讀寫資料的 RADOS op path）與 control plane（改 cluster 狀態 / map 的管理操作）：mon 失 quorum 第一個倒下的是 control plane，dataplane 只是慢慢被拖下水。下面從 v19.2.3 原始碼追三個維度：quorum 數學、Paxos lease 時序、cephx ticket 過期、與哪些 I/O 真的依賴 mon 才能繼續。
 
 ## quorum 是「N/2 + 1」，不是「過半」
 
@@ -125,7 +125,7 @@ void Paxos::lease_ack_timeout()
   mon.bootstrap();
 }
 ...
-void Paxos::lease_timeout()
+void Paxos::lease_timeout()   // lease_timeout() 在 :1215
 {
   dout(1) << "lease_timeout -- calling new election" << dendl;
   ceph_assert(mon.is_peon());
@@ -176,14 +176,16 @@ if (outside_quorum.size() >= need) {
 | 0 | leader 停掉 |
 | ≤ 10s | 所有 peon 的 `lease_timeout` 同時觸發（沒收到 leader 的下一個 lease） |
 | 10~20s | 全員 `bootstrap()` → probing → 收齊 2 個 mon → election → 新 leader 上任 |
-| 期間 | 同樣：no writeable，read 也會回 `-EAGAIN`（is_readable 也檢查 lease） |
+| 期間 | 同樣：no writeable，read 也被擋 — `is_readable()` 回 false，呼叫端再把它轉成 retry / `-EAGAIN`（is_readable 也檢查 lease） |
+
+這兩個數字直接來自上面的常數：A1 的 `≤10s` 就是 `lease_ack_timeout`（`mon_lease_ack_timeout_factor × mon_lease = 2 × 5`）；A2 的 `10~20s` 是 `lease_timeout`（同樣 ≤10 秒）再加上 election 收斂的時間。
 
 對 **client I/O 的影響**：
 
 | I/O 類型 | 受影響嗎 |
 |---|---|
 | 已建好 connection 的 librbd read/write 直接打 OSD | 短期通常不受影響（不經 mon）；但 reconnect、auth renew、OSDMap 過舊、blocklist / failure path 仍會把它拉回 mon 依賴 |
-| OSD 之間 replication / heartbeat | 已有 peer connection 可繼續；但 MON 不再能 commit 新 OSDMap，failure report 與 map 推進會停住 |
+| OSD 之間 replication / heartbeat | 已有 peer connection 可繼續（peer 關係來自既有 osdmap，沒有新 map 推進就不會變動）；但 MON 不再能 commit 新 OSDMap，failure report 與 map 推進會停住 |
 | `ceph -s` / `ceph osd dump` 等需要 mon read | 卡 10~20 秒 |
 | `kubectl create pvc` 觸發 ceph-csi 建 RBD image | 期間會 retry，超時就失敗 |
 | 新的 OSD 上線 / mark down | 暫停直到 election 完 |
@@ -235,7 +237,7 @@ File: `ceph/src/common/options/global.yaml.in` (line 2205)
 client ticket 的 source 也說明了為什麼不能把「1 小時」講成精準斷點。client 收到 ticket 時把 `expires = 自己的 now + validity`，renew_after 則設在有效期的 3/4 左右；如果 quorum loss 發生在 ticket 壽命後段，剩餘窗口可能只剩幾分鐘。
 
 ```cpp
-// File: ceph/src/auth/cephx/CephxProtocol.cc (line 198)
+// File: ceph/src/auth/cephx/CephxProtocol.cc (line 199)
 expires = ceph_clock_now();
 expires += msg_a.validity;
 renew_after = expires;
@@ -278,15 +280,14 @@ dataplane 的衰退路徑完全一樣：
 
 OSD 端對 mon 的依賴是 outbound：
 
-File: `ceph/src/osd/OSD.cc` (line 1266 區段附近)
+OSD 會主動送這幾類訊息給 mon（都走 `monc->send_mon_message()`，`ceph/src/osd/OSD.cc`，例如 `MOSDPGCreated` 在 line 1279）：
 
-OSD 會主動送這幾類訊息給 mon：
-
-- `MOSDFailure` — 透過 `monc->send_mon_message(m)` 告訴 mon 「我覺得 osd.X 死了」
+- `MOSDFailure` — 告訴 mon 「我覺得 osd.X 死了」
 - `MOSDPGCreated` — pg 建好通知
 - `MOSDPGReadyToMerge` — pg merge 握手
-- `osd_beacon` — 定期心跳（每 5 分鐘）
-- `MPGStats` — 給 mgr，但走 mon route
+- `osd_beacon`（`MOSDBeacon`）— 定期心跳（每 5 分鐘）
+
+（注意：OSD 的 PG 統計 `MPGStats` **不**走 mon——它透過獨立的 MgrClient 連線直接送給 **mgr**（`mgrc.send_pgstats()`，`OSD.cc:3099`／回呼註冊在 `:3983`），不經 mon，所以不在這條「送給 mon」的清單裡。`OSD.cc:7779` 那行只是用 `monc->get_fsid()` 讀 fsid 來組訊息，不是送給 mon。）
 
 如果 mon 沒 quorum，這些訊息都不會被消化（mon 不會寫進 osdmap）。但**OSD 對 client 的 service 不會因此停止**，因為這條 path 不經過 mon：
 
@@ -304,7 +305,7 @@ OSD 自己不需要 mon 也能服務 read/write。只要 client 還有有效的 
 
 **「`ceph -s` hang，是不是 mon 壞了？」**：`ceph -s` 經 mon 路由、需要 `is_readable()`，所以 mon 沒 quorum 時它會 timeout。從 OSD node 上跑 `rados -p mypool get foo /tmp/foo` 如果還能跑，代表 dataplane 還活著。確認 mon 狀態的可靠方法是看 mon log（`/var/log/ceph/ceph-mon.<host>.log` 找 `PROBING` 或 `ELECTING` 字樣）。
 
-**「只剩 1 mon 想暫時讓它服務」**：唯一支援的方式是 `ceph mon remove <name>`（從 monmap 移除其他兩台），讓 monmap.size() 變 1、min_quorum_size 跟著變 1。但這需要 quorum 才能執行 — 已經沒 quorum 就鎖死，必須走 `ceph-mon --extract-monmap` + `--inject-monmap` 的離線編輯流程。
+**「只剩 1 mon 想暫時讓它服務」**：唯一支援的方式是 `ceph mon remove <name>`（從 monmap 移除其他兩台），讓 monmap.size() 變 1、min_quorum_size 跟著變 1。但這需要 quorum 才能執行 — 已經沒 quorum 就鎖死，必須走 `ceph-mon --extract-monmap` + `--inject-monmap` 的離線編輯流程。（注意：`ceph mon remove`、`--extract-monmap`/`--inject-monmap`、以及情境 C 的 `ceph-objectstore-tool ... update-mon-db` 都是官方文件記載的救援流程，不是本頁從這份 source checkout 追出來的行為；實際操作前請對照對應版本的官方 disaster-recovery 文件。）
 
 **「election 來回打」**：lease_ack 與 lease timeout 都用 `mon_lease_ack_timeout_factor` × `mon_lease`（10 秒）。如果你的 mon node 跨 WAN 部署、平均 RTT > 1 秒，election 可能反覆觸發。先確認 timecheck 沒在報、再決定要不要調大 `mon_lease`。
 
