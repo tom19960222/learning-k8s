@@ -20,8 +20,8 @@ node_timex_offset_seconds{instance="node-1"}  0.0023
 
 這頁就是把這條 metric 從 Go 程式碼一路追進 Linux kernel，把這三個問題回答清楚。先講結論，後面再用原始碼證明：
 
-- node_exporter 每次 scrape 只做**一次** syscall，而且是**唯讀**的。它沒有去改你的時鐘，也沒有重新發 NTP 封包量測。
-- 你看到的 offset 是 kernel 內部那個 PLL 控制器**還沒修完、正在往零推**的殘餘相位誤差（residual phase error）。它是時間 daemon（systemd-timesyncd / chrony）某次寫進去的值，被 kernel clamp、scale 之後的結果。
+- node_exporter 每次 scrape（Prometheus 定期來抓一次資料，這個動作叫 scrape）只做**一次** syscall（系統呼叫，程式向 kernel 要求服務的入口），而且是**唯讀**的。它沒有去改你的時鐘，也沒有重新發 NTP 封包量測。
+- 你看到的 offset 是 kernel 內部那個 PLL 控制器**還沒修完、正在往零推**的那段剩餘誤差——也就是 kernel 知道自己還欠多少、正在還的那個餘額。它是時間 daemon（systemd-timesyncd / chrony）某次寫進去的值，被 kernel clamp（夾限：限制在範圍內）、scale（縮放單位）之後的結果。
 - 所以它是一個很好的「這台 node 自己看起來在漂 / 正在被修」的早期訊號，**不是**拿來做跨 node 互減的權威量測。
 
 ## 先補三個觀念
@@ -38,7 +38,7 @@ node_timex_offset_seconds{instance="node-1"}  0.0023
 
 ### (b) NTP / 時間 daemon 在做什麼：discipline the clock
 
-你的機器上會跑一支時間 daemon（這個專案的脈絡裡通常是 `systemd-timesyncd`，也可能是 chrony）。它定期去問遠端的 NTP server「現在標準時間是幾點」，比對自己本機的時鐘，算出「我比標準時間差了多少」。
+你的機器上會跑一支時間 daemon（這個專案的脈絡裡通常是 `systemd-timesyncd`，也可能是 chrony——另一套常見的時間 daemon 實作）。它定期去問遠端的 NTP server「現在標準時間是幾點」，比對自己本機的時鐘，算出「我比標準時間差了多少」。
 
 但它**不會**粗暴地把系統時間「啪」一下跳到正確值——那會讓正在跑的程式看到時間倒退或暴衝，引發各種災難（log 時間錯亂、TLS 憑證瞬間過期或未生效、分散式系統的順序假設崩掉）。它做的是 **discipline（馴服）時鐘**：把「我差了多少」這個資訊餵給 kernel，讓 kernel 用一個**控制器**去微調時鐘走的快慢，慢慢、平滑地把誤差推回零。
 
@@ -48,9 +48,9 @@ node_timex_offset_seconds{instance="node-1"}  0.0023
 
 關鍵就在這裡。daemon 算出「我差了 5ms」之後，把這個 5ms 寫進 kernel。kernel 的 PLL 接手，開始把時鐘往這個方向推。
 
-但這個修正是**漸進**的——不是寫進去那一刻就清零。下一秒鐘，PLL 可能只推了一點點，內部還剩 4.8ms 沒修完。再下一秒剩 4.5ms……
+但這個修正是**漸進**的——不是寫進去那一刻就清零。下一秒鐘，PLL 可能只推了一點點，內部還剩 4.8ms 沒修完。再下一秒剩 4.5ms……（示意數字）
 
-當 node_exporter 來讀的時候，kernel 回給它的 `offset`，就是**這個當下還沒修完的殘值（residual phase error）**。它不是 daemon 剛量到的新時差，而是「kernel 知道自己還欠多少、正在還的那個餘額」。
+當 node_exporter 來讀的時候，kernel 回給它的 `offset`，就是**這個當下還沒修完的殘值**。這個「還沒修完的剩餘相位誤差」有個正式名稱，叫 **residual phase error**（殘餘相位誤差）——後面追原始碼時都會用這個詞指它。它不是 daemon 剛量到的新時差，而是「kernel 知道自己還欠多少、正在還的那個餘額」。
 
 > **一句話記住**：offset 就像你的手錶現在快了幾秒、而 kernel 正溫柔地把它往回撥的那個「還剩多少沒撥完」的量。它會隨著 PLL 收斂而趨近零，不是一個你每次 scrape 都重新量測的獨立數字。
 
@@ -103,6 +103,8 @@ node_timex_offset_seconds{instance="node-1"}  0.0023
 ## 第一層：node_exporter 的 timex collector
 
 這個 collector 預設就是開的——node_exporter 一啟動，`timex` 就在抓取清單裡（`init()` 裡呼叫 `registerCollector("timex", defaultEnabled, ...)`）。它在 `NewTimexCollector` 裡把 `node_timex_offset_seconds` 這條 metric 的描述建好：FQName 由 `BuildFQName(namespace, subsystem, "offset_seconds")` 組成（subsystem 是 `"timex"`），help text 是「Time offset in between local system and reference clock.」，型別是 gauge。
+
+File: node_exporter/collector/timex.go (line 70)
 
 真正每次 scrape 做事的是 `Update()` 方法。它一開頭做兩件事：開一個全新的、欄位全是零的 `unix.Timex` struct，然後把它的指標交給 `unix.Adjtimex`。
 
@@ -225,7 +227,7 @@ if errors.Is(err, os.ErrPermission) {
 
 進到 kernel，`adjtimex(2)` syscall 最後落到 `kernel/time/ntp.c` 的 `int __do_adjtimex(...)`。這個函式既能讀也能寫，分水嶺就是 `txc->modes`：
 
-- 如果 `txc->modes` 非零（有設要改的旋鈕），它會進入 `if (txc->modes) { ... process_adjtimex_modes(txc, ...) ... }` 區塊，真的去改 kernel 的時鐘參數。
+- 如果 `txc->modes` 非零（有設要改的旋鈕），它會進入 `if (txc->modes) { ... process_adjtimex_modes(txc, ...) ... }`（示意，實際結構見下）區塊，真的去改 kernel 的時鐘參數。
 - 但我們從第一層傳進來的 `Modes` 是 **0**，所以這整個寫入區塊被**完整跳過**。沒有任何時鐘狀態被改動。這就是「唯讀」在 kernel 端的證明。
 
 跳過寫入之後，kernel 開始回填 `txc` 給呼叫者讀。`offset` 欄位是這樣填的：
@@ -241,8 +243,8 @@ if (!(time_status & STA_NANO))
 
 讀法：
 
-- `time_offset` 是 kernel **內部**保存的相位誤差（就是觀念 (c) 講的那個 residual）。kernel 把它經過 `shift_right(... NTP_SCALE_SHIFT)` 從內部的高精度定點格式，scale 回奈秒等級，寫進 `txc->offset`。
-- 接著那個 `if` 是關鍵：**只有在 `STA_NANO` 沒被設的時候**，才再把 `txc->offset` 除以 `NSEC_PER_USEC`（每微秒有幾奈秒，1000），把單位從奈秒降成微秒。
+- `time_offset` 是 kernel **內部**保存的相位誤差（就是觀念 (c) 講的那個 residual）。kernel 把它經過 `shift_right(... NTP_SCALE_SHIFT)` 從內部的高精度定點格式（kernel 內部把相位誤差用一個放大過的整數存著以保住精度，shift_right 就是把它按 `NTP_SCALE_SHIFT` 位移縮回正常的奈秒大小），scale 回奈秒等級，寫進 `txc->offset`。
+- 接著那個 `if` 是關鍵：**只有在 `STA_NANO` 沒被設的時候**，才先把 `txc->offset` 用 `(u32)` 截斷成 32 位元、再除以 `NSEC_PER_USEC`（每微秒有幾奈秒，1000），把單位從奈秒降成微秒。
 - 換句話說：`STA_NANO` 設了 → kernel 輸出奈秒；`STA_NANO` 沒設 → kernel 多除一次、輸出微秒。
 
 這也對得上 uapi header 裡對這個欄位的註解——base unit 預設是微秒，除非 `STA_NANO`：
@@ -317,13 +319,13 @@ staNano = 0x2000
 - kernel 在 `STA_NANO` 沒設時**多除一次** `NSEC_PER_USEC`（把 ns 降成 µs）；node_exporter 在同一個 bit 沒設時就用 1e6 當 divisor，把 µs **乘回去**成秒。
 - kernel 設了 `STA_NANO` 時直接輸出 ns；node_exporter 就用 1e9 當 divisor。
 
-兩邊的單位永遠對得上，**不是因為巧合，是 by construction**：node_exporter 的 divisor 邏輯就是 kernel 單位換算的逆運算，兩者讀的是同一個 status bit。同樣地，Go 的 `timeError = 5` 等於 kernel 的 `TIME_ERROR 5`，`staNano = 0x2000` 等於 kernel 的 `STA_NANO 0x2000`。node_exporter 沒有自己發明任何常數——它把 kernel 的 ABI 抄了一份。
+兩邊的單位永遠對得上，**不是因為巧合，是 by construction**：node_exporter 的 divisor 邏輯就是 kernel 單位換算的逆運算，兩者讀的是同一個 status bit。同樣地，Go 的 `timeError = 5` 等於 kernel 的 `TIME_ERROR 5`，`staNano = 0x2000` 等於 kernel 的 `STA_NANO 0x2000`。node_exporter 沒有自己發明任何常數——它把 kernel 的 ABI（二進位介面約定）抄了一份。
 
 ## offset 不是「現在量到的」，是 residual
 
 現在回答場景裡的第二、三個問題。
 
-那個 `time_offset`（被回填成 `txc->offset` 的 kernel 內部變數）是誰寫進去的？是時間 daemon。當 systemd-timesyncd 或 chrony 算出「本機差了多少」，它會發一次**有 modes 的** `adjtimex`，帶 `ADJ_OFFSET` 旗標。kernel 在 `process_adjtimex_modes` 裡看到這個旗標，就把這個值交給 `ntp_update_offset()`，由 PLL 接手去 clamp、scale，然後一點一點往零 steer。
+那個 `time_offset`（被回填成 `txc->offset` 的 kernel 內部變數）是誰寫進去的？是時間 daemon。當 systemd-timesyncd 或 chrony 算出「本機差了多少」，它會發一次**有 modes 的** `adjtimex`，帶 `ADJ_OFFSET` 旗標。kernel 在 `process_adjtimex_modes` 裡看到這個旗標，就把這個值交給 `ntp_update_offset()`，由 PLL 接手去 clamp、scale，然後一點一點往零 steer（一點一點導向）。
 
 所以 node_exporter 讀回來的 `offset`，是 daemon **某次寫進去、被 PLL 修到一半的剩餘量**。把因果鏈整理出來：
 
@@ -361,7 +363,7 @@ static inline int is_error_status(int status)
 }
 ```
 
-它只看 `STA_UNSYNC | STA_CLOCKERR` 兩個 bit。`STA_UNSYNC` 是**時間 daemon 自己判定「我目前認定時鐘沒同步」時設的旗標**。於是會出現兩種看似矛盾的情況：
+它只看 `STA_UNSYNC | STA_CLOCKERR` 兩個 bit。`STA_UNSYNC` 是**時間 daemon 判定「我目前認定時鐘沒同步」時設的旗標（由 daemon 透過 adjtimex 寫入 kernel，實際存在 kernel 的 `time_status` 裡）**。於是會出現兩種看似矛盾的情況：
 
 - `sync_status = 0`（沒同步）但 `offset` 很小：daemon 把 `STA_UNSYNC` 設起來了（例如剛重啟、還沒拿到第一次 NTP 回應，或上游失聯太久），可是 kernel 內部殘值剛好接近零。**offset 小不代表同步是好的。**
 - `sync_status = 1`（看起來同步）但 `offset` 在變大：daemon 沒設 `STA_UNSYNC`，但 PLL 正在追一個比較大的修正。判斷要兩個一起看，不能只信 offset。
