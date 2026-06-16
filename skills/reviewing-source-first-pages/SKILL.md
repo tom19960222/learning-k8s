@@ -112,6 +112,37 @@ digraph review_loop {
 
 A page that is correct but unreadable fails. A page that is readable but wrong fails harder.
 
+### Axis 2 — four readability smells the challenger must always flag
+
+These four came from real review misses (a page passed the loop, then the human caught all four).
+A naive challenger checks "is each sentence clear?" and misses them — they are about structure,
+labels, and naturalness, not individual sentences. Check every page for all four:
+
+1. **Method stated before its own corrections / refinements.** In a report or experiment page, the
+   reader must learn **what the method IS** (how it measures, the setup, the pass criteria) BEFORE
+   the page discusses fixes/pitfalls/caveats of that method. A "methodology" section that opens with
+   "the two things we corrected" before the baseline method is even described is `NEEDS WORK` — the
+   reader can't judge a correction to a method they haven't met.
+2. **Internal shorthand in the reading flow.** Experiment-internal codes — tier ids (`a40`, `j40`,
+   `loss10`), metric codes (`rm31`, `rm241`), mode tags (`sym`/`asym`) — force the reader to keep a
+   legend in their head. In prose and result tables use **short plain descriptions** ("對稱抖動
+   10±10ms", "31 秒視窗中位數", "不對稱・出向延遲 40ms"). Identifiers may appear ONLY inside a
+   committed-artifact citation (a file path), never as the primary label a reader must decode. Flag
+   any abbreviation the reader has to cross-reference to read the page.
+3. **Numbers / table columns with no stated quantity or unit.** A column of bare numbers (e.g. "ms")
+   must say **what the quantity is** (e.g. "the clock's offset from correct time"), its unit, and —
+   where there's a pass line — the threshold. "ms of what?" is a failing question. A header that
+   leads with an opaque code + unit (e.g. `rm31（…, ms）`) fails this **even if a distant intro
+   defines it** — the column header itself should name the quantity in plain words (this overlaps
+   smell #2: an opaque-code header is both unlabeled AND shorthand).
+4. **Translationese, not native Taiwan Mandarin.** Beyond the never-translate / no-mainland-vocab
+   rules below: flag stiff, coined, or translationese Chinese that no Taiwanese engineer would
+   actually say — e.g. 判準 → 判定標準 / 通過標準, 孤立尖刺 → 偶發的單筆尖峰, 膝點 → 臨界點 / 轉折點,
+   野樣本 → 脫序的樣本. This is the OPPOSITE direction from the protected-vocabulary rule: that rule
+   says don't suggest English/simplified for *intentional* Taiwan terms; this one says DO flag
+   awkward translationese and naturalise it. When in doubt, prefer the phrasing a TW engineer would
+   speak aloud.
+
 ### Axis 2 escalation — the self-contained manager bar (report / experiment / decision pages)
 
 When the page reports an **experiment, investigation, or recommendation** (not a pure code
