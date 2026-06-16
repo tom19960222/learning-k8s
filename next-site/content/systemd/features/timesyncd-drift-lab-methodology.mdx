@@ -167,13 +167,13 @@ kernel 不准 tick 被亂調，合法範圍是預設值 ±10%。下面這段 sou
 #define SHIFT_PLL	2	/* PLL frequency factor (shift) */
 ```
 
-`time_constant`（簡寫 tc）由 poll 週期決定。32 秒 poll 時 timesyncd 算出的 tc = `log2(32) − 4 = 1`（slew 路徑見 [timesyncd-manager.c:247](/systemd/features/timesyncd-low-max-poll-simulation)），所以每秒消耗比例是 `1/2^(2+1) = 1/8`。剩餘量每秒乘上 7/8，這就是指數衰減。它的時間常數（衰減一個 e 倍需要多久）：
+`time_constant`（簡寫 tc）由 poll 週期決定。32 秒 poll 時 timesyncd 算出的 tc = `log2(32) − 4 = 1`（slew 路徑見 [timesyncd-manager.c:247](/systemd/features/timesyncd-low-max-poll-simulation)）；kernel 端能維持 tc=1，是因為 timesyncd 的 slew 請求同時帶了 `ADJ_NANO`（設定 `STA_NANO`，見 `timesyncd-manager.c:249`），讓 `ntp.c:737-738` 那段 `if (!(time_status & STA_NANO)) time_constant += 4;` 不會觸發——否則 kernel 會把 tc 加成 5，每秒消耗比例縮成 `1/2^7`，τ 暴增到約 120 秒。所以每秒消耗比例是 `1/2^(2+1) = 1/8`。剩餘量每秒乘上 7/8，這就是指數衰減。它的時間常數（衰減一個 e 倍需要多久）：
 
 ```
 τ = 1 / ln(8/7) ≈ 7.5 秒
 ```
 
-這是個指數，不是定速。對一個 399 毫秒的偏移，**起始那一刻**的有效修正速率是 `399ms × ln(8/7) ≈ 53ms/s`，換算成等效頻率約是 **53,000ppm**——比那句傳言的 500ppm 高出兩個數量級。也就是說，小偏移收斂之快，跟「500ppm 上限」毫無關係。
+這是個指數，不是定速。對一個 399 毫秒的偏移，**起始那一刻**的有效修正速率是 `399ms × ln(8/7) ≈ 53ms/s`，換算成等效頻率約是 **53,000ppm**（這是用連續式 `×ln(8/7)` 算的首步速率；下面講最壞情況時還會出現一個用離散式 `×1/8` 算的 62,500ppm，兩者是同一條指數的不同寫法）——比那句傳言的 500ppm 高出兩個數量級。也就是說，小偏移收斂之快，跟「500ppm 上限」毫無關係。
 
 有了 τ≈7.5s，任何小偏移要滑到 50 毫秒以內的時間都能算：360 毫秒偏移約 15 秒收進 50 毫秒（`ln(360/50) × 7.5s ≈ 15s`），144 毫秒約 8 秒。這幾個算出來的數字，下一篇會拿去跟實測對照。
 
