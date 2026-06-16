@@ -1,0 +1,5 @@
+PING 192.168.18.163 (192.168.18.163) 56(84) bytes of data.
+
+--- 192.168.18.163 ping statistics ---
+530901 packets transmitted, 352167 received, +2030 errors, 33.6662% packet loss, time 9000600ms
+rtt min/avg/max/mdev = 0.055/1.093/3074.742/32.120 ms, pipe 193

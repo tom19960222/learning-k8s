@@ -1,0 +1,30 @@
+{
+ "pass": true,
+ "checks": [
+  {
+   "name": "ping（jitter 注入下僅供參考）",
+   "value": "660220 tx / 660218 rx / lost 2",
+   "ok": true
+  },
+  {
+   "name": "step 事件 ≤ 0（只計 |jump| ≥ 50ms）",
+   "value": "0 筆",
+   "ok": true
+  },
+  {
+   "name": "lease sentinel 0 miss/backward",
+   "value": "miss=0 backward=0",
+   "ok": true
+  },
+  {
+   "name": "journal 無 error",
+   "value": "0 行",
+   "ok": true
+  },
+  {
+   "name": "offset 滾動中位數(w=31) < 50ms",
+   "value": "peak |median| = 44.0ms（raw peak 51ms = 探針 jitter 雜訊，9002 樣本）",
+   "ok": true
+  }
+ ]
+}

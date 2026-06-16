@@ -128,20 +128,20 @@ stop_monitors() {  # $1 = outdir
 }
 
 run_tier() {  # $1=name $2=mode $3=delay $4=jitter $5=loss $6=hours
-  local name=$1 mode=$2 delay=$3 jitter=$4 loss=$5 hours=$6 outdir secs rc=0
+  local name=$1 mode=$2 delay=$3 jitter=$4 loss=$5 hours=$6 poll=${7:-256} outdir secs rc=0
   outdir="$EXP_DIR/$name"
   if [[ -f "$outdir/verdict.json" ]]; then
     log "skip tier $name（已有 verdict.json）"; return 0
   fi
   mkdir -p "$outdir"
-  echo "{\"name\":\"$name\",\"mode\":\"$mode\",\"delay_ms\":$delay,\"jitter_ms\":$jitter,\"loss_pct\":$loss}" \
+  echo "{\"name\":\"$name\",\"mode\":\"$mode\",\"delay_ms\":$delay,\"jitter_ms\":$jitter,\"loss_pct\":$loss,\"poll\":$poll}" \
     > "$outdir/tier.json"
   secs=$($PY -c "print(int($hours*3600))")
   [[ "$SMOKE" == 1 ]] && secs=90
-  log "=== tier $name（$mode）：delay ${delay}±${jitter}ms loss ${loss}%，跑 ${secs}s（max poll 256）==="
+  log "=== tier $name（$mode）：delay ${delay}±${jitter}ms loss ${loss}%，跑 ${secs}s（max poll ${poll}）==="
   # one-shot trap：函式內 RETURN trap 會殘留到呼叫者，開頭先解除；netem_clear 冪等
   trap 'trap - RETURN; stop_monitors "$outdir"; netem_clear; set_poll_max default || true' RETURN
-  set_poll_max 256
+  set_poll_max "$poll"
   netem_clear   # 確保乾淨網路再對時
   wait_synced 50 600 || { log "ERROR tier $name：baseline 收斂失敗，略過此 tier"; return 0; }
   start_monitors "$outdir"
@@ -158,32 +158,31 @@ run_tier() {  # $1=name $2=mode $3=delay $4=jitter $5=loss $6=hours
 
 summarize() {
   local md="$EXP_DIR/summary.md"
-  {
-    echo "# exp5 — PollIntervalMaxSec=256 網路惡化耐受地圖"
-    echo
-    echo "| tier | mode | delay±jitter (ms) | loss (%) | peak \\|offset\\| | step | lease miss | verdict |"
-    echo "|---|---|---|---|---|---|---|---|"
-    for spec in "${TIERS[@]}"; do
-      # shellcheck disable=SC2086
-      set -- $spec
-      local nm=$1 mode=$2 delay=$3 jitter=$4 loss=$5 vj="$EXP_DIR/$1/verdict.json"
-      if [[ -f "$vj" ]]; then
-        $PY - "$vj" "$nm" "$mode" "$delay" "$jitter" "$loss" <<'PYEOF'
-import json, sys
-vj, nm, mode, delay, jitter, loss = sys.argv[1:7]
-d = json.load(open(vj))
-c = {x["name"]: x["value"] for x in d.get("checks", [])}
-peak = next((v for k, v in c.items() if "offset" in k), "—")
-step = next((v for k, v in c.items() if k.startswith("step")), "—")
-miss = next((v for k, v in c.items() if "lease" in k), "—")
-print(f"| {nm} | {mode} | {delay}±{jitter} | {loss} | {peak} | {step} | {miss} | "
-      f"{'✅ PASS' if d.get('pass') else '❌ FAIL'} |")
+  $PY - "$EXP_DIR" > "$md" <<'PYEOF'
+import json, os, sys
+exp = sys.argv[1]
+print("# exp5 — PollIntervalMaxSec 網路惡化耐受地圖")
+print()
+print("| tier | mode | poll | delay±jitter (ms) | loss (%) | peak \\|offset\\| | step | lease miss | verdict |")
+print("|---|---|---|---|---|---|---|---|---|")
+dirs = sorted(d for d in os.listdir(exp) if os.path.isdir(os.path.join(exp, d)))
+for nm in dirs:
+    tj = os.path.join(exp, nm, "tier.json")
+    vj = os.path.join(exp, nm, "verdict.json")
+    t = json.load(open(tj)) if os.path.exists(tj) else {}
+    dj, jt, ls = t.get("delay_ms", "?"), t.get("jitter_ms", "?"), t.get("loss_pct", "?")
+    poll, mode = t.get("poll", 256), t.get("mode", "?")
+    if os.path.exists(vj):
+        d = json.load(open(vj))
+        c = {x["name"]: x["value"] for x in d.get("checks", [])}
+        peak = next((v for k, v in c.items() if "offset" in k), "—")
+        step = next((v for k, v in c.items() if k.startswith("step")), "—")
+        miss = next((v for k, v in c.items() if "lease" in k), "—")
+        verd = "✅ PASS" if d.get("pass") else "❌ FAIL"
+    else:
+        peak = step = miss = "—"; verd = "(進行中/未跑)"
+    print(f"| {nm} | {mode} | {poll} | {dj}±{jt} | {ls} | {peak} | {step} | {miss} | {verd} |")
 PYEOF
-      else
-        echo "| $nm | $mode | $delay±$jitter | $loss | — | — | — | (未跑) |"
-      fi
-    done
-  } > "$md"
   cat "$md"
 }
 
@@ -208,6 +207,23 @@ case "${1:-}" in
     run_tier a80 asym 80 0 0 0
     run_tier j40 sym 40 40 0 0
     summarize ;;
+  --controls)
+    # 對照組：同樣對稱抖動但 max poll 用預設 2048，回答「抖動下的失穩是 256s 特有、還是任何 poll 都一樣」
+    shift
+    require_root
+    [[ -n "${CLIENT_IFACE:-}" ]] || die "env.sh 缺 CLIENT_IFACE（netem 需要）"
+    trap 'netem_clear; set_poll_max default || true' EXIT INT TERM
+    preflight; mkdir -p "$EXP_DIR"
+    run_tier c2048-j40  sym 40  40  0 2.5 2048
+    run_tier c2048-j100 sym 100 100 0 2.5 2048
+    summarize
+    systemctl start systemd-timesyncd 2>/dev/null || true
+    log "exp5 controls 完成 → $EXP_DIR/summary.md" ;;
+  --detach-controls)
+    require_root
+    [[ -n "${CLIENT_IFACE:-}" ]] || die "env.sh 缺 CLIENT_IFACE（netem 需要）"
+    detach_self exp5 --controls
+    exit 0 ;;
   --all)
     shift
     require_root
