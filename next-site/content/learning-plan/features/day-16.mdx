@@ -151,7 +151,7 @@ created rule my_ssd_rule at 1
 CRUSH 的優點：去中心化（不需 metadata server 查表）、確定性（任何節點算的結果一致）、cluster map 變動時只有少量 PG 需要搬移。缺點：cluster map 必須同步給所有節點，大型 cluster 的 map 可能很大。
 
 參考：
-- [CRUSH 論文 (PDF)](https://ceph.com/wp-content/uploads/2016/08/weil-crush-sc06.pdf) — 原始演算法論文
+- [CRUSH 論文 (PDF)](https://ceph.io/assets/pdfs/weil-crush-sc06.pdf) — 原始演算法論文
 - [Ceph 原始碼 src/crush](https://github.com/ceph/ceph/tree/v19.2.3/src/crush) — C++ 實作
 - [CRUSH map 文件](https://docs.ceph.com/en/squid/rados/operations/crush-map/)
 
@@ -165,7 +165,7 @@ CRUSH 的優點：去中心化（不需 metadata server 查表）、確定性（
 
 ## 參考資料
 
-- [CRUSH 演算法論文](https://ceph.com/wp-content/uploads/2016/08/weil-crush-sc06.pdf) — 原始論文，含 pseudocode
+- [CRUSH 演算法論文](https://ceph.io/assets/pdfs/weil-crush-sc06.pdf) — 原始論文，含 pseudocode
 - [CRUSH map 操作指南](https://docs.ceph.com/en/squid/rados/operations/crush-map/) — Squid 文件
 - [Ceph 原始碼 src/crush](https://github.com/ceph/ceph/tree/v19.2.3/src/crush) — C++ 實作入口
 - [Device Classes](https://docs.ceph.com/en/squid/rados/operations/crush-map/#device-classes) — device class 設定說明

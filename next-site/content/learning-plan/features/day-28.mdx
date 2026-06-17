@@ -224,7 +224,7 @@ PVC clone 走 CSI 的 [`spec.dataSource`](https://kubernetes.io/docs/concepts/st
 
 更深入：
 
-- [DataVolume types](https://kubevirt.io/user-guide/storage/datavolumes/) — 所有 source 形式
+- [DataVolume types](https://kubevirt.io/user-guide/storage/containerized_data_importer/) — 所有 source 形式
 - [CDI repository](https://github.com/kubevirt/containerized-data-importer) — 原始碼
 - [Volume PVC dataSource](https://kubernetes.io/docs/concepts/storage/volume-pvc-datasource/) — k8s clone 規格
 
@@ -239,7 +239,7 @@ CDI 的 clone 流程其實有三條路：smart clone（CSI VolumeSnapshot）、h
 ### 對應原始碼
 
 - [`kubevirt/containerized-data-importer/pkg/controller/clone/`](https://github.com/kubevirt/containerized-data-importer/tree/v1.62.0/pkg/controller/clone) — clone strategy 選擇邏輯（smart vs host-assisted vs network）
-- [`kubevirt/containerized-data-importer/pkg/controller/datavolume/clone-controller.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/datavolume/clone-controller.go) — DataVolume controller 的 clone 分支
+- [`kubevirt/containerized-data-importer/pkg/controller/datavolume/pvc-clone-controller.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/datavolume/pvc-clone-controller.go) — DataVolume controller 的 clone 分支
 - [`kubevirt/containerized-data-importer/pkg/controller/clone/csi-clone.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/clone/csi-clone.go) — smart clone 走 CSI `dataSource` 的實作
 - [`kubevirt/containerized-data-importer/pkg/controller/clone/host-clone.go`](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/pkg/controller/clone/host-clone.go) — fallback 的 importer-based host-assisted clone
 
@@ -257,8 +257,8 @@ CDI 的 clone 流程其實有三條路：smart clone（CSI VolumeSnapshot）、h
 
 ## 參考資料
 
-- [DataVolumes guide](https://kubevirt.io/user-guide/storage/datavolumes/)
-- [CDI 設計](https://github.com/kubevirt/containerized-data-importer/blob/main/doc/basic_flow.md)
+- [DataVolumes guide](https://kubevirt.io/user-guide/storage/containerized_data_importer/)
+- [CDI 設計](https://github.com/kubevirt/containerized-data-importer/blob/v1.62.0/doc/design.md)
 - [Container Disks](https://kubevirt.io/user-guide/virtual_machines/disks_and_volumes/#containerdisk) — 跟 registry source 對比
 
 ## 🧹 Cleanup / 回退

@@ -156,7 +156,7 @@ kubectl delete pod nginx
 
 CRI protocol 參考：
 - [cri-api proto](https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto)
-- [kubelet/cri 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/cri)
+- [kubelet/kuberuntime 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/kuberuntime)
 
 ## 收穫檢查
 
@@ -169,7 +169,7 @@ CRI protocol 參考：
 ## 參考資料
 
 - [CRI API proto](https://github.com/kubernetes/cri-api/blob/master/pkg/apis/runtime/v1/api.proto) — RuntimeService / ImageService 完整定義
-- [kubelet/cri 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/cri) — kubelet 如何呼叫 CRI
+- [kubelet/kuberuntime 原始碼](https://github.com/kubernetes/kubernetes/tree/v1.36.0/pkg/kubelet/kuberuntime) — kubelet 如何呼叫 CRI
 - [containerd 文件](https://containerd.io/docs/) — containerd 的 plugin 架構與 CRI plugin
 - [crictl 使用指南](https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/) — crictl 常用指令速查
 

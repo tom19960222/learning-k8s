@@ -159,7 +159,7 @@ kubectl -n rook-ceph logs -l app=rook-ceph-operator --tail=300 | grep -E '(Recon
 git clone --depth=1 -b release-1.16 https://github.com/rook/rook.git /tmp/rook
 ```
 
-打開 [pkg/operator/ceph/cluster/cluster_controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/cluster_controller.go)，找 `Reconcile()` 函式。標記主要分支：
+打開 [pkg/operator/ceph/cluster/controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/controller.go)，找 `Reconcile()` 函式。標記主要分支：
 
 1. 拿到 CephCluster CR；如果 spec 變了要 detect。
 2. 確認 dependencies（CRD 已安裝、namespace 存在、auth secret）
@@ -183,7 +183,7 @@ Rook 沒有重寫 ceph —— 它跑的是 **upstream ceph binary 包成 contain
 更深入：
 
 - [Rook design](https://rook.io/docs/rook/v1.16/Getting-Started/intro/)
-- 主 controller 原始碼：[pkg/operator/ceph/cluster/cluster_controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/cluster_controller.go)
+- 主 controller 原始碼：[pkg/operator/ceph/cluster/controller.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/controller.go)
 - mon 控制：[pkg/operator/ceph/cluster/mon/mon.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/mon/mon.go)
 - osd 控制：[pkg/operator/ceph/cluster/osd/osd.go](https://github.com/rook/rook/blob/release-1.16/pkg/operator/ceph/cluster/osd/osd.go)
 

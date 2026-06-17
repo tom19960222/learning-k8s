@@ -196,7 +196,7 @@ CephFS 也能 scale-out：在 active MDS 上 `ceph fs set k8s-fs max_mds 2` 可�
 
 更深入：
 
-- [CephFS 架構](https://docs.ceph.com/en/squid/cephfs/architecture/)
+- [CephFS 架構](https://docs.ceph.com/en/squid/cephfs/)
 - 原始碼：[src/mds/MDSDaemon.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/mds/MDSDaemon.cc)（daemon 入口）與 [src/mds/Server.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/mds/Server.cc)（client RPC handler）
 
 ## 收穫檢查
@@ -209,7 +209,7 @@ CephFS 也能 scale-out：在 active MDS 上 `ceph fs set k8s-fs max_mds 2` 可�
 ## 參考資料
 
 - [CephFS](https://docs.ceph.com/en/squid/cephfs/) — 官方文件首頁
-- [ceph-csi cephfs deploy](https://github.com/ceph/ceph-csi/blob/v3.13.0/docs/deploy-cephfs.md) — k8s 端安裝
+- [ceph-csi cephfs deploy](https://github.com/ceph/ceph-csi/blob/v3.13.0/docs/cephfs/deploy.md) — k8s 端安裝
 - [src/mds/Server.cc](https://github.com/ceph/ceph/blob/v19.2.3/src/mds/Server.cc) — MDS 主 RPC handler
 
 ## 🧹 Cleanup / 回退
