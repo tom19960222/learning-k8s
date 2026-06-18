@@ -2,13 +2,20 @@ import { CodeAnchor } from './CodeAnchor'
 import { Callout } from './Callout'
 import { QuizQuestion } from './QuizQuestion'
 
+function withBasePath(value: any) {
+  if (typeof value !== 'string') return value
+  const base = process.env.NEXT_PUBLIC_BASE_PATH || ''
+  if (!base || !value.startsWith('/') || value.startsWith('//')) return value
+  if (value === base || value.startsWith(`${base}/`)) return value
+  return `${base}${value}`
+}
+
 export const MDX_COMPONENTS = {
   CodeAnchor,
   Callout,
   QuizQuestion,
   img: ({ src, alt, ...props }: any) => {
-    const base = process.env.NEXT_PUBLIC_BASE_PATH || ''
-    const resolvedSrc = src?.startsWith('/') ? `${base}${src}` : src
+    const resolvedSrc = withBasePath(src)
     return (
       <img
         src={resolvedSrc}
@@ -51,7 +58,7 @@ export const MDX_COMPONENTS = {
   table: (props: any) => <div className="overflow-x-auto mb-4"><table className="w-full border-collapse text-sm" {...props} /></div>,
   th: (props: any) => <th className="bg-[#21262d] text-[#e6edf3] p-2 border border-[#30363d] text-left font-semibold" {...props} />,
   td: (props: any) => <td className="p-2 border border-[#30363d] text-[#8b949e]" {...props} />,
-  a: (props: any) => <a className="text-[#2f81f7] hover:underline" {...props} />,
+  a: ({ href, ...props }: any) => <a className="text-[#2f81f7] hover:underline" href={withBasePath(href)} {...props} />,
   blockquote: (props: any) => <blockquote className="border-l-4 border-[#2f81f7] pl-4 italic text-[#8b949e] my-4" {...props} />,
   strong: (props: any) => <strong className="text-white font-semibold" {...props} />,
   hr: () => <hr className="border-[#30363d] my-8" />,

@@ -326,15 +326,21 @@ def check_mainland_terms() -> None:
 # ─────────────────────────────────────────────
 def check_build() -> None:
     print(f"\n{BOLD}[8] Next.js Build{RESET}")
-    print("  Running npm run build (this may take ~30s)...")
+    build_base_path = os.environ.get("NEXT_PUBLIC_BASE_PATH", "/learning-k8s")
+    build_env = os.environ.copy()
+    build_env["NEXT_PUBLIC_BASE_PATH"] = build_base_path
+    build_target = build_base_path or "/"
+    print(f"  Running npm run build with NEXT_PUBLIC_BASE_PATH={build_target} (this may take ~30s)...")
     result = subprocess.run(
         ["npm", "run", "build"],
         cwd=NEXT_SITE,
+        env=build_env,
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
         ok("Build passed")
+        check_exported_base_path(build_base_path)
     else:
         # Extract meaningful error lines
         all_output = result.stdout + result.stderr
@@ -343,6 +349,36 @@ def check_build() -> None:
         fail(f"Build failed (exit {result.returncode})")
         for line in error_lines[:10]:
             fail(f"  {line.strip()}")
+
+
+def check_exported_base_path(base_path: str) -> None:
+    """Catch root-relative site links in the GitHub Pages subpath export."""
+    if not base_path:
+        return
+
+    out_dir = NEXT_SITE / "out"
+    if not out_dir.exists():
+        fail("Build output directory not found: next-site/out")
+        return
+
+    site_prefixes = [p.name for p in CONTENT.iterdir() if p.is_dir()] + ["diagrams"]
+    pattern = re.compile(r'(href|src)="(/(?:' + "|".join(re.escape(p) for p in site_prefixes) + r')(?:/|["#]))')
+    issues: list[tuple[Path, str, str]] = []
+
+    for html in out_dir.rglob("*.html"):
+        text = html.read_text(errors="ignore")
+        for match in pattern.finditer(text):
+            issues.append((html.relative_to(NEXT_SITE), match.group(1), match.group(2)))
+            if len(issues) >= 20:
+                break
+        if len(issues) >= 20:
+            break
+
+    if issues:
+        for html, attr, value in issues:
+            fail(f"Missing basePath in exported HTML: {html} has {attr}=\"{value}\"")
+    else:
+        ok(f"Exported HTML links include basePath ({base_path})")
 
 
 # ─────────────────────────────────────────────
