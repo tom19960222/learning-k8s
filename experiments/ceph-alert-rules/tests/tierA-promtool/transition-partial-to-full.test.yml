@@ -1,0 +1,41 @@
+# Tier A — edge：OSD host 由 partial-down 轉 full-down（mid-window 轉換）。spec §4.11 edge
+# 來源：devil review 的 11.7，改以 promtool 實測確認（非預測）。
+# 結論：host alert 的 for-clock 自「整台變 full-down」那刻起算，不從單顆先 down 那刻起算；
+#       且轉換過程 daemon alert 全程不 fire（單顆未滿 5m 就被 unless 接手、之後被壓）。
+rule_files:
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'   # 全程 down
+        values: '0x20'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'   # t=3m 才 down
+        values: '1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x20'
+    promql_expr_test:
+      - expr: ceph:osd_host_down:scoped   # partial 期間：空
+        eval_time: 2m
+        exp_samples: []
+      - expr: ceph:osd_host_down:scoped   # full 之後：出現
+        eval_time: 3m
+        exp_samples:
+          - labels: 'ceph:osd_host_down:scoped{hostname="osd-host-a"}'
+            value: 2
+    alert_rule_test:
+      - eval_time: 5m   # daemon alert 全程不 fire
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts: []
+      - eval_time: 7m   # host alert：自 t=3m 起算，7m 未滿 5m
+        alertname: CephOSDHostDownScoped
+        exp_alerts: []
+      - eval_time: 8m   # 8m 滿 5m → fire
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"

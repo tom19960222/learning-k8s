@@ -119,7 +119,7 @@ groups:
           summary: "Ceph client-risk check active: {{ $labels.name }}"
 
       - alert: CephMonQuorumLost
-        expr: count(ceph_mon_quorum_status == 1) < 2
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < 2
         for: 1m
         labels:
           severity: critical
@@ -154,7 +154,17 @@ groups:
 - **`CephClientBlocked` vs `CephClientRisk` 的分工**：前者只盯 `PG_AVAILABILITY` / `SLOW_OPS`（client I/O 已經被擋），1 分鐘就 page；後者是「其餘所有會危及 client 的 health check」的 catch-all，5 分鐘 page。
 - **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、以及 `HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING` / `PG_DEGRADED` / `OSDMAP_FLAGS`（這些是低優先，交給 `CephLowPriorityNotice`）。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
 - **特別注意 `PG_DEGRADED` / `OSDMAP_FLAGS` —— 這兩個是「換硬碟一定會叫」的元兇**。停一顆 OSD 換硬碟時，它上面的 PG 副本掉一份 → ceph 升 `PG_DEGRADED`；如果維護前設了 `noout` 旗標，會升 `OSDMAP_FLAGS`。`CephClientRisk` 是 `name!~` 的 catch-all，**任何不在排除清單裡的 health check active 滿 5 分鐘都 page**——所以早期版本只 silence `CephOSDDaemonDownScoped` 是不夠的，`CephClientRisk{name="PG_DEGRADED"}` 還是會在 5 分鐘後叫。把這兩個排除掉、歸到 Slack-only 的 `CephLowPriorityNotice` 是對的：`PG_DEGRADED` 在 ceph 內部就是 `HEALTH_WARN`（`PGMap.cc:2578`，`sev = HEALTH_WARN`），而且 upstream ceph-mixin 預設**沒有任何 rule 直接 page 它**（degraded 只讓 `CephHealthWarning` 這條 Slack-only 的 warning 亮）。換句話說，把 degraded 排出 pager 不是「降級一個該叫的訊號」，是把它修回 ceph 預設本來的等級——真正擋到 I/O 的 `PG_AVAILABILITY` 仍由 `CephClientBlocked` page，生命線不動。
-- **`CephMonQuorumLost` 寫死 3-mon majority**（`count(...) < 2`）。非 3-mon 的改法見文末邊界。
+- **`CephMonQuorumLost` 寫死 3-mon majority**（`(count(...) or vector(0)) < 2`）。`or vector(0)` 不是裝飾——少了它，全部 mon 掛掉時 `ceph_mon_quorum_status == 1` 過濾成空 vector、`count(空)` 在 PromQL 是**無 sample**（不是純量 0），`< 2` 算不出結果反而**不 fire**，剛好在 quorum 全失守的最壞情況靜默。非 3-mon 的改法見文末邊界。
+
+<Callout type="warning" title="為什麼 CephMonQuorumLost 一定要 or vector(0)（promtool 抓到的真 bug）">
+  早期版本寫的是 `count(ceph_mon_quorum_status == 1) < 2`，看起來合理：在 quorum 的 mon 數少於 2 就叫。但 PromQL 的 `count()` 是對「存在的 series」做聚合——當**所有** mon 都 down、`ceph_mon_quorum_status` 全部 = 0 時，`== 1` 過濾後一條都不剩，`count(空 vector)` 回傳的是**無 sample**而非 `0`，於是 `無 sample < 2` 整個運算式沒有結果，alert **不會 fire**。
+
+  也就是這條「quorum 失守生命線」在它最該叫的情況（一台不剩）反而靜默；只有「還剩 1 台」（count=1）時才叫。本頁的開發環境測試計劃用 `promtool test rules` 餵「3 台全 0」就重現了 `got:[]`。
+
+  修法是標準 idiom `(count(...) or vector(0)) < 2`：左邊為空時 `or vector(0)` 退回一條值為 0 的 series，`0 < 2` 成立照樣 page。已驗證 healthy 不 fire、掉 2 台 fire、**掉 3 台也 fire**。對應的驗證見 [Ceph - 在開發環境驗證這套 alert](./prometheus-alert-testing)。
+
+  **一個誠實的 trade-off**：`or vector(0)` 分不出「3 台 mon 都回報 quorum_status=0」與「完全沒有 `ceph_mon_quorum_status` 這個 metric」（例如 mgr 剛重啟、module 還沒匯出），兩者它都會 fire。多數情況這可接受——連 quorum metric 都沒有本來就代表你對 quorum 盲了，值得叫；而 `CephExporterDown` 是「整個 ceph job 抓不到」的主訊號。若你想讓這條只在「真的有 mon 回報但不足額」時 fire，用文末 **metadata-anchored 動態版**：它的門檻 `floor(count(ceph_mon_metadata)/2)+1` 在 metadata 缺席時也變空，`0 < 空` 不成立 → 不會被 metric 缺席誤觸（測試計劃頁有寫死版 fire、動態版不 fire 的對照）。
+</Callout>
 
 ## `ceph-scoped-availability`：帶 label，維護可精準 silence
 
@@ -487,16 +497,16 @@ ceph orch ps --daemon_type mon
 
 ### 3-mon hard-code
 
-`CephMonQuorumLost` 用的是 3-mon majority：
+`CephMonQuorumLost` 用的是 3-mon majority（`or vector(0)` 的原因見前面 callout）：
 
 ```promql
-count(ceph_mon_quorum_status == 1) < 2
+(count(ceph_mon_quorum_status == 1) or vector(0)) < 2
 ```
 
-非 3-mon 的 cluster 改成動態 majority：
+非 3-mon 的 cluster 改成動態 majority（一樣要保留 `or vector(0)`，否則全失守時 `count(空)` 一樣不 fire）：
 
 ```promql
-count(ceph_mon_quorum_status == 1) < (floor(count(ceph_mon_metadata) / 2) + 1)
+(count(ceph_mon_quorum_status == 1) or vector(0)) < (floor(count(ceph_mon_metadata) / 2) + 1)
 ```
 
 ### 預設 rules 仍然會出現
@@ -506,6 +516,14 @@ count(ceph_mon_quorum_status == 1) < (floor(count(ceph_mon_metadata) / 2) + 1)
 ### `CephClientRisk` 不要變成垃圾桶
 
 `CephClientRisk` 的重點是「其餘會危及 client 的 health check」。如果某個 check 長期不是 client 風險，就把它移出這條 rule——不要讓 oncall 被一條過大的 catch-all 訓練到無視 Pager。
+
+### host 由 partial-down 轉 full-down 時的計時
+
+一台 OSD host 可能先掉一顆、幾分鐘後整台才 down（同 host 兩顆碟先後壞）。這時 `ceph:osd_host_down:scoped` 是在「整台變 full-down 那刻」才第一次出現，所以 `CephOSDHostDownScoped` 的 `for: 5m` 是**從整台 down 起算**，不是從第一顆 down 起算；而那段 partial 期間單顆 down 的 `CephOSDDaemonDownScoped` 還沒滿自己的 5m 就被 `unless` 接手，**整段轉換不會雙重 page**。這個邊界由測試計劃用 promtool 實測確認（非推論）。
+
+### Prometheus alert 的共同盲區：metric 缺席
+
+`up{job="ceph"} == 0`（`CephExporterDown`）與所有 `ceph_health_detail` 系列規則都要求**對應的 series 存在**才會 fire。如果某個 metric 從沒被抓過（scrape config 打錯、target 沒註冊），規則靜默、毫無 pager。要補這個盲區用 `absent()` 元規則，例如 `absent(up{job="ceph"})` 或 `absent(ceph_health_status)`——這超出本頁「在預設 rule 之上加一層」的範圍，但部署時值得一併補上。
 
 ## 接下來 / 相關頁面
 

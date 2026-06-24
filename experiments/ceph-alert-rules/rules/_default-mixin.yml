@@ -1,0 +1,28 @@
+# 預設 ceph-mixin rule（保留當 context）。逐字取自 ceph v19.2.3 ceph-mixin source：
+# ceph/monitoring/ceph-mixin/prometheus_alerts.yml (pinned commit c92aebb279)
+# 只收本測試會用到的兩條（CephHealthError 要 page、CephHealthWarning slack-only）。
+# 其餘 aggregate rule（CephMonDownQuorumAtRisk / CephOSDDownHigh …）的 expr 複雜且非本頁設計，
+# routing 由 Tier B 用 label set 直接測，不需在此放可載入的 rule。
+groups:
+  - name: ceph-default-mixin
+    rules:
+      - alert: CephHealthError
+        expr: ceph_health_status == 2
+        for: 5m
+        labels:
+          oid: "1.3.6.1.4.1.50495.1.2.1.2.1"
+          severity: critical
+          type: ceph_default
+        annotations:
+          summary: "Ceph is in the ERROR state"
+          description: "The cluster state has been HEALTH_ERROR for more than 5 minutes."
+
+      - alert: CephHealthWarning
+        expr: ceph_health_status == 1
+        for: 15m
+        labels:
+          severity: warning
+          type: ceph_default
+        annotations:
+          summary: "Ceph is in the WARNING state"
+          description: "The cluster state has been HEALTH_WARN for more than 15 minutes."

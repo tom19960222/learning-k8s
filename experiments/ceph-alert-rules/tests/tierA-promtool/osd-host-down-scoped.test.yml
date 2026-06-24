@@ -1,0 +1,71 @@
+# Tier A — CephOSDHostDownScoped：整台 OSD host down，5m page，帶 hostname。spec §4.10
+rule_files:
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 1m
+tests:
+  # 整台 host-a 全 down → for 邊界 4m 不 fire、5m fire {hostname=osd-host-a}
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephOSDHostDownScoped
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+
+  # 部分 down（1/2）→ 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephOSDHostDownScoped
+        exp_alerts: []
+
+  # 多 host：host-a 全 down、host-b 全 up → 只 host-a fire（精準 scope，維護 host-a 不波及 host-b）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.2"}'
+        values: '1x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.3"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="osd-host-b"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.3", hostname="osd-host-b"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"

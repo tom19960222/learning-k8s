@@ -1,0 +1,139 @@
+# Tier A 邊界 — 動態 majority 與寫死 < 2 的等價性 + n=5。spec §4.15
+# 3-mon：門檻 floor(3/2)+1=2，行為應與寫死 < 2 一致。5-mon：門檻 3。
+rule_files:
+  - ../../rules/ceph-mon-quorum-dynamic.yml
+evaluation_interval: 1m
+tests:
+  # 3-mon 掉 1（count=2，門檻 2）：2 < 2 false → 不 fire（與寫死版一致）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="h-a"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="h-b"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="h-c"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts: []
+
+  # 3-mon 掉 2（count=1）：1 < 2 → fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="h-a"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="h-b"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="h-c"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below dynamic majority"}
+
+  # 3-mon 全掉（count 空→0，門檻 2）：0 < 2 → fire（F1 修正在動態版也成立；metadata 仍在 monmap）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="h-a"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="h-b"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="h-c"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below dynamic majority"}
+
+  # 5-mon 掉 2（count=3，門檻 floor(5/2)+1=3）：3 < 3 false → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.d"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.e"}'
+        values: '0x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="h-a"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="h-b"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="h-c"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.d", hostname="h-d"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.e", hostname="h-e"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts: []
+
+  # 5-mon 掉 3（count=2）：2 < 3 → fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.d"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.e"}'
+        values: '0x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="h-a"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="h-b"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="h-c"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.d", hostname="h-d"}'
+        values: '1x5'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.e", hostname="h-e"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below dynamic majority"}
+
+  # 對照寫死版的 absence trade-off：metric 完全不存在（連 metadata 都沒有）時，
+  # 動態版的門檻 floor(count(ceph_mon_metadata)/2)+1 也變成空 → 0 < 空 = 空 → 不 fire。
+  # 即 metadata-anchored 動態版「天生」不會被 metric 缺席誤觸（與寫死版的 absence-fire 相反）。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'   # 完全沒有 mon quorum/metadata series
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostDynamic
+        exp_alerts: []

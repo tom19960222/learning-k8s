@@ -1,0 +1,52 @@
+# 逐字取自 next-site/content/ceph/features/prometheus-alert-design.mdx
+# §「ceph-scoped-availability：帶 label，維護可精準 silence」
+# 被測物 — 不得改寫。lib/check-rules-match-page.sh 會比對。
+groups:
+  - name: ceph-scoped-availability
+    rules:
+      - record: ceph:osd_up:with_hostname
+        expr: |
+          ceph_osd_up
+            * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+
+      - record: ceph:osd_host_down:scoped
+        expr: |
+          count by (hostname) (ceph:osd_up:with_hostname == 0)
+          ==
+          count by (hostname) (ceph:osd_up:with_hostname)
+
+      - alert: CephOSDHostDownScoped
+        expr: ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph OSD host down: {{ $labels.hostname }}"
+          runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+
+      - alert: CephOSDDaemonDownScoped
+        expr: |
+          (ceph:osd_up:with_hostname == 0)
+          unless on (hostname) ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph OSD down: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+          runbook: "ceph osd tree; ceph osd ok-to-stop {{ $labels.ceph_daemon }}; inspect daemon log"
+
+      - alert: CephMonDownScoped
+        expr: |
+          (
+            (1 - ceph_mon_quorum_status)
+              * on (ceph_daemon) group_left(hostname) ceph_mon_metadata
+          ) == 1
+        for: 30s
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph MON down or out of quorum: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+          runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"

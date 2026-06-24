@@ -1,0 +1,27 @@
+# Alertmanager routing（被測物）。route 區塊逐字取自 prometheus-alert-design.mdx
+# §「Alertmanager routing：把角色映射到 receiver」。receivers 補成 amtool 可吃的最小定義。
+# 效果：pager 只收 CephHealthError + ceph-stability-first + ceph-scoped-availability；
+#       預設 aggregate（type=ceph_default，除 CephHealthError）一律落到 route 4 → slack。
+route:
+  receiver: slack-ceph
+  routes:
+    - receiver: pager-ceph
+      matchers:
+        - type="ceph_default"
+        - alertname="CephHealthError"
+
+    - receiver: pager-ceph
+      matchers:
+        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
+
+    - receiver: slack-ceph
+      matchers:
+        - alertname="CephLowPriorityNotice"
+
+    - receiver: slack-ceph
+      matchers:
+        - type="ceph_default"
+
+receivers:
+  - name: slack-ceph
+  - name: pager-ceph

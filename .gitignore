@@ -6,3 +6,6 @@ next-site/out/
 experiments/timesyncd/env.sh
 __pycache__/
 experiments/timesyncd/.ssh
+
+# superpowers SDD scratch / progress ledger (do not commit)
+.superpowers/

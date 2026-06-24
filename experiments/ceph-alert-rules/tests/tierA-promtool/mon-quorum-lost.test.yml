@@ -1,0 +1,83 @@
+# Tier A — CephMonQuorumLost：3-mon majority 生命線，1m page。spec §4.5
+# 含 F1 修正後行為：全部 mon 掛掉（count(==1) 為空）也必須 fire。
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+evaluation_interval: 1m
+tests:
+  # 健康 3 台在 quorum：count=3，不 < 2 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+
+  # 維護 1 台（count=2）：生命線靜默，不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+
+  # 掉 2 台（count=1 < 2）：for 邊界 0m 不 fire、1m fire（count() 去掉所有 label，只剩 rule label）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CephMonQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below 3-mon majority"}
+
+  # F1 關鍵：全部 3 台掉（count(==1) 空 → or vector(0) 退 0 < 2）→ 必須 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '0x5'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below 3-mon majority"}
+
+  # F1 副作用（已知 trade-off）：metric 完全不存在（連一條 ceph_mon_quorum_status 都沒有，
+  # 例如 mgr 剛重啟還沒匯出）時，or vector(0) 也會讓寫死版 fire。這不是「mon 掛了」而是「metric 缺席」，
+  # 但寫死版分不出來。此 case 記錄「實際就是會 fire」的真實行為（非主張它該不該 fire）。
+  # 想避免 absence 觸發 → 用文末 metadata-anchored 動態版（見 mon-quorum-dynamic.test.yml 對照）。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'   # 故意只有別的 metric，完全沒有 mon quorum/metadata
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLost
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph MON quorum lost or below 3-mon majority"}

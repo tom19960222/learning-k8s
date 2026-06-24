@@ -1,0 +1,60 @@
+# Tier A — CephMonDownScoped：某 mon 不在 quorum，30s page，帶 ceph_daemon+hostname。spec §4.12
+# for:30s → evaluation_interval 設 15s 才測得到邊界。
+rule_files:
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 15s
+tests:
+  # mon.a down(quorum_status=0)+metadata → 15s 不 fire、30s fire；mon.b/mon.c up
+  - interval: 15s
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '0x8'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x8'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="mon-host-a"}'
+        values: '1x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="mon-host-b"}'
+        values: '1x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="mon-host-c"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 15s
+        alertname: CephMonDownScoped
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: CephMonDownScoped
+        exp_alerts:
+          - exp_labels: {ceph_daemon: mon.a, hostname: mon-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph MON down or out of quorum: mon.a on mon-host-a"
+              runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"
+
+  # 全部 in quorum → 不 fire
+  - interval: 15s
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x8'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="mon-host-a"}'
+        values: '1x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="mon-host-b"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 60s
+        alertname: CephMonDownScoped
+        exp_alerts: []
+
+  # edge：mon.a down 但無 metadata → join 無結果 → 不 fire（呼應 monmap 宣稱：metadata 在才接得到）
+  - interval: 15s
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '0x8'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="mon-host-b"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 60s
+        alertname: CephMonDownScoped
+        exp_alerts: []

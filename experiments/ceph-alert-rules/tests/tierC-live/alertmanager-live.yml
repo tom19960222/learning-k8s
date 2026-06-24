@@ -1,0 +1,33 @@
+# Tier C live AM 設定：與 rules/alertmanager-route.yml 同邏輯，但 receivers 指向 webhook sink，
+# 並把 group_wait 設 0s 讓 webhook 立刻送達（測試用，非生產值）。sink port 由 run.sh 用 sed 帶入。
+global:
+  resolve_timeout: 5m
+route:
+  receiver: slack-ceph
+  group_by: ['alertname', 'hostname', 'ceph_daemon']
+  group_wait: 0s
+  group_interval: 1s
+  repeat_interval: 1h
+  routes:
+    - receiver: pager-ceph
+      group_wait: 0s
+      matchers:
+        - type="ceph_default"
+        - alertname="CephHealthError"
+    - receiver: pager-ceph
+      group_wait: 0s
+      matchers:
+        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
+    - receiver: slack-ceph
+      matchers:
+        - alertname="CephLowPriorityNotice"
+    - receiver: slack-ceph
+      matchers:
+        - type="ceph_default"
+receivers:
+  - name: slack-ceph
+    webhook_configs:
+      - url: 'http://127.0.0.1:__SINKPORT__/slack'
+  - name: pager-ceph
+    webhook_configs:
+      - url: 'http://127.0.0.1:__SINKPORT__/pager'

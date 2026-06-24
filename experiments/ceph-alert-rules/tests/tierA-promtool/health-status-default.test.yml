@@ -1,0 +1,76 @@
+# Tier A — 預設 ceph-mixin 健康總開關：CephHealthError（要 page）/ CephHealthWarning（slack-only）
+# 規則來源：rules/_default-mixin.yml（ceph-mixin v19.2.3 逐字）。
+# 覆蓋 spec §4.1 / §4.2。
+rule_files:
+  - ../../rules/_default-mixin.yml
+evaluation_interval: 1m
+tests:
+  # 正常觸發 + for 邊界：HEALTH_ERR(status=2) 持續 → 4m 未到不 fire、5m 才 fire；同時 Warning 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_status'
+        values: '2x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephHealthError
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephHealthError
+        exp_alerts:
+          - exp_labels: {oid: "1.3.6.1.4.1.50495.1.2.1.2.1", severity: critical, type: ceph_default}
+            exp_annotations:
+              summary: "Ceph is in the ERROR state"
+              description: "The cluster state has been HEALTH_ERROR for more than 5 minutes."
+      - eval_time: 5m
+        alertname: CephHealthWarning
+        exp_alerts: []
+
+  # CephHealthWarning：HEALTH_WARN(status=1) 持續 15m fire（severity warning, type ceph_default）；HealthError 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_status'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: CephHealthWarning
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CephHealthWarning
+        exp_alerts:
+          - exp_labels: {severity: warning, type: ceph_default}
+            exp_annotations:
+              summary: "Ceph is in the WARNING state"
+              description: "The cluster state has been HEALTH_WARN for more than 15 minutes."
+      - eval_time: 15m
+        alertname: CephHealthError
+        exp_alerts: []
+
+  # HEALTH_OK(status=0)：兩條都不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_status'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephHealthError
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: CephHealthWarning
+        exp_alerts: []
+
+  # for flap reset：status 在 5m 內跳掉一次 → active 計時重置，5m 時不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_status'
+        values: '2 2 2 0 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephHealthError
+        exp_alerts: []
+      - eval_time: 9m   # 自 t=4m 重新 active，9m 才滿 5m → fire（確認重置後仍會 fire，非永久壞掉）
+        alertname: CephHealthError
+        exp_alerts:
+          - exp_labels: {oid: "1.3.6.1.4.1.50495.1.2.1.2.1", severity: critical, type: ceph_default}
+            exp_annotations:
+              summary: "Ceph is in the ERROR state"
+              description: "The cluster state has been HEALTH_ERROR for more than 5 minutes."

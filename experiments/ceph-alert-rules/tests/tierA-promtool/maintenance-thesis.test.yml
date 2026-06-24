@@ -1,0 +1,120 @@
+# Tier A — 旗艦：維護 osd-host-a 的真實情境，同時載入兩個 rule group。spec §4.4 + devil #2
+# 驗證頁面整套設計的核心宣稱：維護期間「cluster-wide 噪音壓掉、scoped 訊號保留」。
+# 模擬 ceph orch host maintenance enter osd-host-a 實際升起的 health check：
+#   OSD_HOST_DOWN（整台 OSD down）、OSDMAP_FLAGS（自動 noout）、PG_DEGRADED（副本掉一份）。
+# 同時 osd-host-a 兩顆 OSD 的 ceph_osd_up=0、host-b 正常。
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      # scoped 用的 metric：host-a 兩顆全 down、host-b 一顆 up
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.7"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.7", hostname="osd-host-b"}'
+        values: '1x10'
+      # stability-first 用的 metric：維護升起的三個 health check（全在 CephClientRisk 排除清單）
+      - series: 'ceph_health_detail{name="OSD_HOST_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      # 噪音壓掉：catch-all 與 client-blocked 都不 fire
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: CephClientBlocked
+        exp_alerts: []
+      # 訊號保留：唯一的 pager 訊號是 scoped host-down（維護時用 hostname=osd-host-a silence 它）
+      - eval_time: 6m
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+      # 整台 down → 不會每顆 OSD 各叫一次（unless 去重）
+      - eval_time: 6m
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts: []
+
+  # thesis 2 — 維護單台 mon（devil #4）：mon.a 維護，升 MON_DOWN + HOST_IN_MAINTENANCE。
+  # 噪音壓掉（CephClientRisk、CephMonQuorumLost 都不 fire）+ 訊號保留（CephMonDownScoped fire）。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '0x10'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x10'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x10'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.a", hostname="mon-host-a"}'
+        values: '1x10'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.b", hostname="mon-host-b"}'
+        values: '1x10'
+      - series: 'ceph_mon_metadata{ceph_daemon="mon.c", hostname="mon-host-c"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="MON_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="HOST_IN_MAINTENANCE", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 6m       # 1 mon 維護，count=2，生命線正確靜默
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+      - eval_time: 6m       # 訊號保留：scoped mon-down（用 hostname/ceph_daemon silence）
+        alertname: CephMonDownScoped
+        exp_alerts:
+          - exp_labels: {ceph_daemon: mon.a, hostname: mon-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph MON down or out of quorum: mon.a on mon-host-a"
+              runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"
+
+  # thesis 3 — 換單顆硬碟（devil #4）：osd.5 down（同 host 還有 osd.6 up），升 OSD_DOWN+PG_DEGRADED+OSDMAP_FLAGS。
+  # 噪音壓掉（CephClientRisk 不 fire）+ 訊號保留（CephOSDDaemonDownScoped fire，非整台 host alert）。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.5"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.6"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.5", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.6", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 6m       # 訊號保留：單顆 scoped daemon-down（用 ceph_daemon silence）
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.5, hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD down: osd.5 on osd-host-a"
+              runbook: "ceph osd tree; ceph osd ok-to-stop osd.5; inspect daemon log"
+      - eval_time: 6m       # 非整台 → host alert 不 fire
+        alertname: CephOSDHostDownScoped
+        exp_alerts: []

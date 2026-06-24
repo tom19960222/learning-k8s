@@ -1,0 +1,13 @@
+# 頁面「邊界 / 3-mon hard-code」提供的動態 majority 版本（已套 F1 的 or vector(0) 修正）。
+# 來源：next-site/content/ceph/features/prometheus-alert-design.mdx §邊界。
+groups:
+  - name: ceph-mon-quorum-dynamic
+    rules:
+      - alert: CephMonQuorumLostDynamic
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < (floor(count(ceph_mon_metadata) / 2) + 1)
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost or below dynamic majority"

@@ -1,0 +1,45 @@
+# Tier A — 兩條 recording rule（用 promql_expr_test 直接斷言輸出值與 label）。spec §4.8 / §4.9
+# 場景：host-a 兩顆 OSD 全 down；host-b 一顆 up 一顆 down（部分）；osd.9 有 up 但「無 metadata」。
+rule_files:
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x5'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x5'
+      - series: 'ceph_osd_up{ceph_daemon="osd.2"}'
+        values: '1x5'
+      - series: 'ceph_osd_up{ceph_daemon="osd.3"}'
+        values: '0x5'
+      - series: 'ceph_osd_up{ceph_daemon="osd.9"}'   # 無對應 metadata
+        values: '0x5'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x5'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x5'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="osd-host-b"}'
+        values: '1x5'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.3", hostname="osd-host-b"}'
+        values: '1x5'
+    promql_expr_test:
+      # join 正確接上 hostname，值 = osd_up；osd.9 因無 metadata 整條消失（scoped 規則盲區）
+      - expr: ceph:osd_up:with_hostname
+        eval_time: 1m
+        exp_samples:
+          - labels: 'ceph:osd_up:with_hostname{ceph_daemon="osd.0", hostname="osd-host-a"}'
+            value: 0
+          - labels: 'ceph:osd_up:with_hostname{ceph_daemon="osd.1", hostname="osd-host-a"}'
+            value: 0
+          - labels: 'ceph:osd_up:with_hostname{ceph_daemon="osd.2", hostname="osd-host-b"}'
+            value: 1
+          - labels: 'ceph:osd_up:with_hostname{ceph_daemon="osd.3", hostname="osd-host-b"}'
+            value: 0
+      # host-a 全 down（2 down == 2 total）→ 出 {host-a} 值 2；host-b 部分（1≠2）→ 不出
+      - expr: ceph:osd_host_down:scoped
+        eval_time: 1m
+        exp_samples:
+          - labels: 'ceph:osd_host_down:scoped{hostname="osd-host-a"}'
+            value: 2
