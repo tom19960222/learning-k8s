@@ -1,0 +1,55 @@
+# Tier A — CephExporterDown：up{job="ceph"}==0，5m page。spec §4.6
+# 注意：expr 回傳的 series 帶 job 等 label，會進 alert label set（連同 rule label）。
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+evaluation_interval: 1m
+tests:
+  # 正常 up=1 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephExporterDown
+        exp_alerts: []
+
+  # down：up=0 持續 → 4m 不 fire、5m fire（alert 帶 job="ceph" + rule label）
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephExporterDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephExporterDown
+        exp_alerts:
+          - exp_labels: {job: ceph, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph Prometheus exporter is down"}
+
+  # 負向 label 選擇：up{job="node"}==0 → 此規則只認 job="ceph"，不 fire
+  - interval: 1m
+    input_series:
+      - series: 'up{job="node"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephExporterDown
+        exp_alerts: []
+
+  # for flap reset：5m 內 up 跳回 1 一次 → 計時重置，5m 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '0 0 1 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephExporterDown
+        exp_alerts: []
+      - eval_time: 8m   # 自 t=3m 重新 down，8m 滿 5m → fire
+        alertname: CephExporterDown
+        exp_alerts:
+          - exp_labels: {job: ceph, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph Prometheus exporter is down"}

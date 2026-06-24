@@ -1,0 +1,80 @@
+# Tier A — CephLowPriorityNotice：5 個低優先 name，30m，severity info（slack-only）。spec §4.7
+# 強化（analyzer I3）：跨規則一致性對 PG_DEGRADED 與 OSDMAP_FLAGS 雙驗——
+# 兩者都該 fire LowPriorityNotice(info) 但 NOT fire CephClientRisk(critical)。
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+evaluation_interval: 1m
+tests:
+  # 5 個 name 同時 active：for 邊界 29m 不 fire、30m fire 5 個實例（severity 被蓋成 info）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="HOST_IN_MAINTENANCE", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="OBJECT_MISPLACED", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="PG_SLOW_SNAP_TRIMMING", severity="HEALTH_WARN"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: CephLowPriorityNotice
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CephLowPriorityNotice
+        exp_alerts:
+          - exp_labels: {name: HOST_IN_MAINTENANCE, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: HOST_IN_MAINTENANCE"}
+          - exp_labels: {name: OBJECT_MISPLACED, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: OBJECT_MISPLACED"}
+          - exp_labels: {name: OSDMAP_FLAGS, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: OSDMAP_FLAGS"}
+          - exp_labels: {name: PG_DEGRADED, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: PG_DEGRADED"}
+          - exp_labels: {name: PG_SLOW_SNAP_TRIMMING, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: PG_SLOW_SNAP_TRIMMING"}
+
+  # 負向：PG_AVAILABILITY 不在低優先清單 → LowPriorityNotice 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CephLowPriorityNotice
+        exp_alerts: []
+
+  # 跨規則一致性 PG_DEGRADED：LowPriority fire(info)、ClientRisk 全程不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CephLowPriorityNotice
+        exp_alerts:
+          - exp_labels: {name: PG_DEGRADED, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: PG_DEGRADED"}
+
+  # 跨規則一致性 OSDMAP_FLAGS（noout 的元兇）：LowPriority fire、ClientRisk 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CephLowPriorityNotice
+        exp_alerts:
+          - exp_labels: {name: OSDMAP_FLAGS, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: OSDMAP_FLAGS"}

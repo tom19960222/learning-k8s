@@ -1,0 +1,93 @@
+# Tier A — CephOSDDaemonDownScoped 去重（unless on hostname）+ CephOSDHostDownScoped。spec §4.10 / §4.11
+rule_files:
+  - ../../rules/ceph-scoped-availability.yml
+evaluation_interval: 1m
+tests:
+  # 單顆 down（osd.5 down、osd.6 up 同 host-a；host-b osd.7 up）→ 只 daemon alert，無 host alert
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.5"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.6"}'
+        values: '1x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.7"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.5", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.6", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.7", hostname="osd-host-b"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.5, hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD down: osd.5 on osd-host-a"
+              runbook: "ceph osd tree; ceph osd ok-to-stop osd.5; inspect daemon log"
+      - eval_time: 6m
+        alertname: CephOSDHostDownScoped
+        exp_alerts: []
+
+  # 整台 host-a 全 down（osd.0,osd.1 both down；host-b osd.7 up）→ 只 host alert，daemon 被 unless 壓掉
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.7"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.7", hostname="osd-host-b"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+      - eval_time: 6m
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts: []
+
+  # 混合：host-a 全 down + host-b 單顆 osd.7 down（osd.8 up）→ host-a 出 host alert、osd.7 出 daemon alert
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.0"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.7"}'
+        values: '0x10'
+      - series: 'ceph_osd_up{ceph_daemon="osd.8"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.0", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="osd-host-a"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.7", hostname="osd-host-b"}'
+        values: '1x10'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.8", hostname="osd-host-b"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephOSDHostDownScoped
+        exp_alerts:
+          - exp_labels: {hostname: osd-host-a, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD host down: osd-host-a"
+              runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+      - eval_time: 6m
+        alertname: CephOSDDaemonDownScoped
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.7, hostname: osd-host-b, severity: critical, source: ceph_scoped}
+            exp_annotations:
+              summary: "Ceph OSD down: osd.7 on osd-host-b"
+              runbook: "ceph osd tree; ceph osd ok-to-stop osd.7; inspect daemon log"

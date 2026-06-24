@@ -106,5 +106,41 @@
     ],
     "answer": 3,
     "explanation": "`src/test/crush/crush.cc:973-1072` 的 `straw2_reweight` 測試註解寫明：調整 straw2 bucket 中某 item 的 weight 時，只應看到 mapping 往返該 item，不應在其他 item 之間移動。測試也用 `ASSERT_EQ(out0[0], out1[0])` 鎖住未受影響 item 的 mapping。"
+  },
+  {
+    "id": 10,
+    "question": "CephMonQuorumLost 早期版寫成 `count(ceph_mon_quorum_status == 1) < 2`。為什麼它在「全部 mon 都掛掉」這個最壞情況反而不會 fire？",
+    "options": [
+      "因為 mon 全掛時 Prometheus 也抓不到 metric，整條規則被當 stale 自動停用",
+      "因為 `< 2` 門檻寫死，只有剛好掉到剩 1 台時才成立，剩 0 台超出範圍",
+      "因為全部 mon 的 quorum_status 都 = 0，`== 1` 過濾後是空 vector，`count(空)` 回傳的是「無 sample」而非純量 0，`無 sample < 2` 算不出結果 → 不 fire",
+      "因為 count() 會把值為 0 的 series 也算進去，全掉時 count 仍 = 3，不小於 2"
+    ],
+    "answer": 2,
+    "explanation": "PromQL 的 count() 是對『存在的 series』聚合。內層 `== 1` 把全部 = 0 的 series 過濾光後是空 vector，count(空 vector) 回傳無 sample（不是 0），於是比較整個算不出結果、不 fire。測試計劃用 promtool 餵『3 台全 0』重現了 got:[]。修法是標準 idiom `(count(...) or vector(0)) < 2`：左邊為空時退回值 0 的 series，0 < 2 成立照樣 page。見 prometheus-alert-testing 頁 §4。"
+  },
+  {
+    "id": 11,
+    "question": "這套測試的 Tier A（promtool）餵給規則的是手刻的合成 ceph_health_detail / ceph_osd_up series。關於它能證明什麼，哪個說法正確？",
+    "options": [
+      "能證明 ceph 在維護時真的會升起那些 health check，所以 Tier A/B/C 全綠就等於設計在 production 必然正確",
+      "能證明『如果這些 metric/health check 以這些 label 與值存在，規則就如設計行為』；但『ceph 到底會不會升這些、是哪些』只有 Tier D 的真叢集 + 原始碼 oracle 能答",
+      "什麼都證明不了，因為環境裡沒有真 ceph，promtool 的綠燈不可信",
+      "只能證明 YAML 語法合法，無法驗證任何 alert 規則的邏輯"
+    ],
+    "answer": 1,
+    "explanation": "Tier A 證明的是 IF…THEN（規則邏輯在給定輸入下的行為），不是『ceph 真的會這樣』。後者（維護升哪些 health check、stopped mon 是否仍匯出 metric）是 Tier D 用 ceph v19.2.3 原始碼當 oracle 負責的。理解這條分工，才知道為什麼絕對不能因為 dev 全綠就跳過 Tier D。"
+  },
+  {
+    "id": 12,
+    "question": "旗艦的 maintenance-thesis.test.yml 重現維護情境時，除了斷言『CephClientRisk 不 fire（噪音壓掉）』，為什麼一定要同時斷言『CephOSDHostDownScoped fire（訊號保留）』？",
+    "options": [
+      "為了讓測試檔看起來更完整，這兩個斷言其實是等價的",
+      "因為 Alertmanager 規定每個情境至少要產生兩個 alert 才能成功 route",
+      "因為光驗『不 fire』不夠——一條永遠不會 fire 的壞規則也能通過『不 fire』；同時驗 scoped 訊號仍 fire，才證明設計沒有把生命線連同噪音一起靜音",
+      "因為 CephClientRisk 和 CephOSDHostDownScoped 其實是同一條規則的兩個別名"
+    ],
+    "answer": 2,
+    "explanation": "『噪音壓掉』與『訊號保留』是雙軸，缺一不可。只驗『CephClientRisk 不 fire』會放過一種迴歸：scoped 規則的正向路徑壞掉、真訊號也一起消失——這時噪音確實沒了，但你也聾了。同時斷言 scoped alert 仍 fire 才補上這個缺口，這是 review 特別補強（devil #2）的點。"
   }
 ]

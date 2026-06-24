@@ -1,0 +1,240 @@
+---
+layout: doc
+title: Ceph — 在開發環境驗證這套維護友善的 alert 設計（四層測試，附抓到的真 bug）
+description: prometheus-alert-design 那頁宣稱「維護噪音壓掉、scoped 可精準 silence、生命線保留」。這頁用 promtool / amtool / live / 真 ceph 四層把每條規則逐一驗過，並完整交代測試怎麼抓到 CephMonQuorumLost 在「全部 mon 掛掉」時靜默不 fire 的真 bug——以及修正後一個誠實的 trade-off。
+---
+
+## 緣起：強宣稱的設計，要先在 dev 證明再上 production
+
+[Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design) 那頁不是小修小補，它做了幾個**很強的宣稱**：
+
+- 維護一台 node 時，cluster-wide 的維護噪音（`PG_DEGRADED`、`OSDMAP_FLAGS`、`MON_DOWN`、`OSD_DOWN`…）**不會 page**——`CephClientRisk` 這條 catch-all 的排除清單會把它們擋在 pager 外。
+- 同一時間「真出事」的 scoped 訊號（哪台 host / 哪顆 daemon down）**仍然會 page**，而且帶 `hostname` / `ceph_daemon` label，所以維護時能**只 silence 目標那台**。
+- 維護期間有一條**生命線不准被 silence**：`CephMonQuorumLost`——維護第一台 mon 時還剩 2 台不該叫，但若連第二台也掉就必須叫。
+- 預設 ceph-mixin 的 aggregate alert（連 `severity=critical` 的 `CephMonDownQuorumAtRisk` / `CephOSDDownHigh`）**只進 Slack，不得進 pager**。
+
+這些宣稱聽起來都對，但 alert 規則最危險的地方就是「看起來對」。一條 PromQL 寫錯，平常 demo 都正常，偏偏在最壞情況（quorum 全失守）那一刻靜默——你不會在 production 發現，你會在**該被叫醒卻沒被叫醒**的那個凌晨發現。
+
+所以這頁不是再寫一套設計，而是把上面那套設計**當作被測對象（single source of truth）**，在開發環境逐條規則驗證它。harness 在 `experiments/ceph-alert-rules/`，規則檔逐字抽自設計頁（`lib/check-rules-match-page.sh` 會比對防止漂移）。而且——**這套測試真的抓到一個 bug**，下面 §4 會完整交代。這就是寫測試的價值：不是儀式，是它賺到了自己的位置。
+
+## 方法論：四層（promtool / amtool / live / 真 ceph）
+
+一個關鍵問題先講清楚，整頁的可信度都建立在它上面：**在沒有真 ceph 叢集的開發環境，到底能證明什麼、不能證明什麼？**
+
+答案是：dev 能證明「**如果** metric 與 label 如設計假設的那樣存在，規則的行為就正確」；但「ceph **到底會不會**匯出那些 metric、維護時**實際升起哪些** health check」——這個 dev 無法回答，只有真 ceph 能答。把這條界線畫清楚，就自然分出四層：
+
+| Tier | 工具 | 測什麼 | 本機可跑？ | 性質 |
+|---|---|---|---|---|
+| **A — 規則邏輯** | `promtool test rules` | 每條 alert + recording rule 的 expr / `for:` 時長 / 輸出 label / 排除清單 / scoped 去重 | ✅ deterministic、可凍結時間 | **核心，必過** |
+| **B — Routing** | `amtool config routes test` | 每個 label set → 哪個 receiver；預設 aggregate 不進 pager | ✅ deterministic | **核心，必過** |
+| **C — Live 整合** | 真 `prometheus` + 真 `alertmanager` + python webhook sink | 規則真載入評估、alert 真送達 receiver、silence 真壓制目標 | ✅（裝 alertmanager 後） | 整合層，獨立於 A/B |
+| **D — 真 ceph** | Proxmox 3-node + ceph v19.2.3 | 每情境 ceph 實際升的 health check、stopped daemon 是否仍有 metric | ❌ 需真環境 | 以 ceph 原始碼當 oracle |
+
+為什麼要分這四層，而不是「裝個 ceph 跑端到端就好」：
+
+- **A 用合成 series 測純邏輯**。promtool 可以凍結時間、餵任意 `ceph_health_detail{name="..."}` 值，所以 `for: 5m` 的精確邊界、`count()` 在空 vector 的行為、`unless` 去重——這些**只在 Tier A 測**，因為只有它能精準到「第 4 分鐘不 fire、第 5 分鐘才 fire」。
+- **B 測 routing 表**。`amtool config routes test` 餵一個 label set，回答「會送到哪個 receiver」，不需要起任何服務，deterministic。
+- **C 起真服務測 wiring**。規則真的被 Prometheus 載入嗎？alert 真的會送到 Alertmanager 並 route 嗎？silence 真的壓得掉嗎？這些是「線接對沒」的問題，A/B 證明不了。
+- **D 留給真 ceph**。
+
+### Tier A 證明的是「IF」，不是「ceph 真會這樣」
+
+這是整套方法論最重要、也最容易被誤會的一點，所以單獨拉出來講。
+
+Tier A 餵給 promtool 的，是**手刻的**合成 series。例如測「維護整台 OSD host」時，`maintenance-thesis.test.yml` 直接寫入：
+
+```yaml
+- series: 'ceph_health_detail{name="OSD_HOST_DOWN", severity="HEALTH_WARN"}'
+  values: '1x10'
+- series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+  values: '1x10'
+- series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+  values: '1x10'
+```
+
+這段在斷言：「**假設** ceph 在維護整台 OSD host 時升起了 `OSD_HOST_DOWN` + `OSDMAP_FLAGS` + `PG_DEGRADED` 這三個 health check，**那麼** `CephClientRisk` 就不會 fire、而 `CephOSDHostDownScoped` 會 fire。」
+
+但「ceph **真的**會升這三個、而不是別的」——這個前提 Tier A 沒有驗、也驗不了，因為環境裡根本沒有 ceph。它由 **Tier D 用 ceph 原始碼當 oracle** 負責；設計頁已逐一附行號，例如：
+
+- `noout` 自動設 → `OSDMAP_FLAGS`（`cephadm/module.py:2131`）
+- 副本掉一份 → `PG_DEGRADED`
+- stopped mon 仍在 monmap → `mon_quorum_status{ceph_daemon=...}=0` 與 metadata 仍在（`prometheus/module.py:1021`）
+
+換句話說，把整套驗證讀成一句話：
+
+> **Tier A/B/C：「IF 這些 metric/health check 以這些 label 和值存在，規則就如設計行為。」**
+> **Tier D：「這些 metric/health check 到底存不存在、是哪些。」**
+
+理解這條分工，才知道每個綠燈各自證明了什麼、沒證明什麼——也才知道為什麼下面 §6 會說「絕對不要因為 dev 全綠就跳過 Tier D」。
+
+## 逐條測什麼 / 哪個情境 / 怎麼測 / 預期
+
+Tier A 一共 13 個 `*.test.yml`（`tests/tierA-promtool/`），大致每條規則一個（有的檔涵蓋兩條，例如 `recording-rules.test.yml` 同時測兩條 recording rule、`health-status-default.test.yml` 測兩條預設 mixin），外加旗艦的維護情境、轉換 edge、動態 majority。下面按邏輯分組走一遍。所有「預期」都是真實的 PASS 判準（`exp_alerts` / `exp_labels`），不是示意。
+
+非 Prometheus 專家也讀得懂的三個 PromQL gotcha，先在這裡講白，後面引用：
+
+1. **`count()` 是對「存在的 series」聚合**。如果過濾後一條 series 都不剩（空 vector），`count(空)` 回傳的是**「無 sample」**，不是純量 `0`——這個區別正是 §4 那個 bug 的根源。
+2. **`A unless on (label) B`** 的意思是「A 裡面、其 `label` 沒出現在 B 裡的那些」。scoped 去重就靠它：單顆 OSD down 的 alert，`unless` 掉「已經由整台 host alert 接手的 hostname」。
+3. **rule 的 `labels:` 會覆蓋 metric 自帶的同名 label**。`ceph_health_detail` 自帶 `severity="HEALTH_WARN"`，但 alert 規則寫 `severity: critical`，所以最終 alert 的 `severity` 是 `critical`——測試的 `exp_labels` 也驗了這個覆蓋。
+
+### A. client 風險：catch-all 與排除清單（`client-blocked` / `client-risk` / `low-priority-notice`）
+
+這組是整套設計「噪音 vs 訊號」的主戰場。
+
+**`CephClientBlocked`（`client-blocked.test.yml`）** 只盯 `PG_AVAILABILITY` / `SLOW_OPS`（client I/O 已被擋），`for: 1m`。測試驗：
+
+- 餵 `PG_AVAILABILITY=1`，第 0 分鐘不 fire、第 1 分鐘 fire，`exp_labels: {name: PG_AVAILABILITY, severity: critical, source: ceph_stability}`，summary 帶 name。注意這裡 metric 自帶的 `severity="HEALTH_WARN"` 被規則蓋成 `critical`（gotcha 3）。
+- 兩個 name 同時 active → **兩個獨立 alert 實例**（`name` 在 series label set 裡，每個 name 各一條）。
+- 餵 `PG_DEGRADED=1`（不該它接的 name）→ **不 fire**，交給別條。
+
+**`CephClientRisk`（`client-risk.test.yml`）—— 最關鍵的一條**。它是 `name!~"<10 個排除>"` 的 catch-all：除了排除清單，任何 health check active 滿 5 分鐘都 page。危險點顯而易見——排除清單漏一個，維護噪音就從這裡繞回來 page。測試用兩個手法守住：
+
+- **完整排除清單完整性**：一次餵全部 10 個排除 name + 2 個非排除 name（`POOL_NEAR_FULL`、`POOL_FULL`），斷言**只為那 2 個非排除 fire**。任何一個排除 name 被偷偷移出清單，這裡就會多冒一個 alert 而 FAIL；任何非排除 name 被誤加進清單，就會少一個而 FAIL。這把「排除清單被改動」變成測試會擋下的迴歸。
+- **真實 check 的正向**：餵 `OSD_NEARFULL` / `RECENT_CRASH`（v19.2.3 真實存在、不在排除清單的 check），斷言 catch-all 各 fire 一個——證明它對「排除清單外的真 check」確實接得到，不是只會 round-trip 那 10 個已知 name。
+
+**維護綜合情境（旗艦，`maintenance-thesis.test.yml`）—— 設計最乾淨的證明**。這條同時載入 `ceph-stability-first` 與 `ceph-scoped-availability` 兩個 rule group，重現三種真實維護，每種都**雙軸斷言**「噪音壓掉 **且** 訊號保留」：
+
+| 維護情境 | 餵入的 health check | 斷言「噪音壓掉」 | 斷言「訊號保留」 |
+|---|---|---|---|
+| 整台 OSD host（`osd-host-a` 兩顆全 down） | `OSD_HOST_DOWN` + `OSDMAP_FLAGS` + `PG_DEGRADED` | `CephClientRisk` 不 fire、`CephClientBlocked` 不 fire | `CephOSDHostDownScoped{hostname=osd-host-a}` fire（且 daemon alert 被 `unless` 壓掉、不會每顆各叫） |
+| 單台 mon（`mon.a` 維護） | `MON_DOWN` + `HOST_IN_MAINTENANCE` | `CephClientRisk` 不 fire、`CephMonQuorumLost` 不 fire（剩 2 台 count=2） | `CephMonDownScoped{ceph_daemon=mon.a, hostname=mon-host-a}` fire |
+| 換單顆硬碟（`osd.5` down、同 host 還有 `osd.6` up） | `OSD_DOWN` + `PG_DEGRADED` + `OSDMAP_FLAGS` | `CephClientRisk` 不 fire | `CephOSDDaemonDownScoped{ceph_daemon=osd.5}` fire（非整台 host alert） |
+
+表裡被餵入的那些 health check（`OSD_HOST_DOWN` / `MON_DOWN` / `HOST_IN_MAINTENANCE` / `OSDMAP_FLAGS` / `PG_DEGRADED`）之所以「噪音壓掉」，是因為它們全在 `CephClientRisk` 的排除清單裡；其中 `HOST_IN_MAINTENANCE` / `OSDMAP_FLAGS` / `PG_DEGRADED` 還同時是 `CephLowPriorityNotice` 的 name，所以它們**不 page、但仍會進 Slack**——正是下面 §低優先 講的「同一個 check 被兩條規則正確分流」。
+
+光驗「噪音壓掉」不夠——一條永遠不 fire 的規則也能通過「不 fire」。**同時驗「scoped 訊號仍 fire」**才證明設計沒有把生命線一起靜音。這是這次審查特別補強的點。
+
+**`CephLowPriorityNotice`（`low-priority-notice.test.yml`）** 是被排出 pager 的那 5 個低優先 name（`HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING` / `PG_DEGRADED` / `OSDMAP_FLAGS`），`for: 30m`、`severity: info`、只進 Slack。最有價值的是**跨規則一致性**斷言：餵 `PG_DEGRADED=1`（換硬碟一定會升），斷言它讓 `CephLowPriorityNotice` fire（info/slack）**且** `CephClientRisk` 全程不 fire（critical/page）。對 `OSDMAP_FLAGS`（`noout` 的元兇）也做同樣的雙斷言。一個 health check 同時被兩條規則「正確地分流」——這就是設計想要的效果，而測試把它釘死。
+
+### B. scoped：帶 label、host/daemon 去重（`recording-rules` / `osd-host-down-scoped` / `osd-daemon-down-scoped` / `mon-down-scoped`）
+
+這組驗「down 狀態如何接上 `hostname` / `ceph_daemon`，以及整台 vs 單顆怎麼去重」。
+
+**recording rule（`recording-rules.test.yml`）** 用 `promql_expr_test` 直接斷言輸出值與 label：
+
+- `ceph:osd_up:with_hostname`：把 `ceph_osd_up` 的 0/1 join 上 `ceph_osd_metadata` 的 `hostname`，輸出值等於 `osd_up`、帶上 `hostname`。測試還故意放一顆 `osd.9` **有 `ceph_osd_up` 但無對應 metadata** → join 後該 series **整條消失**。這刻意暴露 scoped 規則的依賴點：metadata 不在，這顆 OSD 就是盲區（呼應設計頁「metadata 一定存在」的假設，而那個假設由 Tier D 驗）。
+- `ceph:osd_host_down:scoped`：用「同 host 上 down 的 OSD 數 == 該 host 全部 OSD 數」判定整台 down。`osd-host-a` 兩顆全 down → 出 `{hostname=osd-host-a}` 值 2；`osd-host-b` 部分 down（1≠2）→ 不出。
+
+**`CephOSDDaemonDownScoped` 去重（`osd-daemon-down-scoped.test.yml`）—— `unless` 的價值**。三個情境：
+
+- 單顆 `osd.5` down（同 host 其他 up）→ 只 fire daemon alert `{ceph_daemon=osd.5, hostname=osd-host-a}`，host alert 不 fire。
+- 整台 `osd-host-a` 全 down → 只 fire `CephOSDHostDownScoped`，daemon alert 對該 host 任何 OSD **皆不 fire**（被 `unless on (hostname)` 壓掉）。**這就是「整台掛掉不會每顆 OSD 各 page 一次」的證明**。
+- 混合：`osd-host-a` 全 down + `osd-host-b` 的 `osd.7` 單顆 down → host-a 出 host alert、osd.7 出 daemon alert，各自精準。
+
+**`CephMonDownScoped`（`mon-down-scoped.test.yml`）** `for: 30s`（mon down 比 OSD 急），所以測試把 `evaluation_interval` 設 15s 才量得到邊界：第 15 秒不 fire、第 30 秒 fire，`{ceph_daemon=mon.a, hostname=mon-host-a}`。edge：`mon.a` down 但**無 metadata** → join 無結果 → 不 fire（呼應 monmap 宣稱：metadata 在才接得到；「stopped mon 是否仍有 metadata」交給 Tier D）。
+
+### C. 生命線：mon quorum（`mon-quorum-lost` / `mon-quorum-dynamic`）
+
+這條就是下一節主角，先給正常行為：3 台健康 count=3 不 fire；維護 1 台 count=2 不 fire（生命線正確靜默）；掉 2 台 count=1 `<2` 第 1 分鐘 fire。`count()` 把多條 series 聚合成單一數字，聚合過程會丟掉個別 series 的 label，所以最終 alert 只剩 rule label `{severity: critical, source: ceph_stability}`、不帶 `ceph_daemon`。**掉 3 台**那一格，就是 bug 的所在。
+
+### D. Routing（Tier B，`routes-test.sh`）
+
+對每個 label set 跑 `amtool config routes test`，斷言 receiver：
+
+- → **pager**：`CephHealthError`（`type=ceph_default`）、`CephClientBlocked`、`CephClientRisk`、`CephMonQuorumLost`、`CephExporterDown`、`CephOSDHostDownScoped`、`CephOSDDaemonDownScoped`、`CephMonDownScoped`。
+- → **slack**：`CephLowPriorityNotice`、`CephHealthWarning`，以及**核心斷言**——帶 `type=ceph_default` 的預設 aggregate 連 `CephMonDownQuorumAtRisk` / `CephOSDDownHigh`（兩者 `severity=critical`）也一律 slack、不得 pager。無 match 的兜底也落 slack。
+
+「critical 的預設 aggregate 也只進 slack」是整套 routing 最容易寫錯的地方（很多人會圖省事寫成「所有 critical → pager」），所以 Tier B 拿真實的 ceph-mixin 規則 label 把它釘住。
+
+## 這套測試抓到的真 bug（記為 F1）：quorum 全失守時，生命線靜默
+
+這是這頁最該被讀到的一段。
+
+設計的**早期版本**，`CephMonQuorumLost` 寫的是直覺版：
+
+```promql
+count(ceph_mon_quorum_status == 1) < 2
+```
+
+讀起來完全合理：「在 quorum 的 mon 數少於 2 就叫」。3-mon cluster 維護 1 台還剩 2、掉到剩 1 就 page——對。
+
+但回到 gotcha 1：`count()` 是對**存在的 series** 聚合。當**所有** mon 都 down、`ceph_mon_quorum_status` 全部 = 0 時，內層 `== 1` 過濾後**一條 series 都不剩**，得到空 vector。`count(空 vector)` 回傳的是**「無 sample」**，不是純量 `0`。於是 `無 sample < 2` 整個運算式**算不出任何結果**，alert **不會 fire**。
+
+也就是說，這條「quorum 失守生命線」在它**最該叫的最壞情況（一台不剩）反而靜默**；只有「還剩 1 台」（count=1）時才叫。最危險的那一格，正好是規則沉默的那一格。
+
+**promtool 怎麼抓到的**：`mon-quorum-lost.test.yml` 餵「3 台全 0」（`ceph_mon_quorum_status` 三條都 `0x5`）。對原規則跑 `promtool test rules`，斷言「應該 fire」的那格回報 `got:[]`——明確的證據：規則在這個輸入下產不出任何 alert。這不是推論，是工具印出來的空結果。
+
+**修法**是標準 idiom——在設計頁與抽出的 `rules/ceph-stability-first.yml` 同步改成：
+
+```promql
+(count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+```
+
+`or vector(0)` 不是裝飾：左邊為空時，`or vector(0)` 退回一條值為 `0` 的 series，於是 `0 < 2` 成立、照樣 page。修正後 `mon-quorum-lost.test.yml` 三個情境全過：
+
+```yaml
+# F1 關鍵：全部 3 台掉（count(==1) 空 → or vector(0) 退 0 < 2）→ 必須 fire
+- interval: 1m
+  input_series:
+    - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+      values: '0x5'
+    - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+      values: '0x5'
+    - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+      values: '0x5'
+  alert_rule_test:
+    - eval_time: 2m
+      alertname: CephMonQuorumLost
+      exp_alerts:
+        - exp_labels: {severity: critical, source: ceph_stability}
+          exp_annotations: {summary: "Ceph MON quorum lost or below 3-mon majority"}
+```
+
+healthy 不 fire、掉 2 台 fire、**掉 3 台也 fire**——生命線補回來了。
+
+### F1b：修正帶來一個誠實的 trade-off（absence ≠ down）
+
+修 bug 不該假裝沒有代價。`(count(...) or vector(0)) < 2` 也會在**「`ceph_mon_quorum_status` 完全不存在」**時 fire——例如 mgr 剛重啟、prometheus module 還沒匯出任何 mon metric。這時並不是「mon 掛了」，而是「metric 缺席」，但寫死版**分不出這兩者**，兩種它都會 fire。
+
+`mon-quorum-lost.test.yml` 把這個真實行為也測出來（餵一條與 mon quorum 無關的 `up{job="ceph"}`、完全沒有任何 mon metric → 寫死版確實 fire）。測試標註得很白：**這格記錄的是「實際就是會 fire」，不是主張它該不該 fire**。
+
+多數情況這可接受——連 quorum metric 都沒有，本來就代表你對 quorum 盲了，值得叫一聲；而「整個 ceph job 抓不到」另有 `CephExporterDown` 當主訊號。但如果你希望這條**只在「真的有 mon 回報但不足額」時 fire**、不被 metric 缺席誤觸，設計頁文末的 **metadata-anchored 動態版**天生免疫：
+
+```promql
+(count(ceph_mon_quorum_status == 1) or vector(0)) < (floor(count(ceph_mon_metadata) / 2) + 1)
+```
+
+`mon-quorum-dynamic.test.yml` 用同一個「metric 完全缺席」輸入對照證明：動態版的門檻 `floor(count(ceph_mon_metadata)/2)+1` 在 metadata 缺席時也變成空，`0 < 空 = 空` → **不 fire**。寫死版 fire、動態版不 fire，兩種行為都被測出來、攤在桌上讓你選。同一支測試還驗了動態版在 n=3 時與寫死 `<2` 等價、n=5 時門檻變 3（掉 2 台不叫、掉 3 台叫）。
+
+這就是測試「賺到位置」的完整故事：抓到一個會在最壞情況靜默的 bug、給出修正、再誠實標出修正的副作用並提供替代方案——全部有 promtool 證據，不是嘴上說。
+
+## 怎麼跑
+
+入口在 `experiments/ceph-alert-rules/run/`，全部靠 exit code 判 PASS/FAIL，無 GUI、無互動（為了能讓 AI agent 無人值守跑）：
+
+```bash
+bash experiments/ceph-alert-rules/run/all.sh    # A→B→C 依序，任一 tier 非 0 即整體 FAIL
+# 或單跑
+bash experiments/ceph-alert-rules/run/tierA.sh  # 防漂移 guard + promtool lint + 13 個單元測試（無服務）
+bash experiments/ceph-alert-rules/run/tierB.sh  # amtool routing 斷言（無服務）
+bash experiments/ceph-alert-rules/run/tierC.sh  # 起真 prometheus / alertmanager
+```
+
+**PASS 判準**：每個 tier 結尾印 `TIER X PASS`，`all.sh` 結尾印 `ALL PASS`，整體 exit 0。各 tier 輸出落在 `results/`。
+
+Tier A/B 無外部相依（`promtool` / `amtool`）。Tier C 需要 `alertmanager` binary——本機用官方 release 放 `~/go/bin`（run 腳本找 binary 的順序是 PATH → `~/go/bin` → harness 自帶 `.bin/`）：
+
+```bash
+cd /tmp
+curl -fsSL -o am.tgz https://github.com/prometheus/alertmanager/releases/download/v0.28.1/alertmanager-0.28.1.darwin-amd64.tar.gz
+tar xzf am.tgz && cp alertmanager-0.28.1.darwin-amd64/{amtool,alertmanager} ~/go/bin/
+```
+
+Tier C 自己分三段：C1（`lib/prometheus-load-check.sh`，確認規則真被 Prometheus 載入、`health=ok`）、C2（`tests/tierC-live/run.sh`，真 Alertmanager 的 routing + silence）、C3（`run-e2e.sh`，合成 metric → 真 Prometheus 評估真規則 → 真 Alertmanager → webhook sink 的全鏈路）。
+
+## 邊界與限制
+
+測試證明了很多，但有幾條界線必須說清楚，否則綠燈會被過度解讀：
+
+- **Tier C 不測 `for:` 時長**。C2 的做法是把「已成形的 alert」直接 POST 到 Alertmanager 的 `/api/v2/alerts`、**繞過 Prometheus 評估**，所以不必等 30 分鐘、也不需要 `for:`-縮短版規則。C3 為了不等 5 分鐘，用 `sed 's/for: 5m/for: 5s/'` 產一份只縮時長、邏輯逐字不動的副本。**`for:` 的精確語意（1m/5m/30m/30s 邊界、flap 重置）只由 Tier A 保證**——這條分工要記得，別把 Tier C 的綠燈讀成「時長也驗過了」。
+
+- **所有規則的共同盲區：metric 缺席**。`up{job="ceph"} == 0` 與所有 `ceph_health_detail` 系列規則，都要求**對應的 series 存在**才可能 fire。如果某個 metric 從沒被抓過（scrape config 打錯、target 沒註冊），規則靜默、毫無 pager——這正是 F1b 那條 trade-off 的一般化版本。要補這個盲區得用 `absent()` 元規則（`absent(up{job="ceph"})`、`absent(ceph_health_status)`），那超出「在預設 rule 之上加一層」的範圍，但部署時值得一併補。本 harness 的 Tier A 對 absence 的覆蓋僅止於 F1b 那一格（寫死版會被誤觸、動態版不會），不是完整的 absence 測試套。
+
+- **Tier D 需要你的真 ceph 叢集**。所有「ceph 到底升哪些 health check、stopped 的 mon/osd 是否仍匯出 metric」的宣稱，在 dev 都是**假設**——Tier A 餵的是手刻 series。這些假設目前用 ceph v19.2.3 原始碼當 oracle（設計頁附行號），標「在你環境跑後對照」。`tests/tierD-realceph/` 是對照表，要在真 Proxmox + 3-node ceph 上跑過才算閉環。**絕對不要因為 Tier A/B/C 全綠就認定整套設計在 production 必然正確**——dev 證明的是「IF…THEN」，那個 IF 還欠真 ceph 簽收。
+
+## 接下來 / 相關頁面
+
+- [Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design)：本頁驗證的對象（被測 single source of truth）
+- [Ceph — osd ok-to-stop 在 v19.2.3 原始碼裡檢查了什麼](./osd-ok-to-stop)：維護 silence 前先 `ok-to-stop`，本頁多條 runbook 都引用它
+- [Ceph — MON quorum loss](./mon-quorum-loss-impact)：3-mon / 5-mon quorum loss 對 client I/O 的影響，呼應本頁生命線設計
+- [Ceph — PG health states](./pg-health-states)：`PG_AVAILABILITY` vs `PG_DEGRADED` 為何一個 page、一個只進 Slack

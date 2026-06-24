@@ -1,0 +1,59 @@
+# 逐字取自 next-site/content/ceph/features/prometheus-alert-design.mdx
+# §「ceph-stability-first：client 風險，多數不可 silence」
+# 被測物 — 不得改寫。lib/check-rules-match-page.sh 會比對。
+groups:
+  - name: ceph-stability-first
+    rules:
+      - alert: CephClientBlocked
+        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client I/O blocked: {{ $labels.name }}"
+
+      - alert: CephClientRisk
+        expr: |
+          ceph_health_detail{
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+          } == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client-risk check active: {{ $labels.name }}"
+
+      - alert: CephMonQuorumLost
+        # FIX (F1)：原 `count(ceph_mon_quorum_status == 1) < 2` 在全部 mon 掛掉時，
+        # 內層 ==1 過濾為空，count(空) 無 sample，< 2 算不出結果 → 不 fire（最壞情況靜默）。
+        # `or vector(0)` 讓空 count 退回 0，quorum 全失守照樣 page。promtool 實證見測試。
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost or below 3-mon majority"
+
+      - alert: CephExporterDown
+        expr: up{job="ceph"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph Prometheus exporter is down"
+
+      - alert: CephLowPriorityNotice
+        expr: |
+          ceph_health_detail{
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+          } == 1
+        for: 30m
+        labels:
+          severity: info
+          source: ceph_stability
+        annotations:
+          summary: "Ceph low-priority notice: {{ $labels.name }}"

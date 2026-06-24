@@ -1,0 +1,103 @@
+# Tier A — CephClientRisk：catch-all（name!~ 10 個排除），5m page。spec §4.4（最關鍵）
+# 強化（devil #1/#2 + analyzer I3）：除個別負向，加「完整排除清單完整性」測試——
+# 餵全部 10 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
+# 若任何一個排除 name 被偷偷移出清單，這裡就會多出一個 alert 而 FAIL；
+# 若任何非排除 name 被誤加進清單，這裡就會少一個 alert 而 FAIL。
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+evaluation_interval: 1m
+tests:
+  # 正常觸發：非排除 name → 5m fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="POOL_NEAR_FULL", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephClientRisk
+        exp_alerts:
+          - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
+
+  # 完整排除清單完整性：10 排除 + 2 非排除 → 只有 2 非排除 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="SLOW_OPS", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_HOST_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="MON_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="HOST_IN_MAINTENANCE", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OBJECT_MISPLACED", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="PG_SLOW_SNAP_TRIMMING", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="POOL_NEAR_FULL", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="POOL_FULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts:
+          - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
+          - exp_labels: {name: POOL_FULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: POOL_FULL"}
+
+  # 頁面強調的三個排除 name 個別負向（換硬碟元兇 PG_DEGRADED / noout 的 OSDMAP_FLAGS / 維護繞回 MON_DOWN）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="MON_DOWN", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+
+  # 真實 ceph health check 正向（devil #5）：OSD_NEARFULL / RECENT_CRASH 都是 v19.2.3 實際 check，
+  # 不在排除清單 → catch-all 應各 fire 一個。確認 catch-all 對「排除清單外的真 check」確實接得到，
+  # 不是只會 round-trip 那 10 個已知 name。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts:
+          - exp_labels: {name: OSD_NEARFULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: OSD_NEARFULL"}
+          - exp_labels: {name: RECENT_CRASH, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: RECENT_CRASH"}

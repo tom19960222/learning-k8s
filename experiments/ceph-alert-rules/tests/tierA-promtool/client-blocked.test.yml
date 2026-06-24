@@ -1,0 +1,67 @@
+# Tier A — CephClientBlocked：client I/O 已被擋（PG_AVAILABILITY / SLOW_OPS），1m page。spec §4.3
+rule_files:
+  - ../../rules/ceph-stability-first.yml
+evaluation_interval: 1m
+tests:
+  # 正常 PG_AVAILABILITY：for 邊界 0m 不 fire、1m fire；name 帶進 summary；metric severity 被 rule 蓋成 critical
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CephClientBlocked
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CephClientBlocked
+        exp_alerts:
+          - exp_labels: {name: PG_AVAILABILITY, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: PG_AVAILABILITY"}
+
+  # 正常 SLOW_OPS
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="SLOW_OPS", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephClientBlocked
+        exp_alerts:
+          - exp_labels: {name: SLOW_OPS, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: SLOW_OPS"}
+
+  # edge：兩個 name 同時 active → 兩個獨立 alert 實例（name 在 series label set 裡）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="SLOW_OPS", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephClientBlocked
+        exp_alerts:
+          - exp_labels: {name: PG_AVAILABILITY, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: PG_AVAILABILITY"}
+          - exp_labels: {name: SLOW_OPS, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: SLOW_OPS"}
+
+  # 負向：非此規則該接的 name（PG_DEGRADED 不在 PG_AVAILABILITY|SLOW_OPS）→ 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephClientBlocked
+        exp_alerts: []
+
+  # edge：health_detail 存在但 inactive(value=0) → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephClientBlocked
+        exp_alerts: []
