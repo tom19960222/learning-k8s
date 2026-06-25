@@ -142,5 +142,29 @@
     ],
     "answer": 2,
     "explanation": "『噪音壓掉』與『訊號保留』是雙軸，缺一不可。只驗『CephClientRisk 不 fire』會放過一種迴歸：scoped 規則的正向路徑壞掉、真訊號也一起消失——這時噪音確實沒了，但你也聾了。同時斷言 scoped alert 仍 fire 才補上這個缺口，這是 review 特別補強（devil #2）的點。"
+  },
+  {
+    "id": 13,
+    "question": "OSD log 一直在印 `bluestore ... slow operation observed ... latency = 8.2s`，但 Prometheus 上的 ceph_healthcheck_slow_ops 始終是 0、SLOW_OPS health check 也沒亮。最可能的原因是什麼？",
+    "options": [
+      "ceph_healthcheck_slow_ops 壞掉了，要重啟 mgr",
+      "SLOW_OPS 來自 OSD/MON 的 OpTracker，門檻是 osd_op_complaint_time(預設 30s) 且只看當下 in-flight 的 op；8.2s 的 BlueStore 操作在 30s 內就完成，本來就不會觸發 SLOW_OPS。BlueStore 慢操作走的是另一條 BLUESTORE_SLOW_OP_ALERT(門檻 5s)",
+      "BlueStore 的 log 是假警報，可以忽略",
+      "一定是 Prometheus scrape 設定錯誤"
+    ],
+    "answer": 1,
+    "explanation": "兩者量的是不同層、不同門檻的東西。SLOW_OPS：OSD::get_health_metrics() 用 osd_op_complaint_time(global.yaml.in:3130，預設 30s) 數「還在 in-flight 且 age>30s」的 OpRequest，打包成 daemon_metric::SLOW_OPS(OSD.cc:7906)，mgr 累加成 health check(DaemonHealthMetricCollector.cc:18)，prometheus module 解析 summary 字串得出 ceph_healthcheck_slow_ops(module.py:913)。BlueStore 慢操作走 log_latency(BlueStore.cc:18465)，門檻是 bluestore_log_op_age(預設 5s)，累積到 BLUESTORE_SLOW_OP_ALERT(BlueStore.cc:18901，threshold 預設 1、lifetime 預設 24h)，再經 PGMap.cc:3237 變成 ceph_health_detail{name=\"BLUESTORE_SLOW_OP_ALERT\"}。5–29s 的 BlueStore 慢操作 SLOW_OPS 永遠抓不到。"
+  },
+  {
+    "id": 14,
+    "question": "ceph_healthcheck_slow_ops(cluster) 與 ceph_daemon_health_metrics{type=\"SLOW_OPS\"}(per-daemon) 都來自 OpTracker，但拿來做 alert 時，為什麼後者通常更可靠、也更能定位問題？",
+    "options": [
+      "後者的取樣頻率比較高",
+      "前者是用 health check summary 字串解析第一個數字得出(module.py:_get_value)，mgr failover/module 沒開/格式改變時會整個消失或被 del；後者直接 dump 數值(ActivePyModules.cc:1475 的 get_n1())、且帶 ceph_daemon label 可接 ceph_osd_metadata 拿 hostname",
+      "後者包含了 oldest blocked 秒數，前者沒有",
+      "前者只在 HEALTH_ERR 時才有值"
+    ],
+    "answer": 1,
+    "explanation": "ceph_healthcheck_slow_ops 靠 mgr/prometheus 解析 summary 字串第一個 token(module.py:885 _get_value)，格式不符會 err→del 整個 metric 消失；且沒有任何 host/daemon label。ceph_daemon_health_metrics{type=\"SLOW_OPS\"} 由 get_all_daemon_health_metrics(module.py:1630) 對每個 daemon 逐筆 set，值是 ActivePyModules.cc:1475 dump 的 get_n1()(slow 計數)，帶 ceph_daemon label，可用 group_left 接 ceph_osd_metadata 取 hostname 精準定位。注意兩者都沒 export n2(oldest blocked 秒數)。"
   }
 ]

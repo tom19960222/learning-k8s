@@ -19,7 +19,8 @@
     {"id": "osd-safe-to-destroy", "label": "osd safe-to-destroy", "description": "三條規則：osdmap.exists / pg map 仍在此 OSD / 不健康 cluster 中仍持有 PG 資料", "featureSlug": "osd-safe-to-destroy", "category": "tooling", "position": {"x": 700, "y": 660}},
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}},
     {"id": "prometheus-alert-design", "label": "Prometheus alert 補強", "description": "保留 ceph-mixin 預設 rule，補 stability-first 與 scoped OSD / MON page，維護 silence 只鎖目標 label", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}},
-    {"id": "prometheus-alert-testing", "label": "Alert 測試計劃", "description": "用 promtool / amtool / live / 真 ceph 四層逐條驗證上面那套 alert 設計；過程抓到 CephMonQuorumLost 在 quorum 全失守時靜默的真 bug", "featureSlug": "prometheus-alert-testing", "category": "tooling", "position": {"x": 1000, "y": 660}}
+    {"id": "prometheus-alert-testing", "label": "Alert 測試計劃", "description": "用 promtool / amtool / live / 真 ceph 四層逐條驗證上面那套 alert 設計；過程抓到 CephMonQuorumLost 在 quorum 全失守時靜默的真 bug", "featureSlug": "prometheus-alert-testing", "category": "tooling", "position": {"x": 1000, "y": 660}},
+    {"id": "slow-ops-and-bluestore-alerts", "label": "slow ops metric 來源", "description": "ceph_healthcheck_slow_ops / ceph_daemon_health_metrics{type=SLOW_OPS} 走 OpTracker 30s 門檻；BlueStore 慢操作走獨立的 BLUESTORE_SLOW_OP_ALERT(5s/24h)，兩條幾乎不重疊，alert 要三層補", "featureSlug": "slow-ops-and-bluestore-alerts", "category": "tooling", "position": {"x": 1000, "y": 790}}
   ],
   "edges": [
     {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
@@ -56,6 +57,9 @@
     {"id": "e-pghealth-alerts", "source": "pg-health-states", "target": "prometheus-alert-design", "label": "drives alerts"},
     {"id": "e-flapping-alerts", "source": "osd-flapping", "target": "prometheus-alert-design", "label": "警報風暴來源"},
     {"id": "e-okstop-alerts", "source": "osd-ok-to-stop", "target": "prometheus-alert-design", "label": "maintenance gate"},
-    {"id": "e-alertdesign-testing", "source": "prometheus-alert-design", "target": "prometheus-alert-testing", "label": "驗證", "animated": true}
+    {"id": "e-alertdesign-testing", "source": "prometheus-alert-design", "target": "prometheus-alert-testing", "label": "驗證", "animated": true},
+    {"id": "e-bluestore-slowops", "source": "bluestore-deep-dive", "target": "slow-ops-and-bluestore-alerts", "label": "log_latency 5s"},
+    {"id": "e-slowops-alerts", "source": "slow-ops-and-bluestore-alerts", "target": "prometheus-alert-design", "label": "補三層 alert"},
+    {"id": "e-pghealth-slowops", "source": "pg-health-states", "target": "slow-ops-and-bluestore-alerts", "label": "SLOW_OPS check"}
   ]
 }
