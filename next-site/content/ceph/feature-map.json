@@ -19,7 +19,8 @@
     {"id": "osd-safe-to-destroy", "label": "osd safe-to-destroy", "description": "三條規則：osdmap.exists / pg map 仍在此 OSD / 不健康 cluster 中仍持有 PG 資料", "featureSlug": "osd-safe-to-destroy", "category": "tooling", "position": {"x": 700, "y": 660}},
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}},
     {"id": "prometheus-alert-design", "label": "Prometheus alert 補強", "description": "保留 ceph-mixin 預設 rule，補 stability-first 與 scoped OSD / MON page，維護 silence 只鎖目標 label", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}},
-    {"id": "prometheus-alert-testing", "label": "Alert 測試計劃", "description": "用 promtool / amtool / live / 真 ceph 四層逐條驗證上面那套 alert 設計；過程抓到 CephMonQuorumLost 在 quorum 全失守時靜默的真 bug", "featureSlug": "prometheus-alert-testing", "category": "tooling", "position": {"x": 1000, "y": 660}}
+    {"id": "prometheus-alert-testing", "label": "Alert 測試計劃", "description": "用 promtool / amtool / live / 真 ceph 四層逐條驗證上面那套 alert 設計；過程抓到 CephMonQuorumLost 在 quorum 全失守時靜默的真 bug", "featureSlug": "prometheus-alert-testing", "category": "tooling", "position": {"x": 1000, "y": 660}},
+    {"id": "prometheus-alert-real-cluster", "label": "Alert 真機驗證 (Tier D)", "description": "把設計搬上真 cephadm ceph v19.2.3（3 mon + 9 OSD）跑 baseline + S1–S4；核心 label/scoped/silence/monmap 假設全成立，但抓到 OSD_FLAGS≠OSDMAP_FLAGS（排除清單名字錯）與 CephMonQuorumLost 對真 quorum loss 盲（mgr metric 凍結）兩個只有真機看得到的 bug", "featureSlug": "prometheus-alert-real-cluster", "category": "tooling", "position": {"x": 1000, "y": 790}}
   ],
   "edges": [
     {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
@@ -56,6 +57,7 @@
     {"id": "e-pghealth-alerts", "source": "pg-health-states", "target": "prometheus-alert-design", "label": "drives alerts"},
     {"id": "e-flapping-alerts", "source": "osd-flapping", "target": "prometheus-alert-design", "label": "警報風暴來源"},
     {"id": "e-okstop-alerts", "source": "osd-ok-to-stop", "target": "prometheus-alert-design", "label": "maintenance gate"},
-    {"id": "e-alertdesign-testing", "source": "prometheus-alert-design", "target": "prometheus-alert-testing", "label": "驗證", "animated": true}
+    {"id": "e-alertdesign-testing", "source": "prometheus-alert-design", "target": "prometheus-alert-testing", "label": "驗證", "animated": true},
+    {"id": "e-alerttesting-realcluster", "source": "prometheus-alert-testing", "target": "prometheus-alert-real-cluster", "label": "真機 Tier D", "animated": true}
   ]
 }

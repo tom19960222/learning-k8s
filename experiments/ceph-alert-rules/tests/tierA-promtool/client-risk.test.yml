@@ -1,6 +1,6 @@
 # Tier A — CephClientRisk：catch-all（name!~ 10 個排除），5m page。spec §4.4（最關鍵）
 # 強化（devil #1/#2 + analyzer I3）：除個別負向，加「完整排除清單完整性」測試——
-# 餵全部 10 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
+# 餵全部 11 個排除 name（含真機發現的 OSD_FLAGS） + 2 個非排除 name，斷言只為 2 個非排除 fire。
 # 若任何一個排除 name 被偷偷移出清單，這裡就會多出一個 alert 而 FAIL；
 # 若任何非排除 name 被誤加進清單，這裡就會少一個 alert 而 FAIL。
 rule_files:
@@ -22,7 +22,7 @@ tests:
           - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
             exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
 
-  # 完整排除清單完整性：10 排除 + 2 非排除 → 只有 2 非排除 fire
+  # 完整排除清單完整性：11 排除 + 2 非排除 → 只有 2 非排除 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
@@ -44,6 +44,8 @@ tests:
       - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
         values: '1x10'
       - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_FLAGS", severity="HEALTH_WARN"}'
         values: '1x10'
       - series: 'ceph_health_detail{name="POOL_NEAR_FULL", severity="HEALTH_WARN"}'
         values: '1x10'
@@ -86,7 +88,7 @@ tests:
 
   # 真實 ceph health check 正向（devil #5）：OSD_NEARFULL / RECENT_CRASH 都是 v19.2.3 實際 check，
   # 不在排除清單 → catch-all 應各 fire 一個。確認 catch-all 對「排除清單外的真 check」確實接得到，
-  # 不是只會 round-trip 那 10 個已知 name。
+  # 不是只會 round-trip 那 11 個已知 name。
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'

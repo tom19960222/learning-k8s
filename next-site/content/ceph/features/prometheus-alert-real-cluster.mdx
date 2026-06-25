@@ -1,0 +1,224 @@
+---
+layout: doc
+title: Ceph — 把這套 alert 設計搬上真 3-node ceph 叢集（Tier D 真機觀測，兩個只有真機抓得到的 bug）
+description: dev 四層測試證明的是「IF metric/health check 以假設的 label 存在，規則就如設計行為」。這頁是 Tier D：把同一套設計搬到真 cephadm ceph v19.2.3（3 mon + 9 OSD）跑 baseline + S1–S4 四情境，回答 dev 答不了的 ceph 端「IF」。核心 label 假設全部成立、scoped silence/去重/monmap 持久化都守住；但抓到兩個 bug——維護升的是 OSD_FLAGS 不是 OSDMAP_FLAGS（排除清單名字錯，例行維護照樣 page），以及 CephMonQuorumLost 對真 quorum loss 是盲的（mgr metric 凍結，架構級盲區）。
+---
+
+## 結論先講
+
+把 [Prometheus alert 設計](./prometheus-alert-design) 那套搬上一個真的 cephadm ceph v19.2.3 叢集（3 mon、9 OSD/3 host）跑完 baseline + 四個情境，結果是：
+
+- **設計的核心機制全部在真 ceph 上守住**——scoped label（`{ceph_daemon, hostname}`）真的接得上、整台 down 的去重真的把 daemon alert 壓掉、`amtool` silence 真的鎖得住目標、stopped 的 mon 真的還在 monmap 繼續匯出 metric。dev 四層（promtool/amtool/live）證明的「IF…THEN」，那個 IF 在真 ceph 上簽收了。
+- **但抓到兩個 dev 不可能抓到的 bug**：
+  - 🔴 **發現一**：真 ceph 的 `maintenance enter` 對 host subtree 設 `noout`，升的是 `OSD_FLAGS` 而**不是**設計頁排除清單寫的 `OSDMAP_FLAGS`。名字對不上 → `CephClientRisk{name="OSD_FLAGS"}` 在例行維護時 **firing**——正是這套設計存在的目的（不要在維護時叫醒 oncall）。**已修**：排除清單與 `CephLowPriorityNotice` 改成 `OSD_FLAGS|OSDMAP_FLAGS` 兩個都列。
+  - 🔴 **發現二**：`CephMonQuorumLost` 讀的 `ceph_mon_quorum_status` 是 mgr 匯出的，而 mgr 要有 quorum 才能更新它。真的失守 2/3 mon 時，mgr 把 metric **凍結**在「三台都在 quorum」，`count==3` 不變、什麼都不 fire——整個 90 秒視窗 ceph 端對真 quorum loss 是**盲的**。這比 dev 抓到的 F1 更深：F1 是規則層的 PromQL bug（可用 `or vector(0)` 修），這是 metric 來源層的架構盲區，**規則層修不了**，只能靠 out-of-band 偵測。
+
+下面把緣起、觀測架構、baseline、四個情境逐一交代，再深入兩個發現，最後給真機 vs 設計假設的逐欄對帳。
+
+## 緣起：dev 答不了的那一半，只有真機能簽收
+
+[Alert 測試計劃](./prometheus-alert-testing) 那頁用四層測試（promtool/amtool/live/真 ceph）把整套設計逐條驗過，並把一條界線畫得很清楚：
+
+> **Tier A/B/C（dev）證明的是「IF 這些 metric / health check 以這些 label 和值存在，規則就如設計行為」。**
+> **Tier D（真 ceph）證明的是「這些 metric / health check 到底存不存在、是哪些」。**
+
+dev 測試餵給 promtool 的是**手刻的**合成 series——例如測「維護整台 OSD host」時直接寫入 `ceph_health_detail{name="OSDMAP_FLAGS"}` 然後斷言規則行為。這能精準驗 `for:` 邊界、`count()` 空 vector 語意、`unless` 去重，但它**沒辦法驗 ceph 在那個情境真的會升 `OSDMAP_FLAGS`**——因為 dev 環境裡根本沒有 ceph。
+
+這頁就是補那一半：把**同一套設計**（rule 檔逐字抽自設計頁）搬到一個真的 cephadm ceph v19.2.3 叢集，跑真實的維護/故障動作，看：
+
+1. 真 ceph 匯出的 metric label，是否真的如設計假設（`ceph_osd_up` 只帶 `ceph_daemon`、metadata 帶 `hostname`、stopped daemon 是否仍有 metric）。
+2. 每個情境 ceph **實際**升起哪些 health check（用 `ceph health detail` 的 raw 名稱對照）。
+3. scoped silence / 去重 / monmap 持久化在真機上是否真的成立。
+
+兩個只有真硬體能揭露的發現，就藏在第 2 點裡——設計頁寫的 health check 名字，跟 ceph 真實升的對不上。
+
+## 環境與觀測架構
+
+叢集（cephadm 部署、`fsid 0c9bf37e`）：
+
+| 角色 | daemon | host |
+|---|---|---|
+| MON × 3 | mon.ceph-lab-mon-01 / -02 / -03 | ceph-lab-mon-01/02/03（.166/.167/.164）|
+| mgr × 2 | active `mgr.ceph-lab-mon-02.wmkpax`、standby `mgr.ceph-lab-mon-01.jvgpfh`（ceph-lab-mon-03 無 mgr）| — |
+| OSD × 9 | osd.0–2 / osd.3–5 / osd.6–8 | ceph-lab-osd-01 / -02 / -03 |
+
+mgr 的 prometheus module 啟用於 `:9283`（baseline snapshot 證實 `ceph_mgr_module_status{name="prometheus"} 1.0`、active mgr 是 `mgr.ceph-lab-mon-02.wmkpax`）。觀測端在我的 Mac 上：跑一份 Prometheus 載入真規則、scrape 真 mgr 的 `192.168.18.167:9283`，接 Alertmanager，再接一個 python webhook sink 收最終送達的 alert。
+
+兩個刻意的設定要先講白，免得讀者誤解數字：
+
+- **`for:` 縮短版（5m → 30s）**：真機跑情境是為了看「ceph 升哪些 check、規則接不接得上、label 對不對」，不是量 `for:` 的精確邊界——那是 dev Tier A 的工作（promtool 能凍結時間、精準到第 4 分鐘不 fire 第 5 分鐘 fire）。為了讓每個 degradation 視窗短一點、能在合理時間內跑完還原，這裡把 `for:` 縮成 30s。所以下面寫的「35s firing」「30s firing」是**縮短版**下的觀測值，讀作「規則確實接上並 fire 了」，不要讀成「真實 production 的告警延遲」。
+- **ok-to-stop gating + 每情境還原**：每個破壞性情境前先跑 `ceph osd ok-to-stop` / host 級檢查確認不會立刻打掉可用性（這套 gating 的原始碼細節見 [osd ok-to-stop](./osd-ok-to-stop)），跑完立刻 `maintenance exit` / `daemon start` 還原到 HEALTH_OK 再進下一個情境。每個情境都是「乾淨進、乾淨出」。
+
+## Baseline — 設計的 label 假設全部成立
+
+進任何情境前先在 HEALTH_OK 抓一份完整 metric snapshot（`baseline-metrics.txt`），逐條對設計頁的 label 假設。**全部成立**：
+
+- **`ceph_osd_up` 只帶 `ceph_daemon`，沒有 label 洩漏**：
+
+  ```
+  ceph_osd_up{ceph_daemon="osd.0"} 1.0
+  ```
+
+  這正是設計頁 scoped 規則的前提——`ceph_osd_up` 自己不帶 `hostname`，所以才需要 `ceph:osd_up:with_hostname` 這條 recording rule 用 `group_left(hostname)` 從 metadata join 上來。真機證實 join 後 `{ceph_daemon, hostname}` 是乾淨的、沒有意外的額外 label 進來污染 cardinality。
+
+- **metadata 帶 `hostname`**（OSD 的額外 label 都在 metadata 上、不在 `ceph_osd_up` 上）：
+
+  ```
+  ceph_osd_metadata{...,ceph_daemon="osd.8",...,hostname="ceph-lab-osd-03",...} 1.0
+  ```
+
+- **`ceph_mon_quorum_status` 對 monmap 每個 mon 各一條、只帶 `ceph_daemon`**，三台都 = 1：
+
+  ```
+  ceph_mon_quorum_status{ceph_daemon="mon.ceph-lab-mon-01"} 1.0
+  ```
+
+  `ceph_mon_metadata` 則帶 `hostname`（`mon.ceph-lab-mon-01` → `hostname="ceph-lab-mon-01"`）。這是 `CephMonDownScoped` 用 `1 - ceph_mon_quorum_status` 乘 metadata join 出 `hostname` 的基礎。
+
+- **HEALTH_OK 時不匯出 `ceph_health_detail` series**：`ceph_health_status 0.0`，且 `ceph_health_detail` 只有 HELP/TYPE 註解、沒有任何 series。這符合設計——health 正常時不該有任何 `ceph_health_detail{name=...}` 讓 catch-all 接到。
+
+透過我的 Prometheus 確認：`up{job="ceph"}=1`、`count(ceph_mon_quorum_status==1)=3`、`count(ceph_osd_up==1)=9`、**沒有任何 alert**。乾淨基線，可以開始動手。
+
+## 逐情境觀測（S1–S4）
+
+四個情境由輕到重：單顆 OSD → 整台 OSD node → 單台 mon → 真 quorum loss。前三個各自驗一塊設計假設，第四個揭露最深的盲區。
+
+### S1 — 單顆 OSD down（停 osd.8）
+
+`ceph osd ok-to-stop osd.8` 先回 `{"ok_to_stop":true,"num_ok_pgs":0}`（osd.8 不持有那唯一一個 .mgr PG，所以不會升 PG_DEGRADED）。停掉後：
+
+- `ceph_osd_up{ceph_daemon="osd.8"}=0`（5 秒內），ceph 升 `OSD_DOWN`（HEALTH_WARN）。
+- prometheus module 匯出 `ceph_health_detail{name="OSD_DOWN", severity="HEALTH_WARN"} 1`——證實 `name` / `severity` 的 label 格式跟 dev 測試的合成 fixture **一致**（dev 餵的 `{name="OSD_DOWN", severity="HEALTH_WARN"}` 不是憑空捏的）。
+- **`CephOSDDaemonDownScoped` firing**，label `{ceph_daemon="osd.8", hostname="ceph-lab-osd-03"}`——recording rule 的 `group_left(hostname)` join 在真 ceph 上正確接上 hostname。維護時用 `ceph_daemon="osd.8"` 就能精準 silence 這一顆。
+- **`CephOSDHostDownScoped` 不 fire**：只有 1/3 的 OSD down，scoped host 判定（同 host down 數 == 該 host 全部 OSD 數）正確不誤判整台。
+
+還原 `ceph orch daemon start osd.8` → osd.8 up → alert 清除。乾淨恢復。
+
+### S2 — 整台 OSD node 維護（ceph-lab-osd-03 進 maintenance）🔴 抓到設計 bug
+
+`ceph orch host maintenance enter ceph-lab-osd-03`：停 osd.6/7/8、並自動對該 host subtree 設 `noout`。ceph **實際**升的 health check（用 `ceph health detail` 確認 raw 名稱）：`HOST_IN_MAINTENANCE`、`OSD_DOWN`、**`OSD_FLAGS`**、`OSD_HOST_DOWN`、`PG_DEGRADED`。
+
+設計預期的 pager 行為大多成立：
+
+- ✅ **`CephOSDHostDownScoped{hostname="ceph-lab-osd-03"}` firing**——整台 down 的 scoped 訊號保留。
+- ✅ **`CephOSDDaemonDownScoped` 不 fire**——整台 down 被 `unless on (hostname)` 壓掉，不會 osd.6/7/8 每顆各叫一次。這正是 dev `osd-daemon-down-scoped.test.yml` 驗的去重，在真機成立。
+- ✅ `CephLowPriorityNotice` fire（接到 `HOST_IN_MAINTENANCE`、`PG_DEGRADED`）——slack-only，正確。
+- ✅ **silence 真機有效**：`amtool silence add alertname=CephOSDHostDownScoped hostname=ceph-lab-osd-03` 後該 alert `state=suppressed`。dev Tier C 的 silence 是 POST 假 alert 測 wiring；這裡是真 ceph 升的真 alert 被真 silence 鎖住。
+
+但有一個 ❌ ——**只有真機抓得到的設計 bug**：
+
+> 🔴 **`CephClientRisk{name="OSD_FLAGS"}` firing！**
+
+設計頁的排除清單寫的是 `OSDMAP_FLAGS`，但 `maintenance enter` 對 host subtree 設 `noout` 升的是 **`OSD_FLAGS`**（per-subtree flag），**不是** `OSDMAP_FLAGS`（那是 cluster-wide `ceph osd set noout` 才升的）。`ceph health detail` 印出來的是：
+
+```
+[WRN] OSD_FLAGS: host ceph-lab-osd-03 has flags noout
+```
+
+名字對不上 → 這個 check 不在排除清單 → `CephClientRisk` 這條 `name!~` 的 catch-all 把它接走 → **例行維護照樣 page oncall**，正是這套設計存在要防的失敗。詳細機制與修法見下面〈發現一〉。
+
+還原 `maintenance exit` → 9 OSD up、`noout` 移除、PG 回 active+clean、HEALTH_OK。
+
+### S3 — 單台 mon 維護（ceph-lab-mon-03，非 mgr 節點）✅ 證實 monmap 宣稱
+
+選 ceph-lab-mon-03 是因為 mgr active 在 mon-02，停 mon-03 不影響 scrape。`maintenance enter ceph-lab-mon-03`：
+
+- live health：`1/3 mons down, quorum ceph-lab-mon-01,ceph-lab-mon-02`；ceph 升 `MON_DOWN`、`HOST_IN_MAINTENANCE`。
+- ✅ **`CephMonDownScoped{ceph_daemon="mon.ceph-lab-mon-03"}` firing**。
+- ✅ **stopped 的 mon 仍匯出 `ceph_mon_quorum_status{...mon-03}=0` 與 `ceph_mon_metadata{...mon-03, hostname=ceph-lab-mon-03}`**——這直接證實設計頁「停掉的 mon 仍在 monmap、quorum metric（值 0）與 metadata 都還在」的宣稱。這是 `CephMonDownScoped` 能用 `ceph_daemon` / `hostname` 精準 silence 的前提：metric 還在，silence matcher 才接得到。dev `mon-down-scoped.test.yml` 測的是反例（缺 metadata → 不 fire）；這裡確認正例在真 ceph 成立。
+- ✅ `count(ceph_mon_quorum_status==1)=2` → **`CephMonQuorumLost` 不 fire**——維護 1 台時生命線正確靜默（剩 2 台還是 majority，不該叫）。
+- ✅ **`MON_DOWN` 被正確排除**：`CephClientRisk` 不 fire，因為 `MON_DOWN` 的名字與排除清單**相符**（對比 S2 的 `OSD_FLAGS` 名字不符——這正是 bug 與非 bug 的差別所在）。
+
+把 S1–S4 跨情境**實際看到的** health-check 名稱彙整起來、對照設計頁（不是 S3 單一情境就升這六個——S3 只升 `MON_DOWN` + `HOST_IN_MAINTENANCE`）：`MON_DOWN` ✓、`HOST_IN_MAINTENANCE` ✓、`OSD_DOWN` ✓、`OSD_HOST_DOWN` ✓、`PG_DEGRADED` ✓，唯獨 `OSD_FLAGS` ✗（設計頁寫成 `OSDMAP_FLAGS`）。六個對照只有這一個對不上——而那一個就是 S2 漏 page 的 root cause。
+
+還原 `maintenance exit` → mon-03 rejoin、quorum=3、HEALTH_OK。
+
+### S4 — 真 quorum loss（systemctl 停 mon-03 + mon-01，保留 mon-02/mgr）🔴🔴 最深層發現
+
+這個情境是刻意設計來逼出 quorum loss 生命線的：直接 `systemctl` 停掉 mon-03 與 mon-01 兩台，只保留 mon-02（mgr 也在這台）。停 2/3 表示 quorum 真的失守。（用 shell 的 `trap`——腳本一離開就一定觸發——保證無論觀測中途發生什麼都會重啟這兩台；不停全部 3 台造成 total outage——那個 count=0 行為 dev Tier A 已用 promtool 證過。）
+
+**觀測結果：quorum 真失守的 90 秒視窗內，mgr 的 metric 完全凍結。**
+
+- `count(ceph_mon_quorum_status==1)` 一直 = 3，`ceph_mon_quorum_status` 三台都還報 1。
+- `up{job="ceph"}` 一直 = 1。
+- **`CephMonQuorumLost` 沒 fire、`CephExporterDown` 也沒 fire。** 整個視窗內 ceph 端對「兩台 mon 已死、quorum 已失守」是完全盲的。
+
+機制與意義見下面〈發現二〉。還原（trap）`systemctl start` mon-01 + mon-03 → 3-mon quorum + HEALTH_OK 恢復。
+
+## 🔴 發現一：OSD_FLAGS ≠ OSDMAP_FLAGS（已修）
+
+設計頁 `CephClientRisk` 的排除清單，與 `CephLowPriorityNotice` 的 name 清單，當初寫的是 `OSDMAP_FLAGS`。背後的意圖完全正確——「維護時自動設的 `noout` 會升一個 flag check，要把它排出 pager，否則例行維護會吵醒人」。意圖對，**但 check 的名字寫錯了**。
+
+真機分得很清楚（`ceph health detail` 證實）：
+
+| 動作 | 升的 health check |
+|---|---|
+| `maintenance enter` 對 host **subtree** 設 `noout` | **`OSD_FLAGS`**（"host ceph-lab-osd-03 has flags noout"，per-subtree）|
+| cluster-wide `ceph osd set noout` | `OSDMAP_FLAGS`（整個 osdmap 的 flag）|
+
+設計排除的是後者，但 `maintenance enter` 升的是前者。結果：
+
+- `OSD_FLAGS` 不在排除清單 → `CephClientRisk` 這條 `name!~"..."` catch-all 把它接走 → `CephClientRisk{name="OSD_FLAGS"}` 在 S2 例行維護中 **firing**。
+- **這是這套設計唯一要防的失敗模式被觸發了**：維護一台 OSD node 這種最日常的操作，照樣把 oncall 叫醒。
+
+這正是真硬體的價值。為什麼 dev 四層全綠卻沒抓到？因為 dev 測的是**設計自己（寫錯）的假設**——`maintenance-thesis.test.yml` 餵的合成 series 就是 `ceph_health_detail{name="OSDMAP_FLAGS"}`（照著設計頁寫的名字餵），於是斷言「`OSDMAP_FLAGS` 被排除、`CephClientRisk` 不 fire」當然通過。測試與被測對象用了**同一個錯誤的名字**，所以一致地綠——綠燈證明的是「規則對 `OSDMAP_FLAGS` 的處理正確」，不是「ceph 維護時升的就是 `OSDMAP_FLAGS`」。後者只有真 ceph 能簽收。
+
+**修法**（已套用到設計頁與抽出的 `rules/ceph-stability-first.yml`）：排除清單與 `CephLowPriorityNotice` 都改成同時列 `OSD_FLAGS|OSDMAP_FLAGS`——subtree noout 升 `OSD_FLAGS`、cluster-wide noout 升 `OSDMAP_FLAGS`，兩種都要排，才完整。設計頁的 callout 與 prose 已同步改成這個名字、並標註「真機驗證：subtree noout 升 `OSD_FLAGS`」。
+
+<Callout type="tip" title="這個 miss 的教訓：測試與設計同源，就驗不出設計的假設錯誤">
+  dev 測試的 fixture 是照著設計頁的 health-check 名字手刻的。當設計頁把名字寫錯（`OSDMAP_FLAGS`），測試也跟著用同一個錯名，於是測試「驗證設計」變成「設計自己跟自己對帳」——名字錯得一致，照樣全綠。這類錯誤**結構上**只有引入一個獨立的事實來源（真 ceph，或 ceph 原始碼當 oracle）才抓得到。這也是 [測試計劃頁](./prometheus-alert-testing) §6 反覆強調「絕對不要因為 dev 全綠就跳過 Tier D」的具體案例。
+</Callout>
+
+## 🔴 發現二：CephMonQuorumLost 對真 quorum loss 是盲的（架構級，規則層修不了）
+
+這個比發現一更深，也比 dev 抓到的 F1 更深。先回顧 F1：dev 用 promtool 發現早期版本 `count(ceph_mon_quorum_status==1) < 2` 在「全部 mon 都 = 0」時，內層 `==1` 過濾成空 vector、`count(空)` 是無 sample 而非 0，整個比較算不出結果、不 fire——用 `or vector(0)` 修好。那是**規則層**的 PromQL 語意 bug。
+
+S4 揭露的是更底層的問題：**就算 F1 修對了，`CephMonQuorumLost` 在真 quorum loss 時還是不會 fire——但原因不在 PromQL，在 metric 來源。**
+
+機制：`CephMonQuorumLost` 與 `CephMonDownScoped` 讀的 `ceph_mon_quorum_status`，是 **mgr 匯出**的。而 mgr 要先有 mon quorum，才能向 monmap 更新 cluster 視圖。S4 停掉 2/3 mon、quorum 一失守，mgr 就**凍結在最後已知狀態**（三台都 = 1），但它的 prometheus HTTP endpoint 仍持續吐這份 stale 資料——所以 scrape 還是成功（`up{job="ceph"}=1`，連 `CephExporterDown` 都不會 fire），`count(...==1)` 永遠是 stale 的 3，`3 < 2` 不成立，沒有任何 alert。
+
+對照兩個發現的層級：
+
+| | F1（dev/promtool 抓到）| 發現二（真機 S4 抓到）|
+|---|---|---|
+| 觸發最壞情況靜默的原因 | PromQL `count(空 vector)` 語意 | mgr metric 來源凍結 |
+| 屬於哪一層 | 規則層 | 架構層（metric source）|
+| 規則層修得了嗎 | 修得了（`or vector(0)`）| **修不了**——`or vector(0)` 也救不了：mgr 凍結時 count 仍是 stale 的 3，根本不會走到空 vector |
+| 哪一層能抓到 | dev promtool（合成 series）| 只有真 ceph（mgr 真的會凍結）|
+
+也就是說「用叢集自己的 mgr 匯出的 metric 偵測 quorum loss」有**先天盲區**：graceful 的單台下線（S3——quorum 還在、mgr 能更新）測得到、scoped silence 也接得上；但真正的 quorum 失守（S4）測不到，因為偵測者本身依賴它要偵測的東西。
+
+**緩解（必須走 out-of-band，叢集外的手段）**：
+
+- **blackbox-probe 每台 mon 的 port**：直接探每個 mon 的網路可達性，不經過 mgr。
+- **外部 quorum 檢查**：從叢集外定期跑 quorum 狀態查詢。
+- **對 metric staleness 告警**：偵測 `ceph_mon_quorum_status`（或其他 mgr metric）**不再更新**——metric 凍結本身就是訊號。
+
+這三者的共通點是「不依賴 mgr 的 cluster 視圖」。設計頁已把這個盲區寫進 `CephMonQuorumLost` 的 callout 並列出緩解；這頁是它的真機證據來源。
+
+## 真機 vs 設計假設 總結表
+
+| 設計頁假設 | 真 ceph v19.2.3 觀測 | 結果 |
+|---|---|---|
+| metric label（`ceph_daemon` / `hostname` / `name` / `severity`） | 完全相符；`ceph_osd_up` 只帶 `ceph_daemon`、無洩漏 | ✅ 規則設計成立 |
+| stopped mon 仍匯出 `quorum_status=0` + metadata | graceful 下線時成立（S3）| ✅ scoped silence 接得到 |
+| 維護升 `OSDMAP_FLAGS`（`noout`） | 實際升 **`OSD_FLAGS`**（subtree noout）| 🔴 排除清單名字錯 → 維護照樣 page（已修）|
+| `CephMonQuorumLost` 是 quorum 失守生命線 | 真失守時 mgr metric 凍結、不 fire | 🔴 架構級盲區，需 out-of-band |
+| scoped 去重 / silence 粒度（osd / host / mon）| 都如設計成立 | ✅ |
+
+## 結論
+
+把設計搬上真 ceph，bottom line 有三句：
+
+1. **核心機制全部守住**。scoped label join、整台 down 的去重、`amtool` silence 鎖定、stopped mon 的 monmap 持久化——這些在真 cephadm ceph v19.2.3 上的行為，跟 dev 四層測試斷言的一致。dev 的「IF…THEN」拿到了真 ceph 的簽收。
+2. **找到兩個真 bug，第一個已修**。`OSD_FLAGS ≠ OSDMAP_FLAGS` 是排除清單名字錯，會讓例行維護 page——名字改成 `OSD_FLAGS|OSDMAP_FLAGS` 兩個都列就解決。這個 miss 之所以躲過 dev 全綠，是因為測試 fixture 照著設計（寫錯）的名字手刻，測試與被測對象同源。
+3. **第二個 bug 是架構盲區，誠實記錄並給緩解**。`CephMonQuorumLost` 依賴 mgr 匯出的 metric，而 mgr 依賴 quorum——真失守時 metric 凍結、規則沉默，規則層修不了。可靠偵測 quorum loss 必須走 out-of-band（blackbox 探 mon、外部 quorum 檢查、metric staleness 告警）。
+
+這就是 Tier D 賺到自己位置的理由：dev 證明「規則邏輯對」，真機證明「ceph 的事實對不對得上規則的假設」——而恰恰是兩個假設對不上的地方，藏著只有真硬體能揭露的 bug。
+
+## 接下來 / 相關頁面
+
+- [Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design)：本頁驗證的對象（被測 single source of truth），已套用發現一的修正
+- [Ceph — 在開發環境驗證這套 alert 設計（四層測試）](./prometheus-alert-testing)：dev 端的 Tier A/B/C，本頁是它的真機 Tier D 對應
+- [Ceph — osd ok-to-stop 在 v19.2.3 原始碼裡檢查了什麼](./osd-ok-to-stop)：每個破壞性情境前的 gating，原始碼層的判定式
+- [Ceph — MON quorum loss](./mon-quorum-loss-impact)：3-mon / 5-mon quorum loss 對 client I/O 的影響，呼應發現二的盲區

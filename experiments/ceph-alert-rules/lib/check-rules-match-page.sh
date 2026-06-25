@@ -13,10 +13,10 @@ RULES_DIR="$ROOT/experiments/ceph-alert-rules/rules"
 # load-bearing invariants（出現在頁面 YAML 與 rules 兩邊）
 invariants=(
   'ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS"} == 1'
-  'PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS'
+  'PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS'
   '(count(ceph_mon_quorum_status == 1) or vector(0)) < 2'
   'up{job="ceph"} == 0'
-  'HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS'
+  'HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS'
   'group_left(hostname) ceph_osd_metadata'
   'count by (hostname) (ceph:osd_up:with_hostname == 0)'
   'unless on (hostname) ceph:osd_host_down:scoped'

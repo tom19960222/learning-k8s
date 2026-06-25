@@ -1,5 +1,5 @@
 # 下載的 prometheus/alertmanager binary（fallback 位置）不進版控
 .bin/
-# 測試輸出是 runtime 產物，每次跑會重生，不進版控（保留 .gitkeep 維持目錄）
-results/*
-!results/.gitkeep
+# 合成測試的 runtime 輸出不進版控（保留 .gitkeep）；但 tierD 真機觀測證據要保留
+/results/*
+!/results/.gitkeep

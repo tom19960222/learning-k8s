@@ -16,7 +16,7 @@ groups:
       - alert: CephClientRisk
         expr: |
           ceph_health_detail{
-            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS"
           } == 1
         for: 5m
         labels:
@@ -49,7 +49,7 @@ groups:
       - alert: CephLowPriorityNotice
         expr: |
           ceph_health_detail{
-            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS"
           } == 1
         for: 30m
         labels:

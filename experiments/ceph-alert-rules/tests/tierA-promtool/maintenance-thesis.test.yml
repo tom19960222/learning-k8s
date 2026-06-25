@@ -1,7 +1,7 @@
 # Tier A — 旗艦：維護 osd-host-a 的真實情境，同時載入兩個 rule group。spec §4.4 + devil #2
 # 驗證頁面整套設計的核心宣稱：維護期間「cluster-wide 噪音壓掉、scoped 訊號保留」。
 # 模擬 ceph orch host maintenance enter osd-host-a 實際升起的 health check：
-#   OSD_HOST_DOWN（整台 OSD down）、OSDMAP_FLAGS（自動 noout）、PG_DEGRADED（副本掉一份）。
+#   OSD_HOST_DOWN（整台 OSD down）、OSD_FLAGS（自動 noout）、PG_DEGRADED（副本掉一份）。
 # 同時 osd-host-a 兩顆 OSD 的 ceph_osd_up=0、host-b 正常。
 rule_files:
   - ../../rules/ceph-stability-first.yml
@@ -26,7 +26,7 @@ tests:
       # stability-first 用的 metric：維護升起的三個 health check（全在 CephClientRisk 排除清單）
       - series: 'ceph_health_detail{name="OSD_HOST_DOWN", severity="HEALTH_WARN"}'
         values: '1x10'
-      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+      - series: 'ceph_health_detail{name="OSD_FLAGS", severity="HEALTH_WARN"}'
         values: '1x10'
       - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
         values: '1x10'
@@ -86,7 +86,7 @@ tests:
               summary: "Ceph MON down or out of quorum: mon.a on mon-host-a"
               runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"
 
-  # thesis 3 — 換單顆硬碟（devil #4）：osd.5 down（同 host 還有 osd.6 up），升 OSD_DOWN+PG_DEGRADED+OSDMAP_FLAGS。
+  # thesis 3 — 換單顆硬碟（devil #4）：osd.5 down（同 host 還有 osd.6 up），升 OSD_DOWN+PG_DEGRADED+OSD_FLAGS。
   # 噪音壓掉（CephClientRisk 不 fire）+ 訊號保留（CephOSDDaemonDownScoped fire，非整台 host alert）。
   - interval: 1m
     input_series:
@@ -102,7 +102,7 @@ tests:
         values: '1x10'
       - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
         values: '1x10'
-      - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
+      - series: 'ceph_health_detail{name="OSD_FLAGS", severity="HEALTH_WARN"}'
         values: '1x10'
     alert_rule_test:
       - eval_time: 6m
