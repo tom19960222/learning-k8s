@@ -34,6 +34,7 @@ check pager-ceph alertname=CephExporterDown     source=ceph_stability
 check pager-ceph alertname=CephOSDHostDownScoped   source=ceph_scoped
 check pager-ceph alertname=CephOSDDaemonDownScoped source=ceph_scoped
 check pager-ceph alertname=CephMonDownScoped     source=ceph_scoped
+check pager-ceph alertname=CephMonQuorumLostExternal source=ceph_external   # 發現二的 out-of-band 生命線也要 page
 
 echo "## slack-ceph：LowPriority + 預設 aggregate（含 critical 的 aggregate 也不可 pager）"
 check slack-ceph alertname=CephLowPriorityNotice source=ceph_stability

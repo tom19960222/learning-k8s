@@ -196,6 +196,23 @@ S4 揭露的是更底層的問題：**就算 F1 修對了，`CephMonQuorumLost` 
 
 這三者的共通點是「不依賴 mgr 的 cluster 視圖」。設計頁已把這個盲區寫進 `CephMonQuorumLost` 的 callout 並列出緩解；這頁是它的真機證據來源。
 
+### 緩解實作 + 真機對照（S5）
+
+光記錄盲區不夠——把第一個緩解真的做出來、在同一座叢集上證明它在原規則失效之處會 fire。實作 `CephMonQuorumLostExternal`：讀一支**叢集外**的 TCP 探針（`mon-tcp-probe.py` 直接連每台 mon 的 msgr2 port `3300`，匯出 `ceph_mon_tcp_up`）匯出的 metric，完全不經 mgr。規則沿用 F1 的 `or vector(0)`：
+
+```promql
+(count(ceph_mon_tcp_up == 1) or vector(0)) < 2
+```
+
+把 mgr-based 與 probe-based 兩條規則載進**同一個** Prometheus，再跑一次停 2/3 mon（trap 保證恢復），側錄對照：
+
+| quorum 失守後全程 | `CephMonQuorumLost`（mgr 來源）| `CephMonQuorumLostExternal`（探針來源）|
+|---|---|---|
+| count | `3`（凍結）| `1`（正確）|
+| alert | **不 fire**（盲，重現 S4）| **firing**（縮短版 `for: 30s` 下，觀測約 35s 起）|
+
+同一個 Prometheus、同一刻、同一場真 quorum loss——mgr-based 沉默，out-of-band 探針正確 fire。**發現二的緩解在真機證明有效。** 限制要誠實講：探針偵測的是「mon port 可達」不是「mon 在 quorum」，能抓 mon-down（mgr 凍結時的盲區），但抓不到「所有 mon 都活著卻網路分區」——那要真的對每台跑 `quorum_status`。harness 在 `experiments/ceph-alert-rules/tests/tierD-realceph/validate-external-lifeline.sh`。
+
 ## 真機 vs 設計假設 總結表
 
 | 設計頁假設 | 真 ceph v19.2.3 觀測 | 結果 |

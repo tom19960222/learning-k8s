@@ -1,0 +1,16 @@
+# 發現二的緩解（out-of-band 生命線）。被測物——驗證見 tierD-realceph。
+# CephMonQuorumLost 讀 mgr 匯出的 ceph_mon_quorum_status，而 mgr 在 quorum 失守時會凍結那份 metric
+# （真機 S4 實證）。這條改讀「叢集外 TCP 探針」的 ceph_mon_tcp_up，不依賴 mgr，所以真失守時也 fire。
+# or vector(0)：套用 F1 的教訓——全部 mon 都 down 時 `==1` 過濾成空、count(空) 無 sample，要退回 0 才會 fire。
+groups:
+  - name: ceph-mon-external
+    rules:
+      - alert: CephMonQuorumLostExternal
+        expr: (count(ceph_mon_tcp_up == 1) or vector(0)) < 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_external
+        annotations:
+          summary: "Ceph MON quorum at risk (out-of-band probe): fewer than 2 mons reachable"
+          runbook: "從叢集外確認 mon 可達性；mgr metric 此時可能已凍結，改信此探針與 ceph quorum_status"

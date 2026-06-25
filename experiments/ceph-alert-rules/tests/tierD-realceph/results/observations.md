@@ -59,3 +59,14 @@ mgr active 在 mon-02，prometheus module 啟用於 :9283。觀測：Mac 跑 Pro
 | 維護升 `OSDMAP_FLAGS`（noout） | 實際升 **`OSD_FLAGS`**（subtree noout） | 🔴 排除清單名字錯 → 維護照樣 page |
 | CephMonQuorumLost 是 quorum 失守生命線 | 真失守時 mgr metric 凍結、不 fire | 🔴 架構級盲區，需 out-of-band |
 | scoped 去重 / silence 粒度 | osd/host/mon 都如設計 | ✅ |
+
+## S5 — 發現二的緩解：out-of-band 探針 lifeline，真機對照驗證 ✅
+- 實作 `ceph-mon-external.yml` 的 `CephMonQuorumLostExternal`：讀叢集外 TCP 探針匯出的 `ceph_mon_tcp_up`（`mon-tcp-probe.py` 直連每台 mon 的 msgr2 port 3300，不經 mgr），`(count(==1) or vector(0)) < 2`。
+- 同一個 Prometheus 同時載 mgr-based 與 probe-based 規則，再跑一次停 2/3 mon（trap 保證恢復），側錄對照：
+
+  | 觀測時間 | CephMonQuorumLost（mgr）| CephMonQuorumLostExternal（probe）|
+  |---|---|---|
+  | quorum 失守後全程 | `count=3`（凍結）、alert **—**（盲，重現 S4）| `count=1`（正確）、alert **firing**（35s 起）|
+
+- **結論**：out-of-band 探針在 mgr-based 規則盲掉的同一刻正確 fire——發現二的緩解在真機證明有效。限制：探針偵測「mon port 可達」非「mon 在 quorum」，能抓 mon-down，抓不到「全 mon 活著但網路分區」（那要對每台真跑 quorum_status）。
+- 還原：trap `systemctl start` mon-01+mon-03 → HEALTH_OK、3-mon quorum。

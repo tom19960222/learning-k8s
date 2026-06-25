@@ -163,7 +163,7 @@ groups:
 
   修法是標準 idiom `(count(...) or vector(0)) < 2`：左邊為空時 `or vector(0)` 退回一條值為 0 的 series，`0 < 2` 成立照樣 page。已驗證 healthy 不 fire、掉 2 台 fire、**掉 3 台也 fire**。對應的驗證見 [Ceph - 在開發環境驗證這套 alert](./prometheus-alert-testing)。
 
-  **更深層的限制（真機才看得到，比 F1 嚴重）**：即使 `or vector(0)` 修對了，`CephMonQuorumLost` 在**真正的 quorum 失守時還是不會 fire**——但原因不在 PromQL，在 metric 來源。它讀的 `ceph_mon_quorum_status` 是 **mgr 匯出**的，而 mgr 要有 mon quorum 才能更新 cluster 視圖。真機實驗（3-mon，停掉 2 台）觀測到：quorum 一沒，mgr 把 metric **凍結在最後已知狀態（三台都 =1）**、prometheus endpoint 仍持續吐這份 stale 資料（所以 `up{job="ceph"}` 還是 1，連 `CephExporterDown` 都不 fire），`count(...==1)` 永遠是 stale 的 3、`3 < 2` 不成立。結論：**用「叢集自己的 mgr」匯出的 metric 偵測 quorum loss 有先天盲區**——graceful 的單台下線（quorum 還在、mgr 能更新）測得到，但真失守測不到。要可靠偵測必須走 **out-of-band**：blackbox 探每台 mon 的 port、外部 quorum 檢查、或對「metric 凍結 / 不再更新」告警。詳見測試計劃頁的真機 Tier D。
+  **更深層的限制（真機才看得到，比 F1 嚴重）**：即使 `or vector(0)` 修對了，`CephMonQuorumLost` 在**真正的 quorum 失守時還是不會 fire**——但原因不在 PromQL，在 metric 來源。它讀的 `ceph_mon_quorum_status` 是 **mgr 匯出**的，而 mgr 要有 mon quorum 才能更新 cluster 視圖。真機實驗（3-mon，停掉 2 台）觀測到：quorum 一沒，mgr 把 metric **凍結在最後已知狀態（三台都 =1）**、prometheus endpoint 仍持續吐這份 stale 資料（所以 `up{job="ceph"}` 還是 1，連 `CephExporterDown` 都不 fire），`count(...==1)` 永遠是 stale 的 3、`3 < 2` 不成立。結論：**用「叢集自己的 mgr」匯出的 metric 偵測 quorum loss 有先天盲區**——graceful 的單台下線（quorum 還在、mgr 能更新）測得到，但真失守測不到。要可靠偵測必須走 **out-of-band**：blackbox 探每台 mon 的 port、外部 quorum 檢查、或對「metric 凍結 / 不再更新」告警。其中第一種已做成具體規則 `CephMonQuorumLostExternal`（`(count(ceph_mon_tcp_up == 1) or vector(0)) < 2`，讀叢集外 TCP 探針、不經 mgr），並在真機證明：mgr-based 規則凍結沉默的同一刻它正確 fire。詳見[真機 Tier D 頁](./prometheus-alert-real-cluster)的 S5 對照。
 
   **一個誠實的 trade-off**：`or vector(0)` 分不出「3 台 mon 都回報 quorum_status=0」與「完全沒有 `ceph_mon_quorum_status` 這個 metric」（例如 mgr 剛重啟、module 還沒匯出），兩者它都會 fire。多數情況這可接受——連 quorum metric 都沒有本來就代表你對 quorum 盲了，值得叫；而 `CephExporterDown` 是「整個 ceph job 抓不到」的主訊號。若你想讓這條只在「真的有 mon 回報但不足額」時 fire，用文末 **metadata-anchored 動態版**：它的門檻 `floor(count(ceph_mon_metadata)/2)+1` 在 metadata 缺席時也變空，`0 < 空` 不成立 → 不會被 metric 缺席誤觸（測試計劃頁有寫死版 fire、動態版不 fire 的對照）。
 </Callout>
@@ -259,7 +259,7 @@ route:
 
     - receiver: pager-ceph
       matchers:
-        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
+        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped|CephMonQuorumLostExternal"
 
     - receiver: slack-ceph
       matchers:

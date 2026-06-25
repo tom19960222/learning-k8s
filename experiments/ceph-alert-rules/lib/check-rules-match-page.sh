@@ -22,7 +22,7 @@ invariants=(
   'unless on (hostname) ceph:osd_host_down:scoped'
   '(1 - ceph_mon_quorum_status)'
   'group_left(hostname) ceph_mon_metadata'
-  'alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"'
+  'alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped|CephMonQuorumLostExternal"'
 )
 
 rules_blob="$(cat "$RULES_DIR"/*.yml)"

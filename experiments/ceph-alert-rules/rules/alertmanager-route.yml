@@ -12,7 +12,7 @@ route:
 
     - receiver: pager-ceph
       matchers:
-        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
+        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped|CephMonQuorumLostExternal"
 
     - receiver: slack-ceph
       matchers:
