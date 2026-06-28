@@ -165,3 +165,73 @@ ok: required files exist
 ### Concerns after the fix
 
 - None. The scripts still remain skeletons, but they no longer report false success.
+
+## Second fix addendum
+
+### What I changed
+
+- Updated `experiments/ceph-incident-bundle/tests/run-tests.sh` to cover the remaining `verify-bundle.sh` behavior gap:
+  - `verify-bundle.sh /tmp/definitely-not-a-bundle` must fail closed
+  - the output must clearly indicate usage or not-implemented/error state
+- Updated `experiments/ceph-incident-bundle/lib/verify-bundle.sh` so any non-empty argument list fails closed with exit 1 until real verification is implemented in Task 3.
+
+### TDD Evidence for the second fix
+
+#### RED
+
+Command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/run-tests.sh
+```
+
+Output:
+
+```text
+FAIL: verify-bundle.sh placeholder args should not exit 0
+```
+
+#### GREEN
+
+Command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/run-tests.sh
+```
+
+Output:
+
+```text
+ok: required files exist
+```
+
+### Direct behavior evidence
+
+- `bash experiments/ceph-incident-bundle/lib/verify-bundle.sh /tmp/definitely-not-a-bundle`
+  - `STATUS=1`
+  - `Usage: verify-bundle.sh <bundle-dir>`
+  - `verify-bundle.sh: not implemented yet`
+
+### Validation evidence
+
+- `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
+  - passed
+- `bash -n experiments/ceph-incident-bundle/run/collect.sh experiments/ceph-incident-bundle/lib/*.sh`
+  - passed
+- `make validate`
+  - passed all checks, including the Next.js build and exported HTML basePath validation
+
+### Files changed in the second fix
+
+- `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
+- `experiments/ceph-incident-bundle/tests/run-tests.sh`
+- `.superpowers/sdd/task-1-report.md`
+
+### Self-review findings for the second fix
+
+- `verify-bundle.sh` now behaves like `collect.sh` and fails closed until the real verifier exists.
+- The new test covers the concrete non-empty-argument path that was previously slipping through.
+
+### Concerns after the second fix
+
+- None. This keeps the skeleton honest until Task 3 fills in real bundle verification.

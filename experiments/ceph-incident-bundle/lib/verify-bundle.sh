@@ -12,6 +12,10 @@ main() {
     usage
     return 1
   fi
+
+  usage
+  printf '%s: not implemented yet\n' "${0##*/}" >&2
+  return 1
 }
 
 main "$@"
