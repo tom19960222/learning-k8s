@@ -62,9 +62,9 @@ verify_required_artifacts() {
 verify_bundle_tree() {
   local root=$1
 
-  verify_members "$root"
-  verify_required_files "$root"
-  verify_required_artifacts "$root"
+  verify_members "$root" || return 1
+  verify_required_files "$root" || return 1
+  verify_required_artifacts "$root" || return 1
 }
 
 verify_bundle_path() {
@@ -98,7 +98,7 @@ verify_bundle_path() {
 }
 
 main() {
-  if [[ $# -eq 0 ]]; then
+  if [[ $# -ne 1 ]]; then
     usage
     return 1
   fi

@@ -101,3 +101,47 @@ Output:
 
 - The verifier assumes bundle contents are rooted directly at the archive top level, matching the test fixtures and current task brief.
 - I did not push the branch, per instruction.
+
+## Fix addendum
+
+### What I fixed
+
+- Propagated failures explicitly inside `verify_bundle_tree` so archive verification cannot keep going after a validator fails.
+- Added archive-negative coverage for:
+  - `.tar.gz` missing `manifest.jsonl`
+  - `.tar.gz` containing `keyring`
+  - `.tar.gz` containing `.ssh`
+  - `.tar.gz` containing `id_ed25519`
+  - `.tar.gz` containing `private_key`
+  - corrupt `.tar.gz`
+- Rejected extra arguments with usage and a non-zero exit status.
+
+### TDD evidence
+
+RED command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
+```
+
+RED output:
+
+```text
+FAIL: expected failure for /var/folders/0r/03g4qs0s1p75k5tsvwpk_41c0000gn/T/tmp.htLTVAN3d6/missing-manifest.tar.gz
+```
+
+GREEN command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
+```
+
+GREEN output:
+
+```text
+```
+
+### Follow-up verification
+
+- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
+- `make validate` passed
