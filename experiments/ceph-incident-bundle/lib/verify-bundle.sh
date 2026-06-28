@@ -3,8 +3,98 @@ set -euo pipefail
 
 # Ceph incident bundle verification entrypoint.
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+source "$ROOT/lib/common.sh"
+
 usage() {
-  printf 'Usage: %s <bundle-dir>\n' "${0##*/}" >&2
+  cat >&2 <<'EOF'
+Usage: verify-bundle.sh <bundle-dir|bundle.tar.gz>
+EOF
+}
+
+verify_fail() {
+  printf 'VERIFY FAIL: %s\n' "$*" >&2
+  return 1
+}
+
+verify_members() {
+  local root=$1 path
+
+  while IFS= read -r path; do
+    case "$path" in
+      *keyring*|*.ssh*|*id_ed25519*|*private_key*)
+        verify_fail "forbidden path: ${path#./}"
+        return 1
+        ;;
+    esac
+  done < <(cd "$root" && find . -mindepth 1 -print)
+}
+
+verify_required_files() {
+  local root=$1
+  local required
+
+  for required in manifest.jsonl summary.txt README-FIRST.txt; do
+    [[ -f "$root/$required" ]] || {
+      verify_fail "missing required file: $required"
+      return 1
+    }
+  done
+}
+
+verify_required_artifacts() {
+  local root=$1 cluster_artifact nodes_artifact
+
+  cluster_artifact="$(find "$root/cluster" -type f -print -quit 2>/dev/null || true)"
+  [[ -n "$cluster_artifact" ]] || {
+    verify_fail "missing cluster/ artifact"
+    return 1
+  }
+
+  nodes_artifact="$(find "$root/nodes" -type f -print -quit 2>/dev/null || true)"
+  [[ -n "$nodes_artifact" ]] || {
+    verify_fail "missing nodes/ artifact"
+    return 1
+  }
+}
+
+verify_bundle_tree() {
+  local root=$1
+
+  verify_members "$root"
+  verify_required_files "$root"
+  verify_required_artifacts "$root"
+}
+
+verify_bundle_path() {
+  local bundle=$1 workdir extracted_root
+
+  if [[ -d "$bundle" ]]; then
+    verify_bundle_tree "$bundle"
+    printf 'VERIFY PASS: %s\n' "$bundle"
+    return 0
+  fi
+
+  [[ -f "$bundle" && "$bundle" == *.tar.gz ]] || verify_fail "expected a directory or .tar.gz bundle: $bundle"
+
+  workdir="$(mktemp -d)"
+  if ! tar -tzf "$bundle" >/dev/null; then
+    rm -rf "$workdir"
+    return 1
+  fi
+  if ! tar -xzf "$bundle" -C "$workdir"; then
+    rm -rf "$workdir"
+    return 1
+  fi
+
+  extracted_root="$workdir"
+  if ! verify_bundle_tree "$extracted_root"; then
+    rm -rf "$workdir"
+    return 1
+  fi
+  rm -rf "$workdir"
+  printf 'VERIFY PASS: %s\n' "$bundle"
 }
 
 main() {
@@ -13,9 +103,7 @@ main() {
     return 1
   fi
 
-  usage
-  printf '%s: not implemented yet\n' "${0##*/}" >&2
-  return 1
+  verify_bundle_path "$1"
 }
 
 main "$@"

@@ -1,0 +1,103 @@
+# Task 3 Report: Bundle Verifier with TDD
+
+## What I implemented
+
+- Implemented `experiments/ceph-incident-bundle/lib/verify-bundle.sh` as a real bundle verifier.
+- The verifier now accepts either an extracted directory or a `.tar.gz` bundle.
+- For `.tar.gz` input, it first runs `tar -tzf` to validate gzip integrity, then extracts to a temporary directory for inspection.
+- It verifies the required bundle shape:
+  - `manifest.jsonl`
+  - `summary.txt`
+  - `README-FIRST.txt`
+  - at least one file under `cluster/`
+  - at least one file under `nodes/`
+- It rejects bundle member paths containing any of:
+  - `keyring`
+  - `.ssh`
+  - `id_ed25519`
+  - `private_key`
+- On success, it prints `VERIFY PASS: <path>`.
+- I also created `experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` and wired it into `experiments/ceph-incident-bundle/tests/run-tests.sh`.
+
+## What I tested and test results
+
+- Ran the verifier test script directly:
+  - `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh`
+  - Result: passed
+- Ran the full test entrypoint:
+  - `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
+  - Result: passed
+- Ran repo validation:
+  - `make validate`
+  - Result: passed
+
+## TDD Evidence
+
+### RED
+
+Command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
+```
+
+Output:
+
+```text
+FAIL: expected success for /var/folders/0r/03g4qs0s1p75k5tsvwpk_41c0000gn/T/tmp.lKjfVbg4zv/valid-dir, got status 1: Usage: verify-bundle.sh <bundle-dir>
+verify-bundle.sh: not implemented yet
+```
+
+### GREEN
+
+Command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
+```
+
+Output:
+
+```text
+```
+
+Command:
+
+```bash
+bash experiments/ceph-incident-bundle/tests/run-tests.sh
+```
+
+Output:
+
+```text
+ok: required files exist
+```
+
+Command:
+
+```bash
+make validate
+```
+
+Output:
+
+```text
+✓ All checks passed!
+```
+
+## Files changed
+
+- `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
+- `experiments/ceph-incident-bundle/tests/test-verify-bundle.sh`
+- `experiments/ceph-incident-bundle/tests/run-tests.sh`
+
+## Self-review findings
+
+- I found and fixed a shell cleanup bug while verifying the archive path: a `RETURN` trap referenced an out-of-scope local variable and triggered `set -u`.
+- I updated the shared test runner so its placeholder check now matches the verifier's real failure style.
+- I expanded the verifier tests to cover the full forbidden-path set, not just `keyring`.
+
+## Any concerns
+
+- The verifier assumes bundle contents are rooted directly at the archive top level, matching the test fixtures and current task brief.
+- I did not push the branch, per instruction.
