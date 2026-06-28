@@ -6,6 +6,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok: %s\n' "$*"; }
 
+run_and_capture() {
+  local output status
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n%s' "$status" "$output"
+}
+
 for path in \
   "$ROOT/run/collect.sh" \
   "$ROOT/lib/common.sh" \
@@ -19,5 +28,23 @@ done
 for path in "$ROOT/run/collect.sh" "$ROOT/lib/verify-bundle.sh"; do
   [[ -x "$path" ]] || fail "not executable $path"
 done
+
+collect_no_args="$(run_and_capture "$ROOT/run/collect.sh")"
+collect_no_args_status="${collect_no_args%%$'\n'*}"
+collect_no_args_output="${collect_no_args#*$'\n'}"
+[[ "$collect_no_args_status" == "1" ]] || fail "collect.sh no args should exit 1, got $collect_no_args_status"
+[[ "$collect_no_args_output" == *"Usage:"* ]] || fail "collect.sh no args should print usage"
+
+verify_no_args="$(run_and_capture "$ROOT/lib/verify-bundle.sh")"
+verify_no_args_status="${verify_no_args%%$'\n'*}"
+verify_no_args_output="${verify_no_args#*$'\n'}"
+[[ "$verify_no_args_status" == "1" ]] || fail "verify-bundle.sh no args should exit 1, got $verify_no_args_status"
+[[ "$verify_no_args_output" == *"Usage:"* ]] || fail "verify-bundle.sh no args should print usage"
+
+collect_placeholder_args="$(run_and_capture "$ROOT/run/collect.sh" --inventory /tmp/example.env --ssh-key /tmp/id_ed25519 --seed 192.168.18.166)"
+collect_placeholder_status="${collect_placeholder_args%%$'\n'*}"
+collect_placeholder_output="${collect_placeholder_args#*$'\n'}"
+[[ "$collect_placeholder_status" != "0" ]] || fail "collect.sh placeholder args should not exit 0"
+[[ "$collect_placeholder_output" == *"not implemented yet"* ]] || fail "collect.sh placeholder args should explain it is not implemented yet"
 
 ok "required files exist"

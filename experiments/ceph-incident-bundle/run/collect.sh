@@ -4,7 +4,9 @@ set -euo pipefail
 # Ceph incident bundle collection entrypoint.
 
 usage() {
-  printf 'Usage: %s <inventory-file>\n' "${0##*/}" >&2
+  cat >&2 <<'EOF'
+Usage: collect.sh --inventory <path> [--ssh-key <path>] [--seed <host>] [--help]
+EOF
 }
 
 main() {
@@ -12,6 +14,10 @@ main() {
     usage
     return 1
   fi
+
+  usage
+  printf '%s: not implemented yet\n' "${0##*/}" >&2
+  return 1
 }
 
 main "$@"
