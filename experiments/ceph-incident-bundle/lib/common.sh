@@ -25,16 +25,18 @@ ensure_dir() {
 }
 
 json_escape() {
-  python3 - "$1" <<'PY'
-import json
-import sys
-
-print(json.dumps(sys.argv[1])[1:-1])
-PY
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
 }
 
 manifest_add() {
   local manifest=$1 host=$2 collector=$3 artifact=$4 command=$5 exit_code=$6 started=$7 ended=$8
+  [[ "$exit_code" =~ ^[0-9]+$ ]] || die "manifest_add requires numeric exit_code: $exit_code"
   ensure_dir "$(dirname "$manifest")"
   printf '{"host":"%s","collector":"%s","artifact":"%s","command":"%s","exit_code":%s,"started":"%s","ended":"%s"}\n' \
     "$(json_escape "$host")" \
@@ -63,7 +65,7 @@ redact_file() {
   shopt -s nocasematch
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ (password|secret|token|keyring|private_key) ]]; then
+    if [[ "$line" =~ (password|secret|token|keyring|private([[:space:]_-]+)?key) ]]; then
       printf '[REDACTED]\n' >>"$tmp_file"
       count=$((count + 1))
     else
@@ -100,17 +102,18 @@ run_capture() {
 
   if command -v timeout >/dev/null 2>&1; then
     printf '# timeout: %ss\n' "${COMMAND_TIMEOUT:-20}" >>"$artifact_tmp"
-    timeout_cmd=(timeout "${COMMAND_TIMEOUT:-20}")
-    set +e
-    "${timeout_cmd[@]}" "${cmd[@]}" >>"$artifact_tmp" 2>&1
-    rc=$?
-    set -e
+    if timeout "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   else
     printf '# timeout: unavailable\n' >>"$artifact_tmp"
-    set +e
-    "${cmd[@]}" >>"$artifact_tmp" 2>&1
-    rc=$?
-    set -e
+    if "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
 
   ended="$(date -u +%FT%TZ)"
