@@ -237,6 +237,20 @@ EOF
   grep -q '^# timeout: 20s$' "$artifact" || fail "timeout header missing"
 }
 
+test_run_capture_handles_leading_dash_artifact() {
+  local manifest="$tmpdir/run-manifest-leading-dash.jsonl"
+  local cwd="$tmpdir/leading-dash"
+  mkdir -p "$cwd"
+
+  (
+    cd "$cwd"
+    run_capture "$manifest" "host-dash" "collector-dash" "-leading-dash.txt" -- printf 'dash-safe\n'
+  )
+
+  [[ -f "$cwd/-leading-dash.txt" ]] || fail "leading-dash artifact was not created"
+  grep -q 'dash-safe' "$cwd/-leading-dash.txt" || fail "leading-dash artifact output missing"
+}
+
 test_run_capture_preserves_errexit_state() {
   local manifest="$tmpdir/run-manifest-state.jsonl"
   local artifact="$tmpdir/run-artifact-state.txt"
@@ -262,6 +276,7 @@ test_run_capture_success
 test_run_capture_non_zero_writes_error_log_and_returns_code
 test_run_capture_missing_double_dash_is_fatal
 test_run_capture_timeout_branch
+test_run_capture_handles_leading_dash_artifact
 test_run_capture_preserves_errexit_state
 
 printf 'ok: common helpers\n'

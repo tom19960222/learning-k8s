@@ -128,8 +128,8 @@ case "$cmd" in
     fi
     emit_json '[
       {"crash_id":"crash-01"},
-      {"crash_id":"crash-02"},
-      {"crash_id":"crash-03"},
+      {"crash_id":"crash/02"},
+      {"crash_id":"crash:02"},
       {"crash_id":"crash-04"},
       {"crash_id":"crash-05"},
       {"crash_id":"crash-06"},
@@ -145,13 +145,13 @@ case "$cmd" in
     maybe_fail 'crash info crash-01'
     emit_json '{"crash_id":"crash-01","detail":"detail-01"}'
     ;;
-  *"ceph crash info crash-02"*)
-    maybe_fail 'crash info crash-02'
-    emit_json '{"crash_id":"crash-02","detail":"detail-02"}'
+  *"ceph crash info crash/02"*)
+    maybe_fail 'crash info crash/02'
+    emit_json '{"crash_id":"crash/02","detail":"detail-02"}'
     ;;
-  *"ceph crash info crash-03"*)
-    maybe_fail 'crash info crash-03'
-    emit_json '{"crash_id":"crash-03","detail":"detail-03"}'
+  *"ceph crash info crash:02"*)
+    maybe_fail 'crash info crash:02'
+    emit_json '{"crash_id":"crash:02","detail":"detail-02-collision"}'
     ;;
   *"ceph crash info crash-04"*)
     maybe_fail 'crash info crash-04'

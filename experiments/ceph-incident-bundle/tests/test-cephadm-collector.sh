@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PATH="$ROOT/tests/fixtures/bin:$PATH"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -11,6 +10,16 @@ fail() {
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
+
+fakebin="$tmpdir/fakebin"
+mkdir -p "$fakebin"
+cat >"$fakebin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf 'python3 should not be used by cephadm collector\n' >&2
+exit 99
+EOF
+chmod +x "$fakebin/python3"
+PATH="$fakebin:$ROOT/tests/fixtures/bin:$PATH"
 
 # shellcheck disable=SC1091
 source "$ROOT/lib/common.sh"
@@ -56,6 +65,8 @@ test_collect_cluster_cephadm_happy_path_and_limit_recent_crashes() {
   [[ -f "$outdir/cluster/ceph/text/orch-ps.txt" ]] || fail "missing orch ps text artifact"
   [[ -f "$outdir/cluster/ceph/json/crash-ls.json" ]] || fail "missing crash ls artifact"
   [[ -f "$outdir/cluster/ceph/json/crash-info/crash-01.json" ]] || fail "missing first crash info artifact"
+  [[ -f "$outdir/cluster/ceph/json/crash-info/crash_02.json" ]] || fail "missing sanitized crash info artifact"
+  [[ -f "$outdir/cluster/ceph/json/crash-info/crash_02-2.json" ]] || fail "missing collision-safe crash info artifact"
   [[ -f "$outdir/cluster/ceph/json/crash-info/crash-10.json" ]] || fail "missing tenth crash info artifact"
   [[ ! -f "$outdir/cluster/ceph/json/crash-info/crash-11.json" ]] || fail "collector did not cap crash info at 10"
 
@@ -64,6 +75,8 @@ test_collect_cluster_cephadm_happy_path_and_limit_recent_crashes() {
   assert_file_contains "$outdir/cluster/ceph/text/orch-ps.txt" "NAME HOST STATUS"
   assert_file_contains "$outdir/cluster/ceph/json/status.json" "\"health\":\"HEALTH_OK\""
   assert_file_contains "$outdir/cluster/ceph/json/crash-info/crash-01.json" "\"crash_id\":\"crash-01\""
+  assert_file_contains "$outdir/cluster/ceph/json/crash-info/crash_02.json" "\"crash_id\":\"crash/02\""
+  assert_file_contains "$outdir/cluster/ceph/json/crash-info/crash_02-2.json" "\"crash_id\":\"crash:02\""
 
   [[ "$(read_manifest_count "$manifest")" == "34" ]] || fail "expected 34 manifest entries"
   grep -qF 'sudo cephadm shell -- ceph status --format json-pretty' "$ssh_log" || fail "ssh log missing cephadm shell invocation"

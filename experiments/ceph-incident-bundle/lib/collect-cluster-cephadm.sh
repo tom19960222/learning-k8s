@@ -12,12 +12,78 @@ collect_cephadm_command() {
   shift 6
 
   local artifact_dir
-  artifact_dir="$(dirname "$artifact")"
+  artifact_dir="$(dirname -- "$artifact")"
   ensure_dir "$artifact_dir"
 
   COMMAND_TIMEOUT="$timeout" ERROR_LOG="${ERROR_LOG:-$outdir/errors.log}" \
     run_capture "$manifest" "$seed" "collect-cluster-cephadm" "$artifact" -- \
-    ssh -i "$ssh_key" "$seed" sudo cephadm shell -- ceph "$@"
+    ssh \
+      -i "$ssh_key" \
+      -o BatchMode=yes \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      "$seed" \
+      sudo cephadm shell -- ceph "$@"
+}
+
+write_cephadm_crash_skip() {
+  local skip_artifact=$1
+  ensure_dir "$(dirname -- "$skip_artifact")"
+  cat >"$skip_artifact" <<'EOF'
+SKIPPED: unable to parse crash list JSON for recent crash inspection
+EOF
+}
+
+extract_cephadm_crash_ids() {
+  local crash_ls_artifact=$1
+  local payload compact ids
+
+  [[ -f "$crash_ls_artifact" ]] || return 1
+  payload="$(sed '/^[[:space:]]*#/d' "$crash_ls_artifact")" || return 1
+
+  ids="$(
+    printf '%s\n' "$payload" |
+      grep -oE '"(crash_id|id|name)"[[:space:]]*:[[:space:]]*"[^"]*"' |
+      sed -E 's/^"(crash_id|id|name)"[[:space:]]*:[[:space:]]*"([^"]*)"$/\2/' |
+      head -n 10
+  )" || true
+
+  if [[ -n "$ids" ]]; then
+    printf '%s\n' "$ids"
+    return 0
+  fi
+
+  compact="$(printf '%s' "$payload" | tr -d '[:space:]')"
+  case "$compact" in
+    "[]"|"{}"|"{\"crashes\":[]}"|"{\"items\":[]}"|"{\"entries\":[]}"|"{\"crash_ls\":[]}")
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+cephadm_crash_artifact_name() {
+  local crash_id=$1 safe_id
+  safe_id="$(printf '%s' "$crash_id" | tr -c 'A-Za-z0-9._-' '_')"
+  while [[ "$safe_id" == *..* ]]; do
+    safe_id="${safe_id//../__}"
+  done
+  [[ -n "$safe_id" ]] || safe_id="crash"
+  printf '%s' "$safe_id"
+}
+
+cephadm_unique_crash_artifact() {
+  local crash_dir=$1 safe_id=$2
+  local artifact="$crash_dir/$safe_id.json"
+  local suffix=2
+
+  while [[ -e "$artifact" ]]; do
+    artifact="$crash_dir/$safe_id-$suffix.json"
+    suffix=$((suffix + 1))
+  done
+
+  printf '%s' "$artifact"
 }
 
 collect_cephadm_recent_crashes() {
@@ -25,62 +91,20 @@ collect_cephadm_recent_crashes() {
 
   local crash_dir="$outdir/cluster/ceph/json/crash-info"
   local skip_artifact="$outdir/cluster/ceph/text/crash-info-skip.txt"
-  local crash_ids
-  local parse_output rc=0
+  local crash_ids rc=0
 
-  parse_output="$(
-    python3 - "$crash_ls_artifact" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path) as handle:
-    payload = ''.join(line for line in handle if not line.startswith('#'))
-
-try:
-    data = json.loads(payload)
-except Exception:
-    raise SystemExit(1)
-
-if isinstance(data, dict):
-    for key in ('crashes', 'items', 'entries', 'crash_ls'):
-        if isinstance(data.get(key), list):
-            data = data[key]
-            break
-    else:
-        data = []
-
-ids = []
-if isinstance(data, list):
-    for item in data[:10]:
-        if isinstance(item, str):
-            ident = item
-        elif isinstance(item, dict):
-            ident = item.get('crash_id') or item.get('id') or item.get('name')
-        else:
-            ident = None
-        if ident:
-            ids.append(str(ident))
-
-print('\n'.join(ids))
-PY
-  )" || rc=$?
-
-  if [[ $rc -ne 0 ]]; then
-    ensure_dir "$(dirname "$skip_artifact")"
-    cat >"$skip_artifact" <<'EOF'
-SKIPPED: unable to parse crash list JSON for recent crash inspection
-EOF
+  if ! crash_ids="$(extract_cephadm_crash_ids "$crash_ls_artifact")"; then
+    write_cephadm_crash_skip "$skip_artifact"
     return 0
   fi
 
-  crash_ids="$parse_output"
   [[ -n "$crash_ids" ]] || return 0
 
-  local crash_id crash_info_artifact
+  local crash_id safe_id crash_info_artifact
   while IFS= read -r crash_id; do
     [[ -n "$crash_id" ]] || continue
-    crash_info_artifact="$crash_dir/$crash_id.json"
+    safe_id="$(cephadm_crash_artifact_name "$crash_id")"
+    crash_info_artifact="$(cephadm_unique_crash_artifact "$crash_dir" "$safe_id")"
     if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$crash_info_artifact" crash info "$crash_id"; then
       rc=2
     fi
@@ -94,6 +118,9 @@ collect_cluster_cephadm() {
   local failed=0
   local json_dir="$outdir/cluster/ceph/json"
   local text_dir="$outdir/cluster/ceph/text"
+
+  # Cluster-level ceph commands are point-in-time snapshots; node collectors apply the time window.
+  : "$since"
 
   ensure_dir "$json_dir"
   ensure_dir "$text_dir"
