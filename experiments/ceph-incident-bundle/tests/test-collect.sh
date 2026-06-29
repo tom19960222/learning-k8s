@@ -101,19 +101,33 @@ if [[ "${FAKE_SSH_BAD_TAR_ALIAS:-}" == "$alias_name" ]]; then
   exit 0
 fi
 
+sleep "${FAKE_SSH_SLEEP:-0}"
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/system"
 mkdir -p "$tmpdir/cephadm/var-lib-ceph-configs/fsid/mon.a"
 printf 'node %s\n' "$alias_name" >"$tmpdir/system/hostname.txt"
 printf 'secret = should-redact\n' >"$tmpdir/cephadm/var-lib-ceph-configs/fsid/mon.a/config"
+if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
+  printf '{"node":"%s"}\n' "$alias_name" >"$tmpdir/manifest.jsonl"
+fi
+if [[ "${FAKE_SSH_PEM_ALIAS:-}" == "$alias_name" ]]; then
+  printf 'cert\n' >"$tmpdir/system/leak.pem"
+fi
 tar -czf - -C "$tmpdir" .
 
 if [[ "${FAKE_SSH_FAIL_ALIAS:-}" == "$alias_name" ]]; then
   exit 2
 fi
 EOF
-chmod +x "$fakebin/kubectl" "$fakebin/ssh"
+cat >"$fakebin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"${FAKE_TIMEOUT_LOG:?}"
+shift
+exec "$@"
+EOF
+chmod +x "$fakebin/kubectl" "$fakebin/ssh" "$fakebin/timeout"
 
 inventory="$tmpdir/inventory.env"
 cat >"$inventory" <<'EOF'
@@ -131,6 +145,7 @@ printf 'fake key\n' >"$ssh_key"
 
 export FAKE_KUBECTL_LOG="$tmpdir/kubectl.log"
 export FAKE_SSH_LOG="$tmpdir/ssh.log"
+export FAKE_TIMEOUT_LOG="$tmpdir/timeout.log"
 
 out_success="$tmpdir/out-success"
 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
@@ -140,7 +155,8 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --mode rook \
   --out "$out_success" \
   --since 24h \
-  --timeout 5
+  --timeout 5 \
+  --node-timeout 90
 
 bundle_success="$(find_bundle "$out_success")"
 assert_archive_contains "$bundle_success" "manifest.jsonl"
@@ -151,6 +167,8 @@ assert_archive_contains "$bundle_success" "nodes/monitor01/system/hostname.txt"
 assert_archive_contains "$bundle_success" "nodes/osd01/system/hostname.txt"
 assert_archive_file_contains "$bundle_success" "nodes/monitor01/cephadm/var-lib-ceph-configs/fsid/mon.a/config" "[REDACTED]"
 grep -qF 'ConnectTimeout=5' "$FAKE_SSH_LOG" || fail "ssh calls should include ConnectTimeout from --timeout"
+# C1: the whole-node SSH wrapper must use --node-timeout (90), not the per-command timeout (5)
+grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node SSH wrapper should use --node-timeout (90); timeout log: $(cat "$FAKE_TIMEOUT_LOG")"
 
 out_partial="$tmpdir/out-partial"
 partial_status=0
@@ -188,3 +206,48 @@ set -e
 
 bundle_bad_tar="$(find_bundle "$out_bad_tar")"
 assert_archive_contains "$bundle_bad_tar" "nodes/osd01/SKIPPED.txt"
+
+# C4: a node tar that extracts but is missing its own manifest.jsonl (truncated
+# transfer) must be treated as a failure, not silently counted as ok.
+out_no_manifest="$tmpdir/out-no-manifest"
+no_manifest_status=0
+set +e
+FAKE_SSH_NO_MANIFEST_ALIAS=osd01 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --seed tester@seed.example.invalid --mode rook \
+  --out "$out_no_manifest" --since 24h --timeout 5
+no_manifest_status=$?
+set -e
+[[ "$no_manifest_status" == "2" ]] || fail "truncated node (no manifest) should exit 2, got $no_manifest_status"
+bundle_no_manifest="$(find_bundle "$out_no_manifest")"
+assert_archive_contains "$bundle_no_manifest" "nodes/osd01/SKIPPED.txt"
+assert_archive_contains "$bundle_no_manifest" "nodes/monitor01/system/hostname.txt"
+
+# C2: on mid-run abort, the temp workdir must be trap-cleaned (no tmp.* left behind).
+out_abort="$tmpdir/out-abort"
+set +e
+COLLECT_TEST_ABORT_AFTER_NODES=1 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --seed tester@seed.example.invalid --mode rook \
+  --out "$out_abort" --since 24h --timeout 5 >/dev/null 2>&1
+abort_status=$?
+set -e
+[[ "$abort_status" != "0" ]] || fail "abort hook should make collect.sh exit non-zero"
+leftover="$(find "$out_abort" -maxdepth 1 -name 'tmp.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+[[ "$leftover" == "0" ]] || fail "abort left $leftover tmp workdir(s) behind"
+
+# C3: if verification fails (forbidden secret path), evidence is preserved
+# (workdir kept) and NO shareable .tar.gz is produced; exit 1.
+out_verify_fail="$tmpdir/out-verify-fail"
+set +e
+FAKE_SSH_PEM_ALIAS=osd01 PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --seed tester@seed.example.invalid --mode rook \
+  --out "$out_verify_fail" --since 24h --timeout 5 >/dev/null 2>&1
+verify_fail_status=$?
+set -e
+[[ "$verify_fail_status" == "1" ]] || fail "verify failure should exit 1, got $verify_fail_status"
+produced="$(find "$out_verify_fail" -maxdepth 1 -name 'ceph-incident-*.tar.gz' 2>/dev/null | wc -l | tr -d '[:space:]')"
+[[ "$produced" == "0" ]] || fail "verify failure must not produce a shareable bundle"
+kept="$(find "$out_verify_fail" -maxdepth 1 -name 'tmp.*' -type d 2>/dev/null | wc -l | tr -d '[:space:]')"
+[[ "$kept" == "1" ]] || fail "verify failure should keep the workdir for inspection (found $kept)"

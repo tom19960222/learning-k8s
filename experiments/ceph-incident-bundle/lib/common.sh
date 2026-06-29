@@ -24,6 +24,16 @@ ensure_dir() {
   mkdir -p "$1"
 }
 
+# Resolve a timeout binary: GNU coreutils `timeout`, or `gtimeout` on macOS.
+# Prints the binary name, or nothing if neither is installed.
+timeout_cmd() {
+  if command -v timeout >/dev/null 2>&1; then
+    printf 'timeout'
+  elif command -v gtimeout >/dev/null 2>&1; then
+    printf 'gtimeout'
+  fi
+}
+
 json_escape() {
   local value=$1
   value=${value//\\/\\\\}
@@ -147,9 +157,11 @@ run_capture() {
   printf -v command_string '%q ' "${cmd[@]}"
   command_string=${command_string% }
 
-  if command -v timeout >/dev/null 2>&1; then
+  local tbin
+  tbin="$(timeout_cmd)"
+  if [[ -n "$tbin" ]]; then
     printf '# timeout: %ss\n' "${COMMAND_TIMEOUT:-20}" >>"$artifact_tmp"
-    if timeout "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
+    if "$tbin" "${COMMAND_TIMEOUT:-20}" "${cmd[@]}" >>"$artifact_tmp" 2>&1; then
       rc=0
     else
       rc=$?
@@ -161,6 +173,12 @@ run_capture() {
     else
       rc=$?
     fi
+  fi
+
+  # Make timeout-kills (124) distinguishable from ordinary command failure, and
+  # mark the artifact so a truncated capture is visible to whoever reads it.
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    printf '# TRUNCATED: command timed out after %ss (exit %s)\n' "${COMMAND_TIMEOUT:-20}" "$rc" >>"$artifact_tmp"
   fi
 
   ended="$(date -u +%FT%TZ)"
