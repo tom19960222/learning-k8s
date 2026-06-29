@@ -142,7 +142,7 @@ run_capture() {
   [[ ${1-} == -- ]] || die "run_capture requires -- before the command"
   shift
 
-  local -a cmd timeout_cmd
+  local -a cmd
   local started ended rc command_string artifact_dir artifact_tmp
 
   cmd=("$@")

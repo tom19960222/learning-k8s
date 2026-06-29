@@ -44,7 +44,7 @@ rook_get_first_pod() {
 }
 
 collect_cluster_rook() {
-  local outdir= manifest= namespace=rook-ceph since=24h timeout=20 allow_skip=0
+  local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in

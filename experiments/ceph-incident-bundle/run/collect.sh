@@ -210,7 +210,8 @@ collect_remote_node() {
 }
 
 redact_bundle_text() {
-  local workdir=$1 redaction_log="$workdir/redactions.log"
+  local workdir=$1
+  local redaction_log="$workdir/redactions.log"
   local path
 
   while IFS= read -r path; do
@@ -238,9 +239,9 @@ cleanup_workdir() {
 }
 
 main() {
-  local inventory= ssh_key= seed_override= out_dir="$COLLECT_ROOT/results"
+  local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
-  local seed= ssh_user= seed_host= rook_namespace=rook-ceph
+  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
   if [[ $# -eq 0 ]]; then
