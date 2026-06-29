@@ -124,6 +124,37 @@ printf 'node01\n' >"$private_key_dir/nodes/node01/system/hostname.txt"
 private_key_archive="$tmpdir/private-key-bundle.tar.gz"
 make_bundle_archive "$private_key_dir" "$private_key_archive"
 
+pem_dir="$tmpdir/pem-bundle"
+mkdir -p "$pem_dir/cluster/ceph" "$pem_dir/nodes/node01/system"
+cat >"$pem_dir/manifest.jsonl" <<'EOF'
+{"bundle":"ceph-incident"}
+EOF
+printf 'summary\n' >"$pem_dir/summary.txt"
+printf 'read me first\n' >"$pem_dir/README-FIRST.txt"
+printf 'ok\n' >"$pem_dir/cluster/ceph/status.txt"
+printf 'node01\n' >"$pem_dir/nodes/node01/system/hostname.txt"
+printf 'cert material\n' >"$pem_dir/nodes/node01/system/tls.pem"
+pem_archive="$tmpdir/pem-bundle.tar.gz"
+make_bundle_archive "$pem_dir" "$pem_archive"
+
+content_key_dir="$tmpdir/content-key-bundle"
+mkdir -p "$content_key_dir/cluster/ceph" "$content_key_dir/nodes/node01/system"
+cat >"$content_key_dir/manifest.jsonl" <<'EOF'
+{"bundle":"ceph-incident"}
+EOF
+printf 'summary\n' >"$content_key_dir/summary.txt"
+printf 'read me first\n' >"$content_key_dir/README-FIRST.txt"
+printf 'node01\n' >"$content_key_dir/nodes/node01/system/hostname.txt"
+# an un-redacted PEM body slipped into an allowed extension
+{
+  printf 'some log preamble\n'
+  printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n'
+  printf 'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n'
+  printf -- '-----END OPENSSH PRIVATE KEY-----\n'
+} >"$content_key_dir/cluster/ceph/leak.txt"
+content_key_archive="$tmpdir/content-key-bundle.tar.gz"
+make_bundle_archive "$content_key_dir" "$content_key_archive"
+
 corrupt_archive="$tmpdir/corrupt-bundle.tar.gz"
 printf 'not a tar.gz\n' >"$corrupt_archive"
 
@@ -139,6 +170,10 @@ assert_fail "$id_ed25519_dir" "id_ed25519"
 assert_fail "$id_ed25519_archive" "id_ed25519"
 assert_fail "$private_key_dir" "private_key"
 assert_fail "$private_key_archive" "private_key"
+assert_fail "$pem_dir" "tls.pem"
+assert_fail "$pem_archive" "tls.pem"
+assert_fail "$content_key_dir" "PRIVATE KEY"
+assert_fail "$content_key_archive" "PRIVATE KEY"
 assert_fail "$corrupt_archive" "invalid archive"
 
 extra_args_result="$(run_and_capture "$ROOT/lib/verify-bundle.sh" "$valid_dir" extra)"
