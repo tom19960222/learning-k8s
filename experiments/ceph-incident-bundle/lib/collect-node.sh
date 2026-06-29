@@ -40,7 +40,7 @@ node_run_optional() {
     return 0
   fi
 
-  node_run_capture "$outdir" "$manifest" "$host_alias" "$timeout" "$artifact_rel" "$command_name" "$@"
+  node_run_capture "$outdir" "$manifest" "$host_alias" "$timeout" "$artifact_rel" "$command_name" "$@" || return 0
 }
 
 node_run_privileged() {
@@ -58,6 +58,15 @@ node_run_privileged() {
   fi
 
   node_run_capture "$outdir" "$manifest" "$host_alias" "$timeout" "$artifact_rel" sudo -n "$command_name" "$@"
+}
+
+journal_since_arg() {
+  local since=$1
+  if [[ "$since" =~ ^[0-9]+[smhdw]$ ]]; then
+    printf -- '-%s' "$since"
+  else
+    printf '%s' "$since"
+  fi
 }
 
 node_find0() {
@@ -256,6 +265,8 @@ collect_node_main() {
   ensure_dir "$outdir"
   local manifest="$outdir/manifest.jsonl"
   local failed=0
+  local journal_since
+  journal_since="$(journal_since_arg "$since")"
 
   local -a basic_specs=(
     "system/hostname.txt::hostname"
@@ -285,7 +296,7 @@ collect_node_main() {
   if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "kernel/dmesg.txt" dmesg -T; then
     failed=1
   fi
-  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "systemd/journal-ceph.txt" journalctl --since "$since" -u 'ceph*' --no-pager; then
+  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "systemd/journal-ceph.txt" journalctl --since "$journal_since" -u 'ceph*' --no-pager; then
     failed=1
   fi
 
@@ -318,9 +329,7 @@ collect_node_main() {
   fi
 
   if command -v cephadm >/dev/null 2>&1; then
-    if ! node_run_capture "$outdir" "$manifest" "$host_alias" "$timeout" "cephadm/cephadm-ls.json" cephadm ls --format json-pretty; then
-      failed=1
-    fi
+    node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "cephadm/cephadm-ls.json" cephadm ls --format json-pretty || true
   else
     write_skip_artifact "$outdir/cephadm/cephadm-ls.json" "command not found: cephadm"
   fi

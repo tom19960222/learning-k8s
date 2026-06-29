@@ -90,7 +90,12 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_SSH_LOG:?}"
 cat >/dev/null
 
-alias_name="${@: -4:1}"
+remote_command="${@: -1}"
+alias_name="$(printf '%s\n' "$remote_command" | sed -n "s/.*--host-alias '\\([^']*\\)'.*/\\1/p")"
+[[ -n "$alias_name" ]] || {
+  printf 'remote command did not preserve quoted --host-alias: %s\n' "$remote_command" >&2
+  exit 99
+}
 if [[ "${FAKE_SSH_BAD_TAR_ALIAS:-}" == "$alias_name" ]]; then
   printf 'not a tar archive\n'
   exit 0

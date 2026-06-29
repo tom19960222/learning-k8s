@@ -129,3 +129,13 @@ Rook mode 會在本機使用 `kubectl get`、`kubectl logs`，並在 toolbox Pod
 - script 會遮蔽明顯含有 `password`、`secret`、`token`、`keyring`、`private key` 的文字行，但這不是完整 DLP。
 - 分享 bundle 前仍應自行檢查是否包含內部 IP、hostname、路徑、帳號名稱或其他敏感資料。
 - `verify-bundle.sh` 會阻擋明顯不該出現的 secret path，但不能保證內容完全沒有敏感資料。
+
+## Lab smoke test
+
+- 日期：2026-06-29
+- cluster mode：`cephadm`
+- host count：6
+- exit code：0
+- bundle verifier：`VERIFY PASS`
+- node aliases：`monitor01`, `mon02`, `mon03`, `osd01`, `osd02`, `osd03`
+- 已知 optional/read-only 非零紀錄：各 node 的 LVM 查詢（`pvs` / `vgs` / `lvs`）、`docker ps -a`、node-level `sudo cephadm ls --format json-pretty` 可能回非零；artifact 與 node 內部 `errors.log` 會保留原始輸出，整體 bundle 仍驗證通過。

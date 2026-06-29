@@ -60,6 +60,12 @@ ssh_target_for_host() {
   fi
 }
 
+shell_quote() {
+  local value=$1
+  [[ "$value" != *"'"* ]] || return 1
+  printf "'%s'" "$value"
+}
+
 write_initial_metadata() {
   local workdir=$1 mode=$2 seed=$3 since=$4 timeout=$5
   local git_commit
@@ -144,37 +150,26 @@ collect_remote_node() {
   local node_dir="$workdir/nodes/$alias"
   local node_tar="$workdir/.node-$alias.tar.gz"
   local remote_cmd rc=0
+  local q_alias q_since q_timeout
   local -a ssh_cmd
 
-  remote_cmd='set -u
-alias_name=$1
-since=$2
-timeout_value=$3
-skip_logs=$4
-tmp="${TMPDIR:-/tmp}/ceph-incident-node.$$"
-rm -rf "$tmp"
-mkdir -p "$tmp"
-tar -xzf - -C "$tmp"
-out="$tmp/out"
-args=(--out "$out" --host-alias "$alias_name" --since "$since" --timeout "$timeout_value")
-if [[ "$skip_logs" == "1" ]]; then
-  args+=(--skip-logs)
-fi
-set +e
-bash "$tmp/lib/collect-node.sh" "${args[@]}"
-rc=$?
-set -e
-tar -czf - -C "$out" .
-rm -rf "$tmp"
-exit "$rc"'
+  q_alias="$(shell_quote "$alias")" || return 1
+  q_since="$(shell_quote "$since")" || return 1
+  q_timeout="$(shell_quote "$timeout")" || return 1
 
-  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" bash -c "$remote_cmd" bash "$alias" "$since" "$timeout" "$skip_logs")
+  remote_cmd="set -u; tmp=\"\${TMPDIR:-/tmp}/ceph-incident-node.\$\$\"; rm -rf \"\$tmp\"; mkdir -p \"\$tmp\"; tar -xzf - -C \"\$tmp\"; out=\"\$tmp/out\"; set +e; bash \"\$tmp/lib/collect-node.sh\" --out \"\$out\" --host-alias $q_alias --since $q_since --timeout $q_timeout"
+  if [[ "$skip_logs" == "1" ]]; then
+    remote_cmd+=" --skip-logs"
+  fi
+  remote_cmd+="; rc=\$?; set -e; if [ -d \"\$out\" ]; then tar -czf - -C \"\$out\" .; else mkdir -p \"\$out\"; printf 'SKIPPED: remote collect-node did not create output\n' >\"\$out/SKIPPED.txt\"; tar -czf - -C \"\$out\" .; fi; rm -rf \"\$tmp\"; exit \"\$rc\""
+
+  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" "$remote_cmd")
   if command -v timeout >/dev/null 2>&1; then
     ssh_cmd=(timeout "$timeout" "${ssh_cmd[@]}")
   fi
 
   set +e
-  tar -czf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh |
+  COPYFILE_DISABLE=1 tar -czf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh |
     "${ssh_cmd[@]}" >"$node_tar"
   rc=$?
   set -e

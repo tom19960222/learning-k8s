@@ -45,6 +45,10 @@ EOF
 cat >"$fakebin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+case "$*" in
+  *"--since -24h"*) ;;
+  *) printf 'journalctl expected --since -24h, got: %s\n' "$*" >&2; exit 12 ;;
+esac
 printf 'fake journalctl %s\n' "$*"
 EOF
 
@@ -58,6 +62,7 @@ cat >"$fakebin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'fake docker %s\n' "$*"
+exit 1
 EOF
 
 cat >"$fakebin/cephadm" <<'EOF'
@@ -181,6 +186,7 @@ done
 
 assert_file_contains "$outdir/cephadm/cephadm-ls.json" '"style":"cephadm"'
 assert_file_contains "$outdir/kernel/dmesg.txt" 'fake kernel ring buffer'
+assert_file_contains "$outdir/containers/docker-ps.txt" 'fake docker'
 assert_file_contains "$outdir/logs/ceph-log-listing.txt" "$fake_log_dir"
 assert_file_contains "$outdir/time/ntpq-peers.txt" 'SKIPPED: command not found: ntpq'
 
