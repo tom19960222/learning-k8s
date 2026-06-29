@@ -166,5 +166,29 @@
     ],
     "answer": 1,
     "explanation": "ceph_healthcheck_slow_ops 靠 mgr/prometheus 解析 summary 字串第一個 token(module.py:885 _get_value)，格式不符會 err→del 整個 metric 消失；且沒有任何 host/daemon label。ceph_daemon_health_metrics{type=\"SLOW_OPS\"} 由 get_all_daemon_health_metrics(module.py:1630) 對每個 daemon 逐筆 set，值是 ActivePyModules.cc:1475 dump 的 get_n1()(slow 計數)，帶 ceph_daemon label，可用 group_left 接 ceph_osd_metadata 取 hostname 精準定位。注意兩者都沒 export n2(oldest blocked 秒數)。"
+  },
+  {
+    "id": 15,
+    "question": "Ceph incident bundle 的 collect.sh 在事故發生時最重要的定位是什麼？",
+    "options": [
+      "先用 read-only 方式保留 cluster、node、kernel、systemd、log 等現場證據，打包成 tar.gz 供後續判讀",
+      "自動修復 HEALTH_ERR，必要時 restart OSD / MON",
+      "替代 Prometheus，長期保存所有 Ceph metric",
+      "只收 ceph status，其他 Linux 狀態不在範圍內"
+    ],
+    "answer": 0,
+    "explanation": "Incident bundle 是證據保全工具，不是修復工具。入口是 experiments/ceph-incident-bundle/run/collect.sh；它會收 cephadm 或 Rook cluster-level 狀態、每台 node 的 Linux 狀態、kernel/systemd/log、manifest/errors，驗證後打包成 ceph-incident-*.tar.gz。它不會 restart、delete、repair、scrub 或改 Ceph flag。"
+  },
+  {
+    "id": 16,
+    "question": "collect.sh 回傳 exit code 2 時，正確解讀是什麼？",
+    "options": [
+      "bundle 已產生，但有部分 command 或部分 node 失敗；先保留 tar.gz，再看 summary.txt 和 errors.log",
+      "bundle 完全不可用，應立刻刪掉重新跑",
+      "代表驗證器發現 keyring 或 private key 被打包，必須視為資安事件",
+      "代表 cluster 已自動修復完成，但仍有 warning"
+    ],
+    "answer": 0,
+    "explanation": "collect.sh 的 exit code 0 是完整成功，2 是部分失敗但 bundle 已產生，1 才是使用方式、必要輸入或驗證失敗。事故現場常有某台 node 半失聯，所以工具刻意保留可收集到的資料；遇到 2 時應先保留 .tar.gz，從 summary.txt、errors.log、manifest.jsonl 判斷哪些 artifact 或 node 需要補跑。"
   }
 ]
