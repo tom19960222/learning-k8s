@@ -111,7 +111,29 @@ node_copy_file() {
   fi
 
   if command -v sudo >/dev/null 2>&1; then
+    # Intentional: read the source as root, but write $dest as the calling user
+    # (who owns the bundle). `sudo tee` would create $dest as root — not wanted.
+    # shellcheck disable=SC2024
     sudo -n cat -- "$source" >"$dest"
+    return $?
+  fi
+
+  return 1
+}
+
+node_tail_file() {
+  local source=$1 nbytes=$2 dest=$3
+  ensure_dir "$(dirname -- "$dest")"
+
+  if [[ $EUID -eq 0 || -r "$source" ]]; then
+    tail -c "$nbytes" "$source" >"$dest"
+    return $?
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    # Intentional: read as root, write $dest as the calling user (see node_copy_file).
+    # shellcheck disable=SC2024
+    sudo -n tail -c "$nbytes" "$source" >"$dest"
     return $?
   fi
 
@@ -135,6 +157,8 @@ collect_ceph_log_listing() {
   local listing="$outdir/logs/ceph-log-listing.txt"
 
   if [[ -d "$log_dir" ]]; then
+    # SC2016: the sh -c body is meant to expand on the remote sh, not here.
+    # shellcheck disable=SC2016
     if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "logs/ceph-log-listing.txt" \
       find "$log_dir" -maxdepth 2 -type f -exec sh -c '
         for path do
@@ -166,11 +190,28 @@ copy_ceph_logs() {
       failed=1
       continue
     fi
-    (( size <= cap_bytes )) || continue
-    rel="${source#$log_dir/}"
+    rel="${source#"$log_dir"/}"
     dest="$copied_dir/$rel"
-    if ! node_copy_file "$source" "$dest"; then
-      failed=1
+    if (( size <= cap_bytes )); then
+      if ! node_copy_file "$source" "$dest"; then
+        failed=1
+      fi
+    elif [[ "$source" == *.gz ]]; then
+      # A byte-tail of a gzip stream is not decompressible (and would evade
+      # redaction); record it instead of shipping garbage.
+      ensure_dir "$(dirname -- "$dest")"
+      printf 'original_bytes=%s\nnote=oversized compressed log skipped (gzip tail is not usable)\n' \
+        "$size" >"$dest.TRUNCATED"
+    else
+      # Oversized: keep the most recent cap_bytes (tail) instead of dropping the
+      # file silently — the active large log is often exactly what's wanted —
+      # and record the truncation so the omission is visible.
+      if node_tail_file "$source" "$cap_bytes" "$dest"; then
+        printf 'original_bytes=%s\ntail_bytes=%s\nnote=captured trailing bytes only (file exceeded cap)\n' \
+          "$size" "$cap_bytes" >"$dest.TRUNCATED"
+      else
+        failed=1
+      fi
     fi
   done < <(node_find0 "$log_dir" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' -o -name '*.txt' -o -name '*.gz' \) -print0 2>/dev/null || true)
 
@@ -185,6 +226,8 @@ collect_var_lib_ceph() {
   local failed=0
 
   if [[ -d "$ceph_dir" ]]; then
+    # SC2016: the sh -c body is meant to expand on the remote sh, not here.
+    # shellcheck disable=SC2016
     if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "cephadm/var-lib-ceph-listing.txt" \
       find "$ceph_dir" -maxdepth 3 \
         \( -iname '*keyring*' -o -iname '*private_key*' -o -path '*/.ssh/*' \) -prune \
@@ -209,7 +252,7 @@ collect_var_lib_ceph() {
 
   ensure_dir "$config_dest"
   while IFS= read -r -d '' source; do
-    rel="${source#$ceph_dir/}"
+    rel="${source#"$ceph_dir"/}"
     dest="$config_dest/$rel"
     if ! node_copy_file "$source" "$dest"; then
       failed=1
@@ -222,7 +265,7 @@ collect_var_lib_ceph() {
 }
 
 collect_node_main() {
-  local outdir= host_alias= since="24h" timeout=20 skip_logs=0
+  local outdir='' host_alias='' since="24h" timeout=20 skip_logs=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -268,6 +311,13 @@ collect_node_main() {
   local journal_since
   journal_since="$(journal_since_arg "$since")"
 
+  # dmesg and the ceph journal can be large under load; give them a heavier
+  # timeout than the per-command one so they are not silently truncated.
+  local heavy_timeout=$timeout
+  if [[ "$heavy_timeout" =~ ^[0-9]+$ ]] && (( heavy_timeout < 120 )); then
+    heavy_timeout=120
+  fi
+
   local -a basic_specs=(
     "system/hostname.txt::hostname"
     "system/uname.txt::uname -a"
@@ -293,10 +343,10 @@ collect_node_main() {
   if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "storage/lsblk.txt" lsblk -a -o NAME,MAJ:MIN,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL; then
     failed=1
   fi
-  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "kernel/dmesg.txt" dmesg -T; then
+  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$heavy_timeout" "kernel/dmesg.txt" dmesg -T; then
     failed=1
   fi
-  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "systemd/journal-ceph.txt" journalctl --since "$journal_since" -u 'ceph*' --no-pager; then
+  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$heavy_timeout" "systemd/journal-ceph.txt" journalctl --since "$journal_since" -u 'ceph*' --no-pager; then
     failed=1
   fi
 

@@ -44,7 +44,7 @@ rook_get_first_pod() {
 }
 
 collect_cluster_rook() {
-  local outdir= manifest= namespace=rook-ceph since=24h timeout=20
+  local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,6 +68,10 @@ collect_cluster_rook() {
         timeout=${2-}
         shift 2
         ;;
+      --allow-skip)
+        allow_skip=1
+        shift
+        ;;
       --help|-h)
         usage
         return 0
@@ -86,14 +90,17 @@ collect_cluster_rook() {
 
   ensure_dir "$outdir/cluster/rook"
 
+  # Missing kubectl / namespace means we collected NO cluster evidence. In
+  # explicit rook mode that is a partial failure (exit 2) so the bundle does not
+  # falsely look complete; auto-mode fallback passes --allow-skip to tolerate it.
   if ! command -v kubectl >/dev/null 2>&1; then
     rook_skip "$outdir" "kubectl command not found"
-    return 0
+    [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
   if ! kubectl get namespace "$namespace" >/dev/null 2>&1; then
     rook_skip "$outdir" "namespace not found: $namespace"
-    return 0
+    [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
   local failed=0

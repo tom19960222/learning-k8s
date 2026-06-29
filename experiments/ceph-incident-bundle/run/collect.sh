@@ -32,7 +32,8 @@ Options:
   --out DIR              output dir (default: experiments/ceph-incident-bundle/results)
   --mode auto|cephadm|rook
   --since DURATION       log/journal window (default: 24h)
-  --timeout SECONDS      per command/SSH timeout (default: 20)
+  --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
+  --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
   --skip-logs            collect state but skip larger Ceph log copies
   --keep-workdir         keep temporary extracted workdir for debugging
   --help                 print this help
@@ -129,14 +130,17 @@ run_cluster_collector() {
       collect_cluster_rook --out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout"
       ;;
     auto)
+      local probe_tbin
       probe_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$seed" command -v cephadm)
-      if command -v timeout >/dev/null 2>&1; then
-        probe_cmd=(timeout "$timeout" "${probe_cmd[@]}")
+      probe_tbin="$(timeout_cmd)"
+      if [[ -n "$probe_tbin" ]]; then
+        probe_cmd=("$probe_tbin" "$timeout" "${probe_cmd[@]}")
       fi
       if [[ -n "$seed" && -n "$ssh_key" ]] && "${probe_cmd[@]}" >/dev/null 2>&1; then
         collect_cluster_cephadm "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout"
       else
-        collect_cluster_rook --out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout"
+        # auto-fallback is a guess; tolerate a non-rook cluster gracefully
+        collect_cluster_rook --out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout" --allow-skip
       fi
       ;;
     *)
@@ -146,10 +150,10 @@ run_cluster_collector() {
 }
 
 collect_remote_node() {
-  local workdir=$1 alias=$2 target=$3 ssh_key=$4 since=$5 timeout=$6 skip_logs=$7
+  local workdir=$1 alias=$2 target=$3 ssh_key=$4 since=$5 timeout=$6 skip_logs=$7 node_timeout=$8
   local node_dir="$workdir/nodes/$alias"
   local node_tar="$workdir/.node-$alias.tar.gz"
-  local remote_cmd rc=0
+  local remote_cmd rc=0 tbin
   local q_alias q_since q_timeout
   local -a ssh_cmd
 
@@ -157,33 +161,48 @@ collect_remote_node() {
   q_since="$(shell_quote "$since")" || return 1
   q_timeout="$(shell_quote "$timeout")" || return 1
 
-  remote_cmd="set -u; tmp=\"\${TMPDIR:-/tmp}/ceph-incident-node.\$\$\"; rm -rf \"\$tmp\"; mkdir -p \"\$tmp\"; tar -xzf - -C \"\$tmp\"; out=\"\$tmp/out\"; set +e; bash \"\$tmp/lib/collect-node.sh\" --out \"\$out\" --host-alias $q_alias --since $q_since --timeout $q_timeout"
+  # Remote side uses a gzip pipe (not `tar -z`) so minimal/BusyBox tar still works,
+  # and traps its own temp dir so an interrupted/timed-out run leaves nothing behind.
+  remote_cmd="set -u; tmp=\"\${TMPDIR:-/tmp}/ceph-incident-node.\$\$\"; rm -rf \"\$tmp\"; mkdir -p \"\$tmp\" || { printf 'SKIPPED: remote tmp not writable\n' >&2; exit 75; }; trap 'rm -rf \"\$tmp\"' EXIT INT TERM; gzip -dc | tar -xf - -C \"\$tmp\"; out=\"\$tmp/out\"; set +e; bash \"\$tmp/lib/collect-node.sh\" --out \"\$out\" --host-alias $q_alias --since $q_since --timeout $q_timeout"
   if [[ "$skip_logs" == "1" ]]; then
     remote_cmd+=" --skip-logs"
   fi
-  remote_cmd+="; rc=\$?; set -e; if [ -d \"\$out\" ]; then tar -czf - -C \"\$out\" .; else mkdir -p \"\$out\"; printf 'SKIPPED: remote collect-node did not create output\n' >\"\$out/SKIPPED.txt\"; tar -czf - -C \"\$out\" .; fi; rm -rf \"\$tmp\"; exit \"\$rc\""
+  remote_cmd+="; rc=\$?; set -e; if [ -d \"\$out\" ]; then tar -cf - -C \"\$out\" . | gzip -c; else mkdir -p \"\$out\"; printf 'SKIPPED: remote collect-node did not create output\n' >\"\$out/SKIPPED.txt\"; tar -cf - -C \"\$out\" . | gzip -c; fi; exit \"\$rc\""
 
   ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" "$remote_cmd")
-  if command -v timeout >/dev/null 2>&1; then
-    ssh_cmd=(timeout "$timeout" "${ssh_cmd[@]}")
+  tbin="$(timeout_cmd)"
+  if [[ -n "$tbin" ]]; then
+    # Outer wrapper bounds the WHOLE node collection — must be the generous
+    # node timeout, never the small per-command timeout (which would kill a
+    # slow/large node mid-collection).
+    ssh_cmd=("$tbin" "$node_timeout" "${ssh_cmd[@]}")
   fi
 
   set +e
-  COPYFILE_DISABLE=1 tar -czf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh |
+  COPYFILE_DISABLE=1 tar -cf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh | gzip -c |
     "${ssh_cmd[@]}" >"$node_tar"
   rc=$?
   set -e
 
   ensure_dir "$node_dir"
-  if [[ -s "$node_tar" ]]; then
-    if ! tar -xzf "$node_tar" -C "$node_dir" >/dev/null 2>/dev/null; then
-      rm -rf "$node_dir"
-      ensure_dir "$node_dir"
-      printf 'SKIPPED: invalid node archive returned from %s\n' "$target" >"$node_dir/SKIPPED.txt"
+  if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+    printf 'SKIPPED: node collection timed out after %ss (exit %s) from %s\n' "$node_timeout" "$rc" "$target" >"$node_dir/SKIPPED.txt"
+    rm -f "$node_tar"
+    return 2
+  fi
+
+  if [[ -s "$node_tar" ]] && tar -xzf "$node_tar" -C "$node_dir" >/dev/null 2>/dev/null; then
+    # A node that streamed a valid archive but is missing its own manifest.jsonl
+    # was truncated (partial/interrupted transfer) — do not count it as ok.
+    if [[ ! -f "$node_dir/manifest.jsonl" ]]; then
+      printf 'SKIPPED: node archive from %s is incomplete (no manifest.jsonl); treated as failure\n' "$target" >"$node_dir/SKIPPED.txt"
       rc=2
     fi
   else
-    printf 'SKIPPED: no node archive returned from %s\n' "$target" >"$node_dir/SKIPPED.txt"
+    rm -rf "$node_dir"
+    ensure_dir "$node_dir"
+    printf 'SKIPPED: no usable node archive returned from %s (ssh exit %s)\n' "$target" "$rc" >"$node_dir/SKIPPED.txt"
+    [[ $rc -ne 0 ]] || rc=2
   fi
   rm -f "$node_tar"
 
@@ -191,18 +210,38 @@ collect_remote_node() {
 }
 
 redact_bundle_text() {
-  local workdir=$1 redaction_log="$workdir/redactions.log"
+  local workdir=$1
+  local redaction_log="$workdir/redactions.log"
   local path
 
   while IFS= read -r path; do
-    redact_file "$path" "$redaction_log"
-  done < <(find "$workdir/cluster" "$workdir/nodes" -type f \( -name '*.txt' -o -name '*.log' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' \) -print 2>/dev/null || true)
+    case "$path" in
+      *.gz) redact_gz_file "$path" "$redaction_log" ;;
+      *) redact_file "$path" "$redaction_log" ;;
+    esac
+  done < <(find "$workdir/cluster" "$workdir/nodes" -type f \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' \) -print 2>/dev/null || true)
+}
+
+# Single cleanup point. Uses globals (not main's locals) so it works as an
+# EXIT trap, which fires after main has returned and its locals are gone.
+CLEANUP_WORKDIR=
+CLEANUP_KEEP=0
+cleanup_workdir() {
+  local rc=$?
+  if [[ -n "${CLEANUP_WORKDIR:-}" && -d "$CLEANUP_WORKDIR" ]]; then
+    if [[ "${CLEANUP_KEEP:-0}" -eq 1 ]]; then
+      printf 'kept workdir: %s\n' "$CLEANUP_WORKDIR" >&2
+    else
+      rm -rf -- "$CLEANUP_WORKDIR"
+    fi
+  fi
+  return "$rc"
 }
 
 main() {
-  local inventory= ssh_key= seed_override= out_dir="$COLLECT_ROOT/results"
-  local mode=auto since=24h timeout=20 skip_logs=0 keep_workdir=0
-  local seed= ssh_user= seed_host= rook_namespace=rook-ceph
+  local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
+  local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
+  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
   if [[ $# -eq 0 ]]; then
@@ -238,6 +277,10 @@ main() {
         ;;
       --timeout)
         timeout=${2-}
+        shift 2
+        ;;
+      --node-timeout)
+        node_timeout=${2-}
         shift 2
         ;;
       --skip-logs)
@@ -279,11 +322,18 @@ main() {
     seed="$(ssh_target_for_host "$seed_host" "$ssh_user")"
   fi
 
+  if [[ -z "$(timeout_cmd)" ]]; then
+    log "WARNING: no 'timeout'/'gtimeout' found on this workstation; outer timeouts are disabled — relying on SSH ConnectTimeout/ServerAlive only (install coreutils for full bounding)"
+  fi
+
   ensure_dir "$out_dir"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   workdir="$out_dir/tmp.$timestamp.$$"
   manifest="$workdir/manifest.jsonl"
   ensure_dir "$workdir"
+  CLEANUP_WORKDIR="$workdir"
+  CLEANUP_KEEP=$keep_workdir
+  trap cleanup_workdir EXIT INT TERM
   write_initial_metadata "$workdir" "$mode" "$seed" "$since" "$timeout"
 
   set +e
@@ -297,11 +347,24 @@ main() {
 
   local entry alias host target node_rc
   for entry in "${HOSTS[@]}"; do
-    alias="$(parse_host_entry "$entry" | sed -n '1p')" || die "invalid HOSTS entry: $entry"
-    host="$(parse_host_entry "$entry" | sed -n '2p')" || die "invalid HOSTS entry: $entry"
+    # Robust parse: a malformed entry must not abort an in-progress collection.
+    if [[ "$entry" != *=* ]]; then
+      append_error "$workdir" "skipped malformed HOSTS entry: $entry"
+      node_failed=$((node_failed + 1))
+      rc=2
+      continue
+    fi
+    alias="${entry%%=*}"
+    host="${entry#*=}"
+    if [[ -z "$alias" || -z "$host" ]]; then
+      append_error "$workdir" "skipped malformed HOSTS entry: $entry"
+      node_failed=$((node_failed + 1))
+      rc=2
+      continue
+    fi
     target="$(ssh_target_for_host "$host" "$ssh_user")"
 
-    if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs"; then
+    if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
       node_ok=$((node_ok + 1))
     else
       node_rc=$?
@@ -311,19 +374,41 @@ main() {
     fi
   done
 
+  # Test-only hook: simulate a mid-run abort to exercise trap cleanup. Inert in production.
+  if [[ -n "${COLLECT_TEST_ABORT_AFTER_NODES:-}" ]]; then
+    die "test abort after nodes"
+  fi
+
   redact_bundle_text "$workdir"
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
 
-  "$COLLECT_ROOT/lib/verify-bundle.sh" "$workdir" >/dev/null
+  # Verify BEFORE packaging, but never let verification destroy collected
+  # evidence: capture its result instead of aborting under set -e. On failure,
+  # keep the workdir for inspection and do not produce a shareable bundle.
+  local verify_rc=0
+  set +e
+  "$COLLECT_ROOT/lib/verify-bundle.sh" "$workdir" >/dev/null 2>>"$workdir/errors.log"
+  verify_rc=$?
+  set -e
+  if [[ $verify_rc -ne 0 ]]; then
+    CLEANUP_KEEP=1
+    append_error "$workdir" "bundle verification failed (rc=$verify_rc); workdir kept, NOT packaged for sharing"
+    write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "1"
+    printf 'VERIFY FAILED: workdir kept at %s (not packaged) — review errors.log\n' "$workdir" >&2
+    return 1
+  fi
 
   bundle="$out_dir/ceph-incident-$timestamp.tar.gz"
-  tar -czf "$bundle" -C "$workdir" .
-  "$COLLECT_ROOT/lib/verify-bundle.sh" "$bundle" >/dev/null
-
-  if [[ $keep_workdir -eq 0 ]]; then
-    rm -rf "$workdir"
-  else
-    printf 'kept workdir: %s\n' "$workdir"
+  COPYFILE_DISABLE=1 tar -czf "$bundle" -C "$workdir" .
+  set +e
+  "$COLLECT_ROOT/lib/verify-bundle.sh" "$bundle" >/dev/null 2>>"$workdir/errors.log"
+  verify_rc=$?
+  set -e
+  if [[ $verify_rc -ne 0 ]]; then
+    CLEANUP_KEEP=1
+    rm -f -- "$bundle"
+    printf 'VERIFY FAILED on packaged bundle; removed it, workdir kept at %s\n' "$workdir" >&2
+    return 1
   fi
 
   printf 'bundle: %s\n' "$bundle"
