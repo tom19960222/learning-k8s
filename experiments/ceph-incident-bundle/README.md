@@ -97,6 +97,14 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 
 Rook mode 會在本機使用 `kubectl get`、`kubectl logs`，並在 toolbox Pod 存在時執行 read-only 的 `ceph status`。
 
+## 逾時與大型 log
+
+- `--timeout`（預設 20s）是**單一指令 / SSH 連線**的逾時。
+- `--node-timeout`（預設 600s）是**單一 node 整輪收集**的逾時。兩者分開：慢或大的 node 不會被單指令逾時誤殺。
+- 大型 Ceph log（超過 `CEPH_INCIDENT_LOG_FILE_CAP_BYTES`，預設 1 MiB）不會被靜默丟棄，而是收最後一段（tail）並附 `<檔名>.TRUNCATED` 記錄原始大小；壓縮過的 `*.gz` 過大時則只記錄、不收（gzip 的尾段無法解壓）。
+- 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。
+- **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。
+
 ## bundle 內有什麼
 
 主要檔案：
@@ -111,31 +119,37 @@ Rook mode 會在本機使用 `kubectl get`、`kubectl logs`，並在 toolbox Pod
 
 ## exit code 怎麼看
 
-- `0`：收集完成，沒有已知失敗。
+- `0`：收集完成，沒有已知失敗。（注意：OSD/MON down 這類**叢集故障本身**會被收進 bundle，不算收集失敗，仍是 `0`。）
 - `2`：有部分 command 或部分 node 失敗，但 bundle 已產生。先看 `errors.log` 和 `summary.txt`。
-- `1`：使用方式或必要輸入錯誤，例如 inventory 不存在、SSH key 不存在、bundle 驗證失敗。
+- `1`：使用方式或必要輸入錯誤（inventory / SSH key 不存在），或 **bundle 驗證失敗**。驗證失敗時不會打包可分享的 `.tar.gz`，而是**保留 workdir**（印出路徑）讓你檢查——已收集的證據不會因驗證失敗被刪掉。
 
 ## 常見失敗與處理
 
 - `missing inventory`：確認 `--inventory` 路徑存在。
 - `missing ssh key`：確認 `--ssh-key` 路徑存在，且本機可讀。
 - `node <alias> collector exited 255`：通常是 SSH 連線、帳號、key、known_hosts 或 sudo 權限問題。
-- `VERIFY FAIL`：bundle 結構不完整，或包含 `keyring`、`.ssh`、`id_ed25519`、`private_key` 這類不該打包的路徑。
+- `VERIFY FAIL`：bundle 結構不完整，或包含 `keyring`、`.ssh`、`id_ed25519`、`private_key`、`*.pem`/`*.key`/`*.crt` 這類路徑，或檔案內容殘留未遮蔽的 private key / `key = <base64>` 金鑰材料。此時 workdir 會被保留、不打包，先看印出的路徑與 `errors.log`。
 - exit code `2`：先不要重跑覆蓋判讀脈絡，先保留 `.tar.gz`，再看 `errors.log` 決定是否針對失敗 node 補跑。
 
 ## 安全界線
 
 - 這套工具以 read-only 收集為原則，不會主動修復或改變 Ceph 狀態。
-- script 會遮蔽明顯含有 `password`、`secret`、`token`、`keyring`、`private key` 的文字行，但這不是完整 DLP。
+- 遮蔽（redaction）涵蓋：含 `password`/`secret`/`token`/`keyring`/`private key` 的文字行、Ceph 金鑰材料（`key = AQB..==` 與 base64 區塊）、整段多行 PEM private key block；並會把 `*.gz` 解壓後遮蔽再壓回。但這**不是完整 DLP**。
+- `verify-bundle.sh` 會以**檔名**（keyring/.ssh/id_ed25519/private_key/*.pem/*.key/*.crt）與**內容**（殘留的 PRIVATE KEY block / `key = <base64>`）兩道把關，但仍不能保證內容完全沒有敏感資料。
 - 分享 bundle 前仍應自行檢查是否包含內部 IP、hostname、路徑、帳號名稱或其他敏感資料。
-- `verify-bundle.sh` 會阻擋明顯不該出現的 secret path，但不能保證內容完全沒有敏感資料。
 
-## Lab smoke test
+## Lab 驗證（multi-fault）
 
-- 日期：2026-06-29
-- cluster mode：`cephadm`
-- host count：6
-- exit code：0
-- bundle verifier：`VERIFY PASS`
-- node aliases：`monitor01`, `mon02`, `mon03`, `osd01`, `osd02`, `osd03`
+2026-06-30 在真 cephadm v19.2.3 叢集（3 mon + 9 OSD、pool `.mgr` size 3）跑過多故障矩陣，破壞性情境皆先 `ok-to-stop` / 確認 quorum 後注入並立即回退，最後 HEALTH_OK：
+
+| 情境 | 注入 | bundle | exit |
+|---|---|---|---|
+| 健康基準 | 無 | VERIFY PASS、6/6 node、312 行遮蔽 | 0 |
+| OSD down | 停 osd.0 | 收到 `OSD_DOWN`（text+json）| 0 |
+| MON 少一台 | 停 mon-02（quorum 在）| 收到 `MON_DOWN`（out of quorum）| 0 |
+| node 不可達 | inventory 加假 host | 該 node `SKIPPED.txt`、其餘照收、errors.log 有記 | 2 |
+| seed 不可達 | `--seed` 指死 host | cluster collector 失敗、6 node 仍收 | 2 |
+
+詳見 `docs/superpowers/reviews/2026-06-30-lab-validation.md`。
+
 - 已知 optional/read-only 非零紀錄：各 node 的 LVM 查詢（`pvs` / `vgs` / `lvs`）、`docker ps -a`、node-level `sudo cephadm ls --format json-pretty` 可能回非零；artifact 與 node 內部 `errors.log` 會保留原始輸出，整體 bundle 仍驗證通過。
