@@ -100,6 +100,18 @@ printf 'secret\n' >"$ssh_dir/nodes/node01/.ssh/id_ed25519"
 ssh_archive="$tmpdir/ssh-bundle.tar.gz"
 make_bundle_archive "$ssh_dir" "$ssh_archive"
 
+id_ed25519_dir="$tmpdir/id-ed25519-bundle"
+mkdir -p "$id_ed25519_dir/cluster/ceph" "$id_ed25519_dir/nodes/node01/system"
+cat >"$id_ed25519_dir/manifest.jsonl" <<'EOF'
+{"bundle":"ceph-incident"}
+EOF
+printf 'summary\n' >"$id_ed25519_dir/summary.txt"
+printf 'read me first\n' >"$id_ed25519_dir/README-FIRST.txt"
+printf 'ok\n' >"$id_ed25519_dir/cluster/ceph/id_ed25519"
+printf 'node01\n' >"$id_ed25519_dir/nodes/node01/system/hostname.txt"
+id_ed25519_archive="$tmpdir/id-ed25519-bundle.tar.gz"
+make_bundle_archive "$id_ed25519_dir" "$id_ed25519_archive"
+
 private_key_dir="$tmpdir/private-key-bundle"
 mkdir -p "$private_key_dir/cluster/ceph" "$private_key_dir/nodes/node01/system"
 cat >"$private_key_dir/manifest.jsonl" <<'EOF'
@@ -123,6 +135,8 @@ assert_fail "$keyring_dir" "keyring"
 assert_fail "$keyring_archive" "keyring"
 assert_fail "$ssh_dir" ".ssh"
 assert_fail "$ssh_archive" ".ssh"
+assert_fail "$id_ed25519_dir" "id_ed25519"
+assert_fail "$id_ed25519_archive" "id_ed25519"
 assert_fail "$private_key_dir" "private_key"
 assert_fail "$private_key_archive" "private_key"
 assert_fail "$corrupt_archive" "tar"

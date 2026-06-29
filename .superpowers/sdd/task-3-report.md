@@ -145,3 +145,41 @@ GREEN output:
 
 - `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
 - `make validate` passed
+
+## Second fix addendum
+
+### What I fixed
+
+- Made the directory branch in `verify_bundle_path` explicitly propagate `verify_bundle_tree` failures with `|| return 1`.
+- Removed the dead `lib/common.sh` import from `verify-bundle.sh`, since the verifier does not use shared helpers.
+- Added an isolated `id_ed25519` negative case outside `.ssh` and covered both the extracted directory and `.tar.gz` forms.
+
+### Test update
+
+- Added a focused fixture that places `id_ed25519` at `cluster/ceph/id_ed25519`.
+- Kept the existing `.ssh/id_ed25519` coverage so both the token and the path shape remain exercised.
+
+### Verification
+
+- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
+- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
+- `make validate` passed
+
+## Second fix addendum
+
+### What I fixed
+
+- Made the directory branch in `verify_bundle_path` explicitly propagate `verify_bundle_tree` failures with `|| return 1`.
+- Removed the unused `lib/common.sh` import from `verify-bundle.sh`.
+- Added an isolated `id_ed25519` negative case outside `.ssh`, plus archive coverage for the same token.
+
+### Test update
+
+- Added a fixture at `cluster/ceph/id_ed25519` so the forbidden token is tested independently of `.ssh`.
+- Kept the existing `.ssh/id_ed25519` case so both the token and the path shape remain covered.
+
+### Verification
+
+- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
+- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
+- `make validate` passed

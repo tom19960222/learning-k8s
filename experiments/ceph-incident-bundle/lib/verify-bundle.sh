@@ -5,8 +5,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-source "$ROOT/lib/common.sh"
-
 usage() {
   cat >&2 <<'EOF'
 Usage: verify-bundle.sh <bundle-dir|bundle.tar.gz>
@@ -71,7 +69,7 @@ verify_bundle_path() {
   local bundle=$1 workdir extracted_root
 
   if [[ -d "$bundle" ]]; then
-    verify_bundle_tree "$bundle"
+    verify_bundle_tree "$bundle" || return 1
     printf 'VERIFY PASS: %s\n' "$bundle"
     return 0
   fi
