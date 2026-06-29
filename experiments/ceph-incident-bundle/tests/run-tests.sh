@@ -23,6 +23,7 @@ for path in \
   "$ROOT/lib/collect-node.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
+  "$ROOT/tests/test-node-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
@@ -69,5 +70,10 @@ cephadm_collector_args="$(run_and_capture "$ROOT/tests/test-cephadm-collector.sh
 cephadm_collector_status="${cephadm_collector_args%%$'\n'*}"
 cephadm_collector_output="${cephadm_collector_args#*$'\n'}"
 [[ "$cephadm_collector_status" == "0" ]] || fail "test-cephadm-collector.sh failed: $cephadm_collector_output"
+
+node_collector_args="$(run_and_capture "$ROOT/tests/test-node-collector.sh")"
+node_collector_status="${node_collector_args%%$'\n'*}"
+node_collector_output="${node_collector_args#*$'\n'}"
+[[ "$node_collector_status" == "0" ]] || fail "test-node-collector.sh failed: $node_collector_output"
 
 ok "required files exist"
