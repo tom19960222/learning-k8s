@@ -24,6 +24,7 @@ for path in \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
+  "$ROOT/tests/test-rook-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
@@ -75,5 +76,10 @@ node_collector_args="$(run_and_capture "$ROOT/tests/test-node-collector.sh")"
 node_collector_status="${node_collector_args%%$'\n'*}"
 node_collector_output="${node_collector_args#*$'\n'}"
 [[ "$node_collector_status" == "0" ]] || fail "test-node-collector.sh failed: $node_collector_output"
+
+rook_collector_args="$(run_and_capture "$ROOT/tests/test-rook-collector.sh")"
+rook_collector_status="${rook_collector_args%%$'\n'*}"
+rook_collector_output="${rook_collector_args#*$'\n'}"
+[[ "$rook_collector_status" == "0" ]] || fail "test-rook-collector.sh failed: $rook_collector_output"
 
 ok "required files exist"
