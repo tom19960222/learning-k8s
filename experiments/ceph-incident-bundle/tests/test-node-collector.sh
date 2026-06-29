@@ -74,6 +74,12 @@ case "$*" in
 esac
 EOF
 
+cat >"$fakebin/timeout" <<'EOF'
+#!/usr/bin/env bash
+shift
+exec "$@"
+EOF
+
 cat >"$fakebin/dmesg" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -194,7 +200,12 @@ assert_file_contains "$outdir/time/ntpq-peers.txt" 'SKIPPED: command not found: 
 [[ -f "$outdir/logs/ceph/ceph.log.1" ]] || fail "missing copied rotated ceph log"
 [[ -f "$outdir/logs/ceph/ceph-osd.0.log.1" ]] || fail "missing copied rotated osd log"
 [[ -f "$outdir/logs/ceph/ceph.log.2.gz" ]] || fail "missing copied gz ceph log"
-[[ ! -f "$outdir/logs/ceph/ceph-too-large.log" ]] || fail "oversized ceph log should not be copied"
+# R2: oversized logs are tail-captured (not silently dropped) with a marker
+[[ -f "$outdir/logs/ceph/ceph-too-large.log" ]] || fail "oversized ceph log should be tail-captured"
+toobig_bytes="$(wc -c <"$outdir/logs/ceph/ceph-too-large.log" | tr -d '[:space:]')"
+[[ "$toobig_bytes" -le 128 ]] || fail "oversized ceph log tail should be <= cap (got $toobig_bytes)"
+[[ -f "$outdir/logs/ceph/ceph-too-large.log.TRUNCATED" ]] || fail "oversized ceph log missing .TRUNCATED marker"
+assert_file_contains "$outdir/logs/ceph/ceph-too-large.log.TRUNCATED" "original_bytes="
 
 [[ -f "$outdir/cephadm/var-lib-ceph-configs/fsid/mon.a/config" ]] || fail "missing copied var-lib ceph config"
 [[ ! -e "$outdir/cephadm/var-lib-ceph-configs/fsid/mon.a/keyring" ]] || fail "keyring should not be copied from var-lib ceph"
@@ -208,3 +219,8 @@ grep -qF 'vgs <--noheadings> <--separator> < >' "$FAKE_OPTIONAL_LOG" || fail "vg
 grep -qF 'lvs <--noheadings> <--separator> < >' "$FAKE_OPTIONAL_LOG" || fail "lvs separator argv was not preserved"
 
 grep -qF -- '-n dmesg' "$FAKE_SUDO_LOG" || fail "dmesg was not collected through sudo -n"
+
+# C8: dmesg and ceph journal get a heavier timeout than the per-command --timeout (5),
+# so large kernel ring / journals are not silently truncated.
+assert_file_contains "$outdir/kernel/dmesg.txt" '# timeout: 120s'
+assert_file_contains "$outdir/systemd/journal-ceph.txt" '# timeout: 120s'
