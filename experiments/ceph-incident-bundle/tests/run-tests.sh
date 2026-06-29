@@ -22,6 +22,7 @@ for path in \
   "$ROOT/lib/collect-cluster-rook.sh" \
   "$ROOT/lib/collect-node.sh" \
   "$ROOT/lib/verify-bundle.sh" \
+  "$ROOT/tests/test-collect.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
@@ -55,7 +56,7 @@ collect_placeholder_args="$(run_and_capture "$ROOT/run/collect.sh" --inventory /
 collect_placeholder_status="${collect_placeholder_args%%$'\n'*}"
 collect_placeholder_output="${collect_placeholder_args#*$'\n'}"
 [[ "$collect_placeholder_status" != "0" ]] || fail "collect.sh placeholder args should not exit 0"
-[[ "$collect_placeholder_output" == *"not implemented yet"* ]] || fail "collect.sh placeholder args should explain it is not implemented yet"
+[[ "$collect_placeholder_output" == *"missing inventory"* || "$collect_placeholder_output" == *"Usage:"* || "$collect_placeholder_output" == *"error"* ]] || fail "collect.sh placeholder args should explain failure"
 
 common_helpers_args="$(run_and_capture "$ROOT/tests/test-common.sh")"
 common_helpers_status="${common_helpers_args%%$'\n'*}"
@@ -81,5 +82,10 @@ rook_collector_args="$(run_and_capture "$ROOT/tests/test-rook-collector.sh")"
 rook_collector_status="${rook_collector_args%%$'\n'*}"
 rook_collector_output="${rook_collector_args#*$'\n'}"
 [[ "$rook_collector_status" == "0" ]] || fail "test-rook-collector.sh failed: $rook_collector_output"
+
+collect_args="$(run_and_capture "$ROOT/tests/test-collect.sh")"
+collect_status="${collect_args%%$'\n'*}"
+collect_output="${collect_args#*$'\n'}"
+[[ "$collect_status" == "0" ]] || fail "test-collect.sh failed: $collect_output"
 
 ok "required files exist"
