@@ -22,6 +22,7 @@ for path in \
   "$ROOT/lib/collect-cluster-rook.sh" \
   "$ROOT/lib/collect-node.sh" \
   "$ROOT/lib/verify-bundle.sh" \
+  "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
@@ -63,5 +64,10 @@ verify_bundle_args="$(run_and_capture "$ROOT/tests/test-verify-bundle.sh")"
 verify_bundle_status="${verify_bundle_args%%$'\n'*}"
 verify_bundle_output="${verify_bundle_args#*$'\n'}"
 [[ "$verify_bundle_status" == "0" ]] || fail "test-verify-bundle.sh failed: $verify_bundle_output"
+
+cephadm_collector_args="$(run_and_capture "$ROOT/tests/test-cephadm-collector.sh")"
+cephadm_collector_status="${cephadm_collector_args%%$'\n'*}"
+cephadm_collector_output="${cephadm_collector_args#*$'\n'}"
+[[ "$cephadm_collector_status" == "0" ]] || fail "test-cephadm-collector.sh failed: $cephadm_collector_output"
 
 ok "required files exist"
