@@ -149,6 +149,78 @@ EOF
   done
 }
 
+test_redact_file_multiline_pem_body() {
+  local source_file="$tmpdir/pem.txt"
+  local redaction_log="$tmpdir/pem.log"
+
+  cat >"$source_file" <<'EOF'
+prefix safe
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA1234567890abcdefghijKLMNOPqrstuv
+ZZZZnormalbodyline+slashes/and+more1234567890ab==
+-----END RSA PRIVATE KEY-----
+suffix safe
+EOF
+
+  redact_file "$source_file" "$redaction_log"
+
+  [[ "$(sed -n '1p' "$source_file")" == "prefix safe" ]] || fail "pem prefix modified"
+  for i in 2 3 4 5; do
+    [[ "$(sed -n "${i}p" "$source_file")" == "[REDACTED]" ]] || fail "pem body line $i not redacted"
+  done
+  [[ "$(sed -n '6p' "$source_file")" == "suffix safe" ]] || fail "pem suffix modified"
+}
+
+test_redact_file_ceph_key_material() {
+  local source_file="$tmpdir/keymat.txt"
+  local redaction_log="$tmpdir/keymat.log"
+
+  cat >"$source_file" <<'EOF'
+[client.admin]
+	key = AQBabcdefghij0123456789KLMNOPQRSTUVWXyz==
+"auth_key": "AQBZZZZ1111222233334444555566667777abcd=="
+just a normal sentence with words
+EOF
+
+  redact_file "$source_file" "$redaction_log"
+
+  [[ "$(sed -n '1p' "$source_file")" == "[client.admin]" ]] || fail "section header modified"
+  [[ "$(sed -n '2p' "$source_file")" == "[REDACTED]" ]] || fail "ceph 'key =' line not redacted"
+  [[ "$(sed -n '3p' "$source_file")" == "[REDACTED]" ]] || fail "base64 key blob not redacted"
+  [[ "$(sed -n '4p' "$source_file")" == "just a normal sentence with words" ]] || fail "normal line over-redacted"
+}
+
+test_redact_file_preserves_mode() {
+  local source_file="$tmpdir/mode.txt"
+  local redaction_log="$tmpdir/mode.log"
+  printf 'token: leak\nplain\n' >"$source_file"
+  chmod 640 "$source_file"
+
+  redact_file "$source_file" "$redaction_log"
+
+  local got
+  got="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null)"
+  [[ "$got" == "640" ]] || fail "redaction did not preserve file mode (got $got)"
+}
+
+test_redact_gz_file() {
+  local plain="$tmpdir/rotated.log"
+  local gz="$tmpdir/rotated.log.gz"
+  local redaction_log="$tmpdir/gz.log"
+
+  printf 'normal rotated line\n\tkey = AQBsecretkeymaterial0123456789abcdefghij==\nanother line\n' >"$plain"
+  gzip -c "$plain" >"$gz"
+  rm -f "$plain"
+
+  redact_gz_file "$gz" "$redaction_log"
+
+  local decoded
+  decoded="$(gzip -dc "$gz")"
+  [[ "$decoded" == *"normal rotated line"* ]] || fail "gz lost normal content"
+  [[ "$decoded" == *"[REDACTED]"* ]] || fail "gz secret not redacted"
+  [[ "$decoded" != *"AQBsecretkeymaterial"* ]] || fail "gz secret leaked"
+}
+
 test_run_capture_success() {
   local manifest="$tmpdir/run-manifest.jsonl"
   local artifact="$tmpdir/run-artifact.txt"
@@ -272,6 +344,10 @@ test_manifest_add
 test_manifest_add_rejects_non_numeric_exit_code
 test_redact_file
 test_redact_file_private_key_variants
+test_redact_file_multiline_pem_body
+test_redact_file_ceph_key_material
+test_redact_file_preserves_mode
+test_redact_gz_file
 test_run_capture_success
 test_run_capture_non_zero_writes_error_log_and_returns_code
 test_run_capture_missing_double_dash_is_fatal

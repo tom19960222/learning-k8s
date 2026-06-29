@@ -195,8 +195,11 @@ redact_bundle_text() {
   local path
 
   while IFS= read -r path; do
-    redact_file "$path" "$redaction_log"
-  done < <(find "$workdir/cluster" "$workdir/nodes" -type f \( -name '*.txt' -o -name '*.log' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' \) -print 2>/dev/null || true)
+    case "$path" in
+      *.gz) redact_gz_file "$path" "$redaction_log" ;;
+      *) redact_file "$path" "$redaction_log" ;;
+    esac
+  done < <(find "$workdir/cluster" "$workdir/nodes" -type f \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' \) -print 2>/dev/null || true)
 }
 
 main() {

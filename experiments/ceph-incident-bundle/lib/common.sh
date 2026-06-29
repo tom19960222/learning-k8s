@@ -53,10 +53,11 @@ redact_file() {
   require_file "$source_file"
   ensure_dir "$(dirname -- "$redaction_log")"
 
-  local source_dir tmp_file count line nocasematch_state
+  local source_dir tmp_file count line nocasematch_state in_pem redact mode
   source_dir="$(dirname -- "$source_file")"
   tmp_file="$(mktemp "$source_dir/.${source_file##*/}.XXXXXX")"
   count=0
+  in_pem=0
   if shopt -q nocasematch; then
     nocasematch_state='shopt -s nocasematch'
   else
@@ -64,8 +65,28 @@ redact_file() {
   fi
   shopt -s nocasematch
 
+  # Best-effort redaction (NOT a complete DLP): keyword lines, ceph key
+  # material (`key = AQB..==`, base64 blobs), and whole multi-line PEM private
+  # key blocks. Extensions/encodings outside this are intentionally not covered
+  # — see README "安全界線"; operators must self-review before sharing.
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ (password|secret|token|keyring|private([[:space:]_-]+)?key) ]]; then
+    redact=0
+    if [[ "$line" =~ -----BEGIN[[:space:]].*PRIVATE[[:space:]]KEY----- ]]; then
+      in_pem=1
+    fi
+    if [[ $in_pem -eq 1 ]]; then
+      redact=1
+      if [[ "$line" =~ -----END[[:space:]].*PRIVATE[[:space:]]KEY----- ]]; then
+        in_pem=0
+      fi
+    elif [[ "$line" =~ (password|secret|token|keyring|private([[:space:]_-]+)?key) ]]; then
+      redact=1
+    elif [[ "$line" =~ (^|[^[:alnum:]])key[[:space:]]*[:=] ]]; then
+      redact=1
+    elif [[ "$line" =~ [A-Za-z0-9+/]{38,}={1,2} ]]; then
+      redact=1
+    fi
+    if [[ $redact -eq 1 ]]; then
       printf '[REDACTED]\n' >>"$tmp_file"
       count=$((count + 1))
     else
@@ -74,9 +95,35 @@ redact_file() {
   done <"$source_file"
 
   eval "$nocasematch_state"
-  chmod --reference="$source_file" "$tmp_file" 2>/dev/null || true
+  mode="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null || printf '600')"
+  chmod "$mode" "$tmp_file" 2>/dev/null || true
   mv -f -- "$tmp_file" "$source_file"
   printf '%s: %s line(s) redacted\n' "$source_file" "$count" >>"$redaction_log"
+}
+
+redact_gz_file() {
+  # Decompress a gzipped artifact, redact it, recompress in place so rotated
+  # logs (*.gz) get the same redaction as plain text.
+  local source_file=$1 redaction_log=$2
+  require_file "$source_file"
+  ensure_dir "$(dirname -- "$redaction_log")"
+
+  local dir tmp_plain
+  dir="$(dirname -- "$source_file")"
+  tmp_plain="$(mktemp "$dir/.${source_file##*/}.plain.XXXXXX")"
+  if ! gzip -dc -- "$source_file" >"$tmp_plain" 2>/dev/null; then
+    rm -f -- "$tmp_plain"
+    printf '%s: gz decompress failed, left as-is (NOT redacted)\n' "$source_file" >>"$redaction_log"
+    return 0
+  fi
+
+  redact_file "$tmp_plain" "$redaction_log"
+  if gzip -c -- "$tmp_plain" >"$source_file"; then
+    rm -f -- "$tmp_plain"
+  else
+    rm -f -- "$tmp_plain"
+    return 1
+  fi
 }
 
 run_capture() {
