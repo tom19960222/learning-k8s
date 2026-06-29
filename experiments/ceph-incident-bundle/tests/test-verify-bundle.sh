@@ -139,7 +139,7 @@ assert_fail "$id_ed25519_dir" "id_ed25519"
 assert_fail "$id_ed25519_archive" "id_ed25519"
 assert_fail "$private_key_dir" "private_key"
 assert_fail "$private_key_archive" "private_key"
-assert_fail "$corrupt_archive" "tar"
+assert_fail "$corrupt_archive" "invalid archive"
 
 extra_args_result="$(run_and_capture "$ROOT/lib/verify-bundle.sh" "$valid_dir" extra)"
 extra_args_status="${extra_args_result%%$'\n'*}"

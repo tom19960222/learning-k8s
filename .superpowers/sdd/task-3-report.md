@@ -165,6 +165,24 @@ GREEN output:
 - `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
 - `make validate` passed
 
+## Third fix addendum
+
+### What I fixed
+
+- Changed the invalid path guard in `verify_bundle_path` to explicitly return after `verify_fail`, rather than relying on `set -e`.
+- Removed the unused `ROOT` variable from `verify-bundle.sh`.
+- Wrapped archive list/extract failures with `verify_fail "invalid archive: ..."` and suppressed tar's own stderr so corrupt archive output is consistent.
+
+### Test update
+
+- Updated the corrupt archive expectation from a tar-specific substring to `invalid archive`.
+
+### Verification
+
+- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
+- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
+- `make validate` passed
+
 ## Second fix addendum
 
 ### What I fixed

@@ -3,8 +3,6 @@ set -euo pipefail
 
 # Ceph incident bundle verification entrypoint.
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
 usage() {
   cat >&2 <<'EOF'
 Usage: verify-bundle.sh <bundle-dir|bundle.tar.gz>
@@ -74,14 +72,16 @@ verify_bundle_path() {
     return 0
   fi
 
-  [[ -f "$bundle" && "$bundle" == *.tar.gz ]] || verify_fail "expected a directory or .tar.gz bundle: $bundle"
+  [[ -f "$bundle" && "$bundle" == *.tar.gz ]] || { verify_fail "expected a directory or .tar.gz bundle: $bundle"; return 1; }
 
   workdir="$(mktemp -d)"
-  if ! tar -tzf "$bundle" >/dev/null; then
+  if ! tar -tzf "$bundle" >/dev/null 2>/dev/null; then
+    verify_fail "invalid archive: $bundle"
     rm -rf "$workdir"
     return 1
   fi
-  if ! tar -xzf "$bundle" -C "$workdir"; then
+  if ! tar -xzf "$bundle" -C "$workdir" >/dev/null 2>/dev/null; then
+    verify_fail "invalid archive: $bundle"
     rm -rf "$workdir"
     return 1
   fi
