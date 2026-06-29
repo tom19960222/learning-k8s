@@ -16,15 +16,32 @@ usage() {
   cat <<'EOF'
 Usage: collect.sh --inventory PATH --ssh-key PATH [options]
 
+One command example:
+  bash experiments/ceph-incident-bundle/run/collect.sh \
+    --inventory experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
+    --ssh-key .ssh/id_ed25519 \
+    --mode cephadm \
+    --since 24h
+
+Required:
+  --inventory PATH       shell inventory with HOSTS=( "alias=host" ... )
+  --ssh-key PATH         SSH private key used to reach every node
+
 Options:
-  --seed USER@HOST
-  --out DIR
+  --seed USER@HOST       override inventory SEED_HOST
+  --out DIR              output dir (default: experiments/ceph-incident-bundle/results)
   --mode auto|cephadm|rook
-  --since DURATION
-  --timeout SECONDS
-  --skip-logs
-  --keep-workdir
-  --help
+  --since DURATION       log/journal window (default: 24h)
+  --timeout SECONDS      per command/SSH timeout (default: 20)
+  --skip-logs            collect state but skip larger Ceph log copies
+  --keep-workdir         keep temporary extracted workdir for debugging
+  --help                 print this help
+
+Output:
+  DIR/ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz
+
+Exit codes:
+  0 complete, 2 partial collection failure with bundle produced, 1 usage/config/verify failure
 EOF
 }
 

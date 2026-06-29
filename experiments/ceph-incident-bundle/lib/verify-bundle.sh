@@ -6,6 +6,9 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage: verify-bundle.sh <bundle-dir|bundle.tar.gz>
+
+Checks gzip integrity, required top-level files, cluster/node artifacts,
+and obvious secret paths such as keyring, .ssh, id_ed25519, private_key.
 EOF
 }
 
