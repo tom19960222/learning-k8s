@@ -22,8 +22,11 @@ collect_cephadm_command() {
       -o BatchMode=yes \
       -o IdentitiesOnly=yes \
       -o IdentityAgent=none \
+      -o "ConnectTimeout=$timeout" \
+      -o "ServerAliveInterval=$timeout" \
+      -o ServerAliveCountMax=1 \
       "$seed" \
-      sudo cephadm shell -- ceph "$@"
+      sudo -n cephadm shell -- ceph "$@"
 }
 
 write_cephadm_crash_skip() {
@@ -41,10 +44,12 @@ extract_cephadm_crash_ids() {
   [[ -f "$crash_ls_artifact" ]] || return 1
   payload="$(sed '/^[[:space:]]*#/d' "$crash_ls_artifact")" || return 1
 
+  # Anchor strictly to crash_id; matching id/name too would capture unrelated
+  # nested fields and feed bogus ids back into `ceph crash info`.
   ids="$(
     printf '%s\n' "$payload" |
-      grep -oE '"(crash_id|id|name)"[[:space:]]*:[[:space:]]*"[^"]*"' |
-      sed -E 's/^"(crash_id|id|name)"[[:space:]]*:[[:space:]]*"([^"]*)"$/\2/' |
+      grep -oE '"crash_id"[[:space:]]*:[[:space:]]*"[^"]*"' |
+      sed -E 's/^"crash_id"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/' |
       head -n 10
   )" || true
 

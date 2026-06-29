@@ -37,13 +37,36 @@ ln -s "$(command -v mkdir)" "$minimal_bin/mkdir"
 
 out_no_kubectl="$tmpdir/out-no-kubectl"
 manifest_no_kubectl="$tmpdir/manifest-no-kubectl.jsonl"
+no_kubectl_rc=0
+set +e
 PATH="$minimal_bin" "$BASH_BIN" "$ROOT/lib/collect-cluster-rook.sh" \
   --out "$out_no_kubectl" \
   --manifest "$manifest_no_kubectl" \
   --namespace rook-ceph \
   --since 24h \
   --timeout 5
+no_kubectl_rc=$?
+set -e
+# R4: explicit rook mode with no kubectl is a real failure (not a silent success)
+[[ "$no_kubectl_rc" == "2" ]] || fail "explicit rook with no kubectl should exit 2, got $no_kubectl_rc"
 assert_file_contains "$out_no_kubectl/cluster/rook/SKIPPED.txt" "kubectl command not found"
+
+# R4: auto-mode fallback passes --allow-skip, so the same situation is a graceful skip (rc 0)
+out_no_kubectl_skip="$tmpdir/out-no-kubectl-skip"
+manifest_no_kubectl_skip="$tmpdir/manifest-no-kubectl-skip.jsonl"
+allow_skip_rc=0
+set +e
+PATH="$minimal_bin" "$BASH_BIN" "$ROOT/lib/collect-cluster-rook.sh" \
+  --out "$out_no_kubectl_skip" \
+  --manifest "$manifest_no_kubectl_skip" \
+  --namespace rook-ceph \
+  --since 24h \
+  --timeout 5 \
+  --allow-skip
+allow_skip_rc=$?
+set -e
+[[ "$allow_skip_rc" == "0" ]] || fail "rook with --allow-skip and no kubectl should exit 0, got $allow_skip_rc"
+assert_file_contains "$out_no_kubectl_skip/cluster/rook/SKIPPED.txt" "kubectl command not found"
 
 fakebin="$tmpdir/fakebin"
 mkdir -p "$fakebin"
@@ -94,7 +117,12 @@ export FAKE_KUBECTL_LOG="$tmpdir/kubectl.log"
 
 out_missing_ns="$tmpdir/out-missing-ns"
 manifest_missing_ns="$tmpdir/manifest-missing-ns.jsonl"
+missing_ns_rc=0
+set +e
 FAKE_KUBECTL_MODE=missing-namespace PATH="$fakebin:$PATH" run_rook_collector "$out_missing_ns" "$manifest_missing_ns"
+missing_ns_rc=$?
+set -e
+[[ "$missing_ns_rc" == "2" ]] || fail "explicit rook with missing namespace should exit 2, got $missing_ns_rc"
 assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "namespace not found: rook-ceph"
 
 out_present="$tmpdir/out-present"

@@ -79,9 +79,12 @@ test_collect_cluster_cephadm_happy_path_and_limit_recent_crashes() {
   assert_file_contains "$outdir/cluster/ceph/json/crash-info/crash_02-2.json" "\"crash_id\":\"crash:02\""
 
   [[ "$(read_manifest_count "$manifest")" == "34" ]] || fail "expected 34 manifest entries"
-  grep -qF 'sudo cephadm shell -- ceph status --format json-pretty' "$ssh_log" || fail "ssh log missing cephadm shell invocation"
-  grep -qF 'sudo cephadm shell -- ceph status' "$ssh_log" || fail "ssh log missing text status invocation"
-  grep -qF 'sudo cephadm shell -- ceph crash info crash-10' "$ssh_log" || fail "ssh log missing 10th crash info invocation"
+  grep -qF 'sudo -n cephadm shell -- ceph status --format json-pretty' "$ssh_log" || fail "ssh log missing cephadm shell invocation"
+  grep -qF 'sudo -n cephadm shell -- ceph status' "$ssh_log" || fail "ssh log missing text status invocation"
+  grep -qF 'sudo -n cephadm shell -- ceph crash info crash-10' "$ssh_log" || fail "ssh log missing 10th crash info invocation"
+  # R1: cluster SSH must carry connect/keepalive bounds (was missing -> could hang on a half-open seed)
+  grep -qF 'ConnectTimeout=30' "$ssh_log" || fail "cluster ssh missing ConnectTimeout"
+  grep -qF 'ServerAliveInterval=30' "$ssh_log" || fail "cluster ssh missing ServerAliveInterval"
 }
 
 test_collect_cluster_cephadm_returns_partial_failure_and_keeps_collecting() {
