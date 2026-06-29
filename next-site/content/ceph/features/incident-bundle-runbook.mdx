@@ -1,0 +1,362 @@
+---
+layout: doc
+title: Ceph — Incident Bundle：出事時一鍵保留現場證據
+description: 一套給基本 Linux 使用者也能照著跑的 Ceph 事故證據收集流程：用單一 collect.sh 從 cephadm 或 Rook cluster 收集 Ceph 狀態、node 狀態、kernel/systemd/log 資料，驗證後打包成 tar.gz，並說清楚 exit code、安全界線與 lab 實測結果。
+---
+
+## 緣起：事故現場最怕「先修一半，證據消失一半」
+
+Ceph 出問題時，第一個直覺常常是立刻找 repair command、restart daemon、搬 OSD、改 flag。這些動作也許最後會需要做，但在一開始就動手修，最容易把真正有價值的線索抹掉：
+
+- `ceph health detail` 當下亮了哪些 health check。
+- OSD / MON / MGR 當下的 map、quorum、PG、orch 狀態。
+- node 的 CPU、RAM、disk、kernel log、systemd journal、Ceph log 在同一個時間窗內長什麼樣。
+- 哪些 node 有 disk / LVM / container / time sync / dmesg 異常。
+
+所以這頁的目標不是「怎麼修 Ceph」，而是把事故第一步固定成一句話：
+
+> **先保留現場，再判讀；先產出 bundle，再決定要不要修。**
+
+本頁對應的工具在 `experiments/ceph-incident-bundle/`。入口只有一個：
+
+```bash
+bash experiments/ceph-incident-bundle/run/collect.sh ...
+```
+
+它會從一台工作機透過 SSH 到所有 Ceph node 收集資料，最後輸出一個 `ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz`。操作者不需要懂 CRUSH、PG、BlueStore 或 Rook internals；只要會 SSH、會填 inventory、會把產生的 `.tar.gz` 交給會判讀的人。
+
+## 來龍去脈：前面幾頁知道「要看什麼」，這頁把「怎麼一次帶走」補起來
+
+前面的 Ceph 監控頁已經拆過三件事：
+
+- [Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design)：告警要把維護噪音和真正 client 風險分開。
+- [Ceph — 在開發環境驗證這套維護友善的 alert 設計](./prometheus-alert-testing)：alert 規則不能只靠直覺，要用測試驗證。
+- [Ceph — slow ops 兩個 metric 怎麼得出，以及 BlueStore 慢操作為何可能漏掉](./slow-ops-and-bluestore-alerts)：單一 metric 可能只看見某一層，必須保留 Ceph 與系統兩邊的資料。
+
+這些頁面解決的是「應該注意哪些訊號」。但真正在半夜接到告警時，還會遇到一個很務實的問題：資料散在太多地方。
+
+你可能同時需要：
+
+- seed node 上的 `ceph status`、`ceph health detail`、`ceph osd df`、`ceph pg dump_stuck`。
+- 每台 node 的 `dmesg -T`、`journalctl -u 'ceph*'`、`df -hT`、`lsblk`、`free -h`。
+- cephadm 的 `orch ps`、`orch device ls --wide`、`cephadm ls`。
+- 如果是 Rook，還要看 `kubectl get pods -o wide`、Rook CR、operator log、toolbox 裡的 `ceph status`。
+
+這些 command 如果事後才一台一台補跑，時間點已經不一致；如果靠人手複製貼上，也很容易漏掉。Incident Bundle 的設計就是把這些 read-only 收集動作固定成流程，讓「事故發生當下的共同快照」可以被保存下來。
+
+## 要做的事：一個 script，三個結果
+
+這套工具做三件事。
+
+第一，收集 cluster-level 狀態。cephadm mode 會透過 seed node 跑 `sudo cephadm shell -- ceph ...`；Rook mode 會在本機跑 `kubectl ...`，有 toolbox Pod 時才進 toolbox 跑 read-only 的 `ceph status`。
+
+第二，收集每台 node 的系統狀態。`run/collect.sh` 會把 `lib/common.sh` 和 `lib/collect-node.sh` 透過 SSH 串流到遠端，遠端收完後再把 node bundle 串回本機。操作者不用先把 script 複製到每台 node。
+
+第三，驗證並打包。`run/collect.sh` 會先對工作目錄跑 `lib/verify-bundle.sh`，打包成 `.tar.gz` 後再驗一次 archive。驗證通過才會印出 bundle 路徑。
+
+整體流程長這樣：
+
+```text
+operator machine
+  |
+  |-- cluster collector
+  |     |-- cephadm: ssh seed -> sudo cephadm shell -- ceph ...
+  |     `-- rook: local kubectl + optional toolbox ceph status
+  |
+  |-- node collector over SSH
+  |     |-- monitor01 -> nodes/monitor01/
+  |     |-- mon02     -> nodes/mon02/
+  |     `-- osd03     -> nodes/osd03/
+  |
+  |-- redact obvious secrets in text artifacts
+  |-- verify bundle directory
+  |-- tar.gz
+  `-- verify tar.gz
+```
+
+## 操作流程：只懂基本 Linux 的人照這段跑
+
+### 1. 確認可以 SSH 到每台 node
+
+先從工作機測一台：
+
+```bash
+ssh -i .ssh/id_ed25519 ikaros@192.168.18.166 hostname
+```
+
+如果這一步不通，先處理 SSH 帳號、key、known_hosts 或網路問題。Incident Bundle 不會幫你修 SSH。
+
+### 2. 填 inventory
+
+inventory 是一個 shell 檔案。lab 範例在 `experiments/ceph-incident-bundle/inventory/ceph-lab.example.env`：
+
+```bash
+SSH_USER="ikaros"
+SEED_HOST="192.168.18.166"
+HOSTS=(
+  "monitor01=192.168.18.166"
+  "mon02=192.168.18.167"
+  "mon03=192.168.18.164"
+  "osd01=192.168.18.169"
+  "osd02=192.168.18.171"
+  "osd03=192.168.18.174"
+)
+```
+
+欄位的意思：
+
+| 欄位 | 說明 |
+|---|---|
+| `SSH_USER` | 登入每台 node 的 Linux 帳號。 |
+| `SEED_HOST` | cephadm mode 用來跑 cluster-level `ceph` command 的 node。 |
+| `ROOK_NAMESPACE` | Rook mode 的 namespace；未填時是 `rook-ceph`。 |
+| `HOSTS` | `alias=host` 清單；alias 會變成 bundle 裡 `nodes/<alias>/` 的資料夾名稱。 |
+
+### 3. 執行收集
+
+在 repo root 執行：
+
+```bash
+bash experiments/ceph-incident-bundle/run/collect.sh \
+  --inventory experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
+  --ssh-key .ssh/id_ed25519 \
+  --seed ikaros@192.168.18.166 \
+  --mode cephadm \
+  --since 24h \
+  --timeout 60
+```
+
+重要參數：
+
+| 參數 | 說明 |
+|---|---|
+| `--inventory` | node 清單與 seed 設定。 |
+| `--ssh-key` | SSH private key 路徑；這個 key 本身不會被打包。 |
+| `--seed` | 覆蓋 inventory 裡的 seed；格式是 `USER@HOST`。 |
+| `--mode` | `cephadm`、`rook` 或 `auto`。 |
+| `--since` | log / journal 時間窗，例如 `24h`。 |
+| `--timeout` | 每個 command 的 timeout 秒數。 |
+| `--skip-logs` | 跳過整個 Ceph log 收集；`/var/log/ceph` listing 與 log 複製都不做。 |
+
+成功時會看到類似：
+
+```text
+bundle: experiments/ceph-incident-bundle/results/ceph-incident-20260629T024348Z.tar.gz
+```
+
+### 4. 驗證 bundle
+
+```bash
+bash experiments/ceph-incident-bundle/lib/verify-bundle.sh \
+  experiments/ceph-incident-bundle/results/ceph-incident-20260629T024348Z.tar.gz
+```
+
+看到 `VERIFY PASS` 才代表 bundle 結構完整，且沒有明顯不該出現的 secret path。
+
+### 5. 先看三個檔案
+
+解開 bundle 後先看：
+
+```text
+README-FIRST.txt
+summary.txt
+errors.log
+```
+
+`README-FIRST.txt` 是入口說明；`summary.txt` 會列出 mode、seed、node 成功/失敗數、最後狀態；`errors.log` 則保留非零 exit code、SSH 失敗或部分失敗。
+
+## exit code 怎麼判讀
+
+`run/collect.sh` 只用三種 exit code，讓非 Ceph 人也能快速判斷下一步。
+
+| exit code | 意義 | 下一步 |
+|---|---|---|
+| `0` | 收集完成，沒有已知失敗，bundle 已產生並驗證通過。 | 保留 `.tar.gz`，交給負責判讀的人。 |
+| `2` | 有部分 command 或部分 node 失敗，但 bundle 已產生。 | 先不要丟掉 bundle；看 `summary.txt` 和 `errors.log`，必要時針對失敗 node 補跑。 |
+| `1` | 使用方式、必要輸入或 bundle 驗證失敗。 | 檢查 inventory、SSH key、mode、bundle 結構或 forbidden path。 |
+
+這個設計刻意把「部分失敗」和「完全不能用」分開。事故現場最常見的狀況是某台 node 半死不活；如果因為一台 node 的 `journalctl` 失敗就整包不產生，反而會損失其他 node 的證據。
+
+## bundle 結構
+
+產物是一個 gzip tarball。解開後主要長這樣：
+
+```text
+README-FIRST.txt
+summary.txt
+environment.txt
+manifest.jsonl
+errors.log
+redactions.log
+cluster/
+  ceph/
+    json/
+    text/
+  rook/
+nodes/
+  monitor01/
+  mon02/
+  mon03/
+  osd01/
+  osd02/
+  osd03/
+```
+
+幾個入口檔案的用途：
+
+| 檔案 | 用途 |
+|---|---|
+| `README-FIRST.txt` | 給打開 bundle 的人先讀，說明從哪裡開始。 |
+| `summary.txt` | 本次收集摘要：建立時間、mode、seed、node 成功/失敗數、final status。 |
+| `environment.txt` | 收集時間、script 所在 git commit、mode、seed、時間窗。 |
+| `manifest.jsonl` | 每個 artifact 的 host、collector、command、exit code、開始/結束時間。 |
+| `errors.log` | 非零 exit code 與部分失敗紀錄。 |
+| `redactions.log` | 哪些文字檔案被遮蔽了幾行疑似 secret。 |
+
+`manifest.jsonl` 是追查時很有用的索引。它回答三個問題：某個檔案是用哪個 command 產生的、command 當時 exit code 是多少、收集時間點在哪裡。
+
+## 收集清單
+
+### cephadm cluster-level
+
+來源 script：`experiments/ceph-incident-bundle/lib/collect-cluster-cephadm.sh`。
+
+它會在 seed node 上透過 `sudo cephadm shell -- ceph ...` 收集 JSON 與文字版狀態。JSON 主要包含：
+
+- `status.json`
+- `health-detail.json`
+- `versions.json`
+- `df-detail.json`
+- `osd-tree.json`
+- `osd-df.json`
+- `osd-dump.json`
+- `osd-perf.json`
+- `osd-blocked-by.json`
+- `pg-stat.json`
+- `pg-dump.json`
+- `pg-dump-stuck.json`
+- `mon-dump.json`
+- `quorum-status.json`
+- `mgr-dump.json`
+- `orch-host-ls.json`
+- `orch-ps.json`
+- `orch-device-ls-wide.json`
+- `config-dump.json`
+- `crash-ls.json`
+
+另外會保留文字版 `status.txt`、`health-detail.txt`、`osd-tree.txt`、`orch-ps.txt`，方便人直接打開看。若 `crash ls` 有資料，script 會最多取 10 筆 crash id 跑 `ceph crash info`，並把 id 轉成安全檔名，避免奇怪字元影響 tar 路徑。
+
+### node-level
+
+來源 script：`experiments/ceph-incident-bundle/lib/collect-node.sh`。
+
+每台 node 會收：
+
+- 基本系統：`hostname`、`uname -a`、`uptime`。
+- 資源：`free -h`、可用時的 `iostat -xz 1 3`。
+- storage：`df -hT`、`lsblk`，可用時的 `pvs` / `vgs` / `lvs`。
+- 網路：`ip addr show`。
+- kernel：`dmesg -T`。
+- systemd：`systemctl --failed`、`journalctl --since <window> -u 'ceph*'`。
+- time sync：可用時的 `chronyc tracking`、`chronyc sources -v`、`ntpq -pn`。
+- container：可用時的 `podman ps -a`、`docker ps -a`。
+- cephadm：可用時的 `cephadm ls --format json-pretty`。
+- Ceph log：`/var/log/ceph` listing 與可讀 log；可用 `--skip-logs` 跳過整個 log 收集。未跳過時，單一 log 檔案預設只複製 1 MiB 以下的檔案。
+- Ceph 設定與資料目錄線索：安全列出 `/var/lib/ceph`，並複製可讀的設定檔，但排除 keyring。
+
+這裡刻意同時收 Ceph 與 Linux。Ceph 的 `HEALTH_WARN` 只告訴你 cluster 覺得哪裡不對；真正原因可能在 disk、kernel、time sync、container runtime 或 systemd。
+
+### Rook cluster-level
+
+來源 script：`experiments/ceph-incident-bundle/lib/collect-cluster-rook.sh`。
+
+Rook mode 會先檢查本機是否有 `kubectl`，再確認 namespace 存在。若條件不成立，它會寫 `cluster/rook/SKIPPED.txt`，不會把整包視為失敗。條件成立時收：
+
+- `kubectl get pods -n <namespace> -o wide`
+- `kubectl get events -n <namespace> --sort-by=.lastTimestamp`
+- `kubectl get` Rook 的 `CephCluster`、`CephBlockPool`、`CephFilesystem`、`CephObjectStore`
+- Rook operator log
+- toolbox Pod 存在時的 `ceph status`
+
+這讓同一套流程可以用在 cephadm cluster，也可以用在 Rook-managed cluster。
+
+## 安全界線
+
+這套工具的安全界線要講清楚，因為事故工具最怕「看起來方便，實際上改了現場」。
+
+- 它是 read-only 收集工具，不會 restart、delete、repair、scrub，也不會改 Ceph flag。
+- 它會遮蔽文字 artifact 中明顯含有 `password`、`secret`、`token`、`keyring`、`private key` 的整行，但這不是完整 DLP。
+- 它會在驗證階段擋掉路徑中含有 `keyring`、`.ssh`、`id_ed25519`、`private_key` 的檔案。
+- 分享 bundle 前仍要人工檢查：內部 IP、hostname、帳號名稱、mount path、pool name、image name 都可能是敏感資訊。
+- `--skip-logs` 可以降低 log 量和敏感內容風險，但會跳過 `/var/log/ceph` listing 與 log 複製，也會少掉事故判讀常需要的時間序列。
+
+換句話說：這套工具會盡力避免打包明顯 secret，但它不是資安掃描器。要把 bundle 丟給外部人士前，仍要走你自己的資料外洩檢查流程。
+
+## Lab 實測結果
+
+這套流程已在 6-node cephadm lab 上跑過。inventory 對應：
+
+| alias | host |
+|---|---|
+| `monitor01` | `192.168.18.166` |
+| `mon02` | `192.168.18.167` |
+| `mon03` | `192.168.18.164` |
+| `osd01` | `192.168.18.169` |
+| `osd02` | `192.168.18.171` |
+| `osd03` | `192.168.18.174` |
+
+實測 command：
+
+```bash
+bash experiments/ceph-incident-bundle/run/collect.sh \
+  --inventory experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
+  --ssh-key /Users/ikaros/Documents/code/learning-k8s/.ssh/id_ed25519 \
+  --seed ikaros@192.168.18.166 \
+  --mode cephadm \
+  --since 24h \
+  --timeout 60
+```
+
+這次是在 isolated worktree 裡測，所以 `--ssh-key` 用主 repo 的絕對路徑；一般在 repo root 操作時可用 `.ssh/id_ed25519`。
+
+產物：
+
+```text
+experiments/ceph-incident-bundle/results/ceph-incident-20260629T024348Z.tar.gz
+```
+
+驗證結果：
+
+```text
+VERIFY PASS: experiments/ceph-incident-bundle/results/ceph-incident-20260629T024348Z.tar.gz
+```
+
+`summary.txt` 的關鍵內容：
+
+```text
+Ceph incident bundle summary
+created_utc: 2026-06-29T02:49:45Z
+mode: cephadm
+seed: ikaros@192.168.18.166
+cluster_status: 0
+node_ok: 6
+node_failed: 0
+final_status: 0
+```
+
+已知觀察：
+
+- 6 台 node 都有進入 `nodes/<alias>/`。
+- top-level `errors.log` 為空。
+- node 內部的 `errors.log` 有保留某些 optional/read-only command 的非零紀錄，例如部分 node 的 `pvs` / `vgs` / `lvs`、`docker ps -a`、node-level `sudo cephadm ls --format json-pretty`。這些 artifact 仍被保留，整體 bundle 驗證通過。
+- macOS / BSD tar 在打包時可能印出 extended header warning；這次實測它不影響 gzip integrity 或 verifier 結果。
+
+產生的 `.tar.gz` 是事故證據，不應 commit 到 repo；`experiments/ceph-incident-bundle/results/*.tar.gz` 已被 ignore。
+
+## 結論：事故第一步變成固定肌肉記憶
+
+這套流程把 Ceph 事故處理的第一步從「誰在線上、誰知道該跑什麼 command」改成「先跑一個固定 script，把當下證據打包」。
+
+對只懂基本 Linux 的操作者來說，責任很小：確認 SSH、填 inventory、跑 `collect.sh`、看 exit code、把 bundle 保留下來。對後續判讀者來說，責任也更清楚：從同一包裡看 Ceph 狀態、node 狀態、kernel/systemd/log、manifest 與 errors，而不是追問「你剛剛有沒有順手跑某某 command」。
+
+最重要的是：這套工具不假裝會修 Ceph。它只做事故現場最該先做、也最容易被忘記的事：**把證據留住。**
