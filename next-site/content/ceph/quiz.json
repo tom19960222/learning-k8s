@@ -190,5 +190,17 @@
     ],
     "answer": 0,
     "explanation": "collect.sh 的 exit code 0 是完整成功，2 是部分失敗但 bundle 已產生，1 才是使用方式、必要輸入或驗證失敗。事故現場常有某台 node 半失聯，所以工具刻意保留可收集到的資料；遇到 2 時應先保留 .tar.gz，從 summary.txt、errors.log、manifest.jsonl 判斷哪些 artifact 或 node 需要補跑。"
+  },
+  {
+    "id": 17,
+    "question": "如果 Ceph node 的 time sync 是用 systemd-timesyncd，incident bundle 應該保留哪些證據？",
+    "options": [
+      "只要保留 chronyc tracking，因為 systemd-timesyncd 也會寫到 chrony",
+      "`timedatectl` 狀態、`systemd-timesyncd` service 狀態與 journal、timesyncd.conf 與 drop-in；chrony/ntpq 則作為其他環境的旁證",
+      "只要保留 `date` 的輸出，其他時間同步細節都不影響 Ceph",
+      "不需要收 time sync，Ceph 的 MON clock skew 會自動修正 node 時間"
+    ],
+    "answer": 1,
+    "explanation": "collector 會把 systemd-timesyncd 當成一等公民：收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，並複製 `/etc/systemd/timesyncd.conf` 與 `/etc/systemd/timesyncd.conf.d/*.conf`。chrony/ntpq 仍保留，是為了支援不同 Linux 發行版或既有環境。"
   }
 ]

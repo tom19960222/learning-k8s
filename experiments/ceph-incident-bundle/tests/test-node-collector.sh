@@ -21,7 +21,10 @@ fakebin="$tmpdir/fakebin"
 mkdir -p "$fakebin"
 fake_log_dir="$tmpdir/var-log-ceph"
 fake_var_lib="$tmpdir/var-lib-ceph"
+fake_timesyncd_conf="$tmpdir/timesyncd.conf"
+fake_timesyncd_conf_d="$tmpdir/timesyncd.conf.d"
 mkdir -p "$fake_log_dir" "$fake_var_lib/fsid/mon.a"
+mkdir -p "$fake_timesyncd_conf_d"
 
 printf 'current ceph log\n' >"$fake_log_dir/ceph.log"
 printf 'rotated ceph log\n' >"$fake_log_dir/ceph.log.1"
@@ -31,6 +34,8 @@ printf '%0200d\n' 1 >"$fake_log_dir/ceph-too-large.log"
 
 printf 'fsid = fake\n' >"$fake_var_lib/fsid/mon.a/config"
 printf 'secret key material\n' >"$fake_var_lib/fsid/mon.a/keyring"
+printf '[Time]\nNTP=192.168.18.1\n' >"$fake_timesyncd_conf"
+printf '[Time]\nFallbackNTP=time.cloudflare.com\n' >"$fake_timesyncd_conf_d/10-lab.conf"
 
 cat >"$fakebin/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -49,7 +54,26 @@ case "$*" in
   *"--since -24h"*) ;;
   *) printf 'journalctl expected --since -24h, got: %s\n' "$*" >&2; exit 12 ;;
 esac
+if [[ ${FAKE_TIMESYNCD_MISSING:-0} == "1" && "$*" == *"-u systemd-timesyncd"* ]]; then
+  printf 'No journal files were found for systemd-timesyncd\n' >&2
+  exit 1
+fi
 printf 'fake journalctl %s\n' "$*"
+EOF
+
+cat >"$fakebin/timedatectl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${FAKE_TIMESYNCD_MISSING:-0} == "1" ]]; then
+  printf 'systemd-timesyncd unavailable for %s\n' "$*" >&2
+  exit 1
+fi
+case "$*" in
+  "status") printf 'System clock synchronized: yes\nNTP service: active\n' ;;
+  "show-timesync --all") printf 'ServerName=192.168.18.1\nPollIntervalUSec=34min 8s\n' ;;
+  "timesync-status") printf 'Server: 192.168.18.1 (192.168.18.1)\nPoll interval: 34min 8s\n' ;;
+  *) printf 'fake timedatectl %s\n' "$*" ;;
+esac
 EOF
 
 cat >"$fakebin/podman" <<'EOF'
@@ -125,7 +149,16 @@ EOF
 cat >"$fakebin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '0 loaded units listed.\n'
+case "$*" in
+  "status systemd-timesyncd --no-pager --plain")
+    if [[ ${FAKE_TIMESYNCD_MISSING:-0} == "1" ]]; then
+      printf 'Unit systemd-timesyncd.service could not be found.\n' >&2
+      exit 3
+    fi
+    printf 'systemd-timesyncd.service - Network Time Synchronization\nActive: active (running)\n'
+    ;;
+  *) printf '0 loaded units listed.\n' ;;
+esac
 EOF
 
 for tool in iostat chronyc ntpq pvs vgs lvs; do
@@ -157,6 +190,8 @@ set +e
 CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
 CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
 CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+CEPH_INCIDENT_TIMESYNCD_CONF="$fake_timesyncd_conf" \
+CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR="$fake_timesyncd_conf_d" \
 bash "$ROOT/lib/collect-node.sh" \
   --out "$outdir" \
   --host-alias monitor01 \
@@ -178,6 +213,11 @@ for artifact in \
   storage/lsblk.txt \
   network/ip-addr.txt \
   kernel/dmesg.txt \
+  time/timedatectl-status.txt \
+  time/timedatectl-show-timesync.txt \
+  time/timedatectl-timesync-status.txt \
+  time/systemd-timesyncd-status.txt \
+  time/systemd-timesyncd-journal.txt \
   systemd/failed-units.txt \
   cephadm/cephadm-ls.json \
   logs/ceph-log-listing.txt; do
@@ -186,9 +226,16 @@ done
 
 assert_file_contains "$outdir/cephadm/cephadm-ls.json" '"style":"cephadm"'
 assert_file_contains "$outdir/kernel/dmesg.txt" 'fake kernel ring buffer'
+assert_file_contains "$outdir/time/timedatectl-status.txt" 'System clock synchronized: yes'
+assert_file_contains "$outdir/time/timedatectl-show-timesync.txt" 'ServerName=192.168.18.1'
+assert_file_contains "$outdir/time/timedatectl-timesync-status.txt" 'Poll interval'
+assert_file_contains "$outdir/time/systemd-timesyncd-status.txt" 'Network Time Synchronization'
+assert_file_contains "$outdir/time/systemd-timesyncd-journal.txt" 'systemd-timesyncd'
 assert_file_contains "$outdir/containers/docker-ps.txt" 'fake docker'
 assert_file_contains "$outdir/logs/ceph-log-listing.txt" "$fake_log_dir"
 assert_file_contains "$outdir/time/ntpq-peers.txt" 'SKIPPED: command not found: ntpq'
+assert_file_contains "$outdir/time/systemd-timesyncd-config/timesyncd.conf" 'NTP=192.168.18.1'
+assert_file_contains "$outdir/time/systemd-timesyncd-config/timesyncd.conf.d/10-lab.conf" 'FallbackNTP=time.cloudflare.com'
 
 [[ -f "$outdir/logs/ceph/ceph.log" ]] || fail "missing copied current ceph log"
 [[ -f "$outdir/logs/ceph/ceph.log.1" ]] || fail "missing copied rotated ceph log"
@@ -208,3 +255,28 @@ grep -qF 'vgs <--noheadings> <--separator> < >' "$FAKE_OPTIONAL_LOG" || fail "vg
 grep -qF 'lvs <--noheadings> <--separator> < >' "$FAKE_OPTIONAL_LOG" || fail "lvs separator argv was not preserved"
 
 grep -qF -- '-n dmesg' "$FAKE_SUDO_LOG" || fail "dmesg was not collected through sudo -n"
+
+missing_timesyncd_outdir="$tmpdir/node-missing-timesyncd"
+set +e
+FAKE_TIMESYNCD_MISSING=1 \
+CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
+CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+CEPH_INCIDENT_TIMESYNCD_CONF="$tmpdir/missing-timesyncd.conf" \
+CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR="$tmpdir/missing-timesyncd.conf.d" \
+bash "$ROOT/lib/collect-node.sh" \
+  --out "$missing_timesyncd_outdir" \
+  --host-alias monitor02 \
+  --since "24h" \
+  --timeout 5
+missing_timesyncd_rc=$?
+set -e
+if [[ "$missing_timesyncd_rc" != "0" ]]; then
+  [[ -f "$missing_timesyncd_outdir/errors.log" ]] && sed -n '1,120p' "$missing_timesyncd_outdir/errors.log" >&2
+  fail "missing timesyncd should not fail collect-node.sh, got $missing_timesyncd_rc"
+fi
+
+assert_file_contains "$missing_timesyncd_outdir/time/timedatectl-status.txt" 'systemd-timesyncd unavailable'
+assert_file_contains "$missing_timesyncd_outdir/time/systemd-timesyncd-status.txt" 'Unit systemd-timesyncd.service could not be found.'
+assert_file_contains "$missing_timesyncd_outdir/time/systemd-timesyncd-journal.txt" 'No journal files were found for systemd-timesyncd'
+assert_file_contains "$missing_timesyncd_outdir/time/systemd-timesyncd-config/SKIPPED.txt" 'systemd-timesyncd config not found'

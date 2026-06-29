@@ -11,7 +11,7 @@ Ceph 出問題時，第一個直覺常常是立刻找 repair command、restart d
 - `ceph health detail` 當下亮了哪些 health check。
 - OSD / MON / MGR 當下的 map、quorum、PG、orch 狀態。
 - node 的 CPU、RAM、disk、kernel log、systemd journal、Ceph log 在同一個時間窗內長什麼樣。
-- 哪些 node 有 disk / LVM / container / time sync / dmesg 異常。
+- 哪些 node 有 disk / LVM / container / time sync / dmesg 異常；如果環境用 `systemd-timesyncd`，還要保留 `timedatectl`、`systemd-timesyncd` journal 與 timesyncd 設定檔。
 
 所以這頁的目標不是「怎麼修 Ceph」，而是把事故第一步固定成一句話：
 
@@ -258,13 +258,13 @@ nodes/
 - 網路：`ip addr show`。
 - kernel：`dmesg -T`。
 - systemd：`systemctl --failed`、`journalctl --since <window> -u 'ceph*'`。
-- time sync：可用時的 `chronyc tracking`、`chronyc sources -v`、`ntpq -pn`。
+- time sync：可用時的 `chronyc tracking`、`chronyc sources -v`、`ntpq -pn`；若使用 `systemd-timesyncd`，也收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl --since <window> -u systemd-timesyncd`，以及 `/etc/systemd/timesyncd.conf` 與 `/etc/systemd/timesyncd.conf.d/*.conf`。
 - container：可用時的 `podman ps -a`、`docker ps -a`。
 - cephadm：可用時的 `cephadm ls --format json-pretty`。
 - Ceph log：`/var/log/ceph` listing 與可讀 log；可用 `--skip-logs` 跳過整個 log 收集。未跳過時，單一 log 檔案預設只複製 1 MiB 以下的檔案。
 - Ceph 設定與資料目錄線索：安全列出 `/var/lib/ceph`，並複製可讀的設定檔，但排除 keyring。
 
-這裡刻意同時收 Ceph 與 Linux。Ceph 的 `HEALTH_WARN` 只告訴你 cluster 覺得哪裡不對；真正原因可能在 disk、kernel、time sync、container runtime 或 systemd。
+這裡刻意同時收 Ceph 與 Linux。Ceph 的 `HEALTH_WARN` 只告訴你 cluster 覺得哪裡不對；真正原因可能在 disk、kernel、time sync、container runtime 或 systemd。time sync 會把 `systemd-timesyncd` 放在一等公民位置，是因為很多 Debian / Ubuntu 系統不是用 chrony，而是靠 systemd 內建的 timesync daemon 維持時間。
 
 ### Rook cluster-level
 

@@ -129,6 +129,41 @@ copy_readable_etc_files() {
   done
 }
 
+collect_timesyncd_config() {
+  local outdir=$1
+  local conf=${CEPH_INCIDENT_TIMESYNCD_CONF:-/etc/systemd/timesyncd.conf}
+  local conf_d=${CEPH_INCIDENT_TIMESYNCD_CONF_D_DIR:-/etc/systemd/timesyncd.conf.d}
+  local dest="$outdir/time/systemd-timesyncd-config"
+  local source rel copied=0 failed=0
+
+  ensure_dir "$dest"
+  if [[ -f "$conf" ]]; then
+    if node_copy_file "$conf" "$dest/timesyncd.conf"; then
+      copied=1
+    else
+      failed=1
+    fi
+  fi
+
+  if [[ -d "$conf_d" ]]; then
+    ensure_dir "$dest/timesyncd.conf.d"
+    while IFS= read -r -d '' source; do
+      rel="${source#"$conf_d"/}"
+      if node_copy_file "$source" "$dest/timesyncd.conf.d/$rel"; then
+        copied=1
+      else
+        failed=1
+      fi
+    done < <(node_find0 "$conf_d" -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null || true)
+  fi
+
+  if [[ $copied -eq 0 ]]; then
+    write_skip_artifact "$dest/SKIPPED.txt" "systemd-timesyncd config not found at $conf or $conf_d"
+  fi
+
+  [[ $failed -eq 0 ]] || return 2
+}
+
 collect_ceph_log_listing() {
   local outdir=$1 manifest=$2 host_alias=$3 timeout=$4
   local log_dir=${CEPH_INCIDENT_VAR_LOG_CEPH_DIR:-/var/log/ceph}
@@ -310,6 +345,22 @@ collect_node_main() {
     failed=1
   fi
   if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "time/ntpq-peers.txt" ntpq -pn; then
+    failed=1
+  fi
+  if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "time/timedatectl-status.txt" timedatectl status; then
+    failed=1
+  fi
+  if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "time/timedatectl-show-timesync.txt" timedatectl show-timesync --all; then
+    failed=1
+  fi
+  if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "time/timedatectl-timesync-status.txt" timedatectl timesync-status; then
+    failed=1
+  fi
+  if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "time/systemd-timesyncd-status.txt" systemctl status systemd-timesyncd --no-pager --plain; then
+    failed=1
+  fi
+  node_run_privileged "$outdir" "$manifest" "$host_alias" "$timeout" "time/systemd-timesyncd-journal.txt" journalctl --since "$journal_since" -u systemd-timesyncd --no-pager || true
+  if ! collect_timesyncd_config "$outdir"; then
     failed=1
   fi
   if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$timeout" "storage/pvs.txt" pvs --noheadings --separator ' '; then
