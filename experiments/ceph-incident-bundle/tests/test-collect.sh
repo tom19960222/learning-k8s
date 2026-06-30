@@ -42,6 +42,7 @@ help_status="${help_result%%$'\n'*}"
 help_output="${help_result#*$'\n'}"
 [[ "$help_status" == "0" ]] || fail "collect.sh --help exited $help_status"
 [[ "$help_output" == *"Usage:"* ]] || fail "collect.sh --help did not print usage"
+[[ "$help_output" == *"--kube-context"* ]] || fail "help should document --kube-context"
 
 missing_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$tmpdir/missing.env")"
 missing_status="${missing_result%%$'\n'*}"

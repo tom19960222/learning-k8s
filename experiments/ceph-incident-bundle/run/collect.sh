@@ -30,7 +30,8 @@ Required:
 Options:
   --seed USER@HOST       override inventory SEED_HOST
   --out DIR              output dir (default: experiments/ceph-incident-bundle/results)
-  --mode auto|cephadm|rook
+  --mode auto|cephadm|rook   auto = per-node detect, collect ceph and/or rook layer
+  --kube-context CTX     kubectl context for the rook layer (default: none)
   --since DURATION       log/journal window (default: 24h)
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
@@ -241,7 +242,7 @@ cleanup_workdir() {
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
-  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph
+  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph kube_context=''
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
   if [[ $# -eq 0 ]]; then
@@ -269,6 +270,10 @@ main() {
         ;;
       --mode)
         mode=${2-}
+        shift 2
+        ;;
+      --kube-context)
+        kube_context=${2-}
         shift 2
         ;;
       --since)
