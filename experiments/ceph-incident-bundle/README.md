@@ -114,6 +114,19 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 - 被逾時砍掉（exit 124/137）的指令輸出會在 artifact 末尾標 `# TRUNCATED`，讓判讀者知道內容被截斷。
 - **工作機若沒有 `timeout` / `gtimeout`**（如預設 macOS），會在開頭印警告；此時外層逾時停用，只靠 SSH `ConnectTimeout` / `ServerAlive` 把關。要完整把關可 `brew install coreutils`（提供 `gtimeout`），或在 Linux ops 機執行。
 
+## 進度顯示
+
+執行時會把進度印到 **stderr**（探測每台 node、cluster ceph 的逐條指令 `[k/24]`、每台 node 收集、redact/verify/packaging）。**stdout 只會有最後一行 `bundle: <path>`**，方便 script 直接抓。
+
+要安靜（cron / 腳本）加 `--quiet`：不印進度,但 `bundle:` 與錯誤訊息照舊。
+
+```bash
+# 看得到進度（預設）
+bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h
+# 安靜，只取 bundle 路徑
+BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h --quiet | sed 's/^bundle: //')
+```
+
 ## bundle 內有什麼
 
 主要檔案：

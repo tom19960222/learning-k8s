@@ -4,7 +4,8 @@ set -euo pipefail
 # Shared helpers for the Ceph incident bundle harness.
 
 log() {
-  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"
+  # stderr: stdout is reserved for the final `bundle:` line (machine-readable).
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2
 }
 
 die() {
@@ -22,6 +23,14 @@ require_file() {
 
 ensure_dir() {
   mkdir -p "$1"
+}
+
+# Live progress to stderr (stdout stays reserved for the final `bundle:` line).
+# Suppressed when CEPH_INCIDENT_QUIET is set. Call only from workstation-side
+# code — NOT from the remote node collector (its stderr is multiplexed over ssh).
+progress() {
+  [[ -n "${CEPH_INCIDENT_QUIET:-}" ]] && return 0
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >&2
 }
 
 # Resolve a timeout binary: GNU coreutils `timeout`, or `gtimeout` on macOS.

@@ -162,9 +162,12 @@ collect_cluster_cephadm() {
 
   local spec artifact command
   local -a command_words
+  local total=$(( ${#json_specs[@]} + ${#text_specs[@]} )) k=0
   for spec in "${json_specs[@]}"; do
     artifact=${spec%%::*}
     command=${spec#*::}
+    k=$((k + 1))
+    progress "[$k/$total] ceph $command"
     # shellcheck disable=SC2206
     command_words=($command)
     if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$json_dir/$artifact" "${command_words[@]}"; then
@@ -175,6 +178,8 @@ collect_cluster_cephadm() {
   for spec in "${text_specs[@]}"; do
     artifact=${spec%%::*}
     command=${spec#*::}
+    k=$((k + 1))
+    progress "[$k/$total] ceph $command"
     # shellcheck disable=SC2206
     command_words=($command)
     if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$text_dir/$artifact" "${command_words[@]}"; then
@@ -182,6 +187,7 @@ collect_cluster_cephadm() {
     fi
   done
 
+  progress "ceph crash info (recent)…"
   if ! collect_cephadm_recent_crashes "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$json_dir/crash-ls.json"; then
     failed=1
   fi
