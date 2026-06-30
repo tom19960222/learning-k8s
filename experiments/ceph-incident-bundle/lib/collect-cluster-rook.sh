@@ -46,7 +46,9 @@ rook_run_capture() {
 rook_get_first_pod() {
   local namespace=$1 label=$2
   # -o name (not jsonpath) so the arg has no braces/brackets to mangle over ssh.
-  "${ROOK_KUBECTL_ARGV[@]}" get pods -n "$namespace" -l "$label" -o name 2>/dev/null |
+  # `|| true`: a lookup failure (e.g. remote kubectl/ssh error) must yield an
+  # empty result (-> SKIPPED artifact), not abort the collector under set -e.
+  { "${ROOK_KUBECTL_ARGV[@]}" get pods -n "$namespace" -l "$label" -o name 2>/dev/null || true; } |
     head -n1 | sed 's#^pod/##'
 }
 
@@ -130,7 +132,7 @@ collect_cluster_rook() {
   fi
 
   if ! "${ROOK_KUBECTL_ARGV[@]}" get namespace "$namespace" >/dev/null 2>&1; then
-    rook_skip "$outdir" "namespace not found: $namespace"
+    rook_skip "$outdir" "namespace not found (or kubectl unavailable on ${ssh_target:-local}): $namespace"
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 

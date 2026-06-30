@@ -98,6 +98,7 @@ case "$cmd" in
     printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n  metadata:\n    name: rook-ceph\n'
     ;;
   "get pods -n rook-ceph -l app=rook-ceph-operator -o name")
+    [[ "$mode" == "op-lookup-fail" ]] && exit 1
     printf 'pod/rook-ceph-operator-0\n'
     ;;
   "logs -n rook-ceph rook-ceph-operator-0 --since=24h")
@@ -128,7 +129,7 @@ FAKE_KUBECTL_MODE=missing-namespace PATH="$fakebin:$PATH" run_rook_collector "$o
 missing_ns_rc=$?
 set -e
 [[ "$missing_ns_rc" == "2" ]] || fail "explicit rook with missing namespace should exit 2, got $missing_ns_rc"
-assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "namespace not found: rook-ceph"
+assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "namespace not found"
 
 out_present="$tmpdir/out-present"
 manifest_present="$tmpdir/manifest-present.jsonl"
@@ -173,3 +174,14 @@ assert_file_contains "$out_remote/cluster/rook/pods-wide.txt" "rook-ceph-operato
 assert_file_contains "$out_remote/cluster/rook/toolbox-status.txt" "cluster is healthy from toolbox"
 grep -qF -- '--context lab' "$fake_ssh_log" || fail "remote kubectl missing --context"
 grep -qF 'tester@node2 kubectl' "$fake_ssh_log" || fail "kubectl did not run via ssh on the target node"
+
+# A2 regression: a pod-lookup failure must not abort the collector under set -e
+out_oplookup="$tmpdir/out-oplookup"
+manifest_oplookup="$tmpdir/manifest-oplookup.jsonl"
+oplookup_rc=0
+set +e
+FAKE_KUBECTL_MODE=op-lookup-fail PATH="$fakebin:$PATH" run_rook_collector "$out_oplookup" "$manifest_oplookup"
+oplookup_rc=$?
+set -e
+[[ "$oplookup_rc" == "0" ]] || fail "operator pod-lookup failure should not abort collector, got $oplookup_rc"
+assert_file_contains "$out_oplookup/cluster/rook/operator-SKIPPED.txt" "operator Pod not found"

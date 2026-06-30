@@ -119,9 +119,11 @@ append_error() {
 }
 
 detect_node_caps() {
-  # echo a space-joined subset of "cephadm kubectl" present on the target node
+  # echo a space-joined subset of "cephadm kubectl" present on the target node.
+  # A probe that fails to ssh is NOT the same as "node has no caps" — record the
+  # ssh failure to ERROR_LOG so a silently-dropped cluster source is visible.
   local target=$1 ssh_key=$2 timeout=$3
-  local tbin
+  local tbin out rc
   local -a ssh_cmd
   # SC2016: the probe script is single-quoted on purpose — it expands on the remote.
   # shellcheck disable=SC2016
@@ -130,7 +132,14 @@ detect_node_caps() {
   if [[ -n "$tbin" ]]; then
     ssh_cmd=("$tbin" "$timeout" "${ssh_cmd[@]}")
   fi
-  "${ssh_cmd[@]}" 2>/dev/null || true
+  out="$("${ssh_cmd[@]}" 2>/dev/null)"
+  rc=$?
+  if [[ $rc -ne 0 && -n "${ERROR_LOG:-}" ]]; then
+    ensure_dir "$(dirname -- "$ERROR_LOG")"
+    printf '%s capability probe failed for %s (ssh exit %s) — node not considered as a cluster source\n' \
+      "$(date -u +%FT%TZ)" "$target" "$rc" >>"$ERROR_LOG"
+  fi
+  printf '%s' "$out"
 }
 
 # Probe each node once; pick cluster-ceph source (first cephadm node, or --seed)
@@ -140,6 +149,8 @@ collect_clusters() {
   local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9
   local ceph_source='' rook_source='' i caps rc=0
   local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
+  # so detect_node_caps can record probe ssh failures
+  local ERROR_LOG="$workdir/errors.log"
   case "$mode" in
     cephadm) want_ceph=1 ;;
     rook) want_rook=1 ;;
@@ -183,32 +194,43 @@ collect_clusters() {
     [[ -n "$kube_context" ]] && rook_args+=(--kube-context "$kube_context")
     [[ "$mode" == auto ]] && rook_args+=(--allow-skip)
     collect_cluster_rook "${rook_args[@]}" || rc=2
-    rook_done=1
+    # "done" means real rook evidence was collected — NOT just an --allow-skip
+    # (e.g. namespace missing) which returns 0 but only writes SKIPPED.txt.
+    [[ -f "$workdir/cluster/rook/pods-wide.txt" ]] && rook_done=1
   fi
 
   # missing-source handling
+  # When a layer wasn't collected, leave a SKIPPED.txt — but never clobber a more
+  # specific reason the collector already wrote (e.g. "namespace not found").
   if [[ "$mode" == cephadm && $ceph_done -eq 0 ]]; then
     ensure_dir "$workdir/cluster/ceph"
-    printf 'SKIPPED: no cephadm-capable node found (or --seed unreachable)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+    [[ -f "$workdir/cluster/ceph/SKIPPED.txt" ]] || printf 'SKIPPED: no cephadm-capable node found (or --seed unreachable)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
     rc=2
   elif [[ "$mode" == rook && $rook_done -eq 0 ]]; then
     ensure_dir "$workdir/cluster/rook"
-    printf 'SKIPPED: no kubectl-capable node found\n' >"$workdir/cluster/rook/SKIPPED.txt"
+    [[ -f "$workdir/cluster/rook/SKIPPED.txt" ]] || printf 'SKIPPED: no kubectl-capable node found\n' >"$workdir/cluster/rook/SKIPPED.txt"
     rc=2
   elif [[ "$mode" == auto ]]; then
     # auto = collect whatever exists; only a hard failure if NEITHER layer found
     if [[ $ceph_done -eq 0 ]]; then
       ensure_dir "$workdir/cluster/ceph"
-      printf 'SKIPPED: no cephadm-capable node in inventory (auto)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+      [[ -f "$workdir/cluster/ceph/SKIPPED.txt" ]] || printf 'SKIPPED: no cephadm-capable node in inventory (auto)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
     fi
     if [[ $rook_done -eq 0 ]]; then
       ensure_dir "$workdir/cluster/rook"
-      printf 'SKIPPED: no kubectl-capable node in inventory (auto)\n' >"$workdir/cluster/rook/SKIPPED.txt"
+      [[ -f "$workdir/cluster/rook/SKIPPED.txt" ]] || printf 'SKIPPED: no kubectl-capable node in inventory (auto)\n' >"$workdir/cluster/rook/SKIPPED.txt"
     fi
     if [[ $ceph_done -eq 0 && $rook_done -eq 0 ]]; then
       rc=2
     fi
   fi
+
+  # Record which node each cluster layer was collected from (observability:
+  # "which host did we trust for ceph status?").
+  {
+    printf 'ceph_source=%s\n' "${ceph_source:-<none>}"
+    printf 'rook_source=%s\n' "${rook_source:-<none>}"
+  } >>"$workdir/environment.txt"
 
   return "$rc"
 }
@@ -374,6 +396,12 @@ main() {
   done
 
   [[ "$mode" == "auto" || "$mode" == "cephadm" || "$mode" == "rook" ]] || die "unsupported mode: $mode"
+  # kube-context runs through a remote shell (ssh kubectl --context ...). Block the
+  # actual shell metacharacters but allow the chars real contexts use (@ : / for
+  # e.g. kubernetes-admin@kubernetes and EKS ARNs).
+  if [[ -n "$kube_context" && "$kube_context" == *[!A-Za-z0-9._@:/-]* ]]; then
+    die "invalid --kube-context (allowed: A-Za-z0-9._@:/-): $kube_context"
+  fi
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
 
@@ -412,6 +440,10 @@ main() {
   local entry
   HOST_ALIASES=()
   HOST_TARGETS=()
+  # bash 3.2 + set -u: expanding an empty array errors, so guard it.
+  if [[ ${#HOSTS[@]} -eq 0 ]]; then
+    die "inventory HOSTS is empty"
+  fi
   for entry in "${HOSTS[@]}"; do
     if [[ "$entry" != *=* || -z "${entry%%=*}" || -z "${entry#*=}" ]]; then
       append_error "$workdir" "skipped malformed HOSTS entry: $entry"
