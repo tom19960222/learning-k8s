@@ -118,36 +118,97 @@ append_error() {
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$message" >>"$workdir/errors.log"
 }
 
-run_cluster_collector() {
-  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8
-  local -a probe_cmd
+detect_node_caps() {
+  # echo a space-joined subset of "cephadm kubectl" present on the target node
+  local target=$1 ssh_key=$2 timeout=$3
+  local tbin
+  local -a ssh_cmd
+  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\n" "$caps"')
+  tbin="$(timeout_cmd)"
+  if [[ -n "$tbin" ]]; then
+    ssh_cmd=("$tbin" "$timeout" "${ssh_cmd[@]}")
+  fi
+  "${ssh_cmd[@]}" 2>/dev/null || true
+}
 
+# Probe each node once; pick cluster-ceph source (first cephadm node, or --seed)
+# and cluster-rook source (first kubectl node); collect each requested layer once.
+# Uses globals HOST_TARGETS (set by main).
+collect_clusters() {
+  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9
+  local ceph_source='' rook_source='' i caps rc=0
+  local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
   case "$mode" in
-    cephadm)
-      [[ -n "$seed" && -n "$ssh_key" ]] || return 1
-      collect_cluster_cephadm "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout"
-      ;;
-    rook)
-      collect_cluster_rook --out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout"
-      ;;
-    auto)
-      local probe_tbin
-      probe_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$seed" command -v cephadm)
-      probe_tbin="$(timeout_cmd)"
-      if [[ -n "$probe_tbin" ]]; then
-        probe_cmd=("$probe_tbin" "$timeout" "${probe_cmd[@]}")
-      fi
-      if [[ -n "$seed" && -n "$ssh_key" ]] && "${probe_cmd[@]}" >/dev/null 2>&1; then
-        collect_cluster_cephadm "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout"
-      else
-        # auto-fallback is a guess; tolerate a non-rook cluster gracefully
-        collect_cluster_rook --out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout" --allow-skip
-      fi
-      ;;
-    *)
-      return 1
-      ;;
+    cephadm) want_ceph=1 ;;
+    rook) want_rook=1 ;;
+    auto) want_ceph=1; want_rook=1 ;;
+    *) return 1 ;;
   esac
+
+  # explicit --seed pins the cluster-ceph source (no probe needed for it)
+  if [[ $want_ceph -eq 1 && -n "$seed" ]]; then
+    ceph_source="$seed"
+  fi
+
+  # probe nodes only if a source we need is still unknown
+  if { [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; } || [[ $want_rook -eq 1 ]]; then
+    if [[ ${#HOST_TARGETS[@]} -gt 0 ]]; then
+      for i in "${!HOST_TARGETS[@]}"; do
+        caps="$(detect_node_caps "${HOST_TARGETS[$i]}" "$ssh_key" "$timeout")"
+        if [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; then
+          case " $caps " in *" cephadm "*) ceph_source="${HOST_TARGETS[$i]}" ;; esac
+        fi
+        if [[ $want_rook -eq 1 && -z "$rook_source" ]]; then
+          case " $caps " in *" kubectl "*) rook_source="${HOST_TARGETS[$i]}" ;; esac
+        fi
+        if { [[ $want_ceph -eq 0 || -n "$ceph_source" ]]; } && { [[ $want_rook -eq 0 || -n "$rook_source" ]]; }; then
+          break
+        fi
+      done
+    fi
+  fi
+
+  # cluster-ceph layer
+  if [[ $want_ceph -eq 1 && -n "$ceph_source" ]]; then
+    collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" || rc=2
+    ceph_done=1
+  fi
+
+  # cluster-rook layer
+  if [[ $want_rook -eq 1 && -n "$rook_source" ]]; then
+    local -a rook_args
+    rook_args=(--out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout" --ssh-target "$rook_source" --ssh-key "$ssh_key")
+    [[ -n "$kube_context" ]] && rook_args+=(--kube-context "$kube_context")
+    [[ "$mode" == auto ]] && rook_args+=(--allow-skip)
+    collect_cluster_rook "${rook_args[@]}" || rc=2
+    rook_done=1
+  fi
+
+  # missing-source handling
+  if [[ "$mode" == cephadm && $ceph_done -eq 0 ]]; then
+    ensure_dir "$workdir/cluster/ceph"
+    printf 'SKIPPED: no cephadm-capable node found (or --seed unreachable)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+    rc=2
+  elif [[ "$mode" == rook && $rook_done -eq 0 ]]; then
+    ensure_dir "$workdir/cluster/rook"
+    printf 'SKIPPED: no kubectl-capable node found\n' >"$workdir/cluster/rook/SKIPPED.txt"
+    rc=2
+  elif [[ "$mode" == auto ]]; then
+    # auto = collect whatever exists; only a hard failure if NEITHER layer found
+    if [[ $ceph_done -eq 0 ]]; then
+      ensure_dir "$workdir/cluster/ceph"
+      printf 'SKIPPED: no cephadm-capable node in inventory (auto)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+    fi
+    if [[ $rook_done -eq 0 ]]; then
+      ensure_dir "$workdir/cluster/rook"
+      printf 'SKIPPED: no kubectl-capable node in inventory (auto)\n' >"$workdir/cluster/rook/SKIPPED.txt"
+    fi
+    if [[ $ceph_done -eq 0 && $rook_done -eq 0 ]]; then
+      rc=2
+    fi
+  fi
+
+  return "$rc"
 }
 
 collect_remote_node() {
@@ -227,6 +288,9 @@ redact_bundle_text() {
 # EXIT trap, which fires after main has returned and its locals are gone.
 CLEANUP_WORKDIR=
 CLEANUP_KEEP=0
+# Parsed inventory (alias/target pairs); filled by main, read by collect_clusters + node loop.
+HOST_ALIASES=()
+HOST_TARGETS=()
 cleanup_workdir() {
   local rc=$?
   if [[ -n "${CLEANUP_WORKDIR:-}" && -d "$CLEANUP_WORKDIR" ]]; then
@@ -341,43 +405,45 @@ main() {
   trap cleanup_workdir EXIT INT TERM
   write_initial_metadata "$workdir" "$mode" "$seed" "$since" "$timeout"
 
+  # Parse HOSTS once into globals (used by the cluster capability probe AND the
+  # node loop). A malformed entry is recorded but must not abort collection.
+  local entry
+  HOST_ALIASES=()
+  HOST_TARGETS=()
+  for entry in "${HOSTS[@]}"; do
+    if [[ "$entry" != *=* || -z "${entry%%=*}" || -z "${entry#*=}" ]]; then
+      append_error "$workdir" "skipped malformed HOSTS entry: $entry"
+      rc=2
+      continue
+    fi
+    HOST_ALIASES+=("${entry%%=*}")
+    HOST_TARGETS+=("$(ssh_target_for_host "${entry#*=}" "$ssh_user")")
+  done
+
   set +e
-  run_cluster_collector "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace"
+  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context"
   cluster_rc=$?
   set -e
   if [[ $cluster_rc -ne 0 ]]; then
-    append_error "$workdir" "cluster collector exited $cluster_rc"
+    append_error "$workdir" "cluster collection exited $cluster_rc"
     rc=2
   fi
 
-  local entry alias host target node_rc
-  for entry in "${HOSTS[@]}"; do
-    # Robust parse: a malformed entry must not abort an in-progress collection.
-    if [[ "$entry" != *=* ]]; then
-      append_error "$workdir" "skipped malformed HOSTS entry: $entry"
-      node_failed=$((node_failed + 1))
-      rc=2
-      continue
-    fi
-    alias="${entry%%=*}"
-    host="${entry#*=}"
-    if [[ -z "$alias" || -z "$host" ]]; then
-      append_error "$workdir" "skipped malformed HOSTS entry: $entry"
-      node_failed=$((node_failed + 1))
-      rc=2
-      continue
-    fi
-    target="$(ssh_target_for_host "$host" "$ssh_user")"
-
-    if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
-      node_ok=$((node_ok + 1))
-    else
-      node_rc=$?
-      node_failed=$((node_failed + 1))
-      append_error "$workdir" "node $alias ($target) collector exited $node_rc"
-      rc=2
-    fi
-  done
+  local i alias target node_rc
+  if [[ ${#HOST_ALIASES[@]} -gt 0 ]]; then
+    for i in "${!HOST_ALIASES[@]}"; do
+      alias="${HOST_ALIASES[$i]}"
+      target="${HOST_TARGETS[$i]}"
+      if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
+        node_ok=$((node_ok + 1))
+      else
+        node_rc=$?
+        node_failed=$((node_failed + 1))
+        append_error "$workdir" "node $alias ($target) collector exited $node_rc"
+        rc=2
+      fi
+    done
+  fi
 
   # Test-only hook: simulate a mid-run abort to exercise trap cleanup. Inert in production.
   if [[ -n "${COLLECT_TEST_ABORT_AFTER_NODES:-}" ]]; then
