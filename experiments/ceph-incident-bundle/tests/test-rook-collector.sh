@@ -75,6 +75,11 @@ cat >"$fakebin/kubectl" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_KUBECTL_LOG:?}"
 
+# tolerate a leading "--context CTX" (added in remote/ssh mode)
+if [[ "${1:-}" == "--context" ]]; then
+  shift 2
+fi
+
 mode=${FAKE_KUBECTL_MODE:-present}
 cmd="$*"
 
@@ -92,15 +97,15 @@ case "$cmd" in
   "get cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io -n rook-ceph -o yaml")
     printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n  metadata:\n    name: rook-ceph\n'
     ;;
-  "get pods -n rook-ceph -l app=rook-ceph-operator -o jsonpath={.items[0].metadata.name}")
-    printf 'rook-ceph-operator-0'
+  "get pods -n rook-ceph -l app=rook-ceph-operator -o name")
+    printf 'pod/rook-ceph-operator-0\n'
     ;;
   "logs -n rook-ceph rook-ceph-operator-0 --since=24h")
     printf 'operator log line\n'
     ;;
-  "get pods -n rook-ceph -l app=rook-ceph-tools -o jsonpath={.items[0].metadata.name}")
+  "get pods -n rook-ceph -l app=rook-ceph-tools -o name")
     [[ "$mode" == "with-toolbox" ]] || exit 0
-    printf 'rook-ceph-tools-0'
+    printf 'pod/rook-ceph-tools-0\n'
     ;;
   "exec -n rook-ceph rook-ceph-tools-0 -- ceph status")
     printf 'cluster is healthy from toolbox\n'
@@ -137,3 +142,34 @@ assert_file_contains "$out_present/cluster/rook/toolbox-status.txt" "cluster is 
 
 grep -qF 'get namespace rook-ceph' "$FAKE_KUBECTL_LOG" || fail "namespace detection was not called"
 grep -qF 'logs -n rook-ceph rook-ceph-operator-0 --since=24h' "$FAKE_KUBECTL_LOG" || fail "operator logs were not collected"
+
+# --- remote (ssh-target) mode: kubectl runs via ssh on the chosen node, with --context ---
+fake_ssh_log="$tmpdir/ssh.log"
+cat >"$fakebin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${FAKE_SSH_LOG:?}"
+# argv: -i key <opts...> target kubectl <kubectl args...>; forward everything after 'kubectl'
+seen=0
+argv=()
+for a in "$@"; do
+  if [[ $seen -eq 1 ]]; then argv+=("$a"); continue; fi
+  [[ "$a" == "kubectl" ]] && seen=1
+done
+exec kubectl "${argv[@]}"
+EOF
+chmod +x "$fakebin/ssh"
+printf 'k\n' >"$tmpdir/key"
+
+out_remote="$tmpdir/out-remote"
+manifest_remote="$tmpdir/manifest-remote.jsonl"
+FAKE_SSH_LOG="$fake_ssh_log" FAKE_KUBECTL_MODE=with-toolbox PATH="$fakebin:$PATH" \
+  "$BASH_BIN" "$ROOT/lib/collect-cluster-rook.sh" \
+  --out "$out_remote" --manifest "$manifest_remote" \
+  --namespace rook-ceph --since 24h --timeout 5 \
+  --ssh-target tester@node2 --ssh-key "$tmpdir/key" --kube-context lab
+
+assert_file_contains "$out_remote/cluster/rook/pods-wide.txt" "rook-ceph-operator-0"
+assert_file_contains "$out_remote/cluster/rook/toolbox-status.txt" "cluster is healthy from toolbox"
+grep -qF -- '--context lab' "$fake_ssh_log" || fail "remote kubectl missing --context"
+grep -qF 'tester@node2 kubectl' "$fake_ssh_log" || fail "kubectl did not run via ssh on the target node"
