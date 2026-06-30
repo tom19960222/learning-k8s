@@ -32,6 +32,8 @@ Options:
   --out DIR              output dir (default: experiments/ceph-incident-bundle/results)
   --mode auto|cephadm|rook   auto = per-node detect, collect ceph and/or rook layer
   --kube-context CTX     kubectl context for the rook layer (default: none)
+  --kube-mode MODE       where the rook layer runs kubectl: remote (on an
+                         inventory node, default) or local (this jump host)
   --since DURATION       log/journal window (default: 24h)
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
@@ -173,7 +175,7 @@ ceph_runner_for() {
 # and cluster-rook source (first kubectl node); collect each requested layer once.
 # Uses globals HOST_TARGETS (set by main).
 collect_clusters() {
-  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9
+  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9 kube_mode="${10:-remote}"
   local ceph_source='' ceph_runner='' rook_source='' i caps rc=0
   local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
   # so detect_node_caps can record probe ssh failures
@@ -192,8 +194,12 @@ collect_clusters() {
     ceph_runner="$(ceph_runner_for "$seed" "$ssh_key" "$timeout")"
   fi
 
+  # Only probe nodes for kubectl when the rook layer runs remotely.
+  local probe_rook=0
+  [[ $want_rook -eq 1 && "$kube_mode" == remote ]] && probe_rook=1
+
   # probe nodes only if a source we need is still unknown
-  if { [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; } || [[ $want_rook -eq 1 ]]; then
+  if { [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; } || [[ $probe_rook -eq 1 ]]; then
     if [[ ${#HOST_TARGETS[@]} -gt 0 ]]; then
       progress "probing ${#HOST_TARGETS[@]} nodes for capabilities…"
       for i in "${!HOST_TARGETS[@]}"; do
@@ -209,10 +215,10 @@ collect_clusters() {
               ;;
           esac
         fi
-        if [[ $want_rook -eq 1 && -z "$rook_source" ]]; then
+        if [[ $probe_rook -eq 1 && -z "$rook_source" ]]; then
           case " $caps " in *" kubectl "*) rook_source="${HOST_TARGETS[$i]}" ;; esac
         fi
-        if { [[ $want_ceph -eq 0 || -n "$ceph_source" ]]; } && { [[ $want_rook -eq 0 || -n "$rook_source" ]]; }; then
+        if { [[ $want_ceph -eq 0 || -n "$ceph_source" ]]; } && { [[ $probe_rook -eq 0 || -n "$rook_source" ]]; }; then
           break
         fi
       done
@@ -226,11 +232,17 @@ collect_clusters() {
     ceph_done=1
   fi
 
-  # cluster-rook layer
-  if [[ $want_rook -eq 1 && -n "$rook_source" ]]; then
-    progress "collecting rook from $rook_source (ns=$rook_namespace)…"
+  # cluster-rook layer: local (this jump host) or remote (on a kubectl node)
+  if [[ $want_rook -eq 1 && ( "$kube_mode" == local || -n "$rook_source" ) ]]; then
     local -a rook_args
-    rook_args=(--out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout" --ssh-target "$rook_source" --ssh-key "$ssh_key")
+    rook_args=(--out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout")
+    if [[ "$kube_mode" == local ]]; then
+      rook_source=local
+      progress "collecting rook from local kubectl (ns=$rook_namespace)…"
+    else
+      rook_args+=(--ssh-target "$rook_source" --ssh-key "$ssh_key")
+      progress "collecting rook from $rook_source (ns=$rook_namespace)…"
+    fi
     [[ -n "$kube_context" ]] && rook_args+=(--kube-context "$kube_context")
     [[ "$mode" == auto ]] && rook_args+=(--allow-skip)
     collect_cluster_rook "${rook_args[@]}" || rc=2
@@ -379,7 +391,7 @@ cleanup_workdir() {
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
-  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph kube_context=''
+  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph kube_context='' kube_mode=remote
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
   if [[ $# -eq 0 ]]; then
@@ -411,6 +423,10 @@ main() {
         ;;
       --kube-context)
         kube_context=${2-}
+        shift 2
+        ;;
+      --kube-mode)
+        kube_mode=${2-}
         shift 2
         ;;
       --since)
@@ -455,6 +471,7 @@ main() {
   if [[ -n "$kube_context" && "$kube_context" == *[!A-Za-z0-9._@:/-]* ]]; then
     die "invalid --kube-context (allowed: A-Za-z0-9._@:/-): $kube_context"
   fi
+  [[ "$kube_mode" == "local" || "$kube_mode" == "remote" ]] || die "invalid --kube-mode (local|remote): $kube_mode"
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
 
@@ -510,7 +527,7 @@ main() {
   progress "starting: mode=$mode, ${#HOST_TARGETS[@]} hosts"
 
   set +e
-  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context"
+  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context" "$kube_mode"
   cluster_rc=$?
   set -e
   if [[ $cluster_rc -ne 0 ]]; then
