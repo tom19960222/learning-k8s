@@ -200,23 +200,25 @@ collect_clusters() {
   fi
 
   # missing-source handling
+  # When a layer wasn't collected, leave a SKIPPED.txt — but never clobber a more
+  # specific reason the collector already wrote (e.g. "namespace not found").
   if [[ "$mode" == cephadm && $ceph_done -eq 0 ]]; then
     ensure_dir "$workdir/cluster/ceph"
-    printf 'SKIPPED: no cephadm-capable node found (or --seed unreachable)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+    [[ -f "$workdir/cluster/ceph/SKIPPED.txt" ]] || printf 'SKIPPED: no cephadm-capable node found (or --seed unreachable)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
     rc=2
   elif [[ "$mode" == rook && $rook_done -eq 0 ]]; then
     ensure_dir "$workdir/cluster/rook"
-    printf 'SKIPPED: no kubectl-capable node found\n' >"$workdir/cluster/rook/SKIPPED.txt"
+    [[ -f "$workdir/cluster/rook/SKIPPED.txt" ]] || printf 'SKIPPED: no kubectl-capable node found\n' >"$workdir/cluster/rook/SKIPPED.txt"
     rc=2
   elif [[ "$mode" == auto ]]; then
     # auto = collect whatever exists; only a hard failure if NEITHER layer found
     if [[ $ceph_done -eq 0 ]]; then
       ensure_dir "$workdir/cluster/ceph"
-      printf 'SKIPPED: no cephadm-capable node in inventory (auto)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
+      [[ -f "$workdir/cluster/ceph/SKIPPED.txt" ]] || printf 'SKIPPED: no cephadm-capable node in inventory (auto)\n' >"$workdir/cluster/ceph/SKIPPED.txt"
     fi
     if [[ $rook_done -eq 0 ]]; then
       ensure_dir "$workdir/cluster/rook"
-      printf 'SKIPPED: no kubectl-capable node in inventory (auto)\n' >"$workdir/cluster/rook/SKIPPED.txt"
+      [[ -f "$workdir/cluster/rook/SKIPPED.txt" ]] || printf 'SKIPPED: no kubectl-capable node in inventory (auto)\n' >"$workdir/cluster/rook/SKIPPED.txt"
     fi
     if [[ $ceph_done -eq 0 && $rook_done -eq 0 ]]; then
       rc=2
@@ -394,13 +396,14 @@ main() {
   done
 
   [[ "$mode" == "auto" || "$mode" == "cephadm" || "$mode" == "rook" ]] || die "unsupported mode: $mode"
+  # kube-context runs through a remote shell (ssh kubectl --context ...). Block the
+  # actual shell metacharacters but allow the chars real contexts use (@ : / for
+  # e.g. kubernetes-admin@kubernetes and EKS ARNs).
+  if [[ -n "$kube_context" && "$kube_context" == *[!A-Za-z0-9._@:/-]* ]]; then
+    die "invalid --kube-context (allowed: A-Za-z0-9._@:/-): $kube_context"
+  fi
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
-  # kube-context runs through a remote shell (ssh kubectl --context ...); restrict
-  # to the characters kubectl contexts actually use so it cannot word-split/inject.
-  if [[ -n "$kube_context" && "$kube_context" == *[!A-Za-z0-9._-]* ]]; then
-    die "invalid --kube-context (allowed: A-Za-z0-9._-): $kube_context"
-  fi
 
   # shellcheck disable=SC1090
   source "$inventory"

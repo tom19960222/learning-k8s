@@ -308,7 +308,9 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --mode auto --out "$out_nsmiss" --since 24h --timeout 5
 st=$?; set -e
 [[ "$st" == "2" ]] || fail "auto with rook allow-skip and no ceph should exit 2, got $st"
-assert_archive_contains "$(find_bundle "$out_nsmiss")" "cluster/rook/SKIPPED.txt"
+# the specific collector reason must survive (not be overwritten by the generic auto skip)
+tar -xOzf "$(find_bundle "$out_nsmiss")" ./cluster/rook/SKIPPED.txt 2>/dev/null | grep -qF 'namespace not found' \
+  || fail "auto skip overwrote the specific rook SKIPPED reason"
 
 # A3: a node whose capability probe ssh fails is recorded in errors.log
 out_probefail="$tmpdir/out-probefail"
@@ -331,9 +333,16 @@ empty_output="${empty_result#*$'\n'}"
 [[ "$empty_status" == "1" ]] || fail "empty HOSTS should exit 1, got $empty_status"
 [[ "$empty_output" == *"HOSTS is empty"* ]] || fail "empty HOSTS should explain the failure"
 
-# A6: --kube-context with shell metacharacters is rejected (exit 1)
-ctx_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$inventory" --ssh-key "$ssh_key" --kube-context 'bad;ctx')"
-ctx_status="${ctx_result%%$'\n'*}"
-[[ "$ctx_status" == "1" ]] || fail "invalid --kube-context should exit 1, got $ctx_status"
+# A6: --kube-context with shell metacharacters is rejected (exit 1)...
+ctx_bad="$(run_and_capture "$ROOT/run/collect.sh" --kube-context 'bad;ctx' --inventory "$inventory" --ssh-key "$ssh_key")"
+ctx_bad_status="${ctx_bad%%$'\n'*}"
+ctx_bad_output="${ctx_bad#*$'\n'}"
+[[ "$ctx_bad_status" == "1" ]] || fail "invalid --kube-context should exit 1, got $ctx_bad_status"
+[[ "$ctx_bad_output" == *"invalid --kube-context"* ]] || fail "bad context should explain failure"
+# ...but a real context (kubernetes-admin@kubernetes / EKS ARN chars @ : /) is accepted:
+# it passes validation and fails later on the missing inventory instead.
+ctx_ok="$(run_and_capture "$ROOT/run/collect.sh" --kube-context 'arn:aws:eks:us-east-1:1/x@k8s' --inventory /nope.env --ssh-key "$ssh_key")"
+ctx_ok_output="${ctx_ok#*$'\n'}"
+[[ "$ctx_ok_output" == *"missing inventory"* ]] || fail "valid kube-context wrongly rejected: $ctx_ok_output"
 
 printf 'ok: collect orchestration\n'
