@@ -13,11 +13,6 @@ Usage: collect-node.sh --out DIR --host-alias ALIAS [--since DURATION] [--timeou
 EOF
 }
 
-write_skip_artifact() {
-  local artifact=$1 reason=$2
-  ensure_dir "$(dirname -- "$artifact")"
-  printf 'SKIPPED: %s\n' "$reason" >"$artifact"
-}
 
 node_run_capture() {
   local outdir=$1 manifest=$2 host_alias=$3 timeout=$4 artifact_rel=$5
