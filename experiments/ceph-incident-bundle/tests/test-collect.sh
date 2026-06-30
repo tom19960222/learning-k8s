@@ -90,14 +90,39 @@ whole="$*"
 args=("$@")
 n=${#args[@]}
 
-# Order matters: the capability-probe script also contains "kubectl", so it must
-# be matched before the kubectl-forward branch.
+# target = first arg after the -i KEY / -o OPT option pairs
+target=''; j=0
+while [[ $j -lt $n ]]; do
+  case "${args[$j]}" in
+    -i|-o) j=$((j + 2)) ;;
+    *) target="${args[$j]}"; break ;;
+  esac
+done
+
+# Order matters: the capability-probe script also contains "kubectl", and the
+# runner connectivity probe ("--connect-timeout 5 -s") must be matched before the
+# generic ceph/cephadm command branches.
 case "$whole" in
+  *"--connect-timeout 5 -s"*)
+    # ceph runner connectivity probe; succeed per method+target env
+    case "$whole" in
+      *"cephadm shell"*) method=cephadm ;;
+      *"sudo -n ceph"*) method=sudo ;;
+      *) method=direct ;;
+    esac
+    ok=0
+    case "$method" in
+      direct) for t in ${FAKE_CEPH_DIRECT_OK:-}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
+      sudo) for t in ${FAKE_CEPH_SUDO_OK:-}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
+      cephadm) for t in ${FAKE_CEPHADM_OK:-${FAKE_CEPH_TARGETS:-}}; do [[ "$target" == *"$t"* ]] && ok=1; done ;;
+    esac
+    exit $(( ok == 1 ? 0 : 1 ))
+    ;;
   *"command -v cephadm"*)
-    target="${args[$((n-2))]}"   # probe sends a single-arg remote script
     for t in ${FAKE_PROBE_FAIL_TARGETS:-}; do [[ "$target" == *"$t"* ]] && exit 255; done
     caps=""
     for t in ${FAKE_CEPH_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps cephadm"; done
+    for t in ${FAKE_CEPH_BIN_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps ceph"; done
     for t in ${FAKE_KUBE_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps kubectl"; done
     printf '%s\n' "$caps"
     exit 0
@@ -132,8 +157,12 @@ case "$whole" in
     done
     exec kubectl "${kargs[@]}"
     ;;
+  *" ceph "*)
+    # direct/sudo `ceph <args>` cluster commands — same responses as cephadm shell
+    exec "$FIXTURE_SSH" "$@"
+    ;;
   *)
-    printf 'unexpected ssh remote: %s\n' "$remote" >&2
+    printf 'unexpected ssh remote: %s\n' "$whole" >&2
     exit 99
     ;;
 esac
@@ -344,6 +373,44 @@ ctx_bad_output="${ctx_bad#*$'\n'}"
 ctx_ok="$(run_and_capture "$ROOT/run/collect.sh" --kube-context 'arn:aws:eks:us-east-1:1/x@k8s' --inventory /nope.env --ssh-key "$ssh_key")"
 ctx_ok_output="${ctx_ok#*$'\n'}"
 [[ "$ctx_ok_output" == *"missing inventory"* ]] || fail "valid kube-context wrongly rejected: $ctx_ok_output"
+
+# prefer direct ceph: a node where `ceph -s` connects uses plain `ceph` (no cephadm shell)
+inv_direct="$tmpdir/inv-direct.env"
+cat >"$inv_direct" <<'EOF'
+SSH_USER="tester"
+HOSTS=(
+  "cephnode=10.0.0.1"
+)
+EOF
+out_direct="$tmpdir/out-direct"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_BIN_TARGETS="10.0.0.1" FAKE_CEPH_DIRECT_OK="10.0.0.1" FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS="" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inv_direct" --ssh-key "$ssh_key" \
+  --mode cephadm --out "$out_direct" --since 24h --timeout 5
+bundle_direct="$(find_bundle "$out_direct")"
+assert_archive_contains "$bundle_direct" "cluster/ceph/json/status.json"
+grep -qF '10.0.0.1 ceph status --format json-pretty' "$FAKE_SSH_LOG" || fail "direct runner should use plain ceph"
+grep -qF 'cephadm shell' "$FAKE_SSH_LOG" && fail "direct runner must not use cephadm shell" || true
+tar -xOzf "$bundle_direct" ./environment.txt 2>/dev/null | grep -qF 'ceph_runner=direct' || fail "environment.txt should record ceph_runner=direct"
+
+# fallback: direct/sudo don't connect but cephadm does -> cephadm shell runner
+inv_fb="$tmpdir/inv-fb.env"
+cat >"$inv_fb" <<'EOF'
+SSH_USER="tester"
+HOSTS=(
+  "c1=10.0.0.1"
+)
+EOF
+out_fb="$tmpdir/out-fb"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_CEPH_DIRECT_OK="" FAKE_CEPH_SUDO_OK="" FAKE_KUBE_TARGETS="" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inv_fb" --ssh-key "$ssh_key" \
+  --mode cephadm --out "$out_fb" --since 24h --timeout 5
+bundle_fb="$(find_bundle "$out_fb")"
+grep -qF '10.0.0.1 sudo -n cephadm shell -- ceph status --format json-pretty' "$FAKE_SSH_LOG" || fail "fallback should use cephadm shell"
+tar -xOzf "$bundle_fb" ./environment.txt 2>/dev/null | grep -qF 'ceph_runner=cephadm' || fail "environment.txt should record ceph_runner=cephadm"
 
 # Progress: default-on goes to stderr; stdout stays just `bundle:`; --quiet silences it.
 prog_out="$tmpdir/prog.out"; prog_err="$tmpdir/prog.err"

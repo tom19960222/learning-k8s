@@ -7,13 +7,28 @@ CEPHADM_COLLECTOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$CEPHADM_COLLECTOR_DIR/common.sh"
 
+# The remote prefix that actually runs ceph on the source node, by runner token:
+#   direct  -> ceph                          (fast: no container per command)
+#   sudo    -> sudo -n ceph
+#   cephadm -> sudo -n cephadm shell -- ceph (default; spins a container each call)
+ceph_runner_argv() {
+  case "$1" in
+    direct) printf '%s\n' ceph ;;
+    sudo) printf '%s\n' sudo -n ceph ;;
+    *) printf '%s\n' sudo -n cephadm shell -- ceph ;;
+  esac
+}
+
 collect_cephadm_command() {
-  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 timeout=$5 artifact=$6
-  shift 6
+  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 timeout=$5 runner=$6 artifact=$7
+  shift 7
 
   local artifact_dir
   artifact_dir="$(dirname -- "$artifact")"
   ensure_dir "$artifact_dir"
+
+  local -a runner_argv
+  while IFS= read -r _w; do runner_argv+=("$_w"); done < <(ceph_runner_argv "$runner")
 
   COMMAND_TIMEOUT="$timeout" ERROR_LOG="${ERROR_LOG:-$outdir/errors.log}" \
     run_capture "$manifest" "$seed" "collect-cluster-cephadm" "$artifact" -- \
@@ -26,7 +41,7 @@ collect_cephadm_command() {
       -o "ServerAliveInterval=$timeout" \
       -o ServerAliveCountMax=1 \
       "$seed" \
-      sudo -n cephadm shell -- ceph "$@"
+      "${runner_argv[@]}" "$@"
 }
 
 write_cephadm_crash_skip() {
@@ -92,7 +107,7 @@ cephadm_unique_crash_artifact() {
 }
 
 collect_cephadm_recent_crashes() {
-  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 timeout=$5 crash_ls_artifact=$6
+  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 timeout=$5 runner=$6 crash_ls_artifact=$7
 
   local crash_dir="$outdir/cluster/ceph/json/crash-info"
   local skip_artifact="$outdir/cluster/ceph/text/crash-info-skip.txt"
@@ -110,7 +125,7 @@ collect_cephadm_recent_crashes() {
     [[ -n "$crash_id" ]] || continue
     safe_id="$(cephadm_crash_artifact_name "$crash_id")"
     crash_info_artifact="$(cephadm_unique_crash_artifact "$crash_dir" "$safe_id")"
-    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$crash_info_artifact" crash info "$crash_id"; then
+    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$runner" "$crash_info_artifact" crash info "$crash_id"; then
       rc=2
     fi
   done <<<"$crash_ids"
@@ -119,7 +134,7 @@ collect_cephadm_recent_crashes() {
 }
 
 collect_cluster_cephadm() {
-  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 since=$5 timeout=$6
+  local outdir=$1 manifest=$2 seed=$3 ssh_key=$4 since=$5 timeout=$6 runner="${7:-cephadm}"
   local failed=0
   local json_dir="$outdir/cluster/ceph/json"
   local text_dir="$outdir/cluster/ceph/text"
@@ -170,7 +185,7 @@ collect_cluster_cephadm() {
     progress "[$k/$total] ceph $command"
     # shellcheck disable=SC2206
     command_words=($command)
-    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$json_dir/$artifact" "${command_words[@]}"; then
+    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$runner" "$json_dir/$artifact" "${command_words[@]}"; then
       failed=1
     fi
   done
@@ -182,13 +197,13 @@ collect_cluster_cephadm() {
     progress "[$k/$total] ceph $command"
     # shellcheck disable=SC2206
     command_words=($command)
-    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$text_dir/$artifact" "${command_words[@]}"; then
+    if ! collect_cephadm_command "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$runner" "$text_dir/$artifact" "${command_words[@]}"; then
       failed=1
     fi
   done
 
   progress "ceph crash info (recent)…"
-  if ! collect_cephadm_recent_crashes "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$json_dir/crash-ls.json"; then
+  if ! collect_cephadm_recent_crashes "$outdir" "$manifest" "$seed" "$ssh_key" "$timeout" "$runner" "$json_dir/crash-ls.json"; then
     failed=1
   fi
 

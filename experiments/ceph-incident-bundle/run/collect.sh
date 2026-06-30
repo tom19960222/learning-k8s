@@ -128,7 +128,7 @@ detect_node_caps() {
   local -a ssh_cmd
   # SC2016: the probe script is single-quoted on purpose — it expands on the remote.
   # shellcheck disable=SC2016
-  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\n" "$caps"')
+  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v ceph >/dev/null 2>&1 && caps="$caps ceph"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\n" "$caps"')
   tbin="$(timeout_cmd)"
   if [[ -n "$tbin" ]]; then
     ssh_cmd=("$tbin" "$timeout" "${ssh_cmd[@]}")
@@ -143,12 +143,38 @@ detect_node_caps() {
   printf '%s' "$out"
 }
 
+# Does a given runner actually connect to the cluster on this node? "usable" is
+# defined as `ceph -s` succeeding, not merely the binary existing.
+ceph_runner_probe() {
+  local target=$1 ssh_key=$2 timeout=$3 method=$4
+  local tbin w
+  local -a pfx ssh_cmd
+  while IFS= read -r w; do pfx+=("$w"); done < <(ceph_runner_argv "$method")
+  ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" "${pfx[@]}" --connect-timeout 5 -s)
+  tbin="$(timeout_cmd)"
+  [[ -n "$tbin" ]] && ssh_cmd=("$tbin" "$timeout" "${ssh_cmd[@]}")
+  "${ssh_cmd[@]}" >/dev/null 2>&1
+}
+
+# Pick the fastest runner that connects on $target: direct ceph, sudo ceph, then
+# cephadm shell. Echoes the runner token, or nothing if none connects.
+ceph_runner_for() {
+  local target=$1 ssh_key=$2 timeout=$3 m
+  for m in direct sudo cephadm; do
+    if ceph_runner_probe "$target" "$ssh_key" "$timeout" "$m"; then
+      printf '%s' "$m"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # Probe each node once; pick cluster-ceph source (first cephadm node, or --seed)
 # and cluster-rook source (first kubectl node); collect each requested layer once.
 # Uses globals HOST_TARGETS (set by main).
 collect_clusters() {
   local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9
-  local ceph_source='' rook_source='' i caps rc=0
+  local ceph_source='' ceph_runner='' rook_source='' i caps rc=0
   local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
   # so detect_node_caps can record probe ssh failures
   local ERROR_LOG="$workdir/errors.log"
@@ -159,9 +185,11 @@ collect_clusters() {
     *) return 1 ;;
   esac
 
-  # explicit --seed pins the cluster-ceph source (no probe needed for it)
+  # explicit --seed pins the cluster-ceph source; the runner is still chosen by
+  # connectivity (so direct ceph is preferred on the seed too).
   if [[ $want_ceph -eq 1 && -n "$seed" ]]; then
     ceph_source="$seed"
+    ceph_runner="$(ceph_runner_for "$seed" "$ssh_key" "$timeout")"
   fi
 
   # probe nodes only if a source we need is still unknown
@@ -171,8 +199,15 @@ collect_clusters() {
       for i in "${!HOST_TARGETS[@]}"; do
         caps="$(detect_node_caps "${HOST_TARGETS[$i]}" "$ssh_key" "$timeout")"
         progress "[$((i + 1))/${#HOST_TARGETS[@]}] probe ${HOST_TARGETS[$i]}: ${caps:-none}"
+        # ceph source = first candidate (has ceph or cephadm binary) whose runner
+        # actually connects to the cluster.
         if [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; then
-          case " $caps " in *" cephadm "*) ceph_source="${HOST_TARGETS[$i]}" ;; esac
+          case " $caps " in
+            *" ceph "*|*" cephadm "*)
+              ceph_runner="$(ceph_runner_for "${HOST_TARGETS[$i]}" "$ssh_key" "$timeout")"
+              [[ -n "$ceph_runner" ]] && ceph_source="${HOST_TARGETS[$i]}"
+              ;;
+          esac
         fi
         if [[ $want_rook -eq 1 && -z "$rook_source" ]]; then
           case " $caps " in *" kubectl "*) rook_source="${HOST_TARGETS[$i]}" ;; esac
@@ -186,8 +221,8 @@ collect_clusters() {
 
   # cluster-ceph layer
   if [[ $want_ceph -eq 1 && -n "$ceph_source" ]]; then
-    progress "collecting ceph cluster from $ceph_source…"
-    collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" || rc=2
+    progress "collecting ceph cluster from $ceph_source via ${ceph_runner:-cephadm}…"
+    collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" "${ceph_runner:-cephadm}" || rc=2
     ceph_done=1
   fi
 
@@ -234,6 +269,7 @@ collect_clusters() {
   # "which host did we trust for ceph status?").
   {
     printf 'ceph_source=%s\n' "${ceph_source:-<none>}"
+    printf 'ceph_runner=%s\n' "${ceph_runner:-<none>}"
     printf 'rook_source=%s\n' "${rook_source:-<none>}"
   } >>"$workdir/environment.txt"
 

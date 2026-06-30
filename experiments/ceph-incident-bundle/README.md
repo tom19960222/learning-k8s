@@ -64,7 +64,7 @@ HOSTS=(
 
 預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集：
 
-- node 上有 `cephadm` → 從**第一台**有 cephadm 的 node 收 cluster-level ceph（`sudo -n cephadm shell -- ceph ...`）。
+- node 上有 `ceph` 或 `cephadm` → 從**第一台連得上 cluster** 的 node 收 cluster-level ceph。執行方式優先序：直接 `ceph`（最快，免每條起 container）→ `sudo -n ceph` → `sudo -n cephadm shell -- ceph`。「可用」= `ceph -s` 連得上,不是 binary 存在;選到哪個會記在進度（`via ceph` / `via cephadm shell`）與 `environment.txt` 的 `ceph_runner=`。
 - node 上有 `kubectl` → 從**第一台**有 kubectl 的 node、用 ssh 在該 node 上跑 `kubectl`（可加 `--kube-context`）收 rook 層。
 - 兩層都有來源就都收、各收一次;node 層一律每台都收。
 
