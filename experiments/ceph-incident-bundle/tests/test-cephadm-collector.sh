@@ -127,6 +127,44 @@ test_collect_cluster_cephadm_records_skip_text_when_crash_list_is_invalid() {
   fi
 }
 
+test_collect_cluster_cephadm_runner_direct() {
+  local outdir="$tmpdir/out-direct"
+  local manifest="$tmpdir/manifest-direct.jsonl"
+  local ssh_log="$tmpdir/ssh-direct.log"
+  mkdir -p "$outdir"
+  touch "$tmpdir/id_ed25519"
+
+  make_fake_ssh "$ssh_log"
+  collect_cluster_cephadm "$outdir" "$manifest" "monitor01@example.invalid" "$tmpdir/id_ed25519" "7 days ago" "30" "direct"
+
+  [[ -f "$outdir/cluster/ceph/json/status.json" ]] || fail "direct runner produced no status artifact"
+  grep -qF 'monitor01@example.invalid ceph status --format json-pretty' "$ssh_log" || fail "direct runner should run plain 'ceph', got: $(grep -F 'ceph status --format json-pretty' "$ssh_log" | head -1)"
+  if grep -qF 'cephadm shell' "$ssh_log"; then
+    fail "direct runner must NOT use cephadm shell"
+  fi
+  if grep -qF 'sudo -n ceph' "$ssh_log"; then
+    fail "direct runner must NOT use sudo"
+  fi
+}
+
+test_collect_cluster_cephadm_runner_sudo() {
+  local outdir="$tmpdir/out-sudo"
+  local manifest="$tmpdir/manifest-sudo.jsonl"
+  local ssh_log="$tmpdir/ssh-sudo.log"
+  mkdir -p "$outdir"
+  touch "$tmpdir/id_ed25519"
+
+  make_fake_ssh "$ssh_log"
+  collect_cluster_cephadm "$outdir" "$manifest" "monitor01@example.invalid" "$tmpdir/id_ed25519" "7 days ago" "30" "sudo"
+
+  grep -qF 'monitor01@example.invalid sudo -n ceph status --format json-pretty' "$ssh_log" || fail "sudo runner should run 'sudo -n ceph'"
+  if grep -qF 'cephadm shell' "$ssh_log"; then
+    fail "sudo runner must NOT use cephadm shell"
+  fi
+}
+
 test_collect_cluster_cephadm_happy_path_and_limit_recent_crashes
 test_collect_cluster_cephadm_returns_partial_failure_and_keeps_collecting
 test_collect_cluster_cephadm_records_skip_text_when_crash_list_is_invalid
+test_collect_cluster_cephadm_runner_direct
+test_collect_cluster_cephadm_runner_sudo
