@@ -11,6 +11,8 @@ source "$COLLECT_ROOT/lib/common.sh"
 source "$COLLECT_ROOT/lib/collect-cluster-cephadm.sh"
 # shellcheck disable=SC1091
 source "$COLLECT_ROOT/lib/collect-cluster-rook.sh"
+# shellcheck disable=SC1091
+source "$COLLECT_ROOT/lib/bundle.sh"
 
 usage() {
   cat <<'EOF'
@@ -48,71 +50,6 @@ Output:
 Exit codes:
   0 complete, 2 partial collection failure with bundle produced, 1 usage/config/verify failure
 EOF
-}
-
-ssh_target_for_host() {
-  local host=$1 ssh_user=$2
-  if [[ "$host" == *@* || -z "$ssh_user" ]]; then
-    printf '%s' "$host"
-  else
-    printf '%s@%s' "$ssh_user" "$host"
-  fi
-}
-
-shell_quote() {
-  local value=$1
-  [[ "$value" != *"'"* ]] || return 1
-  printf "'%s'" "$value"
-}
-
-write_initial_metadata() {
-  local workdir=$1 mode=$2 seed=$3 since=$4 timeout=$5
-  local git_commit
-  git_commit="$(git -C "$COLLECT_ROOT/../.." rev-parse --short HEAD 2>/dev/null || printf unknown)"
-
-  cat >"$workdir/README-FIRST.txt" <<'EOF'
-Ceph incident bundle
-
-Start with:
-- summary.txt
-- errors.log
-- cluster/
-- nodes/
-
-This bundle is read-only evidence captured at incident time. Review it before sharing outside your team.
-EOF
-
-  cat >"$workdir/environment.txt" <<EOF
-created_utc=$(date -u +%FT%TZ)
-mode=$mode
-seed=$seed
-since=$since
-timeout=$timeout
-git_commit=$git_commit
-EOF
-
-  : >"$workdir/manifest.jsonl"
-  : >"$workdir/errors.log"
-}
-
-write_summary() {
-  local workdir=$1 mode=$2 seed=$3 node_ok=$4 node_failed=$5 cluster_status=$6 final_status=$7
-
-  {
-    printf 'Ceph incident bundle summary\n'
-    printf 'created_utc: %s\n' "$(date -u +%FT%TZ)"
-    printf 'mode: %s\n' "$mode"
-    printf 'seed: %s\n' "$seed"
-    printf 'cluster_status: %s\n' "$cluster_status"
-    printf 'node_ok: %s\n' "$node_ok"
-    printf 'node_failed: %s\n' "$node_failed"
-    printf 'final_status: %s\n' "$final_status"
-  } >"$workdir/summary.txt"
-}
-
-append_error() {
-  local workdir=$1 message=$2
-  printf '%s %s\n' "$(date -u +%FT%TZ)" "$message" >>"$workdir/errors.log"
 }
 
 detect_node_caps() {
@@ -173,7 +110,24 @@ ceph_runner_for() {
 # and cluster-rook source (first kubectl node); collect each requested layer once.
 # Uses globals HOST_TARGETS (set by main).
 collect_clusters() {
-  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9 kube_mode="${10:-remote}" rook_operator_namespace="${11:-}"
+  local mode='' workdir='' manifest='' seed='' ssh_key='' since=24h timeout=20
+  local rook_namespace=rook-ceph kube_context='' kube_mode=remote rook_operator_namespace=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode) mode=${2-}; shift 2 ;;
+      --workdir) workdir=${2-}; shift 2 ;;
+      --manifest) manifest=${2-}; shift 2 ;;
+      --seed) seed=${2-}; shift 2 ;;
+      --ssh-key) ssh_key=${2-}; shift 2 ;;
+      --since) since=${2-}; shift 2 ;;
+      --timeout) timeout=${2-}; shift 2 ;;
+      --namespace) rook_namespace=${2-}; shift 2 ;;
+      --operator-namespace) rook_operator_namespace=${2-}; shift 2 ;;
+      --kube-context) kube_context=${2-}; shift 2 ;;
+      --kube-mode) kube_mode=${2-}; shift 2 ;;
+      *) return 1 ;;
+    esac
+  done
   local ceph_source='' ceph_runner='' rook_source='' i caps rc=0
   local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
   # so detect_node_caps can record probe ssh failures
@@ -346,19 +300,6 @@ collect_remote_node() {
   return "$rc"
 }
 
-redact_bundle_text() {
-  local workdir=$1
-  local redaction_log="$workdir/redactions.log"
-  local path
-
-  while IFS= read -r path; do
-    case "$path" in
-      *.gz) redact_gz_file "$path" "$redaction_log" ;;
-      *) redact_file "$path" "$redaction_log" ;;
-    esac
-  done < <(find "$workdir/cluster" "$workdir/nodes" -type f \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' \) -print 2>/dev/null || true)
-}
-
 # Single cleanup point. Uses globals (not main's locals) so it works as an
 # EXIT trap, which fires after main has returned and its locals are gone.
 CLEANUP_WORKDIR=
@@ -518,7 +459,11 @@ main() {
   progress "starting: mode=$mode, ${#HOST_TARGETS[@]} hosts"
 
   set +e
-  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context" "$kube_mode" "$rook_operator_namespace"
+  collect_clusters \
+    --mode "$mode" --workdir "$workdir" --manifest "$manifest" \
+    --seed "$seed" --ssh-key "$ssh_key" --since "$since" --timeout "$timeout" \
+    --namespace "$rook_namespace" --operator-namespace "$rook_operator_namespace" \
+    --kube-context "$kube_context" --kube-mode "$kube_mode"
   cluster_rc=$?
   set -e
   if [[ $cluster_rc -ne 0 ]]; then
