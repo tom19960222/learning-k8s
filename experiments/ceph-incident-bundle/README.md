@@ -15,6 +15,16 @@
 - node CPU、RAM、disk、網路看起來異常，但還不確定是不是 Ceph 問題
 - 準備請別人或 AI 協助判讀，需要保留當下證據
 
+## 前置需求（known_hosts）
+
+工具的 SSH 都用 `BatchMode=yes`(不互動),所以**第一次從一台新跳板機執行前**,跳板機的 `known_hosts` 必須已經有所有目標 node 的 host key,否則每台會以 `Host key verification failed` 失敗、被標 SKIPPED(exit 2)。先做一次:
+
+```bash
+# 對 inventory 裡每台 host 先建立 host key（擇一）
+ssh-keyscan -H 192.168.18.166 192.168.18.167 ... >> ~/.ssh/known_hosts
+# 或手動 ssh 每台一次，確認指紋後接受
+```
+
 ## 最短操作流程
 
 在 repo root 執行：
@@ -152,7 +162,7 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 
 - `missing inventory`：確認 `--inventory` 路徑存在。
 - `missing ssh key`：確認 `--ssh-key` 路徑存在，且本機可讀。
-- `node <alias> collector exited 255`：通常是 SSH 連線、帳號、key、known_hosts 或 sudo 權限問題。
+- `node <alias> collector exited 255` / `Host key verification failed`：SSH 連線、帳號、key、**known_hosts**(見上方「前置需求」)或 sudo 權限問題。新跳板機最常見的是 known_hosts 還沒有該 node 的 host key。
 - `VERIFY FAIL`：bundle 結構不完整，或包含 `keyring`、`.ssh`、`id_ed25519`、`private_key`、`*.pem`/`*.key`/`*.crt` 這類路徑，或檔案內容殘留未遮蔽的 private key / `key = <base64>` 金鑰材料。此時 workdir 會被保留、不打包，先看印出的路徑與 `errors.log`。
 - exit code `2`：先不要重跑覆蓋判讀脈絡，先保留 `.tar.gz`，再看 `errors.log` 決定是否針對失敗 node 補跑。
 
