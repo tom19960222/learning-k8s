@@ -221,6 +221,20 @@ test_redact_gz_file() {
   [[ "$decoded" != *"AQBsecretkeymaterial"* ]] || fail "gz secret leaked"
 }
 
+test_progress_respects_quiet() {
+  local out
+  out="$(progress "hello-progress" 2>&1)"
+  [[ "$out" == *"hello-progress"* ]] || fail "progress should print when not quiet"
+  out="$(CEPH_INCIDENT_QUIET=1 progress "hello-progress" 2>&1)"
+  [[ -z "$out" ]] || fail "progress should be silent when CEPH_INCIDENT_QUIET set, got '$out'"
+}
+
+test_progress_goes_to_stderr() {
+  local on_stdout
+  on_stdout="$(progress "stderr-check" 2>/dev/null)"
+  [[ -z "$on_stdout" ]] || fail "progress must not write to stdout, got '$on_stdout'"
+}
+
 test_run_capture_success() {
   local manifest="$tmpdir/run-manifest.jsonl"
   local artifact="$tmpdir/run-artifact.txt"
@@ -348,6 +362,8 @@ test_redact_file_multiline_pem_body
 test_redact_file_ceph_key_material
 test_redact_file_preserves_mode
 test_redact_gz_file
+test_progress_respects_quiet
+test_progress_goes_to_stderr
 test_run_capture_success
 test_run_capture_non_zero_writes_error_log_and_returns_code
 test_run_capture_missing_double_dash_is_fatal

@@ -36,6 +36,7 @@ Options:
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
   --skip-logs            collect state but skip larger Ceph log copies
+  --quiet                suppress progress output on stderr (stdout still prints bundle:)
   --keep-workdir         keep temporary extracted workdir for debugging
   --help                 print this help
 
@@ -166,8 +167,10 @@ collect_clusters() {
   # probe nodes only if a source we need is still unknown
   if { [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; } || [[ $want_rook -eq 1 ]]; then
     if [[ ${#HOST_TARGETS[@]} -gt 0 ]]; then
+      progress "probing ${#HOST_TARGETS[@]} nodes for capabilities…"
       for i in "${!HOST_TARGETS[@]}"; do
         caps="$(detect_node_caps "${HOST_TARGETS[$i]}" "$ssh_key" "$timeout")"
+        progress "[$((i + 1))/${#HOST_TARGETS[@]}] probe ${HOST_TARGETS[$i]}: ${caps:-none}"
         if [[ $want_ceph -eq 1 && -z "$ceph_source" ]]; then
           case " $caps " in *" cephadm "*) ceph_source="${HOST_TARGETS[$i]}" ;; esac
         fi
@@ -183,12 +186,14 @@ collect_clusters() {
 
   # cluster-ceph layer
   if [[ $want_ceph -eq 1 && -n "$ceph_source" ]]; then
+    progress "collecting ceph cluster from $ceph_source…"
     collect_cluster_cephadm "$workdir" "$manifest" "$ceph_source" "$ssh_key" "$since" "$timeout" || rc=2
     ceph_done=1
   fi
 
   # cluster-rook layer
   if [[ $want_rook -eq 1 && -n "$rook_source" ]]; then
+    progress "collecting rook from $rook_source (ns=$rook_namespace)…"
     local -a rook_args
     rook_args=(--out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout" --ssh-target "$rook_source" --ssh-key "$ssh_key")
     [[ -n "$kube_context" ]] && rook_args+=(--kube-context "$kube_context")
@@ -380,6 +385,10 @@ main() {
         skip_logs=1
         shift
         ;;
+      --quiet)
+        export CEPH_INCIDENT_QUIET=1
+        shift
+        ;;
       --keep-workdir)
         keep_workdir=1
         shift
@@ -454,6 +463,8 @@ main() {
     HOST_TARGETS+=("$(ssh_target_for_host "${entry#*=}" "$ssh_user")")
   done
 
+  progress "starting: mode=$mode, ${#HOST_TARGETS[@]} hosts"
+
   set +e
   collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context"
   cluster_rc=$?
@@ -463,17 +474,21 @@ main() {
     rc=2
   fi
 
-  local i alias target node_rc
-  if [[ ${#HOST_ALIASES[@]} -gt 0 ]]; then
+  local i alias target node_rc ntotal
+  ntotal=${#HOST_ALIASES[@]}
+  if [[ $ntotal -gt 0 ]]; then
     for i in "${!HOST_ALIASES[@]}"; do
       alias="${HOST_ALIASES[$i]}"
       target="${HOST_TARGETS[$i]}"
+      progress "[$((i + 1))/$ntotal] node $alias…"
       if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
         node_ok=$((node_ok + 1))
+        progress "[$((i + 1))/$ntotal] node $alias: ok"
       else
         node_rc=$?
         node_failed=$((node_failed + 1))
         append_error "$workdir" "node $alias ($target) collector exited $node_rc"
+        progress "[$((i + 1))/$ntotal] node $alias: SKIPPED (exit $node_rc)"
         rc=2
       fi
     done
@@ -484,9 +499,11 @@ main() {
     die "test abort after nodes"
   fi
 
+  progress "redacting…"
   redact_bundle_text "$workdir"
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
 
+  progress "verifying…"
   # Verify BEFORE packaging, but never let verification destroy collected
   # evidence: capture its result instead of aborting under set -e. On failure,
   # keep the workdir for inspection and do not produce a shareable bundle.
@@ -503,6 +520,7 @@ main() {
     return 1
   fi
 
+  progress "packaging…"
   bundle="$out_dir/ceph-incident-$timestamp.tar.gz"
   COPYFILE_DISABLE=1 tar -czf "$bundle" -C "$workdir" .
   set +e

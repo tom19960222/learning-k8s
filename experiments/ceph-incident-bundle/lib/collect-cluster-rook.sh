@@ -136,6 +136,7 @@ collect_cluster_rook() {
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
+  progress "rook: pods/events/resources/operator-log/toolbox…"
   local failed=0
   if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/pods-wide.txt" \
     "${ROOK_KUBECTL_ARGV[@]}" get pods -n "$namespace" -o wide; then

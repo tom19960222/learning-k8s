@@ -345,4 +345,25 @@ ctx_ok="$(run_and_capture "$ROOT/run/collect.sh" --kube-context 'arn:aws:eks:us-
 ctx_ok_output="${ctx_ok#*$'\n'}"
 [[ "$ctx_ok_output" == *"missing inventory"* ]] || fail "valid kube-context wrongly rejected: $ctx_ok_output"
 
+# Progress: default-on goes to stderr; stdout stays just `bundle:`; --quiet silences it.
+prog_out="$tmpdir/prog.out"; prog_err="$tmpdir/prog.err"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --kube-context lab --out "$tmpdir/out-prog" --since 24h --timeout 5 \
+  >"$prog_out" 2>"$prog_err"
+grep -qF 'bundle:' "$prog_out" || fail "stdout must carry the bundle: line"
+grep -qE 'node (cephnode|kubenode)' "$prog_err" || fail "stderr should show node progress"
+grep -qiE 'probing|collecting ceph' "$prog_err" || fail "stderr should show probe/ceph progress"
+grep -qF 'bundle:' "$prog_err" && fail "bundle: must not be on stderr" || true
+
+q_out="$tmpdir/q.out"; q_err="$tmpdir/q.err"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --kube-context lab --out "$tmpdir/out-quiet" --since 24h --timeout 5 --quiet \
+  >"$q_out" 2>"$q_err"
+grep -qF 'bundle:' "$q_out" || fail "--quiet must still print bundle: to stdout"
+grep -qE 'probing|node cephnode|collecting ceph' "$q_err" && fail "--quiet must suppress progress" || true
+
 printf 'ok: collect orchestration\n'
