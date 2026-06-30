@@ -64,7 +64,7 @@ set -euo pipefail
 [[ "${1:-}" == "--context" ]] && shift 2
 cmd="$*"
 case "$cmd" in
-  "get namespace rook-ceph") printf 'rook-ceph\n' ;;
+  "get namespace rook-ceph") [[ "${FAKE_KUBE_NS_MISSING:-}" == "1" ]] && exit 1; printf 'rook-ceph\n' ;;
   "get pods -n rook-ceph -o wide") printf 'NAME READY STATUS\nrook-ceph-operator-0 1/1 Running\n' ;;
   "get events -n rook-ceph --sort-by=.lastTimestamp") printf 'LAST SEEN TYPE\n1m Normal\n' ;;
   *"-n rook-ceph -o yaml") printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n' ;;
@@ -95,6 +95,7 @@ n=${#args[@]}
 case "$whole" in
   *"command -v cephadm"*)
     target="${args[$((n-2))]}"   # probe sends a single-arg remote script
+    for t in ${FAKE_PROBE_FAIL_TARGETS:-}; do [[ "$target" == *"$t"* ]] && exit 255; done
     caps=""
     for t in ${FAKE_CEPH_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps cephadm"; done
     for t in ${FAKE_KUBE_TARGETS:-}; do [[ "$target" == *"$t"* ]] && caps="$caps kubectl"; done
@@ -173,6 +174,10 @@ assert_archive_contains "$bundle_auto" "nodes/kubenode/system/hostname.txt"
 grep -qF -- '--context lab' "$FAKE_SSH_LOG" || fail "rook kubectl missing --context in auto mode"
 grep -qF '10.0.0.9 kubectl' "$FAKE_SSH_LOG" || fail "rook kubectl did not run on the kube node"
 grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node wrapper should use --node-timeout 90"
+# A4: the chosen cluster sources are recorded in environment.txt
+env_txt="$(tar -xOzf "$bundle_auto" ./environment.txt 2>/dev/null)"
+[[ "$env_txt" == *"ceph_source=tester@10.0.0.1"* ]] || fail "environment.txt missing ceph_source"
+[[ "$env_txt" == *"rook_source=tester@10.0.0.9"* ]] || fail "environment.txt missing rook_source"
 
 # ---------------------------------------------------------------------------
 # auto with NO capable nodes: both layers SKIPPED, nodes still collected, exit 2
@@ -285,5 +290,50 @@ produced="$(find "$out_verify" -maxdepth 1 -name 'ceph-incident-*.tar.gz' 2>/dev
 [[ "$produced" == "0" ]] || fail "verify failure must not package a bundle"
 kept="$(find "$out_verify" -maxdepth 1 -name 'tmp.*' -type d 2>/dev/null | wc -l | tr -d '[:space:]')"
 [[ "$kept" == "1" ]] || fail "verify failure should keep the workdir (found $kept)"
+
+# A1: auto with a kubectl node but missing namespace AND no ceph node -> nothing
+# actually collected -> exit 2 (must NOT be a green exit-0).
+inv_kubeonly="$tmpdir/inv-kubeonly.env"
+cat >"$inv_kubeonly" <<'EOF'
+SSH_USER="tester"
+HOSTS=(
+  "kubenode=10.0.0.9"
+)
+EOF
+out_nsmiss="$tmpdir/out-nsmiss"
+st=0; set +e
+FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS="10.0.0.9" FAKE_KUBE_NS_MISSING=1 \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inv_kubeonly" --ssh-key "$ssh_key" \
+  --mode auto --out "$out_nsmiss" --since 24h --timeout 5
+st=$?; set -e
+[[ "$st" == "2" ]] || fail "auto with rook allow-skip and no ceph should exit 2, got $st"
+assert_archive_contains "$(find_bundle "$out_nsmiss")" "cluster/rook/SKIPPED.txt"
+
+# A3: a node whose capability probe ssh fails is recorded in errors.log
+out_probefail="$tmpdir/out-probefail"
+set +e
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="" FAKE_PROBE_FAIL_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --out "$out_probefail" --since 24h --timeout 5 >/dev/null 2>&1
+set -e
+assert_archive_contains "$(find_bundle "$out_probefail")" "errors.log"
+tar -xOzf "$(find_bundle "$out_probefail")" ./errors.log 2>/dev/null | grep -qF 'capability probe failed for tester@10.0.0.9' \
+  || fail "probe ssh failure was not recorded in errors.log"
+
+# A5: empty HOSTS=() -> exit 1 with a clear message (no bash-3.2 unbound error)
+inv_empty="$tmpdir/inv-empty.env"
+printf 'SSH_USER="t"\nHOSTS=()\n' >"$inv_empty"
+empty_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$inv_empty" --ssh-key "$ssh_key" --mode cephadm --seed t@1.2.3.4)"
+empty_status="${empty_result%%$'\n'*}"
+empty_output="${empty_result#*$'\n'}"
+[[ "$empty_status" == "1" ]] || fail "empty HOSTS should exit 1, got $empty_status"
+[[ "$empty_output" == *"HOSTS is empty"* ]] || fail "empty HOSTS should explain the failure"
+
+# A6: --kube-context with shell metacharacters is rejected (exit 1)
+ctx_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$inventory" --ssh-key "$ssh_key" --kube-context 'bad;ctx')"
+ctx_status="${ctx_result%%$'\n'*}"
+[[ "$ctx_status" == "1" ]] || fail "invalid --kube-context should exit 1, got $ctx_status"
 
 printf 'ok: collect orchestration\n'

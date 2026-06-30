@@ -101,6 +101,11 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 - `--mode cephadm`（可配 `--seed USER@HOST`）：只收 ceph 層。
 - `--mode rook`：只收 rook 層（在第一台有 kubectl 的 node 上跑）。
 
+## auto 的限制（已知）
+
+- **來源挑「第一台」、不看 liveness**：cluster-ceph 取第一台有 `cephadm` 的 node、cluster-rook 取第一台有 `kubectl` 的 node;只看指令存在、不檢查該 node 的 ceph/k8s 是否健康,也不會自動 fallback 到第二台。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
+- **探測是逐台序列 ssh**:某層的能力完全不存在時(例如純 cephadm 叢集仍會為了 rook 掃完每台),或 node 沒回應時,探測會逐台等到 `ConnectTimeout`。大型 inventory 建議直接用 `--mode cephadm --seed ...` 跳過探測。探測 ssh 失敗的 node 會記進 `errors.log`(`capability probe failed for ...`),不會被當成「沒有該能力」而靜默忽略。
+
 ## 逾時與大型 log
 
 - `--timeout`（預設 20s）是**單一指令 / SSH 連線**的逾時。
