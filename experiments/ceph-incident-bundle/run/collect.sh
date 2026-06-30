@@ -123,6 +123,8 @@ detect_node_caps() {
   local target=$1 ssh_key=$2 timeout=$3
   local tbin
   local -a ssh_cmd
+  # SC2016: the probe script is single-quoted on purpose — it expands on the remote.
+  # shellcheck disable=SC2016
   ssh_cmd=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$target" 'caps=""; command -v cephadm >/dev/null 2>&1 && caps="$caps cephadm"; command -v kubectl >/dev/null 2>&1 && caps="$caps kubectl"; printf "%s\n" "$caps"')
   tbin="$(timeout_cmd)"
   if [[ -n "$tbin" ]]; then
