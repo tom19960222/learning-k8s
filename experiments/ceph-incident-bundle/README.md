@@ -56,46 +56,50 @@ HOSTS=(
 ```
 
 - `SSH_USER`：登入每台 node 的 Linux 帳號。
-- `SEED_HOST`：cephadm mode 用來跑 cluster-level `ceph` command 的 node。
-- `ROOK_NAMESPACE`：Rook mode 的 namespace，未填時預設 `rook-ceph`。
-- `HOSTS`：每個項目是 `alias=host`，alias 會成為 bundle 裡 `nodes/<alias>/` 的目錄名稱。
+- `SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台有 `cephadm` 的 node。
+- `ROOK_NAMESPACE`：Rook 的 namespace，未填時預設 `rook-ceph`。
+- `HOSTS`：每個項目是 `alias=host`，alias 會成為 bundle 裡 `nodes/<alias>/` 的目錄名稱。external-ceph rook 拓樸可以把 **external ceph 主機與 k8s node 混在同一份** `HOSTS` 裡。
 
-## cephadm 範例
+## 自動偵測（auto，預設）
+
+預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集：
+
+- node 上有 `cephadm` → 從**第一台**有 cephadm 的 node 收 cluster-level ceph（`sudo -n cephadm shell -- ceph ...`）。
+- node 上有 `kubectl` → 從**第一台**有 kubectl 的 node、用 ssh 在該 node 上跑 `kubectl`（可加 `--kube-context`）收 rook 層。
+- 兩層都有來源就都收、各收一次;node 層一律每台都收。
 
 ```bash
 bash experiments/ceph-incident-bundle/run/collect.sh \
   --inventory experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
   --ssh-key .ssh/id_ed25519 \
-  --mode cephadm \
   --since 24h
 ```
 
-cephadm mode 會透過 seed node 執行：
+## external ceph + rook（一份 inventory）
 
-```text
-sudo cephadm shell -- ceph ...
-```
-
-## Rook 範例
-
-先建立自己的 inventory：
+把 external ceph 主機和有 `kubectl` 的 k8s node 列進同一份 `HOSTS`，`auto` 會：ceph 層從 ceph 主機收、rook 層在 k8s node 上跑 kubectl 收。指定 context：
 
 ```bash
-cp experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
-  experiments/ceph-incident-bundle/inventory/rook.env
+SSH_USER="ikaros"
+HOSTS=(
+  "mon01=10.0.0.1"     # external ceph（有 cephadm）
+  "osd01=10.0.0.2"     # external ceph
+  "k8s1=10.0.0.9"      # k8s node（有 kubectl）
+)
 ```
-
-編輯 `experiments/ceph-incident-bundle/inventory/rook.env`，把 `HOSTS` 改成 Rook 所在的 Kubernetes node，並確認 `ROOK_NAMESPACE`。
 
 ```bash
 bash experiments/ceph-incident-bundle/run/collect.sh \
-  --inventory experiments/ceph-incident-bundle/inventory/rook.env \
+  --inventory inventory/external.env \
   --ssh-key ~/.ssh/id_ed25519 \
-  --mode rook \
+  --kube-context my-cluster \
   --since 24h
 ```
 
-Rook mode 會在本機使用 `kubectl get`、`kubectl logs`，並在 toolbox Pod 存在時執行 read-only 的 `ceph status`。
+## 只收單層（覆寫）
+
+- `--mode cephadm`（可配 `--seed USER@HOST`）：只收 ceph 層。
+- `--mode rook`：只收 rook 層（在第一台有 kubectl 的 node 上跑）。
 
 ## 逾時與大型 log
 

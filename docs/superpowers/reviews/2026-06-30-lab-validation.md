@@ -16,6 +16,10 @@ Run from the macOS workstation (no `timeout`/`gtimeout` → R6 warning fires eve
 - **Partial failures (15a/15b) exit 2 with a bundle still produced**: matches the README contract (preserve the scene; record what failed in errors.log/summary).
 - **Redaction held on real data**: 312 redactions on the healthy run and the new `verify_no_secret_content` pass means no `key = <base64>` / PEM / forbidden-path material survived into a packaged bundle.
 
+## Auto-detect feature smoke (real lab)
+
+`--mode auto` against the lab inventory (pure cephadm, no kubectl nodes): the per-node `command -v` probe ran over real ssh, picked a cephadm source, collected the ceph layer, and marked the rook layer `SKIPPED: no kubectl-capable node in inventory (auto)`. Result: cluster_status=0, node_ok=6, final_status=0, VERIFY PASS. Confirms the probe + auto dual-layer logic works on real ssh (rook-over-ssh path is covered by the unit harness).
+
 ## Observations (non-blocking)
 
 - **Workstation has no `timeout`/`gtimeout`** (and bash 3.2): the R6 warning fires every run; outer wrappers are inactive, so only SSH ConnectTimeout/ServerAlive bound remote calls. Installing coreutils (`brew install coreutils` → `gtimeout`) would restore full per-node bounding. On a Linux ops host `timeout` is present and the `--node-timeout` wrapper engages.

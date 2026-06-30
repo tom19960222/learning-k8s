@@ -7,9 +7,14 @@ ROOK_COLLECTOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$ROOK_COLLECTOR_DIR/common.sh"
 
+# Default kubectl prefix (local); collect_cluster_rook overrides it per call.
+ROOK_KUBECTL_ARGV=(kubectl)
+
 usage() {
   cat <<'EOF'
-Usage: collect-cluster-rook.sh --out DIR --manifest PATH [--namespace rook-ceph] [--since DURATION] [--timeout SECONDS]
+Usage: collect-cluster-rook.sh --out DIR --manifest PATH [--namespace rook-ceph]
+       [--since DURATION] [--timeout SECONDS] [--allow-skip]
+       [--ssh-target USER@HOST --ssh-key PATH] [--kube-context CTX]
 EOF
 }
 
@@ -40,11 +45,14 @@ rook_run_capture() {
 
 rook_get_first_pod() {
   local namespace=$1 label=$2
-  kubectl get pods -n "$namespace" -l "$label" -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null || true
+  # -o name (not jsonpath) so the arg has no braces/brackets to mangle over ssh.
+  "${ROOK_KUBECTL_ARGV[@]}" get pods -n "$namespace" -l "$label" -o name 2>/dev/null |
+    head -n1 | sed 's#^pod/##'
 }
 
 collect_cluster_rook() {
   local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
+  local ssh_target='' ssh_key='' kube_context=''
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,6 +80,18 @@ collect_cluster_rook() {
         allow_skip=1
         shift
         ;;
+      --ssh-target)
+        ssh_target=${2-}
+        shift 2
+        ;;
+      --ssh-key)
+        ssh_key=${2-}
+        shift 2
+        ;;
+      --kube-context)
+        kube_context=${2-}
+        shift 2
+        ;;
       --help|-h)
         usage
         return 0
@@ -90,30 +110,41 @@ collect_cluster_rook() {
 
   ensure_dir "$outdir/cluster/rook"
 
+  # Build the kubectl prefix once. With --ssh-target, kubectl runs ON that node
+  # over ssh (the node where kubectl/kubeconfig lives); otherwise locally.
+  # ROOK_KUBECTL_ARGV is global so rook_get_first_pod can use the same prefix.
+  if [[ -n "$ssh_target" ]]; then
+    ROOK_KUBECTL_ARGV=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$ssh_target" kubectl)
+  else
+    ROOK_KUBECTL_ARGV=(kubectl)
+  fi
+  [[ -n "$kube_context" ]] && ROOK_KUBECTL_ARGV+=(--context "$kube_context")
+
   # Missing kubectl / namespace means we collected NO cluster evidence. In
   # explicit rook mode that is a partial failure (exit 2) so the bundle does not
   # falsely look complete; auto-mode fallback passes --allow-skip to tolerate it.
-  if ! command -v kubectl >/dev/null 2>&1; then
+  # (When kubectl is remote we already probed it exists, so skip the local check.)
+  if [[ -z "$ssh_target" ]] && ! command -v kubectl >/dev/null 2>&1; then
     rook_skip "$outdir" "kubectl command not found"
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
-  if ! kubectl get namespace "$namespace" >/dev/null 2>&1; then
+  if ! "${ROOK_KUBECTL_ARGV[@]}" get namespace "$namespace" >/dev/null 2>&1; then
     rook_skip "$outdir" "namespace not found: $namespace"
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
   local failed=0
   if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/pods-wide.txt" \
-    kubectl get pods -n "$namespace" -o wide; then
+    "${ROOK_KUBECTL_ARGV[@]}" get pods -n "$namespace" -o wide; then
     failed=1
   fi
   if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/events.txt" \
-    kubectl get events -n "$namespace" --sort-by=.lastTimestamp; then
+    "${ROOK_KUBECTL_ARGV[@]}" get events -n "$namespace" --sort-by=.lastTimestamp; then
     failed=1
   fi
   if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/rook-resources.yaml" \
-    kubectl get cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io -n "$namespace" -o yaml; then
+    "${ROOK_KUBECTL_ARGV[@]}" get cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io -n "$namespace" -o yaml; then
     failed=1
   fi
 
@@ -121,7 +152,7 @@ collect_cluster_rook() {
   operator_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-operator")"
   if [[ -n "$operator_pod" ]]; then
     if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/operator.log" \
-      kubectl logs -n "$namespace" "$operator_pod" --since="$since"; then
+      "${ROOK_KUBECTL_ARGV[@]}" logs -n "$namespace" "$operator_pod" --since="$since"; then
       failed=1
     fi
   else
@@ -131,7 +162,7 @@ collect_cluster_rook() {
   toolbox_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-tools")"
   if [[ -n "$toolbox_pod" ]]; then
     if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/toolbox-status.txt" \
-      kubectl exec -n "$namespace" "$toolbox_pod" -- ceph status; then
+      "${ROOK_KUBECTL_ARGV[@]}" exec -n "$namespace" "$toolbox_pod" -- ceph status; then
       failed=1
     fi
   else
