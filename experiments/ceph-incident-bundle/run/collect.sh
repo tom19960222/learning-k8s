@@ -269,8 +269,16 @@ collect_remote_node() {
     ssh_cmd=("$tbin" "$node_timeout" "${ssh_cmd[@]}")
   fi
 
+  # macOS bsdtar embeds com.apple.* xattr headers that make the remote GNU tar
+  # print "Ignoring unknown extended header keyword" noise; strip them at source.
+  local noxattrs=''
+  if tar --version 2>&1 | grep -qi 'bsdtar'; then
+    noxattrs='--no-xattrs'
+  fi
+
   set +e
-  COPYFILE_DISABLE=1 tar -cf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh | gzip -c |
+  # shellcheck disable=SC2086
+  COPYFILE_DISABLE=1 tar $noxattrs -cf - -C "$COLLECT_ROOT" lib/common.sh lib/collect-node.sh | gzip -c |
     "${ssh_cmd[@]}" >"$node_tar"
   rc=$?
   set -e
