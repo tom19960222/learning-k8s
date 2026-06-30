@@ -88,14 +88,26 @@ case "$cmd" in
     [[ "$mode" != "missing-namespace" ]] || exit 1
     printf 'rook-ceph\n'
     ;;
+  "get namespace rook-ceph-external")
+    printf 'rook-ceph-external\n'
+    ;;
   "get pods -n rook-ceph -o wide")
     printf 'NAME READY STATUS\nrook-ceph-operator-0 1/1 Running\n'
+    ;;
+  "get pods -n rook-ceph-external -o wide")
+    printf 'No resources found in rook-ceph-external namespace.\n'
     ;;
   "get events -n rook-ceph --sort-by=.lastTimestamp")
     printf 'LAST SEEN TYPE REASON OBJECT MESSAGE\n1m Normal Started pod/osd started\n'
     ;;
+  "get events -n rook-ceph-external --sort-by=.lastTimestamp")
+    printf 'LAST SEEN TYPE REASON OBJECT MESSAGE\n1m Normal ClusterConnected cephcluster/rook-ceph-external connected\n'
+    ;;
   "get cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io -n rook-ceph -o yaml")
     printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n  metadata:\n    name: rook-ceph\n'
+    ;;
+  "get cephclusters.ceph.rook.io,cephblockpools.ceph.rook.io,cephfilesystems.ceph.rook.io,cephobjectstores.ceph.rook.io -n rook-ceph-external -o yaml")
+    printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n  metadata:\n    name: rook-ceph-external\n'
     ;;
   "get pods -n rook-ceph -l app=rook-ceph-operator -o name")
     [[ "$mode" == "op-lookup-fail" ]] && exit 1
@@ -143,6 +155,18 @@ assert_file_contains "$out_present/cluster/rook/toolbox-status.txt" "cluster is 
 
 grep -qF 'get namespace rook-ceph' "$FAKE_KUBECTL_LOG" || fail "namespace detection was not called"
 grep -qF 'logs -n rook-ceph rook-ceph-operator-0 --since=24h' "$FAKE_KUBECTL_LOG" || fail "operator logs were not collected"
+
+out_external="$tmpdir/out-external"
+manifest_external="$tmpdir/manifest-external.jsonl"
+FAKE_KUBECTL_MODE=present PATH="$fakebin:$PATH" \
+  "$BASH_BIN" "$ROOT/lib/collect-cluster-rook.sh" \
+  --out "$out_external" --manifest "$manifest_external" \
+  --namespace rook-ceph-external --operator-namespace rook-ceph \
+  --since 24h --timeout 5
+
+assert_file_contains "$out_external/cluster/rook/rook-resources.yaml" "name: rook-ceph-external"
+assert_file_contains "$out_external/cluster/rook/operator.log" "operator log line"
+grep -qF 'logs -n rook-ceph rook-ceph-operator-0 --since=24h' "$FAKE_KUBECTL_LOG" || fail "external cluster operator logs were not collected from operator namespace"
 
 # --- remote (ssh-target) mode: kubectl runs via ssh on the chosen node, with --context ---
 fake_ssh_log="$tmpdir/ssh.log"

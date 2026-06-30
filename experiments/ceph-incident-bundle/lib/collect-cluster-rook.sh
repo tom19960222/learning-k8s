@@ -13,7 +13,7 @@ ROOK_KUBECTL_ARGV=(kubectl)
 usage() {
   cat <<'EOF'
 Usage: collect-cluster-rook.sh --out DIR --manifest PATH [--namespace rook-ceph]
-       [--since DURATION] [--timeout SECONDS] [--allow-skip]
+       [--operator-namespace rook-ceph] [--since DURATION] [--timeout SECONDS] [--allow-skip]
        [--ssh-target USER@HOST --ssh-key PATH] [--kube-context CTX]
 EOF
 }
@@ -54,7 +54,7 @@ rook_get_first_pod() {
 
 collect_cluster_rook() {
   local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
-  local ssh_target='' ssh_key='' kube_context=''
+  local operator_namespace='' ssh_target='' ssh_key='' kube_context=''
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,6 +68,10 @@ collect_cluster_rook() {
         ;;
       --namespace)
         namespace=${2-}
+        shift 2
+        ;;
+      --operator-namespace)
+        operator_namespace=${2-}
         shift 2
         ;;
       --since)
@@ -111,6 +115,7 @@ collect_cluster_rook() {
   }
 
   ensure_dir "$outdir/cluster/rook"
+  [[ -n "$operator_namespace" ]] || operator_namespace="$namespace"
 
   # Build the kubectl prefix once. With --ssh-target, kubectl runs ON that node
   # over ssh (the node where kubectl/kubeconfig lives); otherwise locally.
@@ -152,14 +157,14 @@ collect_cluster_rook() {
   fi
 
   local operator_pod toolbox_pod
-  operator_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-operator")"
+  operator_pod="$(rook_get_first_pod "$operator_namespace" "app=rook-ceph-operator")"
   if [[ -n "$operator_pod" ]]; then
     if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/operator.log" \
-      "${ROOK_KUBECTL_ARGV[@]}" logs -n "$namespace" "$operator_pod" --since="$since"; then
+      "${ROOK_KUBECTL_ARGV[@]}" logs -n "$operator_namespace" "$operator_pod" --since="$since"; then
       failed=1
     fi
   else
-    rook_write_skip_artifact "$outdir/cluster/rook/operator-SKIPPED.txt" "rook operator Pod not found"
+    rook_write_skip_artifact "$outdir/cluster/rook/operator-SKIPPED.txt" "rook operator Pod not found in namespace: $operator_namespace"
   fi
 
   toolbox_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-tools")"

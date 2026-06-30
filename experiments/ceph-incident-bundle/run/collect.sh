@@ -175,7 +175,7 @@ ceph_runner_for() {
 # and cluster-rook source (first kubectl node); collect each requested layer once.
 # Uses globals HOST_TARGETS (set by main).
 collect_clusters() {
-  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9 kube_mode="${10:-remote}"
+  local mode=$1 workdir=$2 manifest=$3 seed=$4 ssh_key=$5 since=$6 timeout=$7 rook_namespace=$8 kube_context=$9 kube_mode="${10:-remote}" rook_operator_namespace="${11:-}"
   local ceph_source='' ceph_runner='' rook_source='' i caps rc=0
   local want_ceph=0 want_rook=0 ceph_done=0 rook_done=0
   # so detect_node_caps can record probe ssh failures
@@ -236,6 +236,7 @@ collect_clusters() {
   if [[ $want_rook -eq 1 && ( "$kube_mode" == local || -n "$rook_source" ) ]]; then
     local -a rook_args
     rook_args=(--out "$workdir" --manifest "$manifest" --namespace "$rook_namespace" --since "$since" --timeout "$timeout")
+    [[ -n "$rook_operator_namespace" ]] && rook_args+=(--operator-namespace "$rook_operator_namespace")
     if [[ "$kube_mode" == local ]]; then
       rook_source=local
       progress "collecting rook from local kubectl (ns=$rook_namespace)…"
@@ -391,7 +392,7 @@ cleanup_workdir() {
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
-  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph kube_context='' kube_mode=remote
+  local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph rook_operator_namespace=rook-ceph kube_context='' kube_mode=remote
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
   if [[ $# -eq 0 ]]; then
@@ -485,6 +486,7 @@ main() {
   ssh_user=${SSH_USER:-}
   seed_host=${SEED_HOST:-}
   rook_namespace=${ROOK_NAMESPACE:-rook-ceph}
+  rook_operator_namespace=${ROOK_OPERATOR_NAMESPACE:-rook-ceph}
   if [[ -n "$seed_override" ]]; then
     seed=$seed_override
   elif [[ -n "$seed_host" ]]; then
@@ -527,7 +529,7 @@ main() {
   progress "starting: mode=$mode, ${#HOST_TARGETS[@]} hosts"
 
   set +e
-  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context" "$kube_mode"
+  collect_clusters "$mode" "$workdir" "$manifest" "$seed" "$ssh_key" "$since" "$timeout" "$rook_namespace" "$kube_context" "$kube_mode" "$rook_operator_namespace"
   cluster_rc=$?
   set -e
   if [[ $cluster_rc -ne 0 ]]; then
@@ -541,7 +543,7 @@ main() {
     for i in "${!HOST_ALIASES[@]}"; do
       alias="${HOST_ALIASES[$i]}"
       target="${HOST_TARGETS[$i]}"
-      progress "[$((i + 1))/$ntotal] node $alias…"
+      progress "[$((i + 1))/$ntotal] node ${alias}…"
       if collect_remote_node "$workdir" "$alias" "$target" "$ssh_key" "$since" "$timeout" "$skip_logs" "$node_timeout"; then
         node_ok=$((node_ok + 1))
         progress "[$((i + 1))/$ntotal] node $alias: ok"
