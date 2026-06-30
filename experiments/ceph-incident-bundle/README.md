@@ -66,7 +66,7 @@ HOSTS=(
 ```
 
 - `SSH_USER`：登入每台 node 的 Linux 帳號。
-- `SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台有 `cephadm` 的 node。
+- `SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台「ceph 連得上」的 node(有 `ceph` 或 `cephadm` 且 `ceph -s` 成功)。
 - `ROOK_NAMESPACE`：Rook 的 namespace，未填時預設 `rook-ceph`。
 - `HOSTS`：每個項目是 `alias=host`，alias 會成為 bundle 裡 `nodes/<alias>/` 的目錄名稱。external-ceph rook 拓樸可以把 **external ceph 主機與 k8s node 混在同一份** `HOSTS` 裡。
 
@@ -116,7 +116,7 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 
 ## auto 的限制（已知）
 
-- **來源挑「第一台」、不看 liveness**：cluster-ceph 取第一台有 `cephadm` 的 node、cluster-rook 取第一台有 `kubectl` 的 node;只看指令存在、不檢查該 node 的 ceph/k8s 是否健康,也不會自動 fallback 到第二台。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
+- **來源挑「第一台」**：cluster-ceph 取第一台**ceph 連得上**的 node(會實際試 `ceph -s`,連不上就換下一個候選);cluster-rook(remote)取第一台**有 `kubectl` 指令**的 node(只看指令存在,不檢查 k8s 健康、不 fallback 到第二台)。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
 - **探測是逐台序列 ssh**:某層的能力完全不存在時(例如純 cephadm 叢集仍會為了 rook 掃完每台),或 node 沒回應時,探測會逐台等到 `ConnectTimeout`。大型 inventory 建議直接用 `--mode cephadm --seed ...` 跳過探測。探測 ssh 失敗的 node 會記進 `errors.log`(`capability probe failed for ...`),不會被當成「沒有該能力」而靜默忽略。
 
 ## 逾時與大型 log
