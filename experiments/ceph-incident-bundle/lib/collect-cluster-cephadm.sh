@@ -27,29 +27,18 @@ collect_cephadm_command() {
   artifact_dir="$(dirname -- "$artifact")"
   ensure_dir "$artifact_dir"
 
-  local -a runner_argv
+  local -a runner_argv sopts
+  local _w
   while IFS= read -r _w; do runner_argv+=("$_w"); done < <(ceph_runner_argv "$runner")
+  while IFS= read -r _w; do sopts+=("$_w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
 
   COMMAND_TIMEOUT="$timeout" ERROR_LOG="${ERROR_LOG:-$outdir/errors.log}" \
     run_capture "$manifest" "$seed" "collect-cluster-cephadm" "$artifact" -- \
-    ssh \
-      -i "$ssh_key" \
-      -o BatchMode=yes \
-      -o IdentitiesOnly=yes \
-      -o IdentityAgent=none \
-      -o "ConnectTimeout=$timeout" \
-      -o "ServerAliveInterval=$timeout" \
-      -o ServerAliveCountMax=1 \
-      "$seed" \
-      "${runner_argv[@]}" "$@"
+    ssh "${sopts[@]}" "$seed" "${runner_argv[@]}" "$@"
 }
 
 write_cephadm_crash_skip() {
-  local skip_artifact=$1
-  ensure_dir "$(dirname -- "$skip_artifact")"
-  cat >"$skip_artifact" <<'EOF'
-SKIPPED: unable to parse crash list JSON for recent crash inspection
-EOF
+  write_skip_artifact "$1" "unable to parse crash list JSON for recent crash inspection"
 }
 
 extract_cephadm_crash_ids() {

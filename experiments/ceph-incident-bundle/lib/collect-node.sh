@@ -13,11 +13,6 @@ Usage: collect-node.sh --out DIR --host-alias ALIAS [--since DURATION] [--timeou
 EOF
 }
 
-write_skip_artifact() {
-  local artifact=$1 reason=$2
-  ensure_dir "$(dirname -- "$artifact")"
-  printf 'SKIPPED: %s\n' "$reason" >"$artifact"
-}
 
 node_run_capture() {
   local outdir=$1 manifest=$2 host_alias=$3 timeout=$4 artifact_rel=$5
@@ -346,7 +341,7 @@ collect_node_main() {
   if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$heavy_timeout" "kernel/dmesg.txt" dmesg -T; then
     failed=1
   fi
-  if ! node_run_privileged "$outdir" "$manifest" "$host_alias" "$heavy_timeout" "systemd/journal-ceph.txt" journalctl --since "$journal_since" -u 'ceph*' --no-pager; then
+  if ! node_run_optional "$outdir" "$manifest" "$host_alias" "$heavy_timeout" "systemd/journal-ceph.txt" sudo -n journalctl --since "$journal_since" -u 'ceph*' --no-pager; then
     failed=1
   fi
 

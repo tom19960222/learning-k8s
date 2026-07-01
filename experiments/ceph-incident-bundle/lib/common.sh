@@ -13,16 +13,42 @@ die() {
   exit 1
 }
 
-ceph_incident_bundle_log() {
-  log "$*"
-}
-
 require_file() {
   [[ -f "$1" ]] || die "missing file: $1"
 }
 
 ensure_dir() {
   mkdir -p "$1"
+}
+
+# Shared SSH option vector (incl. -i KEY). Printed one argv item per line so
+# callers fill an array with `while IFS= read -r w; do a+=("$w"); done` — the
+# bash-3.2-safe idiom used throughout (no mapfile). Single source of truth so a
+# flag like BatchMode can't drift between call sites.
+ssh_base_opts() {
+  local ssh_key=$1 timeout=$2
+  printf '%s\n' \
+    -i "$ssh_key" \
+    -o BatchMode=yes \
+    -o IdentitiesOnly=yes \
+    -o IdentityAgent=none \
+    -o "ConnectTimeout=$timeout" \
+    -o "ServerAliveInterval=$timeout" \
+    -o ServerAliveCountMax=1
+}
+
+# Write a `SKIPPED: <reason>` artifact. `_once` does not overwrite an existing
+# file (so a collector's specific reason is never clobbered by a generic one).
+write_skip_artifact() {
+  local artifact=$1 reason=$2
+  ensure_dir "$(dirname -- "$artifact")"
+  printf 'SKIPPED: %s\n' "$reason" >"$artifact"
+}
+
+write_skip_artifact_once() {
+  local artifact=$1 reason=$2
+  [[ -f "$artifact" ]] && return 0
+  write_skip_artifact "$artifact" "$reason"
 }
 
 # Live progress to stderr (stdout stays reserved for the final `bundle:` line).
@@ -72,16 +98,13 @@ redact_file() {
   require_file "$source_file"
   ensure_dir "$(dirname -- "$redaction_log")"
 
-  local source_dir tmp_file count line nocasematch_state in_pem redact mode
+  local source_dir tmp_file count line nocase_was_set in_pem redact mode
   source_dir="$(dirname -- "$source_file")"
   tmp_file="$(mktemp "$source_dir/.${source_file##*/}.XXXXXX")"
   count=0
   in_pem=0
-  if shopt -q nocasematch; then
-    nocasematch_state='shopt -s nocasematch'
-  else
-    nocasematch_state='shopt -u nocasematch'
-  fi
+  nocase_was_set=0
+  shopt -q nocasematch && nocase_was_set=1
   shopt -s nocasematch
 
   # Best-effort redaction (NOT a complete DLP): keyword lines, ceph key
@@ -113,7 +136,7 @@ redact_file() {
     fi
   done <"$source_file"
 
-  eval "$nocasematch_state"
+  if [[ $nocase_was_set -eq 1 ]]; then shopt -s nocasematch; else shopt -u nocasematch; fi
   mode="$(stat -c '%a' "$source_file" 2>/dev/null || stat -f '%Lp' "$source_file" 2>/dev/null || printf '600')"
   chmod "$mode" "$tmp_file" 2>/dev/null || true
   mv -f -- "$tmp_file" "$source_file"

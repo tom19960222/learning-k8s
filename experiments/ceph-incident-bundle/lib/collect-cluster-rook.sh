@@ -13,22 +13,13 @@ ROOK_KUBECTL_ARGV=(kubectl)
 usage() {
   cat <<'EOF'
 Usage: collect-cluster-rook.sh --out DIR --manifest PATH [--namespace rook-ceph]
-       [--since DURATION] [--timeout SECONDS] [--allow-skip]
+       [--operator-namespace rook-ceph] [--since DURATION] [--timeout SECONDS] [--allow-skip]
        [--ssh-target USER@HOST --ssh-key PATH] [--kube-context CTX]
 EOF
 }
 
 rook_skip() {
-  local outdir=$1 reason=$2
-  local artifact="$outdir/cluster/rook/SKIPPED.txt"
-  ensure_dir "$(dirname -- "$artifact")"
-  printf 'SKIPPED: %s\n' "$reason" >"$artifact"
-}
-
-rook_write_skip_artifact() {
-  local artifact=$1 reason=$2
-  ensure_dir "$(dirname -- "$artifact")"
-  printf 'SKIPPED: %s\n' "$reason" >"$artifact"
+  write_skip_artifact "$1/cluster/rook/SKIPPED.txt" "$2"
 }
 
 rook_run_capture() {
@@ -54,7 +45,7 @@ rook_get_first_pod() {
 
 collect_cluster_rook() {
   local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
-  local ssh_target='' ssh_key='' kube_context=''
+  local operator_namespace='' ssh_target='' ssh_key='' kube_context=''
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,6 +59,10 @@ collect_cluster_rook() {
         ;;
       --namespace)
         namespace=${2-}
+        shift 2
+        ;;
+      --operator-namespace)
+        operator_namespace=${2-}
         shift 2
         ;;
       --since)
@@ -111,12 +106,15 @@ collect_cluster_rook() {
   }
 
   ensure_dir "$outdir/cluster/rook"
+  [[ -n "$operator_namespace" ]] || operator_namespace="$namespace"
 
   # Build the kubectl prefix once. With --ssh-target, kubectl runs ON that node
   # over ssh (the node where kubectl/kubeconfig lives); otherwise locally.
   # ROOK_KUBECTL_ARGV is global so rook_get_first_pod can use the same prefix.
   if [[ -n "$ssh_target" ]]; then
-    ROOK_KUBECTL_ARGV=(ssh -i "$ssh_key" -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o "ConnectTimeout=$timeout" -o "ServerAliveInterval=$timeout" -o ServerAliveCountMax=1 "$ssh_target" kubectl)
+    local -a sopts; local _w
+    while IFS= read -r _w; do sopts+=("$_w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
+    ROOK_KUBECTL_ARGV=(ssh "${sopts[@]}" "$ssh_target" kubectl)
   else
     ROOK_KUBECTL_ARGV=(kubectl)
   fi
@@ -152,14 +150,14 @@ collect_cluster_rook() {
   fi
 
   local operator_pod toolbox_pod
-  operator_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-operator")"
+  operator_pod="$(rook_get_first_pod "$operator_namespace" "app=rook-ceph-operator")"
   if [[ -n "$operator_pod" ]]; then
     if ! rook_run_capture "$outdir" "$manifest" "$timeout" "cluster/rook/operator.log" \
-      "${ROOK_KUBECTL_ARGV[@]}" logs -n "$namespace" "$operator_pod" --since="$since"; then
+      "${ROOK_KUBECTL_ARGV[@]}" logs -n "$operator_namespace" "$operator_pod" --since="$since"; then
       failed=1
     fi
   else
-    rook_write_skip_artifact "$outdir/cluster/rook/operator-SKIPPED.txt" "rook operator Pod not found"
+    write_skip_artifact "$outdir/cluster/rook/operator-SKIPPED.txt" "rook operator Pod not found in namespace: $operator_namespace"
   fi
 
   toolbox_pod="$(rook_get_first_pod "$namespace" "app=rook-ceph-tools")"
@@ -169,7 +167,7 @@ collect_cluster_rook() {
       failed=1
     fi
   else
-    rook_write_skip_artifact "$outdir/cluster/rook/toolbox-SKIPPED.txt" "rook toolbox Pod not found"
+    write_skip_artifact "$outdir/cluster/rook/toolbox-SKIPPED.txt" "rook toolbox Pod not found"
   fi
 
   [[ $failed -eq 0 ]] || return 2

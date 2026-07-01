@@ -412,6 +412,25 @@ bundle_fb="$(find_bundle "$out_fb")"
 grep -qF '10.0.0.1 sudo -n cephadm shell -- ceph status --format json-pretty' "$FAKE_SSH_LOG" || fail "fallback should use cephadm shell"
 tar -xOzf "$bundle_fb" ./environment.txt 2>/dev/null | grep -qF 'ceph_runner=cephadm' || fail "environment.txt should record ceph_runner=cephadm"
 
+# --kube-mode local: rook layer uses the jump host's local kubectl (no ssh), not a node
+out_klocal="$tmpdir/out-klocal"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS="" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode rook --kube-mode local --kube-context lab --out "$out_klocal" --since 24h --timeout 5
+bundle_klocal="$(find_bundle "$out_klocal")"
+assert_archive_contains "$bundle_klocal" "cluster/rook/pods-wide.txt"
+tar -xOzf "$bundle_klocal" ./environment.txt 2>/dev/null | grep -qF 'rook_source=local' || fail "kube-mode local should record rook_source=local"
+grep -qF 'kubectl' "$FAKE_SSH_LOG" && fail "kube-mode local must not run kubectl over ssh" || true
+
+# --kube-mode invalid -> exit 1
+km_bad="$(run_and_capture "$ROOT/run/collect.sh" --kube-mode bogus --inventory "$inventory" --ssh-key "$ssh_key")"
+km_bad_status="${km_bad%%$'\n'*}"
+km_bad_out="${km_bad#*$'\n'}"
+[[ "$km_bad_status" == "1" ]] || fail "invalid --kube-mode should exit 1, got $km_bad_status"
+[[ "$km_bad_out" == *"invalid --kube-mode"* ]] || fail "bad --kube-mode should explain failure"
+
 # Progress: default-on goes to stderr; stdout stays just `bundle:`; --quiet silences it.
 prog_out="$tmpdir/prog.out"; prog_err="$tmpdir/prog.err"
 FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \

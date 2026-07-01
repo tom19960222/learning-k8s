@@ -15,6 +15,16 @@
 - node CPU、RAM、disk、網路看起來異常，但還不確定是不是 Ceph 問題
 - 準備請別人或 AI 協助判讀，需要保留當下證據
 
+## 前置需求（known_hosts）
+
+工具的 SSH 都用 `BatchMode=yes`(不互動),所以**第一次從一台新跳板機執行前**,跳板機的 `known_hosts` 必須已經有所有目標 node 的 host key,否則每台會以 `Host key verification failed` 失敗、被標 SKIPPED(exit 2)。先做一次:
+
+```bash
+# 對 inventory 裡每台 host 先建立 host key（擇一）
+ssh-keyscan -H 192.168.18.166 192.168.18.167 ... >> ~/.ssh/known_hosts
+# 或手動 ssh 每台一次，確認指紋後接受
+```
+
 ## 最短操作流程
 
 在 repo root 執行：
@@ -56,7 +66,7 @@ HOSTS=(
 ```
 
 - `SSH_USER`：登入每台 node 的 Linux 帳號。
-- `SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台有 `cephadm` 的 node。
+- `SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台「ceph 連得上」的 node(有 `ceph` 或 `cephadm` 且 `ceph -s` 成功)。
 - `ROOK_NAMESPACE`：Rook 的 namespace，未填時預設 `rook-ceph`。
 - `HOSTS`：每個項目是 `alias=host`，alias 會成為 bundle 裡 `nodes/<alias>/` 的目錄名稱。external-ceph rook 拓樸可以把 **external ceph 主機與 k8s node 混在同一份** `HOSTS` 裡。
 
@@ -65,7 +75,10 @@ HOSTS=(
 預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集：
 
 - node 上有 `ceph` 或 `cephadm` → 從**第一台連得上 cluster** 的 node 收 cluster-level ceph。執行方式優先序：直接 `ceph`（最快，免每條起 container）→ `sudo -n ceph` → `sudo -n cephadm shell -- ceph`。「可用」= `ceph -s` 連得上,不是 binary 存在;選到哪個會記在進度（`via ceph` / `via cephadm shell`）與 `environment.txt` 的 `ceph_runner=`。
-- node 上有 `kubectl` → 從**第一台**有 kubectl 的 node、用 ssh 在該 node 上跑 `kubectl`（可加 `--kube-context`）收 rook 層。
+- rook 層的 `kubectl` 由 `--kube-mode` 決定（預設 `remote`）：
+  - `remote`（預設）：從**第一台**有 kubectl 的 inventory node、用 ssh 在該 node 上跑 `kubectl`。
+  - `local`：在**執行工具的跳板機本機**跑 `kubectl`（kubectl/kubeconfig 在跳板機、不在 node 上時用這個）。
+  - 兩種都可配 `--kube-context`。
 - 兩層都有來源就都收、各收一次;node 層一律每台都收。
 
 ```bash
@@ -103,7 +116,7 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 
 ## auto 的限制（已知）
 
-- **來源挑「第一台」、不看 liveness**：cluster-ceph 取第一台有 `cephadm` 的 node、cluster-rook 取第一台有 `kubectl` 的 node;只看指令存在、不檢查該 node 的 ceph/k8s 是否健康,也不會自動 fallback 到第二台。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
+- **來源挑「第一台」**：cluster-ceph 取第一台**ceph 連得上**的 node(會實際試 `ceph -s`,連不上就換下一個候選);cluster-rook(remote)取第一台**有 `kubectl` 指令**的 node(只看指令存在,不檢查 k8s 健康、不 fallback 到第二台)。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
 - **探測是逐台序列 ssh**:某層的能力完全不存在時(例如純 cephadm 叢集仍會為了 rook 掃完每台),或 node 沒回應時,探測會逐台等到 `ConnectTimeout`。大型 inventory 建議直接用 `--mode cephadm --seed ...` 跳過探測。探測 ssh 失敗的 node 會記進 `errors.log`(`capability probe failed for ...`),不會被當成「沒有該能力」而靜默忽略。
 
 ## 逾時與大型 log
@@ -149,7 +162,7 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 
 - `missing inventory`：確認 `--inventory` 路徑存在。
 - `missing ssh key`：確認 `--ssh-key` 路徑存在，且本機可讀。
-- `node <alias> collector exited 255`：通常是 SSH 連線、帳號、key、known_hosts 或 sudo 權限問題。
+- `node <alias> collector exited 255` / `Host key verification failed`：SSH 連線、帳號、key、**known_hosts**(見上方「前置需求」)或 sudo 權限問題。新跳板機最常見的是 known_hosts 還沒有該 node 的 host key。
 - `VERIFY FAIL`：bundle 結構不完整，或包含 `keyring`、`.ssh`、`id_ed25519`、`private_key`、`*.pem`/`*.key`/`*.crt` 這類路徑，或檔案內容殘留未遮蔽的 private key / `key = <base64>` 金鑰材料。此時 workdir 會被保留、不打包，先看印出的路徑與 `errors.log`。
 - exit code `2`：先不要重跑覆蓋判讀脈絡，先保留 `.tar.gz`，再看 `errors.log` 決定是否針對失敗 node 補跑。
 

@@ -49,6 +49,10 @@ case "$*" in
   *"--since -24h"*) ;;
   *) printf 'journalctl expected --since -24h, got: %s\n' "$*" >&2; exit 12 ;;
 esac
+if [[ "${FAKE_JOURNALCTL_NO_CEPH:-}" == "1" ]]; then
+  printf 'no entries\n'
+  exit 1
+fi
 printf 'fake journalctl %s\n' "$*"
 EOF
 
@@ -224,3 +228,20 @@ grep -qF -- '-n dmesg' "$FAKE_SUDO_LOG" || fail "dmesg was not collected through
 # so large kernel ring / journals are not silently truncated.
 assert_file_contains "$outdir/kernel/dmesg.txt" '# timeout: 120s'
 assert_file_contains "$outdir/systemd/journal-ceph.txt" '# timeout: 120s'
+
+outdir_no_ceph_journal="$tmpdir/node-no-ceph-journal"
+set +e
+FAKE_JOURNALCTL_NO_CEPH=1 \
+CEPH_INCIDENT_VAR_LOG_CEPH_DIR="$fake_log_dir" \
+CEPH_INCIDENT_VAR_LIB_CEPH_DIR="$fake_var_lib" \
+CEPH_INCIDENT_LOG_FILE_CAP_BYTES=128 \
+bash "$ROOT/lib/collect-node.sh" \
+  --out "$outdir_no_ceph_journal" \
+  --host-alias kubenode \
+  --since "24h" \
+  --timeout 5 \
+  --skip-logs
+rc=$?
+set -e
+[[ "$rc" == "0" ]] || fail "missing ceph journal should not fail non-ceph node collection (got $rc)"
+assert_file_contains "$outdir_no_ceph_journal/systemd/journal-ceph.txt" 'no entries'
