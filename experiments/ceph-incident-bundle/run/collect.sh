@@ -488,6 +488,7 @@ main() {
   progress "redacting…"
   redact_bundle_text "$workdir"
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
+  write_catalog "$workdir"
 
   progress "verifying…"
   # Verify BEFORE packaging, but never let verification destroy collected

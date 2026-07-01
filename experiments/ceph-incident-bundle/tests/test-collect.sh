@@ -142,7 +142,7 @@ case "$whole" in
     mkdir -p "$t/system"
     printf 'node %s\n' "$alias_name" >"$t/system/hostname.txt"
     if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
-      printf '{"node":"%s"}\n' "$alias_name" >"$t/manifest.jsonl"
+      printf '{"host":"%s","collector":"collect-node","artifact":"/rmt/out/system/hostname.txt","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' "$alias_name" >"$t/manifest.jsonl"
     fi
     [[ "${FAKE_SSH_PEM_ALIAS:-}" == "$alias_name" ]] && printf 'cert\n' >"$t/system/leak.pem"
     tar -czf - -C "$t" .
@@ -207,6 +207,12 @@ grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node wrapper should use --node-timeou
 env_txt="$(tar -xOzf "$bundle_auto" ./environment.txt 2>/dev/null)"
 [[ "$env_txt" == *"ceph_source=tester@10.0.0.1"* ]] || fail "environment.txt missing ceph_source"
 [[ "$env_txt" == *"rook_source=tester@10.0.0.9"* ]] || fail "environment.txt missing rook_source"
+# #3: CONTENTS.md catalogs each artifact and the command that produced it
+assert_archive_contains "$bundle_auto" "CONTENTS.md"
+contents="$(tar -xOzf "$bundle_auto" ./CONTENTS.md 2>/dev/null)"
+[[ "$contents" == *"cluster/ceph/json/status.json"* ]] || fail "CONTENTS.md missing a cluster artifact row"
+[[ "$contents" == *"ceph status --format json-pretty"* ]] || fail "CONTENTS.md missing the producing command"
+[[ "$contents" == *"nodes/cephnode/system/hostname.txt"* ]] || fail "CONTENTS.md missing a per-node artifact row"
 
 # ---------------------------------------------------------------------------
 # auto with NO capable nodes: both layers SKIPPED, nodes still collected, exit 2
