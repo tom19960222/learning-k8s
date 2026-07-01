@@ -73,6 +73,93 @@ append_error() {
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$message" >>"$workdir/errors.log"
 }
 
+# Render manifest.jsonl rows as a markdown table (exit | file | command). $base
+# is the dir the artifact paths are relative to; $prefix is prepended to the
+# bundle-relative path (for per-node manifests whose paths are remote temp dirs).
+# SC2016: backticks in the printf formats are literal markdown, not command subs.
+# shellcheck disable=SC2016
+catalog_rows() {
+  local manifest=$1 base=$2 prefix=${3:-}
+  [[ -f "$manifest" ]] || return 0
+  local line art cmd ex rel
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    art="$(printf '%s' "$line" | sed -n 's/.*"artifact":"\([^"]*\)".*/\1/p')"
+    cmd="$(printf '%s' "$line" | sed -n 's/.*"command":"\(.*\)","exit_code":.*/\1/p')"
+    ex="$(printf '%s' "$line" | sed -n 's/.*"exit_code":\([0-9]*\).*/\1/p')"
+    [[ -n "$art" ]] || continue
+    case "$art" in
+      "$base"/*) rel="${art#"$base"/}" ;;
+      */out/*) rel="$prefix${art##*/out/}" ;;   # per-node manifest: /tmp/…/out/<rel>
+      *) rel="$art" ;;
+    esac
+    cmd="${cmd//\\\"/\"}"   # unescape JSON \" and \\ for display
+    cmd="${cmd//\\\\/\\}"
+    cmd="${cmd//|/\\|}"     # escape markdown table pipe
+    printf '| %s | `%s` | `%s` |\n' "$ex" "$rel" "$cmd"
+  done <"$manifest"
+}
+
+# Human-readable index of the bundle: what each file is, and the exact command
+# (with exit code) that produced each captured artifact. Sourced from the
+# manifests, so it always matches what was actually collected.
+# SC2016: backticks in the printf formats are literal markdown, not command subs.
+# shellcheck disable=SC2016
+write_catalog() {
+  local workdir=$1
+  local nd alias
+  {
+    printf '# Bundle contents\n\n'
+    printf 'Read-only Ceph incident evidence. Below is what each file is, and — for captured commands — the exact command and exit code that produced it (from the manifest.jsonl files).\n\n'
+    printf '## Top-level\n\n'
+    printf -- '- `README-FIRST.txt` — start here\n'
+    printf -- '- `summary.txt` — run summary (mode, seed, nodes ok/failed, final exit code)\n'
+    printf -- '- `environment.txt` — when/mode/seed/git commit + chosen ceph_source / ceph_runner / rook_source\n'
+    printf -- '- `manifest.jsonl` — machine-readable: one JSON line per captured command\n'
+    printf -- '- `errors.log` — commands that returned non-zero, or nodes that failed\n'
+    printf -- '- `redactions.log` — per-file count of lines redacted\n'
+    printf -- '- `CONTENTS.md` — this file\n\n'
+    printf '## Cluster-level commands (cluster/)\n\n'
+    printf '| exit | file | command |\n|---|---|---|\n'
+    catalog_rows "$workdir/manifest.jsonl" "$workdir"
+    for nd in "$workdir"/nodes/*/; do
+      [[ -d "$nd" ]] || continue
+      alias="$(basename "$nd")"
+      printf '\n## Node: %s (nodes/%s/)\n\n' "$alias" "$alias"
+      if [[ -f "$nd/manifest.jsonl" ]]; then
+        printf '| exit | file | command |\n|---|---|---|\n'
+        catalog_rows "$nd/manifest.jsonl" "${nd%/}" "nodes/$alias/"
+      else
+        printf 'Not collected — see `nodes/%s/SKIPPED.txt`.\n' "$alias"
+      fi
+    done
+  } >"$workdir/CONTENTS.md"
+}
+
+# Single cleanup point (EXIT trap). Uses globals (CLEANUP_WORKDIR/CLEANUP_KEEP)
+# because it fires after main has returned and main's locals are gone.
+cleanup_workdir() {
+  local rc=$?
+  if [[ -n "${CLEANUP_WORKDIR:-}" && -d "$CLEANUP_WORKDIR" ]]; then
+    if [[ "${CLEANUP_KEEP:-0}" -eq 1 ]]; then
+      printf 'kept workdir: %s\n' "$CLEANUP_WORKDIR" >&2
+    else
+      rm -rf -- "$CLEANUP_WORKDIR"
+    fi
+  fi
+  return "$rc"
+}
+
+# Ctrl-C / SIGTERM: stop NOW. Without this the plain EXIT-trap handler runs
+# cleanup but bash keeps executing the next node, so the run "can't be stopped".
+# Drop the traps (avoid re-entry / double cleanup), clean up, and exit 130.
+on_interrupt() {
+  trap - INT TERM EXIT
+  printf '\ninterrupted — stopping and cleaning up…\n' >&2
+  cleanup_workdir
+  exit 130
+}
+
 # Redact every text-ish artifact in the bundle in place (gz handled specially).
 redact_bundle_text() {
   local workdir=$1

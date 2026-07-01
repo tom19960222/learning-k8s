@@ -300,24 +300,12 @@ collect_remote_node() {
   return "$rc"
 }
 
-# Single cleanup point. Uses globals (not main's locals) so it works as an
-# EXIT trap, which fires after main has returned and its locals are gone.
+# Lifecycle globals: CLEANUP_WORKDIR / CLEANUP_KEEP (used by the trap handlers in
+# lib/bundle.sh), and the parsed inventory arrays filled by main.
 CLEANUP_WORKDIR=
 CLEANUP_KEEP=0
-# Parsed inventory (alias/target pairs); filled by main, read by collect_clusters + node loop.
 HOST_ALIASES=()
 HOST_TARGETS=()
-cleanup_workdir() {
-  local rc=$?
-  if [[ -n "${CLEANUP_WORKDIR:-}" && -d "$CLEANUP_WORKDIR" ]]; then
-    if [[ "${CLEANUP_KEEP:-0}" -eq 1 ]]; then
-      printf 'kept workdir: %s\n' "$CLEANUP_WORKDIR" >&2
-    else
-      rm -rf -- "$CLEANUP_WORKDIR"
-    fi
-  fi
-  return "$rc"
-}
 
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
@@ -434,7 +422,8 @@ main() {
   ensure_dir "$workdir"
   CLEANUP_WORKDIR="$workdir"
   CLEANUP_KEEP=$keep_workdir
-  trap cleanup_workdir EXIT INT TERM
+  trap cleanup_workdir EXIT
+  trap on_interrupt INT TERM
   write_initial_metadata "$workdir" "$mode" "$seed" "$since" "$timeout"
 
   # Parse HOSTS once into globals (used by the cluster capability probe AND the
@@ -499,6 +488,7 @@ main() {
   progress "redacting…"
   redact_bundle_text "$workdir"
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
+  write_catalog "$workdir"
 
   progress "verifying…"
   # Verify BEFORE packaging, but never let verification destroy collected

@@ -142,7 +142,7 @@ case "$whole" in
     mkdir -p "$t/system"
     printf 'node %s\n' "$alias_name" >"$t/system/hostname.txt"
     if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
-      printf '{"node":"%s"}\n' "$alias_name" >"$t/manifest.jsonl"
+      printf '{"host":"%s","collector":"collect-node","artifact":"/rmt/out/system/hostname.txt","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' "$alias_name" >"$t/manifest.jsonl"
     fi
     [[ "${FAKE_SSH_PEM_ALIAS:-}" == "$alias_name" ]] && printf 'cert\n' >"$t/system/leak.pem"
     tar -czf - -C "$t" .
@@ -207,6 +207,12 @@ grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node wrapper should use --node-timeou
 env_txt="$(tar -xOzf "$bundle_auto" ./environment.txt 2>/dev/null)"
 [[ "$env_txt" == *"ceph_source=tester@10.0.0.1"* ]] || fail "environment.txt missing ceph_source"
 [[ "$env_txt" == *"rook_source=tester@10.0.0.9"* ]] || fail "environment.txt missing rook_source"
+# #3: CONTENTS.md catalogs each artifact and the command that produced it
+assert_archive_contains "$bundle_auto" "CONTENTS.md"
+contents="$(tar -xOzf "$bundle_auto" ./CONTENTS.md 2>/dev/null)"
+[[ "$contents" == *"cluster/ceph/json/status.json"* ]] || fail "CONTENTS.md missing a cluster artifact row"
+[[ "$contents" == *"ceph status --format json-pretty"* ]] || fail "CONTENTS.md missing the producing command"
+[[ "$contents" == *"nodes/cephnode/system/hostname.txt"* ]] || fail "CONTENTS.md missing a per-node artifact row"
 
 # ---------------------------------------------------------------------------
 # auto with NO capable nodes: both layers SKIPPED, nodes still collected, exit 2
@@ -451,5 +457,41 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   >"$q_out" 2>"$q_err"
 grep -qF 'bundle:' "$q_out" || fail "--quiet must still print bundle: to stdout"
 grep -qE 'probing|node cephnode|collecting ceph' "$q_err" && fail "--quiet must suppress progress" || true
+
+# #1: the interrupt handler (Ctrl-C path) stops with exit 130 and cleans the
+# workdir. (Real signal delivery isn't reliably testable in every CI sandbox, so
+# we unit-test the handler contract that the trap invokes.)
+int_wd="$tmpdir/int-workdir"
+mkdir -p "$int_wd"
+int_rc=0
+set +e
+int_out="$( ( set -uo pipefail
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/common.sh"
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/bundle.sh"
+  # shellcheck disable=SC2030
+  CLEANUP_WORKDIR="$int_wd"
+  # shellcheck disable=SC2030
+  CLEANUP_KEEP=0
+  on_interrupt ) 2>&1 )"
+int_rc=$?
+set -e
+[[ "$int_rc" == "130" ]] || fail "on_interrupt must exit 130, got $int_rc"
+[[ "$int_out" == *"interrupted"* ]] || fail "on_interrupt should announce the interruption"
+[[ ! -d "$int_wd" ]] || fail "on_interrupt should remove the workdir"
+# with --keep-workdir the interrupt handler preserves it
+int_wd2="$tmpdir/int-workdir-keep"
+mkdir -p "$int_wd2"
+( set -euo pipefail
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/common.sh"; # shellcheck disable=SC1090
+  source "$ROOT/lib/bundle.sh"
+  # shellcheck disable=SC2030
+  CLEANUP_WORKDIR="$int_wd2"
+  # shellcheck disable=SC2030
+  CLEANUP_KEEP=1
+  on_interrupt ) >/dev/null 2>&1 || true
+[[ -d "$int_wd2" ]] || fail "on_interrupt must honor CLEANUP_KEEP=1"
 
 printf 'ok: collect orchestration\n'
