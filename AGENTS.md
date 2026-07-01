@@ -115,3 +115,33 @@ GIT_SSH_COMMAND='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=n
 3. `superpowers:subagent-driven-development` 或 `superpowers:executing-plans` → 實作
 
 不要省略任何階段。
+
+## 本機工作機（macOS bastion）限制與踩雷
+
+- **bash 3.2**：沒有 `mapfile`/nameref。`set -u` 下展開空陣列會直接報 unbound，一定要先 `[[ ${#arr[@]} -gt 0 ]]` 或用 `"${arr[@]+"${arr[@]}"}"` 保護；把命令輸出填進陣列用 `while IFS= read -r x; do a+=("$x"); done < <(cmd)`。
+- **沒有 `timeout` / `gtimeout`**：寫需要逾時的 shell 工具要偵測並 fallback（有就用、沒有就印警告，而非靜默無界）。
+- **沒有 `gh`**：開／更新 PR 用 `git push` 印出的 `pull/new/<branch>` URL 走 web；別呼叫 `gh`。
+- **bsdtar 會塞 `com.apple.provenance` xattr**：送檔給遠端 GNU tar 會噴 `Ignoring unknown extended header`；打包／傳輸時對 bsdtar 加 `--no-xattrs`。
+- **這個 harness 擋 `set -m`／job-control，背景程序收不到可靠的 SIGINT**：訊號／Ctrl+C 相關行為別靠真訊號測，改測 handler 的單元邏輯（直接呼叫 handler、驗退出碼與副作用）。
+- **ssh/scp 的選項別用「一整串變數」**：`X="-i k -o ..."` 展開常爆；flag 一律逐個寫死。
+
+## Ceph 驗證叢集（子專案需要真機驗證時）
+
+- **cephadm v19.2.3**：3 mon(`.166`/`.167`/`.164`)+ 9 OSD(`.169`/`.171`/`.174`，每台 3)。seed/admin = `.166`（`/etc/ceph` 有 admin keyring，且已裝 `ceph-common` → 可直連 `sudo ceph`）。
+- **single-node k8s(k0s)+ Rook external** = `.160`：operator 在 namespace `rook-ceph`、external CephCluster 在 `rook-ceph-external`（kubeconfig API 是 `localhost:6443`，kubectl 只能在 `.160` 本機用）。
+- ssh：key = repo 內 `.ssh/id_ed25519`；`ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none ikaros@192.168.18.x`；叢集指令 `sudo cephadm shell -- ceph ...`。
+- **破壞性操作**（停 OSD/mon）：先 `ceph osd ok-to-stop` / 確認 quorum → 注入 → 收集 → **立即回退** → 確認 `HEALTH_OK` 才進下一步。
+
+## experiments/ 下的 shell 工具開發約定
+
+- **TDD**：每個修正先寫會紅的測試 → 修 → 綠。測試用 `tests/` 內的 fake `ssh`/`kubectl`（PATH 覆蓋）+ 環境變數注入故障 + 對產出的 bundle/檔案斷言；`bash tests/run-tests.sh` 是總 gate。
+- **`shellcheck lib/*.sh run/*.sh tests/*.sh` 必須 0**（含 info 級）；確定是誤報再用「有註解說明理由」的 `# shellcheck disable=SCxxxx`（例：markdown 反引號誤判 SC2016、`sudo cat >file` 的 SC2024、單引號遠端腳本的 SC2016）。
+- read-only、bash 3.2 相容、**stdout 只放機器要抓的那行**（其餘 log/progress 一律走 stderr）。
+- DRY：重複邏輯（ssh 選項向量、skip-artifact writer…）收斂成 `lib/common.sh` 單一 helper；入口 script 保持精簡 orchestrator，純 helper 抽到 `lib/`。
+- 每次改動後跑 **`run-tests.sh` + `shellcheck` + `make validate`** 三個全綠才 commit／push。
+
+## 多視角 review 迴圈
+
+- 需要嚴謹把關時：平行跑 **Code Reviewer agent**（正確性/DRY/SOLID）、**SRE agent**（生產可用性/失敗模式），必要時加 **codex 跨模型**；整併去重 → triage（標 in-scope/out-of-scope）→ 修（TDD）→ 再 review，iterate 到 reviewer 明確 satisfied。
+- **codex 省 rate limit**：`codex exec --skip-git-repo-check --sandbox read-only "<prompt>" < /dev/null`（macOS 沒 timeout；可背景跑）。verdict 在輸出**最後一個 `codex` 區塊**。codex 的 read-only sandbox **跑不了 `mktemp`/測試** → 測試 gate 自己在本機跑，別信它「測過了」。
+- 破壞性驗證（改真叢集）自己直接控、每步可回退，別丟給無法中斷的背景 subagent。

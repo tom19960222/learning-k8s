@@ -64,7 +64,13 @@ set -euo pipefail
 [[ "${1:-}" == "--context" ]] && shift 2
 cmd="$*"
 case "$cmd" in
-  "get namespace rook-ceph") [[ "${FAKE_KUBE_NS_MISSING:-}" == "1" ]] && exit 1; printf 'rook-ceph\n' ;;
+  "get namespace rook-ceph")
+    if [[ "${FAKE_KUBE_NS_MISSING:-}" == "1" ]]; then
+      printf 'Error from server (NotFound): namespaces "rook-ceph" not found\n' >&2
+      exit 1
+    fi
+    printf 'rook-ceph\n'
+    ;;
   "get pods -n rook-ceph -o wide") printf 'NAME READY STATUS\nrook-ceph-operator-0 1/1 Running\n' ;;
   "get events -n rook-ceph --sort-by=.lastTimestamp") printf 'LAST SEEN TYPE\n1m Normal\n' ;;
   *"-n rook-ceph -o yaml") printf 'apiVersion: v1\nitems:\n- kind: CephCluster\n' ;;
@@ -466,13 +472,14 @@ mkdir -p "$int_wd"
 int_rc=0
 set +e
 int_out="$( ( set -uo pipefail
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   source "$ROOT/lib/common.sh"
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   source "$ROOT/lib/bundle.sh"
-  # shellcheck disable=SC2030
+  # Used by the sourced on_interrupt/cleanup_workdir trap helpers.
+  # shellcheck disable=SC2034
   CLEANUP_WORKDIR="$int_wd"
-  # shellcheck disable=SC2030
+  # shellcheck disable=SC2034
   CLEANUP_KEEP=0
   on_interrupt ) 2>&1 )"
 int_rc=$?
@@ -484,12 +491,14 @@ set -e
 int_wd2="$tmpdir/int-workdir-keep"
 mkdir -p "$int_wd2"
 ( set -euo pipefail
-  # shellcheck disable=SC1090
-  source "$ROOT/lib/common.sh"; # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
+  source "$ROOT/lib/common.sh"
+  # shellcheck disable=SC1091
   source "$ROOT/lib/bundle.sh"
-  # shellcheck disable=SC2030
+  # Used by the sourced on_interrupt/cleanup_workdir trap helpers.
+  # shellcheck disable=SC2034
   CLEANUP_WORKDIR="$int_wd2"
-  # shellcheck disable=SC2030
+  # shellcheck disable=SC2034
   CLEANUP_KEEP=1
   on_interrupt ) >/dev/null 2>&1 || true
 [[ -d "$int_wd2" ]] || fail "on_interrupt must honor CLEANUP_KEEP=1"

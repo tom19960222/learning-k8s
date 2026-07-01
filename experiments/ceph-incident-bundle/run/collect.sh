@@ -420,7 +420,10 @@ main() {
   workdir="$out_dir/tmp.$timestamp.$$"
   manifest="$workdir/manifest.jsonl"
   ensure_dir "$workdir"
+  # Used by cleanup_workdir/on_interrupt trap handlers from lib/bundle.sh.
+  # shellcheck disable=SC2034
   CLEANUP_WORKDIR="$workdir"
+  # shellcheck disable=SC2034
   CLEANUP_KEEP=$keep_workdir
   trap cleanup_workdir EXIT
   trap on_interrupt INT TERM
@@ -500,6 +503,8 @@ main() {
   verify_rc=$?
   set -e
   if [[ $verify_rc -ne 0 ]]; then
+    # Used by cleanup_workdir trap handler from lib/bundle.sh.
+    # shellcheck disable=SC2034
     CLEANUP_KEEP=1
     append_error "$workdir" "bundle verification failed (rc=$verify_rc); workdir kept, NOT packaged for sharing"
     write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "1"
@@ -515,6 +520,8 @@ main() {
   verify_rc=$?
   set -e
   if [[ $verify_rc -ne 0 ]]; then
+    # Used by cleanup_workdir trap handler from lib/bundle.sh.
+    # shellcheck disable=SC2034
     CLEANUP_KEEP=1
     rm -f -- "$bundle"
     printf 'VERIFY FAILED on packaged bundle; removed it, workdir kept at %s\n' "$workdir" >&2
