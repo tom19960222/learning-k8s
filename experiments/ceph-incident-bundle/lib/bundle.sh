@@ -73,6 +73,30 @@ append_error() {
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$message" >>"$workdir/errors.log"
 }
 
+# Single cleanup point (EXIT trap). Uses globals (CLEANUP_WORKDIR/CLEANUP_KEEP)
+# because it fires after main has returned and main's locals are gone.
+cleanup_workdir() {
+  local rc=$?
+  if [[ -n "${CLEANUP_WORKDIR:-}" && -d "$CLEANUP_WORKDIR" ]]; then
+    if [[ "${CLEANUP_KEEP:-0}" -eq 1 ]]; then
+      printf 'kept workdir: %s\n' "$CLEANUP_WORKDIR" >&2
+    else
+      rm -rf -- "$CLEANUP_WORKDIR"
+    fi
+  fi
+  return "$rc"
+}
+
+# Ctrl-C / SIGTERM: stop NOW. Without this the plain EXIT-trap handler runs
+# cleanup but bash keeps executing the next node, so the run "can't be stopped".
+# Drop the traps (avoid re-entry / double cleanup), clean up, and exit 130.
+on_interrupt() {
+  trap - INT TERM EXIT
+  printf '\ninterrupted — stopping and cleaning up…\n' >&2
+  cleanup_workdir
+  exit 130
+}
+
 # Redact every text-ish artifact in the bundle in place (gz handled specially).
 redact_bundle_text() {
   local workdir=$1

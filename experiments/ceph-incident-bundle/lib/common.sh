@@ -27,11 +27,15 @@ ensure_dir() {
 # flag like BatchMode can't drift between call sites.
 ssh_base_opts() {
   local ssh_key=$1 timeout=$2
+  # LogLevel=ERROR keeps ssh's own chatter (e.g. "Warning: Permanently added ...
+  # to the list of known hosts", server banners) out of the captured artifacts,
+  # while still surfacing real connection errors.
   printf '%s\n' \
     -i "$ssh_key" \
     -o BatchMode=yes \
     -o IdentitiesOnly=yes \
     -o IdentityAgent=none \
+    -o LogLevel=ERROR \
     -o "ConnectTimeout=$timeout" \
     -o "ServerAliveInterval=$timeout" \
     -o ServerAliveCountMax=1

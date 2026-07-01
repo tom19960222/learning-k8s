@@ -452,4 +452,40 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
 grep -qF 'bundle:' "$q_out" || fail "--quiet must still print bundle: to stdout"
 grep -qE 'probing|node cephnode|collecting ceph' "$q_err" && fail "--quiet must suppress progress" || true
 
+# #1: the interrupt handler (Ctrl-C path) stops with exit 130 and cleans the
+# workdir. (Real signal delivery isn't reliably testable in every CI sandbox, so
+# we unit-test the handler contract that the trap invokes.)
+int_wd="$tmpdir/int-workdir"
+mkdir -p "$int_wd"
+int_rc=0
+set +e
+int_out="$( ( set -uo pipefail
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/common.sh"
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/bundle.sh"
+  # shellcheck disable=SC2030
+  CLEANUP_WORKDIR="$int_wd"
+  # shellcheck disable=SC2030
+  CLEANUP_KEEP=0
+  on_interrupt ) 2>&1 )"
+int_rc=$?
+set -e
+[[ "$int_rc" == "130" ]] || fail "on_interrupt must exit 130, got $int_rc"
+[[ "$int_out" == *"interrupted"* ]] || fail "on_interrupt should announce the interruption"
+[[ ! -d "$int_wd" ]] || fail "on_interrupt should remove the workdir"
+# with --keep-workdir the interrupt handler preserves it
+int_wd2="$tmpdir/int-workdir-keep"
+mkdir -p "$int_wd2"
+( set -euo pipefail
+  # shellcheck disable=SC1090
+  source "$ROOT/lib/common.sh"; # shellcheck disable=SC1090
+  source "$ROOT/lib/bundle.sh"
+  # shellcheck disable=SC2030
+  CLEANUP_WORKDIR="$int_wd2"
+  # shellcheck disable=SC2030
+  CLEANUP_KEEP=1
+  on_interrupt ) >/dev/null 2>&1 || true
+[[ -d "$int_wd2" ]] || fail "on_interrupt must honor CLEANUP_KEEP=1"
+
 printf 'ok: collect orchestration\n'
