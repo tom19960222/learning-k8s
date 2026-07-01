@@ -76,7 +76,9 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_KUBECTL_LOG:?}"
 
 # tolerate a leading "--context CTX" (added in remote/ssh mode)
+ctx=''
 if [[ "${1:-}" == "--context" ]]; then
+  ctx=${2:-}
   shift 2
 fi
 
@@ -85,7 +87,20 @@ cmd="$*"
 
 case "$cmd" in
   "get namespace rook-ceph")
-    [[ "$mode" != "missing-namespace" ]] || exit 1
+    case "$mode" in
+      missing-namespace)
+        printf 'Error from server (NotFound): namespaces "rook-ceph" not found\n' >&2
+        exit 1
+        ;;
+      context-missing)
+        printf 'error: no context exists with the name: "%s"\n' "$ctx" >&2
+        exit 1
+        ;;
+      connection-refused)
+        printf 'The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?\n' >&2
+        exit 1
+        ;;
+    esac
     printf 'rook-ceph\n'
     ;;
   "get namespace rook-ceph-external")
@@ -142,6 +157,37 @@ missing_ns_rc=$?
 set -e
 [[ "$missing_ns_rc" == "2" ]] || fail "explicit rook with missing namespace should exit 2, got $missing_ns_rc"
 assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "namespace not found"
+assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "rook namespace not found: rook-ceph"
+assert_file_contains "$out_missing_ns/cluster/rook/SKIPPED.txt" "namespaces \"rook-ceph\" not found"
+
+out_missing_ctx="$tmpdir/out-missing-ctx"
+manifest_missing_ctx="$tmpdir/manifest-missing-ctx.jsonl"
+missing_ctx_rc=0
+set +e
+FAKE_KUBECTL_MODE=context-missing PATH="$fakebin:$PATH" \
+  "$BASH_BIN" "$ROOT/lib/collect-cluster-rook.sh" \
+  --out "$out_missing_ctx" \
+  --manifest "$manifest_missing_ctx" \
+  --namespace rook-ceph \
+  --since 24h \
+  --timeout 5 \
+  --kube-context lab
+missing_ctx_rc=$?
+set -e
+[[ "$missing_ctx_rc" == "2" ]] || fail "explicit rook with missing context should exit 2, got $missing_ctx_rc"
+assert_file_contains "$out_missing_ctx/cluster/rook/SKIPPED.txt" "kubectl context not found: lab"
+assert_file_contains "$out_missing_ctx/cluster/rook/SKIPPED.txt" "no context exists with the name"
+
+out_connection_refused="$tmpdir/out-connection-refused"
+manifest_connection_refused="$tmpdir/manifest-connection-refused.jsonl"
+connection_refused_rc=0
+set +e
+FAKE_KUBECTL_MODE=connection-refused PATH="$fakebin:$PATH" run_rook_collector "$out_connection_refused" "$manifest_connection_refused"
+connection_refused_rc=$?
+set -e
+[[ "$connection_refused_rc" == "2" ]] || fail "explicit rook with connection failure should exit 2, got $connection_refused_rc"
+assert_file_contains "$out_connection_refused/cluster/rook/SKIPPED.txt" "kubectl cannot connect to cluster API"
+assert_file_contains "$out_connection_refused/cluster/rook/SKIPPED.txt" "connection to the server"
 
 out_present="$tmpdir/out-present"
 manifest_present="$tmpdir/manifest-present.jsonl"

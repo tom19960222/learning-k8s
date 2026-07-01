@@ -43,6 +43,38 @@ rook_get_first_pod() {
     head -n1 | sed 's#^pod/##'
 }
 
+rook_compact_error() {
+  local value=$1
+  value=${value//$'\r'/}
+  value=${value//$'\n'/ | }
+  printf '%s' "$value"
+}
+
+rook_namespace_probe_failure_reason() {
+  local namespace=$1 kube_context=$2 target=$3 detail=$4
+  local compact nocase_was_set=0
+  compact="$(rook_compact_error "$detail")"
+
+  shopt -q nocasematch && nocase_was_set=1
+  shopt -s nocasematch
+  if [[ "$detail" =~ (kubectl:?[[:space:]]+command[[:space:]]+not[[:space:]]+found|command[[:space:]]+not[[:space:]]+found:?[[:space:]]+kubectl) ]]; then
+    printf 'kubectl command not found on %s' "$target"
+  elif [[ "$detail" =~ (no[[:space:]]+context[[:space:]]+exists|context.*(not[[:space:]]+found|does[[:space:]]+not[[:space:]]+exist)) ]]; then
+    printf 'kubectl context not found: %s on %s' "${kube_context:-<current-context>}" "$target"
+  elif [[ "$detail" =~ (connection[[:space:]]+to[[:space:]]+the[[:space:]]+server|unable[[:space:]]+to[[:space:]]+connect[[:space:]]+to[[:space:]]+the[[:space:]]+server|connection[[:space:]]+refused|i/o[[:space:]]+timeout|context[[:space:]]+deadline[[:space:]]+exceeded|no[[:space:]]+route[[:space:]]+to[[:space:]]+host|tls[[:space:]]+handshake[[:space:]]+timeout) ]]; then
+    printf 'kubectl cannot connect to cluster API from %s' "$target"
+  elif [[ "$detail" =~ (namespace.*not[[:space:]]+found|namespaces.*not[[:space:]]+found|notfound) ]]; then
+    printf 'rook namespace not found: %s' "$namespace"
+  elif [[ "$detail" =~ (forbidden|unauthorized|permission[[:space:]]+denied) ]]; then
+    printf 'kubectl cannot read rook namespace due to authorization failure: %s on %s' "$namespace" "$target"
+  else
+    printf 'kubectl namespace probe failed for rook namespace %s on %s' "$namespace" "$target"
+  fi
+  if [[ $nocase_was_set -eq 1 ]]; then shopt -s nocasematch; else shopt -u nocasematch; fi
+
+  [[ -n "$compact" ]] && printf ': %s' "$compact"
+}
+
 collect_cluster_rook() {
   local outdir='' manifest='' namespace=rook-ceph since=24h timeout=20 allow_skip=0
   local operator_namespace='' ssh_target='' ssh_key='' kube_context=''
@@ -129,8 +161,10 @@ collect_cluster_rook() {
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
-  if ! "${ROOK_KUBECTL_ARGV[@]}" get namespace "$namespace" >/dev/null 2>&1; then
-    rook_skip "$outdir" "namespace not found (or kubectl unavailable on ${ssh_target:-local}): $namespace"
+  local namespace_probe_output namespace_probe_reason
+  if ! namespace_probe_output="$("${ROOK_KUBECTL_ARGV[@]}" get namespace "$namespace" 2>&1)"; then
+    namespace_probe_reason="$(rook_namespace_probe_failure_reason "$namespace" "$kube_context" "${ssh_target:-local}" "$namespace_probe_output")"
+    rook_skip "$outdir" "$namespace_probe_reason"
     [[ "$allow_skip" == "1" ]] && return 0 || return 2
   fi
 
