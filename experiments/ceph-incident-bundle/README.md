@@ -145,11 +145,13 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 主要檔案：
 
 - `README-FIRST.txt`：打開 bundle 後先看的入口。
+- `CONTENTS.md`：**人類可讀的目錄**——每個檔案是什麼,以及(對每個收集到的 artifact)**產生它的完整指令 + exit code**。分 cluster 一段、每台 node 一段,內容直接從 manifest 產生,永遠與實際收到的一致。想知道「某個檔是哪條指令跑出來的」看這份最快。
 - `summary.txt`：本次收集摘要與成功/失敗數。
-- `environment.txt`：收集時間、mode、seed、git commit。
-- `manifest.jsonl`：每個 artifact 的 command、exit code、時間。
+- `environment.txt`：收集時間、mode、seed、git commit,以及選到的 `ceph_source`/`ceph_runner`/`rook_source`。
+- `manifest.jsonl`：每個 artifact 的 command、exit code、時間(machine-readable;`CONTENTS.md` 就是它的可讀版)。
 - `errors.log`：非零 exit code、SSH 失敗、部分失敗。
-- `cluster/`：cephadm 或 Rook cluster-level 狀態。
+- `redactions.log`：每個檔遮蔽了幾行。
+- `cluster/`：cephadm(直接 `ceph` 或 `cephadm shell`)或 Rook cluster-level 狀態。
 - `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、Ceph log 與 cephadm 狀態。
 
 ## exit code 怎麼看
