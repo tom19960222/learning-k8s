@@ -39,6 +39,9 @@ ssh_base_opts() {
     -o "ConnectTimeout=$timeout" \
     -o "ServerAliveInterval=$timeout" \
     -o ServerAliveCountMax=1
+  if [[ "${CEPH_INCIDENT_TRUST_SSH_HOST_KEY:-1}" == "1" ]]; then
+    printf '%s\n' -o StrictHostKeyChecking=accept-new
+  fi
 }
 
 # Write a `SKIPPED: <reason>` artifact. `_once` does not overwrite an existing

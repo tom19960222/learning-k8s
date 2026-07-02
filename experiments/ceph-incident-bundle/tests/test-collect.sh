@@ -29,6 +29,11 @@ assert_archive_contains() {
   tar -tzf "$bundle" | sed 's#^\./##' | grep -qF "$expected" || fail "archive missing $expected"
 }
 
+assert_archive_file_contains() {
+  local bundle=$1 path=$2 expected=$3
+  tar -xOzf "$bundle" "./$path" 2>/dev/null | grep -qF "$expected" || fail "archive file $path missing $expected"
+}
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -41,6 +46,8 @@ help_output="${help_result#*$'\n'}"
 [[ "$help_status" == "0" ]] || fail "collect.sh --help exited $help_status"
 [[ "$help_output" == *"Usage:"* ]] || fail "collect.sh --help did not print usage"
 [[ "$help_output" == *"--kube-context"* ]] || fail "help should document --kube-context"
+[[ "$help_output" == *"--no-trust-ssh-host-key"* ]] || fail "help should document --no-trust-ssh-host-key"
+[[ "$help_output" == *"--no-redact"* ]] || fail "help should document --no-redact"
 
 missing_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$tmpdir/missing.env")"
 missing_status="${missing_result%%$'\n'*}"
@@ -146,7 +153,9 @@ case "$whole" in
     sleep "${FAKE_SSH_SLEEP:-0}"
     t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
     mkdir -p "$t/system"
+    mkdir -p "$t/cephadm/var-lib-ceph-configs/fsid/mon.a"
     printf 'node %s\n' "$alias_name" >"$t/system/hostname.txt"
+    printf 'secret = should-redact\n' >"$t/cephadm/var-lib-ceph-configs/fsid/mon.a/config"
     if [[ "${FAKE_SSH_NO_MANIFEST_ALIAS:-}" != "$alias_name" ]]; then
       printf '{"host":"%s","collector":"collect-node","artifact":"/rmt/out/system/hostname.txt","command":"hostname","exit_code":0,"started":"t0","ended":"t1"}\n' "$alias_name" >"$t/manifest.jsonl"
     fi
@@ -206,8 +215,10 @@ assert_archive_contains "$bundle_auto" "cluster/ceph/json/status.json"
 assert_archive_contains "$bundle_auto" "cluster/rook/pods-wide.txt"
 assert_archive_contains "$bundle_auto" "nodes/cephnode/system/hostname.txt"
 assert_archive_contains "$bundle_auto" "nodes/kubenode/system/hostname.txt"
+assert_archive_file_contains "$bundle_auto" "nodes/cephnode/cephadm/var-lib-ceph-configs/fsid/mon.a/config" "[REDACTED]"
 grep -qF -- '--context lab' "$FAKE_SSH_LOG" || fail "rook kubectl missing --context in auto mode"
 grep -qF '10.0.0.9 kubectl' "$FAKE_SSH_LOG" || fail "rook kubectl did not run on the kube node"
+grep -qF 'StrictHostKeyChecking=accept-new' "$FAKE_SSH_LOG" || fail "ssh host key trust should be enabled by default"
 grep -qx '90' "$FAKE_TIMEOUT_LOG" || fail "node wrapper should use --node-timeout 90"
 # A4: the chosen cluster sources are recorded in environment.txt
 env_txt="$(tar -xOzf "$bundle_auto" ./environment.txt 2>/dev/null)"
@@ -219,6 +230,40 @@ contents="$(tar -xOzf "$bundle_auto" ./CONTENTS.md 2>/dev/null)"
 [[ "$contents" == *"cluster/ceph/json/status.json"* ]] || fail "CONTENTS.md missing a cluster artifact row"
 [[ "$contents" == *"ceph status --format json-pretty"* ]] || fail "CONTENTS.md missing the producing command"
 [[ "$contents" == *"nodes/cephnode/system/hostname.txt"* ]] || fail "CONTENTS.md missing a per-node artifact row"
+
+# safety toggles: defaults are on; each off-switch must be independent.
+out_no_trust="$tmpdir/out-no-trust"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --out "$out_no_trust" --since 24h --timeout 5 \
+  --no-trust-ssh-host-key
+bundle_no_trust="$(find_bundle "$out_no_trust")"
+assert_archive_file_contains "$bundle_no_trust" "nodes/cephnode/cephadm/var-lib-ceph-configs/fsid/mon.a/config" "[REDACTED]"
+grep -qF 'StrictHostKeyChecking=accept-new' "$FAKE_SSH_LOG" && fail "--no-trust-ssh-host-key should not add StrictHostKeyChecking=accept-new" || true
+
+out_no_redact="$tmpdir/out-no-redact"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --out "$out_no_redact" --since 24h --timeout 5 \
+  --no-redact
+bundle_no_redact="$(find_bundle "$out_no_redact")"
+assert_archive_file_contains "$bundle_no_redact" "nodes/cephnode/cephadm/var-lib-ceph-configs/fsid/mon.a/config" "secret = should-redact"
+grep -qF 'StrictHostKeyChecking=accept-new' "$FAKE_SSH_LOG" || fail "--no-redact should not disable default ssh host key trust"
+
+out_explicit_on="$tmpdir/out-explicit-on"
+: >"$FAKE_SSH_LOG"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode auto --out "$out_explicit_on" --since 24h --timeout 5 \
+  --trust-ssh-host-key --redact
+bundle_explicit_on="$(find_bundle "$out_explicit_on")"
+assert_archive_file_contains "$bundle_explicit_on" "nodes/cephnode/cephadm/var-lib-ceph-configs/fsid/mon.a/config" "[REDACTED]"
+grep -qF 'StrictHostKeyChecking=accept-new' "$FAKE_SSH_LOG" || fail "--trust-ssh-host-key should add StrictHostKeyChecking=accept-new"
 
 # ---------------------------------------------------------------------------
 # auto with NO capable nodes: both layers SKIPPED, nodes still collected, exit 2

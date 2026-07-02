@@ -140,6 +140,29 @@ bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h
 BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h --quiet | sed 's/^bundle: //')
 ```
 
+## SSH host key 與 redaction 開關
+
+預設行為：
+
+- SSH 連線會加上 `StrictHostKeyChecking=accept-new`，第一次連到新 host 時自動接受 host key；如果 host key 之後變更，OpenSSH 仍會阻擋。
+- bundle 打包前會執行 redaction，遮蔽明顯敏感內容。
+
+需要改變預設時：
+
+```bash
+# 不自動接受新的 SSH host key，回到 OpenSSH 預設檢查行為
+--no-trust-ssh-host-key
+
+# 保留原始內容，不做 redaction
+--no-redact
+```
+
+也可以明確寫出預設值：
+
+```bash
+--trust-ssh-host-key --redact
+```
+
 ## bundle 內有什麼
 
 主要檔案：
@@ -171,7 +194,7 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 ## 安全界線
 
 - 這套工具以 read-only 收集為原則，不會主動修復或改變 Ceph 狀態。
-- 遮蔽（redaction）涵蓋：含 `password`/`secret`/`token`/`keyring`/`private key` 的文字行、Ceph 金鑰材料（`key = AQB..==` 與 base64 區塊）、整段多行 PEM private key block；並會把 `*.gz` 解壓後遮蔽再壓回。但這**不是完整 DLP**。
+- 遮蔽（redaction）預設開啟，涵蓋：含 `password`/`secret`/`token`/`keyring`/`private key` 的文字行、Ceph 金鑰材料（`key = AQB..==` 與 base64 區塊）、整段多行 PEM private key block；並會把 `*.gz` 解壓後遮蔽再壓回。但這**不是完整 DLP**。若使用 `--no-redact`，bundle 會保留原始內容。
 - `verify-bundle.sh` 會以**檔名**（keyring/.ssh/id_ed25519/private_key/*.pem/*.key/*.crt）與**內容**（殘留的 PRIVATE KEY block / `key = <base64>`）兩道把關，但仍不能保證內容完全沒有敏感資料。
 - 分享 bundle 前仍應自行檢查是否包含內部 IP、hostname、路徑、帳號名稱或其他敏感資料。
 

@@ -40,6 +40,11 @@ Options:
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
   --skip-logs            collect state but skip larger Ceph log copies
+  --trust-ssh-host-key   accept new SSH host keys automatically (default)
+  --no-trust-ssh-host-key
+                         use OpenSSH's normal host-key checking behavior
+  --redact               redact sensitive-looking lines before packaging (default)
+  --no-redact            keep raw collected text without redaction
   --quiet                suppress progress output on stderr (stdout still prints bundle:)
   --keep-workdir         keep temporary extracted workdir for debugging
   --help                 print this help
@@ -310,6 +315,7 @@ HOST_TARGETS=()
 main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
+  local trust_ssh_host_key=1 redact_enabled=1
   local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph rook_operator_namespace=rook-ceph kube_context='' kube_mode=remote
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
@@ -364,6 +370,22 @@ main() {
         skip_logs=1
         shift
         ;;
+      --trust-ssh-host-key)
+        trust_ssh_host_key=1
+        shift
+        ;;
+      --no-trust-ssh-host-key)
+        trust_ssh_host_key=0
+        shift
+        ;;
+      --redact)
+        redact_enabled=1
+        shift
+        ;;
+      --no-redact)
+        redact_enabled=0
+        shift
+        ;;
       --quiet)
         export CEPH_INCIDENT_QUIET=1
         shift
@@ -393,6 +415,7 @@ main() {
   [[ "$kube_mode" == "local" || "$kube_mode" == "remote" ]] || die "invalid --kube-mode (local|remote): $kube_mode"
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
+  export CEPH_INCIDENT_TRUST_SSH_HOST_KEY=$trust_ssh_host_key
 
   # shellcheck disable=SC1090
   source "$inventory"
@@ -488,8 +511,12 @@ main() {
     die "test abort after nodes"
   fi
 
-  progress "redacting…"
-  redact_bundle_text "$workdir"
+  if [[ "$redact_enabled" == "1" ]]; then
+    progress "redacting…"
+    redact_bundle_text "$workdir"
+  else
+    : >"$workdir/redactions.log"
+  fi
   write_summary "$workdir" "$mode" "$seed" "$node_ok" "$node_failed" "$cluster_rc" "$rc"
   write_catalog "$workdir"
 
