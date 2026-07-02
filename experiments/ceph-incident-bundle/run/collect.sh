@@ -78,6 +78,7 @@ detect_node_caps() {
     ensure_dir "$(dirname -- "$ERROR_LOG")"
     printf '%s capability probe failed for %s (ssh exit %s) — node not considered as a cluster source\n' \
       "$(date -u +%FT%TZ)" "$target" "$rc" >>"$ERROR_LOG"
+    write_ssh_debug_log "$(dirname -- "$ERROR_LOG")" capability-probe "$target" "$ssh_key" "$timeout"
   fi
   printf '%s' "$out"
 }
@@ -279,6 +280,9 @@ collect_remote_node() {
     "${ssh_cmd[@]}" >"$node_tar"
   rc=$?
   set -e
+  if [[ $rc -eq 255 || $rc -eq 124 || $rc -eq 137 ]]; then
+    write_ssh_debug_log "$workdir" "node-${alias}" "$target" "$ssh_key" "$timeout"
+  fi
 
   ensure_dir "$node_dir"
   if [[ $rc -eq 124 || $rc -eq 137 ]]; then

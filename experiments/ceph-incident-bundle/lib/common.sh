@@ -44,6 +44,54 @@ ssh_base_opts() {
   fi
 }
 
+ssh_debug_safe_name() {
+  local value=$1
+  value="$(printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_')"
+  while [[ "$value" == *..* ]]; do
+    value="${value//../__}"
+  done
+  [[ -n "$value" ]] || value=ssh
+  printf '%s' "$value"
+}
+
+write_ssh_debug_log() {
+  local workdir=$1 label=$2 target=$3 ssh_key=$4 timeout=$5
+  local debug_dir="$workdir/ssh-debug"
+  local safe_label safe_target artifact started ended rc tbin _w
+  local -a sopts cmd
+
+  ensure_dir "$debug_dir"
+  safe_label="$(ssh_debug_safe_name "$label")"
+  safe_target="$(ssh_debug_safe_name "$target")"
+  artifact="$debug_dir/${safe_label}-${safe_target}.log"
+  while IFS= read -r _w; do sopts+=("$_w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
+  cmd=(ssh "${sopts[@]}" -vvv -o LogLevel=DEBUG3 "$target" true)
+  tbin="$(timeout_cmd)"
+  [[ -n "$tbin" ]] && cmd=("$tbin" "$timeout" "${cmd[@]}")
+
+  started="$(date -u +%FT%TZ)"
+  {
+    printf '# ssh debug log\n'
+    printf '# target: %s\n' "$target"
+    printf '# label: %s\n' "$label"
+    printf '# started: %s\n' "$started"
+    printf '# command: '
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  } >"$artifact"
+
+  if "${cmd[@]}" >>"$artifact" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  ended="$(date -u +%FT%TZ)"
+  {
+    printf '# ended: %s\n' "$ended"
+    printf '# exit_code: %s\n' "$rc"
+  } >>"$artifact"
+}
+
 # Write a `SKIPPED: <reason>` artifact. `_once` does not overwrite an existing
 # file (so a collector's specific reason is never clobbered by a generic one).
 write_skip_artifact() {

@@ -32,9 +32,14 @@ collect_cephadm_command() {
   while IFS= read -r _w; do runner_argv+=("$_w"); done < <(ceph_runner_argv "$runner")
   while IFS= read -r _w; do sopts+=("$_w"); done < <(ssh_base_opts "$ssh_key" "$timeout")
 
+  local rc=0
   COMMAND_TIMEOUT="$timeout" ERROR_LOG="${ERROR_LOG:-$outdir/errors.log}" \
     run_capture "$manifest" "$seed" "collect-cluster-cephadm" "$artifact" -- \
-    ssh "${sopts[@]}" "$seed" "${runner_argv[@]}" "$@"
+    ssh "${sopts[@]}" "$seed" "${runner_argv[@]}" "$@" || rc=$?
+  if [[ $rc -eq 255 || $rc -eq 124 || $rc -eq 137 ]]; then
+    write_ssh_debug_log "$outdir" "cluster-ceph" "$seed" "$ssh_key" "$timeout"
+  fi
+  return "$rc"
 }
 
 write_cephadm_crash_skip() {

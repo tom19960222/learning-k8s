@@ -34,6 +34,19 @@ assert_archive_file_contains() {
   tar -xOzf "$bundle" "./$path" 2>/dev/null | grep -qF "$expected" || fail "archive file $path missing $expected"
 }
 
+assert_archive_has_debug_log_for() {
+  local bundle=$1 target=$2 expected=${3-} member content matched=0
+  while IFS= read -r member; do
+    content="$(tar -xOzf "$bundle" "./$member" 2>/dev/null)"
+    [[ "$content" == *"$target"* ]] || continue
+    [[ "$content" == *"debug1:"* ]] || continue
+    [[ -z "$expected" || "$content" == *"$expected"* ]] || continue
+    matched=1
+    break
+  done < <(tar -tzf "$bundle" | sed 's#^\./##' | grep '^ssh-debug/.*[.]log$')
+  [[ "$matched" == "1" ]] || fail "archive missing ssh-debug log for $target"
+}
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -115,6 +128,15 @@ done
 # Order matters: the capability-probe script also contains "kubectl", and the
 # runner connectivity probe ("--connect-timeout 5 -s") must be matched before the
 # generic ceph/cephadm command branches.
+if [[ "$whole" == *"-vvv"* ]]; then
+  printf 'debug1: fake ssh verbose log for %s\n' "$target" >&2
+  printf 'debug3: fake ssh argv %s\n' "$whole" >&2
+  exit 255
+fi
+for t in ${FAKE_SSH_CONNECT_FAIL_TARGETS:-}; do
+  [[ "$target" == *"$t"* ]] && { printf 'ssh: connect to host %s port 22: Connection refused\n' "$target" >&2; exit 255; }
+done
+
 case "$whole" in
   *"--connect-timeout 5 -s"*)
     # ceph runner connectivity probe; succeed per method+target env
@@ -407,8 +429,33 @@ PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
   --mode auto --out "$out_probefail" --since 24h --timeout 5 >/dev/null 2>&1
 set -e
 assert_archive_contains "$(find_bundle "$out_probefail")" "errors.log"
+assert_archive_has_debug_log_for "$(find_bundle "$out_probefail")" "tester@10.0.0.9"
 tar -xOzf "$(find_bundle "$out_probefail")" ./errors.log 2>/dev/null | grep -qF 'capability probe failed for tester@10.0.0.9' \
   || fail "probe ssh failure was not recorded in errors.log"
+
+# A3b: a node SSH transport failure preserves a verbose ssh debug log in bundle
+out_node_sshfail="$tmpdir/out-node-sshfail"
+set +e
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="" FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.9" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode cephadm --seed tester@10.0.0.1 --out "$out_node_sshfail" --since 24h --timeout 5 >/dev/null 2>&1
+node_sshfail_status=$?
+set -e
+[[ "$node_sshfail_status" == "2" ]] || fail "node ssh transport failure should exit 2, got $node_sshfail_status"
+assert_archive_has_debug_log_for "$(find_bundle "$out_node_sshfail")" "tester@10.0.0.9"
+
+# A3c: a cluster Ceph SSH transport failure also preserves a verbose ssh debug log
+out_cluster_sshfail="$tmpdir/out-cluster-sshfail"
+set +e
+FAKE_CEPH_TARGETS="" FAKE_KUBE_TARGETS="" FAKE_SSH_CONNECT_FAIL_TARGETS="10.0.0.1" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --mode cephadm --seed tester@10.0.0.1 --out "$out_cluster_sshfail" --since 24h --timeout 5 >/dev/null 2>&1
+cluster_sshfail_status=$?
+set -e
+[[ "$cluster_sshfail_status" == "2" ]] || fail "cluster ssh transport failure should exit 2, got $cluster_sshfail_status"
+assert_archive_has_debug_log_for "$(find_bundle "$out_cluster_sshfail")" "tester@10.0.0.1" "label: cluster-ceph"
 
 # A5: empty HOSTS=() -> exit 1 with a clear message (no bash-3.2 unbound error)
 inv_empty="$tmpdir/inv-empty.env"
