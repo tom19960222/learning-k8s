@@ -147,6 +147,11 @@ data:
         - receiver: slack-ceph
           matchers:
             - type="ceph_default"
+    inhibit_rules:
+      - source_matchers:
+          - alertname="CephMonQuorumLost"
+        target_matchers:
+          - alertname="CephMonDownScoped"
     receivers:
       - name: slack-ceph
         webhook_configs:
