@@ -30,8 +30,23 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/ale
   printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephMonQuorumLost"},"state":"firing"}]}}'
   exit 0
 fi
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up{job=\"ceph\"}"* ]]; then
+  printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=sum(ceph_mon_quorum_status)"* ]]; then
+  printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"pager","alertname":"CephMonQuorumLost","labels":{}}'
+  if grep -q 'systemctl stop ceph-' "$trace_file"; then
+    printf '%s\n' '{"receiver":"pager","alertname":"CephMonQuorumLost","labels":{"fresh":"true"}}'
+  fi
+  exit 0
+fi
+if [[ "\$*" == *"-n rook-ceph-external get cephcluster -o wide"* ]]; then
+  printf '%s\n' 'rook-ceph-external Connected HEALTH_OK'
   exit 0
 fi
 printf 'kubectl-noise-for-%s\n' "\$*" >&1
@@ -77,11 +92,15 @@ case "\$command" in
     printf 'HEALTH_WARN mons down, quorum reduced (MON_DOWN)\n'
     exit 0
     ;;
+  *"ceph -s"*)
+    printf 'HEALTH_OK\n'
+    exit 0
+    ;;
   *"quorum_status --format json"*)
     printf '{"quorum":[1]}\n'
     exit 0
     ;;
-  *"ceph -s"*|*"ceph osd tree"*|*"systemctl stop ceph-"*|*"systemctl start ceph-"*)
+  *"ceph osd tree"*|*"systemctl stop ceph-"*|*"systemctl start ceph-"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -169,6 +188,9 @@ if grep -Eq 'ssh-live-noise|kubectl-noise-for-' "$live_stdout_file"; then
 fi
 grep -q '^ssh:sudo systemctl stop ceph-.*@mon\.ceph-lab-mon-01\.service$' "$live_trace_file" || fail "missing stop for mon-01"
 grep -q '^ssh:sudo systemctl stop ceph-.*@mon\.ceph-lab-mon-03\.service$' "$live_trace_file" || fail "missing stop for mon-03"
+if grep -q '^ssh:sudo systemctl stop ceph-.*@mon\.ceph-lab-mon-02\.service$' "$live_trace_file"; then
+  fail "mon-02 should stay running for Prometheus scrape continuity"
+fi
 grep -q '^ssh:sudo systemctl start ceph-.*@mon\.ceph-lab-mon-01\.service$' "$live_trace_file" || fail "missing rollback start for mon-01"
 grep -q '^ssh:sudo systemctl start ceph-.*@mon\.ceph-lab-mon-03\.service$' "$live_trace_file" || fail "missing rollback start for mon-03"
 
@@ -180,5 +202,6 @@ start3_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@mon\.ceph-lab-mon-03\.
 [[ -n "$stop1_line" && -n "$stop3_line" && -n "$start1_line" && -n "$start3_line" ]] || fail "missing trace lines for ordering checks"
 (( start1_line > stop1_line )) || fail "rollback start for mon-01 happened before stop"
 (( start3_line > stop3_line )) || fail "rollback start for mon-03 happened before stop"
+grep -q 'query=sum(ceph_mon_quorum_status)' "$live_trace_file" || fail "missing Prometheus quorum-loss evidence query"
 
 ok "mon-quorum-lost destructive ack guard"

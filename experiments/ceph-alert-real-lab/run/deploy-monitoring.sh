@@ -10,3 +10,4 @@ source "$ROOT/lib/monitoring.sh"
 require_cmd kubectl
 apply_monitoring_stack
 log "monitoring stack ready in namespace $LAB_NAMESPACE"
+printf 'monitoring: %s\n' "$LAB_NAMESPACE"

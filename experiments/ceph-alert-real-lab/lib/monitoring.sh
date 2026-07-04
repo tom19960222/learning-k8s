@@ -33,7 +33,6 @@ metadata:
 data:
   alert-sink.py: |
     import json
-    import sys
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Handler(BaseHTTPRequestHandler):
@@ -270,10 +269,10 @@ apply_monitoring_stack() {
   manifest="$root/rendered/monitoring.yaml"
   mkdir -p "$root/rendered"
   render_monitoring_manifest "$manifest"
-  kubectl_lab apply -f "$manifest"
-  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/alert-sink --timeout=180s
-  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/prometheus --timeout=180s
-  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/alertmanager --timeout=180s
+  kubectl_lab apply -f "$manifest" >&2
+  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/alert-sink --timeout=180s >&2
+  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/prometheus --timeout=180s >&2
+  kubectl_lab -n "$LAB_NAMESPACE" rollout status deploy/alertmanager --timeout=180s >&2
 }
 
 delete_monitoring_stack() {
@@ -288,7 +287,7 @@ prometheus_query() {
 
 wait_prometheus_alert() {
   local alertname=$1 label_name=$2 label_value=$3 result_dir=$4
-  poll_until "Prometheus alert $alertname $label_name=$label_value firing" 60 5 prometheus_alert_is_firing "$alertname" "$label_name" "$label_value" "$result_dir"
+  poll_until "Prometheus alert $alertname $label_name=$label_value firing" "${PROMETHEUS_WAIT_ATTEMPTS:-60}" "${PROMETHEUS_WAIT_SLEEP:-5}" prometheus_alert_is_firing "$alertname" "$label_name" "$label_value" "$result_dir"
 }
 
 prometheus_alert_is_firing() {
@@ -300,12 +299,30 @@ prometheus_alert_is_firing() {
 }
 
 wait_sink_alert() {
-  local receiver=$1 alertname=$2 label_name=$3 label_value=$4 result_dir=$5
+  local receiver=$1 alertname=$2 label_name=$3 label_value=$4 result_dir=$5 checkpoint_file="${6:-}"
   # shellcheck disable=SC2016
   # Intentional single-quoted inline script so jq variables expand in the subshell, not here.
-  poll_until "sink $receiver received $alertname $label_name=$label_value" 60 5 bash -c '
+  poll_until "sink $receiver received $alertname $label_name=$label_value" "${SINK_WAIT_ATTEMPTS:-60}" "${SINK_WAIT_SLEEP:-5}" bash -c '
     logs="$(kubectl --kubeconfig "$0" -n "$1" logs deploy/alert-sink)"
     printf "%s\n" "$logs" >"$2/sink.log"
-    printf "%s\n" "$logs" | jq -r . 2>/dev/null | jq -e --arg r "$3" --arg an "$4" --arg ln "$5" --arg lv "$6" '"'"'select(.receiver==$r) | select(.alertname==$an) | select(($ln=="") or (.labels[$ln]==$lv))'"'"' >/dev/null
-  ' "$LAB_KUBECONFIG" "$LAB_NAMESPACE" "$result_dir" "$receiver" "$alertname" "$label_name" "$label_value"
+    start=0
+    if [[ -n "$7" && -f "$7" ]]; then
+      start="$(cat "$7")"
+    fi
+    awk -v start="$start" '"'"'NR > start'"'"' "$2/sink.log" >"$2/sink-since-checkpoint.log"
+    jq -r . "$2/sink-since-checkpoint.log" 2>/dev/null | jq -e --arg r "$3" --arg an "$4" --arg ln "$5" --arg lv "$6" '"'"'select(.receiver==$r) | select(.alertname==$an) | select(($ln=="") or (.labels[$ln]==$lv))'"'"' >/dev/null
+  ' "$LAB_KUBECONFIG" "$LAB_NAMESPACE" "$result_dir" "$receiver" "$alertname" "$label_name" "$label_value" "$checkpoint_file"
+}
+
+record_sink_checkpoint() {
+  local result_dir=$1 output_file line_file
+  output_file="$result_dir/sink-checkpoint.log"
+  line_file="$result_dir/sink-checkpoint-lines.txt"
+  mkdir -p "$result_dir"
+  if kubectl_lab -n "$LAB_NAMESPACE" logs deploy/alert-sink >"$output_file" 2>"$output_file.err"; then
+    :
+  else
+    : >"$output_file"
+  fi
+  wc -l <"$output_file" | tr -d ' ' >"$line_file"
 }

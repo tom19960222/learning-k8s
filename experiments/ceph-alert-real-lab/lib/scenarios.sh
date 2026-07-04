@@ -11,6 +11,16 @@ mon_service_name() {
   printf 'ceph-%s@mon.%s.service\n' "$fsid" "$mon_name"
 }
 
+lab_osd_host_ip() {
+  local host_name=$1
+  case "$host_name" in
+    ceph-lab-osd-01) printf '%s\n' "$LAB_OSD_01_HOST" ;;
+    ceph-lab-osd-02) printf '%s\n' "$LAB_OSD_02_HOST" ;;
+    ceph-lab-osd-03) printf '%s\n' "$LAB_OSD_03_HOST" ;;
+    *) die "unknown OSD host: $host_name" ;;
+  esac
+}
+
 cgroup_io_max_path_command() {
   local service=$1
   printf '%s\n' "cg=\$(systemctl show -p ControlGroup --value $service); test -n \"\$cg\"; printf '%s\\n' \"/sys/fs/cgroup\${cg}/io.max\""

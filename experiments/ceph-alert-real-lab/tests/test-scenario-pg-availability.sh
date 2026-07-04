@@ -30,8 +30,19 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/ale
   printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"PG_AVAILABILITY"},"state":"firing"}]}}'
   exit 0
 fi
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up{job=\"ceph\"}"* ]]; then
+  printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"PG_AVAILABILITY","labels":{"name":"PG_AVAILABILITY"}}'
+  if grep -q 'systemctl stop ceph-' "$trace_file"; then
+    printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"PG_AVAILABILITY","labels":{"name":"PG_AVAILABILITY","fresh":"true"}}'
+  fi
+  exit 0
+fi
+if [[ "\$*" == *"-n rook-ceph-external get cephcluster -o wide"* ]]; then
+  printf '%s\n' 'rook-ceph-external Connected HEALTH_OK'
   exit 0
 fi
 printf 'kubectl-noise-for-%s\n' "\$*" >&1
@@ -77,6 +88,10 @@ case "\$command" in
     printf 'HEALTH_WARN Reduced data availability: 1 pg inactive (PG_AVAILABILITY)\n'
     exit 0
     ;;
+  *"ceph -s"*)
+    printf 'HEALTH_OK\n'
+    exit 0
+    ;;
   *"quorum_status --format json"*)
     printf '{"quorum":[0,1,2]}\n'
     exit 0
@@ -93,7 +108,7 @@ case "\$command" in
     printf '{"crush_location":{"host":"ceph-lab-osd-02"}}\n'
     exit 0
     ;;
-  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p alert-pg-availability put sentinel /etc/hosts"*|*"ceph -s"*|*"ceph osd tree"*|*"systemctl stop ceph-"*|*"systemctl start ceph-"*|*"ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it"*)
+  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p alert-pg-availability put sentinel /etc/hosts"*|*"ceph osd tree"*|*"systemctl stop ceph-"*|*"systemctl start ceph-"*|*"ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
