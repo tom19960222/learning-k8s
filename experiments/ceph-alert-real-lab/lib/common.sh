@@ -39,8 +39,7 @@ new_result_dir() {
   local scenario=$1 root stamp dir
   root="$(lab_root)"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  dir="$root/results/${scenario}-${stamp}"
-  mkdir -p "$dir"
+  dir="$(mktemp -d "$root/results/${scenario}-${stamp}.XXXXXX")"
   printf '%s\n' "$dir"
 }
 
@@ -74,6 +73,11 @@ require_destructive_ack() {
 run_capture() {
   local output_file=$1
   shift
+  if [[ $# -lt 1 ]]; then
+    printf '# error: run_capture requires at least an output file and a command\n' >"$output_file"
+    printf 'run_capture requires at least an output file and a command\n' >&2
+    return 2
+  fi
   local started ended rc
   started="$(date -u +%FT%TZ)"
   {

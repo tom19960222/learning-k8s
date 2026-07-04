@@ -25,7 +25,7 @@ FAIL: missing /Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-r
 - `experiments/ceph-alert-real-lab/README.md`
 - `experiments/ceph-alert-real-lab/results/.gitkeep`
 - `experiments/ceph-alert-real-lab/rendered/.gitkeep`
-- `experiments/ceph-alert-real-lab/run/`
+- `experiments/ceph-alert-real-lab/run/.gitkeep`
 
 完成後重新執行：
 
@@ -59,6 +59,87 @@ make validate
 - `experiments/ceph-alert-real-lab/README.md`
 - `experiments/ceph-alert-real-lab/results/.gitkeep`
 - `experiments/ceph-alert-real-lab/rendered/.gitkeep`
+- `experiments/ceph-alert-real-lab/run/.gitkeep`
+
+## Fix Review Findings
+
+### RED
+
+1. `new_result_dir` collision proof against the parent commit:
+
+```bash
+bash -lc 'tmp=$(mktemp); git show HEAD:experiments/ceph-alert-real-lab/lib/common.sh >"$tmp"; source "$tmp"; result_dir=$(new_result_dir smoke); second_result_dir=$(new_result_dir smoke); if [[ "$result_dir" == "$second_result_dir" ]]; then printf "FAIL: new_result_dir returned the same path twice\n" >&2; exit 1; fi'
+```
+
+Output:
+
+```text
+FAIL: new_result_dir returned the same path twice
+```
+
+2. `run_capture` with only an output path against the parent commit:
+
+```bash
+bash -lc 'tmp=$(mktemp); git show HEAD:experiments/ceph-alert-real-lab/lib/common.sh >"$tmp"; source "$tmp"; capture_file=$(mktemp); capture_err_file=$(mktemp); run_capture "$capture_file" 2>"$capture_err_file"; status=$?; printf "STATUS=%s\n" "$status"; printf "FILE:\n"; cat "$capture_file"; printf "ERR:\n"; cat "$capture_err_file"'
+```
+
+Output:
+
+```text
+STATUS=0
+FILE:
+# started: 2026-07-04T03:10:37Z
+# command: ''
+
+# ended: 2026-07-04T03:10:37Z
+# exit_code: 0
+ERR:
+```
+
+### GREEN
+
+After the fixes, the focused helper test passes:
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/test-common.sh
+```
+
+Output:
+
+```text
+[2026-07-04T03:08:52Z] PASS: counter reaches 2
+ok: common helpers
+```
+
+And the repo gates pass:
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/common.sh experiments/ceph-alert-real-lab/tests/run-tests.sh experiments/ceph-alert-real-lab/tests/test-common.sh
+make validate
+```
+
+Outputs:
+
+```text
+[2026-07-04T03:09:04Z] PASS: counter reaches 2
+ok: common helpers
+ok: unit tests
+```
+
+```text
+<shellcheck produced no output and exited 0>
+```
+
+```text
+==================================================
+  Summary
+==================================================
+
+  ✓ All checks passed!
+```
+
+Task 1 only ran shellcheck on its actual `.sh` files. The exact `shellcheck -x ... run/*.sh` gate becomes applicable once Task 2 adds real run scripts under `experiments/ceph-alert-real-lab/run/`.
 
 ## Self-review
 
