@@ -1,9 +1,9 @@
-# Tier A — CephClientRisk：catch-all（name!~ 24 個排除），5m page。spec §4.4（最關鍵）
+# Tier A — CephClientRisk：catch-all（name!~ 25 個排除），5m page。spec §4.4（最關鍵）
 # 強化（devil #1/#2 + analyzer I3）：除個別負向，加「完整排除清單完整性」測試——
-# 餵全部 24 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
+# 餵全部 25 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
 # 若任何一個排除 name 被偷偷移出清單，這裡就會多出一個 alert 而 FAIL；
 # 若任何非排除 name 被誤加進清單，這裡就會少一個 alert 而 FAIL。
-# v2：排除清單擴充到 24 個（新增 OSD_FULL/POOL_FULL — 交給 CephClientBlocked；
+# v2：排除清單擴充到 25 個（新增 OSD_FULL/POOL_FULL — 交給 CephClientBlocked；
 # POOL_APP_NOT_ENABLED/POOL_NEARFULL — 交給 CephLowPriorityNotice；
 # OSD_SLOW_PING_TIME_BACK/FRONT、MON_CLOCK_SKEW、RECENT_CRASH、OSD_NEARFULL、OSD_BACKFILLFULL、
 # MON_DISK_LOW、MON_DISK_CRIT、PG_DAMAGED、OSD_SCRUB_ERRORS、OBJECT_UNFOUND
@@ -27,7 +27,7 @@ tests:
           - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
             exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
 
-  # 完整排除清單完整性：24 排除 + 2 非排除 → 只有 2 非排除 fire
+  # 完整排除清單完整性：25 排除 + 2 非排除 → 只有 2 非排除 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'

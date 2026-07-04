@@ -421,7 +421,7 @@ amtool silence add \
 
 ### `CephClientBlocked`
 
-client I/O 已被 `PG_AVAILABILITY` 或 `SLOW_OPS` 影響。**不要 silence。** 目標不是先分類，是先恢復 client 可用性。
+client I/O 已被 `PG_AVAILABILITY` / `SLOW_OPS` 影響，或容量已到硬擋（`OSD_FULL` / `POOL_FULL`）。**不要 silence。** 目標不是先分類，是先恢復 client 可用性。
 
 ```bash
 ceph -s
@@ -429,9 +429,10 @@ ceph health detail
 ceph pg dump_stuck inactive
 ceph pg dump_stuck unclean
 ceph osd tree
+ceph df
 ```
 
-`PG_AVAILABILITY` → 優先找 inactive / unavailable PG、down OSD、full / backfillfull。`SLOW_OPS` → 先看 slow op 卡在 MON、OSD 還是整體 I/O 壓力，再看 OSD latency、磁碟、網路、recovery / backfill。
+`PG_AVAILABILITY` → 優先找 inactive / unavailable PG、down OSD、full / backfillfull。`SLOW_OPS` → 先看 slow op 卡在 MON、OSD 還是整體 I/O 壓力，再看 OSD latency、磁碟、網路、recovery / backfill。`OSD_FULL` / `POOL_FULL` → 立刻用 `ceph df` 找出寫滿的 OSD 或 pool，擴充容量或清資料；這是硬擋，不會自己恢復。
 
 ### `CephClientRisk`
 
