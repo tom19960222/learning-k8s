@@ -23,15 +23,25 @@ RESULT_DIR="$(new_result_dir slow-ops)"
 OSD_SERVICE="$(osd_service_name "$LAB_FSID" "$OSD_ID")"
 IO_PATH=""
 MAJMIN=""
+pool_step=1
+cleanup_step=1
+
+run_live_step() {
+  local label=$1 host=$2 command=$3
+  run_capture "$RESULT_DIR/${label}.txt" ssh_lab "$host" "$command"
+}
 
 cleanup() {
   log "rollback slow-ops scenario"
 
   if [[ -n "$MAJMIN" && -n "$IO_PATH" ]]; then
-    ssh_lab "$OSD_HOST" "$(io_unthrottle_command "$MAJMIN" "$IO_PATH")" || true
+    run_live_step "rollback-unthrottle" "$OSD_HOST" "$(io_unthrottle_command "$MAJMIN" "$IO_PATH")" || true
   fi
 
-  ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $(pool_cleanup_commands "$POOL")" || true
+  while IFS= read -r cleanup_cmd; do
+    run_live_step "rollback-pool-cleanup-$((cleanup_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $cleanup_cmd" || true
+    cleanup_step=$((cleanup_step + 1))
+  done < <(pool_cleanup_commands "$POOL")
   collect_postcheck "$RESULT_DIR/postcheck" || true
 }
 
@@ -40,7 +50,8 @@ trap cleanup EXIT
 collect_baseline "$RESULT_DIR/baseline"
 
 while IFS= read -r pool_cmd; do
-  ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $pool_cmd"
+  run_live_step "pool-setup-$((pool_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $pool_cmd"
+  pool_step=$((pool_step + 1))
 done < <(pool_create_commands "$POOL")
 
 ssh_lab "$OSD_HOST" "stat -fc %T /sys/fs/cgroup | grep -qx cgroup2fs"
@@ -50,7 +61,7 @@ MAJMIN="$(ssh_lab "$OSD_HOST" "lsblk -no MAJ:MIN $OSD_DEVICE | head -1")"
 IO_PATH="$(ssh_lab "$OSD_HOST" "$(cgroup_io_max_path_command "$OSD_SERVICE")")"
 [[ -n "$IO_PATH" ]] || die "could not resolve io.max path for $OSD_SERVICE on $OSD_HOST"
 
-ssh_lab "$OSD_HOST" "$(io_throttle_command "$MAJMIN" "$THROTTLE_BPS" "$IO_PATH")"
+run_live_step "throttle" "$OSD_HOST" "$(io_throttle_command "$MAJMIN" "$THROTTLE_BPS" "$IO_PATH")"
 
 run_capture "$RESULT_DIR/rados-bench.txt" \
   ssh_lab "$LAB_MON_01_HOST" \

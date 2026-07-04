@@ -18,12 +18,12 @@ cgroup_io_max_path_command() {
 
 io_throttle_command() {
   local major_minor=$1 bytes_per_second=$2 io_max_path=$3
-  printf '%s\n' "printf '%s\\n' '$major_minor rbps=$bytes_per_second wbps=$bytes_per_second riops=max wiops=max' | sudo tee $io_max_path"
+  printf '%s\n' "printf '%s\\n' '$major_minor rbps=$bytes_per_second wbps=$bytes_per_second riops=max wiops=max' | sudo tee $io_max_path >/dev/null"
 }
 
 io_unthrottle_command() {
   local major_minor=$1 io_max_path=$2
-  printf '%s\n' "printf '%s\\n' '$major_minor rbps=max wbps=max riops=max wiops=max' | sudo tee $io_max_path"
+  printf '%s\n' "printf '%s\\n' '$major_minor rbps=max wbps=max riops=max wiops=max' | sudo tee $io_max_path >/dev/null"
 }
 
 pool_create_commands() {

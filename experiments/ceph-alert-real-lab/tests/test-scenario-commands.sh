@@ -19,10 +19,10 @@ expected_cgroup_path="/sys/fs/cgroup\${cg}/io.max"
 printf '%s\n' "$io_path_cmd" | grep -Fq "$expected_cgroup_path" || fail "io.max discovery missing cgroup path"
 
 throttle="$(io_throttle_command '8:16' 65536 '/sys/fs/cgroup/x/io.max')"
-[[ "$throttle" == "printf '%s\n' '8:16 rbps=65536 wbps=65536 riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max" ]] || fail "bad throttle command: $throttle"
+[[ "$throttle" == "printf '%s\n' '8:16 rbps=65536 wbps=65536 riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max >/dev/null" ]] || fail "bad throttle command: $throttle"
 
 unthrottle="$(io_unthrottle_command '8:16' '/sys/fs/cgroup/x/io.max')"
-[[ "$unthrottle" == "printf '%s\n' '8:16 rbps=max wbps=max riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max" ]] || fail "bad unthrottle command: $unthrottle"
+[[ "$unthrottle" == "printf '%s\n' '8:16 rbps=max wbps=max riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max >/dev/null" ]] || fail "bad unthrottle command: $unthrottle"
 
 pool_cmds="$(pool_create_commands alert-test)"
 printf '%s\n' "$pool_cmds" | grep -q 'ceph osd pool create alert-test 1' || fail "missing pool create"
