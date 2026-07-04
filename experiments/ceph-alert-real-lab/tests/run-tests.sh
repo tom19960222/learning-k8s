@@ -8,9 +8,12 @@ ok() { printf 'ok: %s\n' "$*"; }
 
 for path in \
   "$ROOT/lib/common.sh" \
-  "$ROOT/tests/test-common.sh"; do
+  "$ROOT/lib/monitoring.sh" \
+  "$ROOT/tests/test-common.sh" \
+  "$ROOT/tests/test-monitoring-render.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
 
 bash "$ROOT/tests/test-common.sh"
+bash "$ROOT/tests/test-monitoring-render.sh"
 ok "unit tests"
