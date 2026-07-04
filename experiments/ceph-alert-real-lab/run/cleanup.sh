@@ -12,7 +12,7 @@ source "$ROOT/lib/scenarios.sh"
 pool_delete_best_effort() {
   local pool=$1
   if ssh_lab "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- ceph osd pool delete $pool $pool --yes-i-really-really-mean-it" \
+    "sudo -n cephadm shell -- $(pool_delete_command "$pool")" \
     >/dev/null 2>&1; then
     log "deleted test pool $pool"
     return 0
@@ -63,6 +63,7 @@ clear_known_cgroup_throttles() {
 
   if [[ -z "$majmin" && -n "$osd_device" ]]; then
     majmin="$(ssh_lab "$osd_host" "lsblk -no MAJ:MIN $osd_device | head -1" 2>/dev/null || true)"
+    majmin="$(printf '%s' "$majmin" | tr -d '[:space:]')"
   fi
   if [[ -z "$majmin" ]]; then
     log "skip cgroup throttle cleanup on $osd_host: could not resolve major:minor"

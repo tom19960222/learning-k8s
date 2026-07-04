@@ -34,7 +34,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/que
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
   exit 0
 fi
-if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=sum%28ceph_mon_quorum_status%29"* ]]; then
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=%28count%28ceph_mon_quorum_status%20%3D%3D%201%29%20or%20vector%280%29%29%20%3C%202"* ]]; then
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
   exit 0
 fi
@@ -98,6 +98,10 @@ case "\$command" in
     ;;
   *"quorum_status --format json"*)
     printf '{"quorum":[1]}\n'
+    exit 0
+    ;;
+  *"ceph mgr dump --format json"*)
+    printf '{"active_name":"ceph-lab-mon-02.fake"}\n'
     exit 0
     ;;
   *"ceph osd tree"*|*"systemctl stop ceph-"*|*"systemctl start ceph-"*)
@@ -202,6 +206,6 @@ start3_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@mon\.ceph-lab-mon-03\.
 [[ -n "$stop1_line" && -n "$stop3_line" && -n "$start1_line" && -n "$start3_line" ]] || fail "missing trace lines for ordering checks"
 (( start1_line > stop1_line )) || fail "rollback start for mon-01 happened before stop"
 (( start3_line > stop3_line )) || fail "rollback start for mon-03 happened before stop"
-grep -q 'query=sum%28ceph_mon_quorum_status%29' "$live_trace_file" || fail "missing Prometheus quorum-loss evidence query"
+grep -q 'query=%28count%28ceph_mon_quorum_status%20%3D%3D%201%29%20or%20vector%280%29%29%20%3C%202' "$live_trace_file" || fail "missing Prometheus quorum-loss evidence query"
 
 ok "mon-quorum-lost destructive ack guard"

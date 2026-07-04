@@ -49,10 +49,15 @@ if FAKE_SYSTEMCTL_CGROUP=fail PATH="$fake_bin_dir:$PATH" bash -c "$io_path_cmd" 
 fi
 
 throttle="$(io_throttle_command '8:16' 65536 '/sys/fs/cgroup/x/io.max')"
-[[ "$throttle" == "printf '%s\n' '8:16 rbps=65536 wbps=65536 riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max >/dev/null" ]] || fail "bad throttle command: $throttle"
+[[ "$throttle" == "printf '%s\n' '8:16 rbps=65536 wbps=65536 riops=max wiops=max' | sudo tee '/sys/fs/cgroup/x/io.max' >/dev/null" ]] || fail "bad throttle command: $throttle"
 
 unthrottle="$(io_unthrottle_command '8:16' '/sys/fs/cgroup/x/io.max')"
-[[ "$unthrottle" == "printf '%s\n' '8:16 rbps=max wbps=max riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max >/dev/null" ]] || fail "bad unthrottle command: $unthrottle"
+[[ "$unthrottle" == "printf '%s\n' '8:16 rbps=max wbps=max riops=max wiops=max' | sudo tee '/sys/fs/cgroup/x/io.max' >/dev/null" ]] || fail "bad unthrottle command: $unthrottle"
+
+escaped_path="/sys/fs/cgroup/system.slice/system-ceph\\x2dfsid.slice/ceph-fsid@osd.4.service/io.max"
+escaped_throttle="$(io_throttle_command '8:16' 65536 "$escaped_path")"
+printf '%s\n' "$escaped_throttle" | grep -Fq "sudo tee '$escaped_path' >/dev/null" ||
+  fail "escaped systemd cgroup path was not single-quoted: $escaped_throttle"
 
 pool_cmds="$(pool_create_commands alert-test)"
 printf '%s\n' "$pool_cmds" | grep -q 'ceph osd pool create alert-test 1' || fail "missing pool create"
@@ -60,5 +65,7 @@ printf '%s\n' "$pool_cmds" | grep -q 'ceph osd pool set alert-test min_size 2' |
 
 cleanup_cmds="$(pool_cleanup_commands alert-test)"
 printf '%s\n' "$cleanup_cmds" | grep -q 'ceph osd pool delete alert-test alert-test --yes-i-really-really-mean-it' || fail "missing pool delete"
+printf '%s\n' "$cleanup_cmds" | grep -q 'ceph config set mon mon_allow_pool_delete true' || fail "missing temporary pool delete enable"
+printf '%s\n' "$cleanup_cmds" | grep -q 'ceph config set mon mon_allow_pool_delete false' || fail "missing pool delete disable"
 
 ok "scenario command generation"

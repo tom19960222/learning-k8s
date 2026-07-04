@@ -198,14 +198,14 @@ grep -q '^ssh:sudo systemctl stop ceph-.*@osd\.0\.service$' "$live_trace_file" |
 grep -q '^ssh:sudo systemctl stop ceph-.*@osd\.1\.service$' "$live_trace_file" || fail "missing stop for osd.1"
 grep -q '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$live_trace_file" || fail "missing rollback start for osd.0"
 grep -q '^ssh:sudo systemctl start ceph-.*@osd\.1\.service$' "$live_trace_file" || fail "missing rollback start for osd.1"
-delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it$' "$live_trace_file" || true)"
+delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it' "$live_trace_file" || true)"
 [[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
 
 stop0_line="$(grep -n '^ssh:sudo systemctl stop ceph-.*@osd\.0\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 stop1_line="$(grep -n '^ssh:sudo systemctl stop ceph-.*@osd\.1\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 start0_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 start1_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.1\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
-delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it$' "$live_trace_file" | head -1 | cut -d: -f1)"
+delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it' "$live_trace_file" | head -1 | cut -d: -f1)"
 
 [[ -n "$stop0_line" && -n "$stop1_line" && -n "$start0_line" && -n "$start1_line" && -n "$delete_line" ]] || fail "missing trace lines for ordering checks"
 (( start0_line > stop0_line )) || fail "rollback start for osd.0 happened before stop"

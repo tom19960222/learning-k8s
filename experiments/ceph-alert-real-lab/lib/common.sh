@@ -46,6 +46,7 @@ new_result_dir() {
 ssh_base_opts() {
   local ssh_key=$1 timeout_seconds=$2
   printf '%s\n' \
+    -n \
     -i "$ssh_key" \
     -o BatchMode=yes \
     -o IdentitiesOnly=yes \

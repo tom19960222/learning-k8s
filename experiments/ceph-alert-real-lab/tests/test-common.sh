@@ -21,6 +21,7 @@ second_result_dir="$(new_result_dir smoke)"
 
 opts_file="$(mktemp)"
 ssh_base_opts "$ROOT/test-key" 7 >"$opts_file"
+grep -qx -- '-n' "$opts_file" || fail "ssh opts missing -n stdin guard"
 grep -qx -- '-i' "$opts_file" || fail "ssh opts missing -i"
 grep -qx -- "$ROOT/test-key" "$opts_file" || fail "ssh opts missing key path"
 grep -qx -- '-o' "$opts_file" || fail "ssh opts missing -o entries"

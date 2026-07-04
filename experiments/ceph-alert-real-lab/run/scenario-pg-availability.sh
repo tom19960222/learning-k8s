@@ -48,7 +48,7 @@ cleanup() {
   fi
 
   run_live_step "rollback-pool-delete" "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- ceph osd pool delete $POOL $POOL --yes-i-really-really-mean-it" || rc=1
+    "sudo -n cephadm shell -- $(pool_delete_command "$POOL")" || rc=1
   collect_postcheck "$RESULT_DIR/postcheck" || true
   assert_lab_recovered "$RESULT_DIR/recovery" || rc=1
   CLEANED=1

@@ -36,7 +36,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/que
 fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"SLOW_OPS","labels":{"name":"SLOW_OPS"}}'
-  if grep -q 'rbps=65536' "$trace_file"; then
+  if grep -q 'rbps=262144' "$trace_file"; then
     printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"SLOW_OPS","labels":{"name":"SLOW_OPS","fresh":"true"}}'
   fi
   exit 0
@@ -138,7 +138,7 @@ case "\$command" in
     printf '{"quorum":[0,1,2]}\n'
     exit 0
     ;;
-  *"pkill -f \"rados bench -p "*)
+  *"pkill -f \"[r]ados bench -p "*)
     printf 'pkill-live-noise\n'
     exit 0
     ;;
@@ -238,15 +238,13 @@ grep -Eq '^result: .*/results/slow-ops-[^/]+$' "$live_stdout_file" || fail "miss
 if grep -Eq 'ssh-live-noise|tee-live-noise|bench-live-noise|kubectl-noise-for-' "$live_stdout_file"; then
   fail "live command stdout leaked into scenario stdout"
 fi
-cleanup_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*cleanup --prefix benchmark_data' "$live_trace_file" || true)"
-[[ "$cleanup_count" -eq 1 ]] || fail "expected one cleanup invocation, got $cleanup_count"
-delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it' "$live_trace_file" || true)"
-[[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
-pkill_count="$(grep -c '^ssh:sudo -n cephadm shell -- sh -c '\''pkill -f "rados bench -p alert-slow-ops" || true'\''' "$live_trace_file" || true)"
-[[ "$pkill_count" -eq 1 ]] || fail "expected one scoped rados bench pkill, got $pkill_count"
-if grep -q '^ssh:sudo -n cephadm shell -- .*cleanup --prefix benchmark_data.*ceph osd pool delete' "$live_trace_file"; then
-  fail "cleanup and delete commands were combined into one cephadm shell invocation"
+if grep -q '^ssh:sudo -n cephadm shell -- .*cleanup --prefix benchmark_data' "$live_trace_file"; then
+  fail "slow-ops cleanup should delete the temporary pool instead of running rados cleanup"
 fi
+delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it' "$live_trace_file" || true)"
+[[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
+pkill_count="$(grep -F -c "ssh:sudo -n cephadm shell -- sh -c 'pkill -f \"[r]ados bench -p alert-slow-ops\" || true'" "$live_trace_file" || true)"
+[[ "$pkill_count" -eq 1 ]] || fail "expected one scoped rados bench pkill, got $pkill_count"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd map alert-slow-ops sentinel --format json$' "$live_trace_file" || fail "missing dynamic osd map"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd find 4 --format json$' "$live_trace_file" || fail "missing selected osd find"
 grep -q '^ssh:sudo -n ceph-volume lvm list --format json$' "$live_trace_file" || fail "missing ceph-volume device discovery"
@@ -334,7 +332,7 @@ rc=$?
 [[ "$rc" -eq 0 ]] || fail "expected async fake bench scenario success, got $rc"
 grep -Fq '# exit_code: 143' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$async_stdout_file")")/rados-bench.txt" ||
   fail "cleanup did not terminate and capture the still-running fake bench"
-grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee /sys/fs/cgroup/system\\.slice/fake/io\\.max >/dev/null$" "$async_trace_file" || fail "missing unthrottle during async cleanup"
+grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee '/sys/fs/cgroup/system\\.slice/fake/io\\.max' >/dev/null$" "$async_trace_file" || fail "missing unthrottle during async cleanup"
 
 recovery_fail_stdout_file="$(mktemp)"
 recovery_fail_stderr_file="$(mktemp)"

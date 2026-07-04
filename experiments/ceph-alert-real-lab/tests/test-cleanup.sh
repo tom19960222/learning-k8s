@@ -40,11 +40,11 @@ for arg in "\$@"; do
 done
 printf 'ssh:%s\n' "\$command" >>"$trace_file"
 case "\$command" in
-  "sudo -n cephadm shell -- ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it")
+  *"ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it"*)
     printf 'delete-slow-ops-noise\n'
     exit 0
     ;;
-  "sudo -n cephadm shell -- ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it")
+  *"ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it"*)
     printf 'delete-pg-availability-noise\n'
     exit 1
     ;;
@@ -102,10 +102,12 @@ rm -rf "$ROOT/results/slow-ops-99999999T999999Z.fake"
 [[ "$rc" -eq 0 ]] || fail "cleanup should best-effort succeed, got $rc"
 [[ ! -s "$stdout_file" ]] || fail "cleanup polluted stdout"
 grep -q '^kubectl:delete namespace ceph-alert-lab --ignore-not-found=true$' "$trace_file" || fail "missing namespace delete"
-grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it$' "$trace_file" || fail "missing slow-ops pool delete"
-grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it$' "$trace_file" || fail "missing pg-availability pool delete"
+grep -q '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it' "$trace_file" || fail "missing slow-ops pool delete"
+grep -q '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it' "$trace_file" || fail "missing pg-availability pool delete"
+grep -q 'ceph config set mon mon_allow_pool_delete true' "$trace_file" || fail "missing temporary pool delete enable"
+grep -q 'ceph config set mon mon_allow_pool_delete false' "$trace_file" || fail "missing pool delete disable"
 grep -q '^ssh:stat -fc %T /sys/fs/cgroup | grep -qx cgroup2fs$' "$trace_file" || fail "missing cgroup v2 probe"
-grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee /sys/fs/cgroup/system\\.slice/selected/io\\.max >/dev/null$" "$trace_file" || fail "missing selected-target cgroup cleanup command"
+grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee '/sys/fs/cgroup/system\\.slice/selected/io\\.max' >/dev/null$" "$trace_file" || fail "missing selected-target cgroup cleanup command"
 if grep -q '/dev/sdb' "$trace_file"; then
   fail "cleanup fell back to stale /dev/sdb instead of selected-target.env"
 fi

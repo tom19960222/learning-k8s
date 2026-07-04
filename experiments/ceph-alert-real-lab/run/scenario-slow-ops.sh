@@ -16,7 +16,7 @@ require_cmd jq
 
 POOL="${SLOW_OPS_POOL:-alert-slow-ops}"
 OBJECT="${SLOW_OPS_OBJECT:-sentinel}"
-THROTTLE_BPS="${SLOW_OPS_THROTTLE_BPS:-65536}"
+THROTTLE_BPS="${SLOW_OPS_THROTTLE_BPS:-262144}"
 RESULT_DIR="$(new_result_dir slow-ops)"
 TARGET_FILE="$RESULT_DIR/selected-target.env"
 MAP_JSON="$RESULT_DIR/osd-map.json"
@@ -38,6 +38,63 @@ cleanup_step=1
 run_live_step() {
   local label=$1 host=$2 command=$3
   run_capture "$RESULT_DIR/${label}.txt" ssh_lab "$host" "$command"
+}
+
+osd_ok_to_stop() {
+  local osd=$1
+  run_capture "$RESULT_DIR/bluestore-ok-to-stop-osd-${osd}.txt" ceph_seed_cmd osd ok-to-stop "$osd"
+}
+
+osd_up_in() {
+  local osd=$1 output_file
+  output_file="$RESULT_DIR/bluestore-osd-${osd}-dump.json"
+  ceph_seed_cmd osd dump --format json >"$output_file"
+  jq -e --arg osd "$osd" '.osds[] | select(.osd|tostring==$osd) | select(.up==1 and .in==1)' "$output_file" >/dev/null
+}
+
+pgs_active_clean() {
+  local output_file
+  output_file="$RESULT_DIR/bluestore-pg-status.json"
+  ceph_seed_cmd status --format json >"$output_file"
+  jq -e '.pgmap.pgs_by_state | length == 1 and .[0].state_name == "active+clean"' "$output_file" >/dev/null
+}
+
+clear_bluestore_slow_ops() {
+  local health_file osds_file osd find_json host_name host_ip service rc=0
+
+  health_file="$RESULT_DIR/bluestore-slow-ops-health.txt"
+  osds_file="$RESULT_DIR/bluestore-slow-ops-osds.txt"
+  run_capture "$health_file" ceph_seed_cmd health detail || return 0
+  grep -Eo 'osd\.[0-9]+ observed slow operation' "$health_file" |
+    sed 's/^osd\.//; s/ observed slow operation$//' |
+    sort -nu >"$osds_file" || true
+
+  if [[ ! -s "$osds_file" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r osd; do
+    [[ -n "$osd" ]] || continue
+    log "clear BlueStore slow-op health by restarting osd.$osd"
+    find_json="$RESULT_DIR/bluestore-osd-find-${osd}.json"
+    ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd find $osd --format json" >"$find_json"
+    host_name="$(jq -r '.crush_location.host' "$find_json")"
+    host_ip="$(lab_osd_host_ip "$host_name")"
+    service="$(osd_service_name "$LAB_FSID" "$osd")"
+
+    poll_until "osd.$osd ok-to-stop" 30 5 osd_ok_to_stop "$osd" || {
+      rc=1
+      continue
+    }
+    run_live_step "bluestore-restart-osd-${osd}" "$host_ip" "sudo systemctl restart $service" || {
+      rc=1
+      continue
+    }
+    poll_until "osd.$osd up/in after BlueStore slow-op restart" 30 5 osd_up_in "$osd" || rc=1
+    poll_until "PGs active+clean after osd.$osd restart" 30 5 pgs_active_clean || rc=1
+  done <"$osds_file"
+
+  return "$rc"
 }
 
 start_background_capture() {
@@ -124,13 +181,14 @@ cleanup() {
   fi
   stop_bench_workload "after unthrottle"
   run_live_step "rollback-kill-rados-bench" "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- sh -c 'pkill -f \"rados bench -p $POOL\" || true'" || rc=1
+    "sudo -n cephadm shell -- sh -c 'pkill -f \"[r]ados bench -p $POOL\" || true'" || rc=1
 
   while IFS= read -r cleanup_cmd; do
     run_live_step "rollback-pool-cleanup-$((cleanup_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $cleanup_cmd" || rc=1
     cleanup_step=$((cleanup_step + 1))
   done < <(pool_cleanup_commands "$POOL")
   collect_postcheck "$RESULT_DIR/postcheck" || true
+  clear_bluestore_slow_ops || rc=1
   assert_lab_recovered "$RESULT_DIR/recovery" || rc=1
   CLEANED=1
   return "$rc"
@@ -182,6 +240,7 @@ select_slow_ops_target() {
   OSD_HOST="$host_ip"
   OSD_SERVICE="$(osd_service_name "$LAB_FSID" "$OSD_ID")"
   MAJMIN="$(ssh_lab "$OSD_HOST" "lsblk -no MAJ:MIN $OSD_DEVICE | head -1")"
+  MAJMIN="$(printf '%s' "$MAJMIN" | tr -d '[:space:]')"
   [[ -n "$MAJMIN" ]] || die "could not resolve major:minor for $OSD_DEVICE on $OSD_HOST"
   IO_PATH="$(ssh_lab "$OSD_HOST" "$(cgroup_io_max_path_command "$OSD_SERVICE")")"
   [[ -n "$IO_PATH" ]] || die "could not resolve io.max path for $OSD_SERVICE on $OSD_HOST"
