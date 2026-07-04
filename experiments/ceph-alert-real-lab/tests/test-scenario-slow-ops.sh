@@ -99,7 +99,7 @@ case "\$command" in
     printf '{"crush_location":{"host":"ceph-lab-osd-02"}}\n'
     exit 0
     ;;
-  "sudo ceph-volume lvm list --format json")
+  "sudo -n ceph-volume lvm list --format json")
     if [[ "\${FAKE_CEPH_VOLUME_HOST_FAIL:-0}" == "1" ]]; then
       printf 'ceph-volume: command not found\n' >&2
       exit 127
@@ -136,6 +136,10 @@ case "\$command" in
     ;;
   *"quorum_status --format json"*)
     printf '{"quorum":[0,1,2]}\n'
+    exit 0
+    ;;
+  *"pkill -f \"rados bench -p "*)
+    printf 'pkill-live-noise\n'
     exit 0
     ;;
   *"rados bench -p "*)
@@ -238,12 +242,14 @@ cleanup_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*cleanup --prefix bench
 [[ "$cleanup_count" -eq 1 ]] || fail "expected one cleanup invocation, got $cleanup_count"
 delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it' "$live_trace_file" || true)"
 [[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
+pkill_count="$(grep -c '^ssh:sudo -n cephadm shell -- sh -c '\''pkill -f "rados bench -p alert-slow-ops" || true'\''' "$live_trace_file" || true)"
+[[ "$pkill_count" -eq 1 ]] || fail "expected one scoped rados bench pkill, got $pkill_count"
 if grep -q '^ssh:sudo -n cephadm shell -- .*cleanup --prefix benchmark_data.*ceph osd pool delete' "$live_trace_file"; then
   fail "cleanup and delete commands were combined into one cephadm shell invocation"
 fi
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd map alert-slow-ops sentinel --format json$' "$live_trace_file" || fail "missing dynamic osd map"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd find 4 --format json$' "$live_trace_file" || fail "missing selected osd find"
-grep -q '^ssh:sudo ceph-volume lvm list --format json$' "$live_trace_file" || fail "missing ceph-volume device discovery"
+grep -q '^ssh:sudo -n ceph-volume lvm list --format json$' "$live_trace_file" || fail "missing ceph-volume device discovery"
 grep -q '^ssh:lsblk -no MAJ:MIN /dev/sdc | head -1$' "$live_trace_file" || fail "missing selected device maj:min lookup"
 if grep -q '/dev/sdb' "$live_trace_file"; then
   fail "slow-ops used hard-coded /dev/sdb"
@@ -268,7 +274,7 @@ rc=$?
 set -e
 
 [[ "$rc" -eq 0 ]] || fail "expected success with cephadm ceph-volume fallback, got $rc"
-grep -q '^ssh:sudo ceph-volume lvm list --format json$' "$cephadm_fallback_trace_file" || fail "missing host ceph-volume attempt before fallback"
+grep -q '^ssh:sudo -n ceph-volume lvm list --format json$' "$cephadm_fallback_trace_file" || fail "missing host ceph-volume attempt before fallback"
 grep -q '^ssh:sudo -n cephadm shell -- ceph-volume lvm list --format json$' "$cephadm_fallback_trace_file" || fail "missing cephadm ceph-volume fallback"
 grep -q 'ceph_volume_method=cephadm' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$cephadm_fallback_stdout_file")")/selected-target.env" || fail "selected target did not record cephadm method"
 

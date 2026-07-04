@@ -123,6 +123,8 @@ cleanup() {
     run_live_step "rollback-unthrottle" "$OSD_HOST" "$(io_unthrottle_command "$MAJMIN" "$IO_PATH")" || rc=1
   fi
   stop_bench_workload "after unthrottle"
+  run_live_step "rollback-kill-rados-bench" "$LAB_MON_01_HOST" \
+    "sudo -n cephadm shell -- sh -c 'pkill -f \"rados bench -p $POOL\" || true'" || rc=1
 
   while IFS= read -r cleanup_cmd; do
     run_live_step "rollback-pool-cleanup-$((cleanup_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $cleanup_cmd" || rc=1
@@ -160,7 +162,7 @@ select_slow_ops_target() {
     die "SLOW_OPS_OSD_HOST=$override_host does not match osd.$selected_osd host $host_name/$host_ip"
   fi
 
-  if ssh_lab "$host_ip" "sudo ceph-volume lvm list --format json" >"$CEPH_VOLUME_JSON" 2>"$RESULT_DIR/ceph-volume-host.err"; then
+  if ssh_lab "$host_ip" "sudo -n ceph-volume lvm list --format json" >"$CEPH_VOLUME_JSON" 2>"$RESULT_DIR/ceph-volume-host.err"; then
     CEPH_VOLUME_METHOD=host
   else
     ssh_lab "$host_ip" "sudo -n cephadm shell -- ceph-volume lvm list --format json" >"$CEPH_VOLUME_JSON" 2>"$RESULT_DIR/ceph-volume-cephadm.err"

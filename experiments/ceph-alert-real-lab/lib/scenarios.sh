@@ -23,7 +23,7 @@ lab_osd_host_ip() {
 
 cgroup_io_max_path_command() {
   local service=$1
-  printf '%s\n' "cg=\$(systemctl show -p ControlGroup --value $service); test -n \"\$cg\"; printf '%s\\n' \"/sys/fs/cgroup\${cg}/io.max\""
+  printf '%s\n' "cg=\$(systemctl show -p ControlGroup --value $service) || exit 1; test -n \"\$cg\" || exit 1; printf '%s\\n' \"/sys/fs/cgroup\${cg}/io.max\""
 }
 
 io_throttle_command() {
