@@ -279,10 +279,31 @@ delete_monitoring_stack() {
   kubectl_lab delete namespace "$LAB_NAMESPACE" --ignore-not-found=true
 }
 
+url_encode() {
+  local value=$1 encoded="" char hex i
+  local LC_ALL=C
+  i=0
+  while [[ "$i" -lt "${#value}" ]]; do
+    char="${value:$i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-])
+        encoded="${encoded}${char}"
+        ;;
+      *)
+        printf -v hex '%%%02X' "'$char"
+        encoded="${encoded}${hex}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s\n' "$encoded"
+}
+
 prometheus_query() {
-  local query=$1 pod
+  local query=$1 pod encoded_query
   pod="$(kubectl_lab -n "$LAB_NAMESPACE" get pod -l app=prometheus -o jsonpath='{.items[0].metadata.name}')"
-  kubectl_lab -n "$LAB_NAMESPACE" exec "$pod" -- wget -qO- "http://127.0.0.1:9090/api/v1/query?query=${query}"
+  encoded_query="$(url_encode "$query")"
+  kubectl_lab -n "$LAB_NAMESPACE" exec "$pod" -- wget -qO- "http://127.0.0.1:9090/api/v1/query?query=${encoded_query}"
 }
 
 wait_prometheus_alert() {

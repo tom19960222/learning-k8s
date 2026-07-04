@@ -30,7 +30,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/ale
   printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"}]}}'
   exit 0
 fi
-if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up{job=\"ceph\"}"* ]]; then
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
   exit 0
 fi
@@ -100,6 +100,14 @@ case "\$command" in
     exit 0
     ;;
   "sudo ceph-volume lvm list --format json")
+    if [[ "\${FAKE_CEPH_VOLUME_HOST_FAIL:-0}" == "1" ]]; then
+      printf 'ceph-volume: command not found\n' >&2
+      exit 127
+    fi
+    printf '{"4":[{"devices":["/dev/sdc"]}]}\n'
+    exit 0
+    ;;
+  "sudo -n cephadm shell -- ceph-volume lvm list --format json")
     printf '{"4":[{"devices":["/dev/sdc"]}]}\n'
     exit 0
     ;;
@@ -131,6 +139,15 @@ case "\$command" in
     exit 0
     ;;
   *"rados bench -p "*)
+    if [[ -n "\${FAKE_BENCH_STARTED_FILE:-}" ]]; then
+      printf 'started\n' >"\$FAKE_BENCH_STARTED_FILE"
+    fi
+    if [[ -n "\${FAKE_BENCH_BLOCK_FILE:-}" ]]; then
+      trap 'printf terminated >"\${FAKE_BENCH_TERMINATED_FILE:-/dev/null}"; exit 143' TERM INT
+      while [[ ! -f "\$FAKE_BENCH_BLOCK_FILE" ]]; do
+        sleep 1
+      done
+    fi
     printf 'bench-live-noise\n'
     exit 0
     ;;
@@ -232,6 +249,86 @@ if grep -q '/dev/sdb' "$live_trace_file"; then
   fail "slow-ops used hard-coded /dev/sdb"
 fi
 grep -q 'osd_id=4' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_file")")/selected-target.env" || fail "selected target did not record osd.4"
+
+cephadm_fallback_stdout_file="$(mktemp)"
+cephadm_fallback_stderr_file="$(mktemp)"
+cephadm_fallback_trace_file="$(mktemp)"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$cephadm_fallback_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$cephadm_fallback_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$cephadm_fallback_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$cephadm_fallback_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_CEPH_VOLUME_HOST_FAIL=1 \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$cephadm_fallback_stdout_file" 2>"$cephadm_fallback_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -eq 0 ]] || fail "expected success with cephadm ceph-volume fallback, got $rc"
+grep -q '^ssh:sudo ceph-volume lvm list --format json$' "$cephadm_fallback_trace_file" || fail "missing host ceph-volume attempt before fallback"
+grep -q '^ssh:sudo -n cephadm shell -- ceph-volume lvm list --format json$' "$cephadm_fallback_trace_file" || fail "missing cephadm ceph-volume fallback"
+grep -q 'ceph_volume_method=cephadm' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$cephadm_fallback_stdout_file")")/selected-target.env" || fail "selected target did not record cephadm method"
+
+async_stdout_file="$(mktemp)"
+async_stderr_file="$(mktemp)"
+async_trace_file="$(mktemp)"
+bench_started_file="$(mktemp)"
+bench_block_file="$(mktemp)"
+bench_terminated_file="$(mktemp)"
+rm -f "$bench_started_file" "$bench_block_file" "$bench_terminated_file"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$async_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$async_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$async_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$async_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_BENCH_STARTED_FILE="$bench_started_file" \
+  FAKE_BENCH_BLOCK_FILE="$bench_block_file" \
+  FAKE_BENCH_TERMINATED_FILE="$bench_terminated_file" \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$async_stdout_file" 2>"$async_stderr_file" &
+async_pid=$!
+set -e
+
+started_wait=0
+while [[ "$started_wait" -lt 20 && ! -f "$bench_started_file" ]]; do
+  sleep 0.2
+  started_wait=$((started_wait + 1))
+done
+[[ -f "$bench_started_file" ]] || fail "fake bench did not start"
+
+poll_wait=0
+while [[ "$poll_wait" -lt 20 ]] && ! grep -q 'ceph health detail' "$async_trace_file"; do
+  sleep 0.2
+  poll_wait=$((poll_wait + 1))
+done
+if ! grep -q 'ceph health detail' "$async_trace_file"; then
+  kill "$async_pid" 2>/dev/null || true
+  wait "$async_pid" 2>/dev/null || true
+  fail "scenario did not poll Ceph health while rados bench was still running"
+fi
+
+exit_wait=0
+while [[ "$exit_wait" -lt 30 ]] && kill -0 "$async_pid" 2>/dev/null; do
+  sleep 0.2
+  exit_wait=$((exit_wait + 1))
+done
+if kill -0 "$async_pid" 2>/dev/null; then
+  kill "$async_pid" 2>/dev/null || true
+  wait "$async_pid" 2>/dev/null || true
+  fail "scenario left the async fake bench running"
+fi
+wait "$async_pid"
+rc=$?
+[[ "$rc" -eq 0 ]] || fail "expected async fake bench scenario success, got $rc"
+grep -Fq '# exit_code: 143' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$async_stdout_file")")/rados-bench.txt" ||
+  fail "cleanup did not terminate and capture the still-running fake bench"
+grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee /sys/fs/cgroup/system\\.slice/fake/io\\.max >/dev/null$" "$async_trace_file" || fail "missing unthrottle during async cleanup"
 
 recovery_fail_stdout_file="$(mktemp)"
 recovery_fail_stderr_file="$(mktemp)"

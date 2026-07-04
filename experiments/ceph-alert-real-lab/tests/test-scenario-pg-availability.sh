@@ -30,7 +30,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/ale
   printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"PG_AVAILABILITY"},"state":"firing"}]}}'
   exit 0
 fi
-if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up{job=\"ceph\"}"* ]]; then
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
   exit 0
 fi

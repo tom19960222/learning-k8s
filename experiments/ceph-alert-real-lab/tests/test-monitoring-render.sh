@@ -42,6 +42,18 @@ if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   cat "$sink_log_file"
   exit 0
 fi
+if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}"* ]]; then
+  printf 'prometheus-0\n'
+  exit 0
+fi
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
+  printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=sum%28ceph_mon_quorum_status%29"* ]]; then
+  printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
 printf 'unexpected kubectl command: %s\n' "\$*" >&2
 exit 1
 EOF
@@ -57,5 +69,12 @@ printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","labels":{"na
 SINK_WAIT_ATTEMPTS=1 SINK_WAIT_SLEEP=0 PATH="$fake_bin_dir:$PATH" \
   wait_sink_alert pager CephClientBlocked name SLOW_OPS "$sink_dir" "$sink_dir/sink-checkpoint-lines.txt" ||
   fail "wait_sink_alert should pass on a post-checkpoint alert"
+
+PATH="$fake_bin_dir:$PATH" prometheus_query 'up{job="ceph"}' >/dev/null ||
+  fail "prometheus_query should URL-encode label matcher queries"
+PATH="$fake_bin_dir:$PATH" prometheus_query 'sum(ceph_mon_quorum_status)' >/dev/null ||
+  fail "prometheus_query should URL-encode function queries"
+grep -Fq 'query=up%7Bjob%3D%22ceph%22%7D' "$trace_file" || fail "label matcher query was not URL-encoded"
+grep -Fq 'query=sum%28ceph_mon_quorum_status%29' "$trace_file" || fail "function query was not URL-encoded"
 
 ok "monitoring manifest render"

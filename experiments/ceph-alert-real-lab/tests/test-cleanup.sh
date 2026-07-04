@@ -51,10 +51,6 @@ case "\$command" in
   "stat -fc %T /sys/fs/cgroup | grep -qx cgroup2fs")
     exit 0
     ;;
-  "lsblk -no MAJ:MIN /dev/sdb | head -1")
-    printf '8:16\n'
-    exit 0
-    ;;
   *"printf '%s\\n' \"/sys/fs/cgroup"*)
     printf '/sys/fs/cgroup/system.slice/fake/io.max\n'
     exit 0
@@ -85,10 +81,23 @@ trap cleanup EXIT
 make_fake_kubectl "$fake_bin_dir/kubectl" "$trace_file"
 make_fake_ssh "$fake_bin_dir/ssh" "$trace_file"
 
+mkdir -p "$ROOT/results/slow-ops-99999999T999999Z.fake"
+cat >"$ROOT/results/slow-ops-99999999T999999Z.fake/selected-target.env" <<'EOF'
+osd_id=4
+osd_host=192.168.18.171
+osd_device=/dev/sdc
+osd_service=ceph-fake@osd.4.service
+majmin=8:32
+io_path=/sys/fs/cgroup/system.slice/selected/io.max
+ceph_volume_method=cephadm
+EOF
+
 set +e
 PATH="$fake_bin_dir:$PATH" bash "$ROOT/run/cleanup.sh" >"$stdout_file" 2>"$stderr_file"
 rc=$?
 set -e
+
+rm -rf "$ROOT/results/slow-ops-99999999T999999Z.fake"
 
 [[ "$rc" -eq 0 ]] || fail "cleanup should best-effort succeed, got $rc"
 [[ ! -s "$stdout_file" ]] || fail "cleanup polluted stdout"
@@ -96,8 +105,10 @@ grep -q '^kubectl:delete namespace ceph-alert-lab --ignore-not-found=true$' "$tr
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-slow-ops alert-slow-ops --yes-i-really-really-mean-it$' "$trace_file" || fail "missing slow-ops pool delete"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool delete alert-pg-availability alert-pg-availability --yes-i-really-really-mean-it$' "$trace_file" || fail "missing pg-availability pool delete"
 grep -q '^ssh:stat -fc %T /sys/fs/cgroup | grep -qx cgroup2fs$' "$trace_file" || fail "missing cgroup v2 probe"
-grep -q '^ssh:lsblk -no MAJ:MIN /dev/sdb | head -1$' "$trace_file" || fail "missing MAJ:MIN probe"
-grep -Eq "^ssh:printf '%s\\\\n' '8:16 rbps=max wbps=max riops=max wiops=max' \\| sudo tee /sys/fs/cgroup/system\\.slice/fake/io\\.max >/dev/null$" "$trace_file" || fail "missing cgroup cleanup command"
+grep -Eq "^ssh:printf '%s\\\\n' '8:32 rbps=max wbps=max riops=max wiops=max' \\| sudo tee /sys/fs/cgroup/system\\.slice/selected/io\\.max >/dev/null$" "$trace_file" || fail "missing selected-target cgroup cleanup command"
+if grep -q '/dev/sdb' "$trace_file"; then
+  fail "cleanup fell back to stale /dev/sdb instead of selected-target.env"
+fi
 if grep -Eq 'kubectl-live-noise|delete-slow-ops-noise|delete-pg-availability-noise|unthrottle-noise' "$stdout_file"; then
   fail "live command stdout leaked into cleanup stdout"
 fi
