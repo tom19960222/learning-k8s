@@ -18,8 +18,11 @@ global:
 rule_files:
   - $RULES_DIR/ceph-stability-first.yml
   - $RULES_DIR/ceph-scoped-availability.yml
+  - $RULES_DIR/ceph-production-coverage.yml
 EOF
 
+# shellcheck disable=SC2329
+# Invoked by the EXIT trap.
 cleanup() { [ -n "${PROM_PID:-}" ] && kill "$PROM_PID" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -46,9 +49,13 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 
-expected=(CephClientBlocked CephClientRisk CephMonQuorumLost CephExporterDown CephLowPriorityNotice \
+expected=(CephClientBlocked CephClientRisk CephMonQuorumLost CephExporterAllDown CephExporterTargetDown CephLowPriorityNotice \
           "ceph:osd_up:with_hostname" "ceph:osd_host_down:scoped" \
-          CephOSDHostDownScoped CephOSDDaemonDownScoped CephMonDownScoped)
+          CephOSDHostDownScoped CephOSDDaemonDownScoped CephMonDownScoped \
+          CephMetricsAbsent Watchdog CephOSDSlowHeartbeat CephOSDFlapping CephMonClockSkew \
+          CephOSDLatencyOutlier CephDaemonSlowOps CephDaemonRecentCrash CephMgrNoStandby \
+          CephOSDNearFull CephOSDBackfillFull CephMonDiskLow CephMonDiskCritical \
+          CephPoolNearQuota CephCapacityForecast CephDataDamage CephObjectUnfound CephPGUnhealthyStates)
 fail=0
 for r in "${expected[@]}"; do
   health="$(printf '%s' "$rules_json" | jq -r --arg n "$r" '.data.groups[].rules[] | select(.name==$n) | .health' | head -1)"

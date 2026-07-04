@@ -1,0 +1,31 @@
+# Tier A — CephOSDFlapping：changes(ceph_osd_up[15m]) * on(ceph_daemon) group_left(hostname)
+# ceph_osd_metadata >= 4，無 for（changes 本身就要求 4 次以上翻轉，不需再疊等待時間）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # osd.1 在 4 個 1m 間隔內翻轉 4 次（1 0 1 0 1）→ changes=4 >= 4 → fire，帶 hostname
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.1"}'
+        values: '1 0 1 0 1'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="h1"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephOSDFlapping
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.1, hostname: h1, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD flapping: osd.1 on h1"}
+
+  # 單次重啟（1 0 1 1 1）→ changes=2 < 4 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_up{ceph_daemon="osd.2"}'
+        values: '1 0 1 1 1'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="h2"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephOSDFlapping
+        exp_alerts: []

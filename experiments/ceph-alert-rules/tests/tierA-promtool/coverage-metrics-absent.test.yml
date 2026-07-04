@@ -1,0 +1,30 @@
+# Tier A — CephMetricsAbsent：absent(ceph_health_status)，5m critical。補「metric 完全沒被抓到」的盲區
+# （頁面「邊界」段落早已預告：absent(ceph_health_status) 是這頁範圍外、部署時該補的元規則）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # ceph_health_status 這個 metric 完全不存在（只有無關 series）→ absent() 為真 → 4m 不 fire、5m fire
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephMetricsAbsent
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephMetricsAbsent
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph metrics absent from Prometheus (blind monitoring)"}
+
+  # ceph_health_status 存在（即使值是 0）→ absent() 為假 → 全程不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_status'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephMetricsAbsent
+        exp_alerts: []

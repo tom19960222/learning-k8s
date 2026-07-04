@@ -1,55 +1,110 @@
-# Tier A — CephExporterDown：up{job="ceph"}==0，5m page。spec §4.6
-# 注意：expr 回傳的 series 帶 job 等 label，會進 alert label set（連同 rule label）。
+# Tier A — CephExporterAllDown / CephExporterTargetDown：v2 把原 CephExporterDown 拆成兩條。spec §4.6
+# CephExporterAllDown：全部 target 都抓不到才 5m critical page（(count(==1) or vector(0)) == 0，
+#   跟 CephMonQuorumLost 同款 or vector(0) idiom：連一個 job="ceph" 的 up series 都不存在時也會 fire —
+#   這是「對整個 ceph exporter 盲了」的已知、刻意的 trade-off，非 bug）。
+# CephExporterTargetDown：單一 target 抓不到，15m 才 warning（進 Slack，不 page）。
 rule_files:
   - ../../rules/ceph-stability-first.yml
 evaluation_interval: 1m
 tests:
-  # 正常 up=1 → 不 fire
+  # 健康：兩個 target 都 up=1 → 兩條都不 fire
   - interval: 1m
     input_series:
-      - series: 'up{job="ceph"}'
-        values: '1x10'
+      - series: 'up{job="ceph", instance="mgr1"}'
+        values: '1x20'
+      - series: 'up{job="ceph", instance="mgr2"}'
+        values: '1x20'
     alert_rule_test:
-      - eval_time: 6m
-        alertname: CephExporterDown
+      - eval_time: 20m
+        alertname: CephExporterAllDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CephExporterTargetDown
         exp_alerts: []
 
-  # down：up=0 持續 → 4m 不 fire、5m fire（alert 帶 job="ceph" + rule label）
+  # 雙 target 全 0：AllDown 4m 不 fire、5m fire（count() 去掉所有 label）；
+  # TargetDown 14m 不 fire、15m 兩個 instance 各自 fire（for: 15m 從 t=0 起算，邊界在 15m，非 16m）
   - interval: 1m
     input_series:
-      - series: 'up{job="ceph"}'
-        values: '0x10'
+      - series: 'up{job="ceph", instance="mgr1"}'
+        values: '0x20'
+      - series: 'up{job="ceph", instance="mgr2"}'
+        values: '0x20'
     alert_rule_test:
       - eval_time: 4m
-        alertname: CephExporterDown
+        alertname: CephExporterAllDown
         exp_alerts: []
       - eval_time: 5m
-        alertname: CephExporterDown
+        alertname: CephExporterAllDown
         exp_alerts:
-          - exp_labels: {job: ceph, severity: critical, source: ceph_stability}
-            exp_annotations: {summary: "Ceph Prometheus exporter is down"}
-
-  # 負向 label 選擇：up{job="node"}==0 → 此規則只認 job="ceph"，不 fire
-  - interval: 1m
-    input_series:
-      - series: 'up{job="node"}'
-        values: '0x10'
-    alert_rule_test:
-      - eval_time: 6m
-        alertname: CephExporterDown
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "All Ceph Prometheus exporter targets are down"}
+      - eval_time: 14m
+        alertname: CephExporterTargetDown
         exp_alerts: []
+      - eval_time: 15m
+        alertname: CephExporterTargetDown
+        exp_alerts:
+          - exp_labels: {job: ceph, instance: mgr1, severity: warning, source: ceph_stability}
+            exp_annotations: {summary: "Ceph exporter target mgr1 is down"}
+          - exp_labels: {job: ceph, instance: mgr2, severity: warning, source: ceph_stability}
+            exp_annotations: {summary: "Ceph exporter target mgr2 is down"}
 
-  # for flap reset：5m 內 up 跳回 1 一次 → 計時重置，5m 不 fire
+  # 一 up 一 down：count(==1)=1，1==0 為假 → AllDown 全程不 fire；
+  # 該 down 的 target 仍照 TargetDown 自己的 15m 走（邊界同上：14m 不 fire、15m fire）
   - interval: 1m
     input_series:
-      - series: 'up{job="ceph"}'
-        values: '0 0 1 0 0 0 0 0 0'
+      - series: 'up{job="ceph", instance="mgr1"}'
+        values: '1x20'
+      - series: 'up{job="ceph", instance="mgr2"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CephExporterAllDown
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: CephExporterTargetDown
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CephExporterTargetDown
+        exp_alerts:
+          - exp_labels: {job: ceph, instance: mgr2, severity: warning, source: ceph_stability}
+            exp_annotations: {summary: "Ceph exporter target mgr2 is down"}
+
+  # 負向 label 選擇：只有 job="node" 的 target down，完全沒有任何 job="ceph" series
+  # → up{job="ceph"} == 1 過濾為空 → count(空) 空 → or vector(0) 退 0 → 0==0 成立 → AllDown 仍會 fire
+  # （已知 trade-off，同 CephMonQuorumLost：分不出「exporter 真的全掛」與「scrape 根本沒註冊這個 job」）。
+  # TargetDown 沒有 or vector(0) fallback，過濾為空就是空，不會 fire。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="node", instance="n1"}'
+        values: '0x20'
     alert_rule_test:
       - eval_time: 5m
-        alertname: CephExporterDown
-        exp_alerts: []
-      - eval_time: 8m   # 自 t=3m 重新 down，8m 滿 5m → fire
-        alertname: CephExporterDown
+        alertname: CephExporterAllDown
         exp_alerts:
-          - exp_labels: {job: ceph, severity: critical, source: ceph_stability}
-            exp_annotations: {summary: "Ceph Prometheus exporter is down"}
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "All Ceph Prometheus exporter targets are down"}
+      - eval_time: 16m
+        alertname: CephExporterTargetDown
+        exp_alerts: []
+
+  # for flap reset（TargetDown）：15m 內 up 跳回 1 一次 → 計時重置。
+  # t=10m 短暫 up 一次、t=11m 起重新 down；資料要延伸夠長，否則 promtool 會在最後一個樣本之後
+  # 判定 series 進入 staleness、中斷 for: 計時（這是本檔第一版寫太短觸發的真實 promtool 行為，非臆測）。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph", instance="mgr1"}'
+        values: '0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CephExporterTargetDown
+        exp_alerts: []
+      - eval_time: 25m   # 自 t=11m 重新 down，25m 未滿 15m（差 1 分鐘）→ 不 fire
+        alertname: CephExporterTargetDown
+        exp_alerts: []
+      - eval_time: 27m   # 自 t=11m 重新 down，27m 進入 firing
+        alertname: CephExporterTargetDown
+        exp_alerts:
+          - exp_labels: {job: ceph, instance: mgr1, severity: warning, source: ceph_stability}
+            exp_annotations: {summary: "Ceph exporter target mgr1 is down"}

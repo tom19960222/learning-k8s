@@ -14,6 +14,8 @@ ALERTMANAGER="$(find_bin alertmanager)"; AMTOOL="$(find_bin amtool)"
 [ -z "$ALERTMANAGER" ] && { echo "FATAL: alertmanager not found"; exit 2; }
 [ -z "$AMTOOL" ] && { echo "FATAL: amtool not found"; exit 2; }
 
+# shellcheck disable=SC2329
+# Invoked by the EXIT trap.
 cleanup() {
   [ -n "${AM_PID:-}" ] && kill "$AM_PID" 2>/dev/null
   [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null
@@ -59,30 +61,30 @@ wait_sink() {  # $1 receiver $2 alertname $3 key
 
 echo "## 場景 1：routing 真送達（Prom→AM→receiver pipe）"
 post '{"alertname":"CephOSDHostDownScoped","hostname":"osd-host-a","severity":"critical","source":"ceph_scoped"}'
-wait_state CephOSDHostDownScoped osd-host-a active && ok "CephOSDHostDownScoped{host-a} active" || no "host-a not active"
-wait_sink pager CephOSDHostDownScoped osd-host-a && ok "→ webhook pager 收到 host-a" || no "pager sink 未收到 host-a"
+if wait_state CephOSDHostDownScoped osd-host-a active; then ok "CephOSDHostDownScoped{host-a} active"; else no "host-a not active"; fi
+if wait_sink pager CephOSDHostDownScoped osd-host-a; then ok "→ webhook pager 收到 host-a"; else no "pager sink 未收到 host-a"; fi
 # 預設 critical aggregate 走 slack（live 版核心斷言）
 post '{"alertname":"CephMonDownQuorumAtRisk","type":"ceph_default","severity":"critical"}'
-wait_sink slack CephMonDownQuorumAtRisk - && ok "預設 aggregate → webhook slack（非 pager）" || no "aggregate 未到 slack"
+if wait_sink slack CephMonDownQuorumAtRisk -; then ok "預設 aggregate → webhook slack（非 pager）"; else no "aggregate 未到 slack"; fi
 
 echo "## 場景 2：host 粒度 silence 只壓目標台"
 "$AMTOOL" --alertmanager.url="http://127.0.0.1:$AMPORT" silence add \
   alertname=CephOSDHostDownScoped hostname=osd-host-a --duration=1h --comment="maint osd-host-a" >/dev/null 2>&1
 post '{"alertname":"CephOSDHostDownScoped","hostname":"osd-host-a","severity":"critical","source":"ceph_scoped"}'
-wait_state CephOSDHostDownScoped osd-host-a suppressed && ok "host-a 被 silence 壓成 suppressed" || no "host-a 未被壓"
+if wait_state CephOSDHostDownScoped osd-host-a suppressed; then ok "host-a 被 silence 壓成 suppressed"; else no "host-a 未被壓"; fi
 post '{"alertname":"CephOSDHostDownScoped","hostname":"osd-host-b","severity":"critical","source":"ceph_scoped"}'
-wait_state CephOSDHostDownScoped osd-host-b active && ok "host-b 未被波及（active）" || no "host-b 被誤壓"
+if wait_state CephOSDHostDownScoped osd-host-b active; then ok "host-b 未被波及（active）"; else no "host-b 被誤壓"; fi
 
 echo "## 場景 3：silence 是 alertname+label 範圍（devil #9）"
 # 同 hostname=osd-host-a 但不同 alertname → 不該被 host-a 那條 silence 壓到
 post '{"alertname":"CephOSDDaemonDownScoped","hostname":"osd-host-a","ceph_daemon":"osd.5","severity":"critical","source":"ceph_scoped"}'
-wait_state CephOSDDaemonDownScoped osd.5 active && ok "不同 alertname 同 host 不被誤壓（active）" || no "alertname-scoping 失效"
+if wait_state CephOSDDaemonDownScoped osd.5 active; then ok "不同 alertname 同 host 不被誤壓（active）"; else no "alertname-scoping 失效"; fi
 
 echo "## 場景 4：維護 silence 不得壓掉生命線"
 post '{"alertname":"CephMonQuorumLost","severity":"critical","source":"ceph_stability"}'
-wait_state CephMonQuorumLost "" active && ok "CephMonQuorumLost 仍 active（未被壓）" || no "生命線被誤壓"
+if wait_state CephMonQuorumLost "" active; then ok "CephMonQuorumLost 仍 active（未被壓）"; else no "生命線被誤壓"; fi
 post '{"alertname":"CephClientBlocked","name":"PG_AVAILABILITY","severity":"critical","source":"ceph_stability"}'
-wait_state CephClientBlocked PG_AVAILABILITY active && ok "CephClientBlocked 仍 active（未被壓）" || no "client-blocked 被誤壓"
+if wait_state CephClientBlocked PG_AVAILABILITY active; then ok "CephClientBlocked 仍 active（未被壓）"; else no "client-blocked 被誤壓"; fi
 
 echo ""
 echo "Tier C2 live: $pass passed, $fail failed"

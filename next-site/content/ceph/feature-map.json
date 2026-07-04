@@ -20,8 +20,9 @@
     {"id": "rbd-and-csi", "label": "RBD & CSI", "description": "block image 切割、kRBD/rbd-nbd、Ceph CSI plugin", "featureSlug": "rbd-and-csi", "category": "api", "position": {"x": 400, "y": 390}},
     {"id": "prometheus-alert-design", "label": "Prometheus alert 補強", "description": "保留 ceph-mixin 預設 rule，補 stability-first 與 scoped OSD / MON page，維護 silence 只鎖目標 label", "featureSlug": "prometheus-alert-design", "category": "tooling", "position": {"x": 1000, "y": 530}},
     {"id": "prometheus-alert-testing", "label": "Alert 測試計劃", "description": "用 promtool / amtool / live / 真 ceph 四層逐條驗證上面那套 alert 設計；過程抓到 CephMonQuorumLost 在 quorum 全失守時靜默的真 bug", "featureSlug": "prometheus-alert-testing", "category": "tooling", "position": {"x": 1000, "y": 660}},
-    {"id": "slow-ops-and-bluestore-alerts", "label": "slow ops metric 來源", "description": "ceph_healthcheck_slow_ops / ceph_daemon_health_metrics{type=SLOW_OPS} 走 OpTracker 30s 門檻；BlueStore 慢操作走獨立的 BLUESTORE_SLOW_OP_ALERT(5s/24h)，兩條幾乎不重疊，alert 要三層補", "featureSlug": "slow-ops-and-bluestore-alerts", "category": "tooling", "position": {"x": 1000, "y": 790}},
-    {"id": "incident-bundle-runbook", "label": "Incident Bundle", "description": "Ceph 出事時先用 collect.sh 保留 cluster 狀態、node 狀態、kernel/systemd/log 與 manifest，驗證後打包成 tar.gz，再交給人判讀", "featureSlug": "incident-bundle-runbook", "category": "tooling", "position": {"x": 700, "y": 790}}
+    {"id": "prometheus-alert-real-lab-findings", "label": "真機 alert findings", "description": "SLOW_OPS / PG_AVAILABILITY 真機通過，MON quorum 暴露 mgr exporter stale；據此把 ClientBlocked、Exporter、coverage rule 升到 v2", "featureSlug": "prometheus-alert-real-lab-findings", "category": "tooling", "position": {"x": 1000, "y": 790}},
+    {"id": "slow-ops-and-bluestore-alerts", "label": "slow ops metric 來源", "description": "ceph_healthcheck_slow_ops / ceph_daemon_health_metrics{type=SLOW_OPS} 走 OpTracker 30s 門檻；BlueStore 慢操作走獨立的 BLUESTORE_SLOW_OP_ALERT(5s/24h)，兩條幾乎不重疊，alert 要三層補", "featureSlug": "slow-ops-and-bluestore-alerts", "category": "tooling", "position": {"x": 1000, "y": 920}},
+    {"id": "incident-bundle-runbook", "label": "Incident Bundle", "description": "Ceph 出事時先用 collect.sh 保留 cluster 狀態、node 狀態、kernel/systemd/log 與 manifest，驗證後打包成 tar.gz，再交給人判讀", "featureSlug": "incident-bundle-runbook", "category": "tooling", "position": {"x": 700, "y": 920}}
   ],
   "edges": [
     {"id": "e-arch-osd", "source": "architecture", "target": "osd-and-bluestore", "label": "deploys"},
@@ -59,7 +60,11 @@
     {"id": "e-flapping-alerts", "source": "osd-flapping", "target": "prometheus-alert-design", "label": "警報風暴來源"},
     {"id": "e-okstop-alerts", "source": "osd-ok-to-stop", "target": "prometheus-alert-design", "label": "maintenance gate"},
     {"id": "e-alertdesign-testing", "source": "prometheus-alert-design", "target": "prometheus-alert-testing", "label": "驗證", "animated": true},
+    {"id": "e-alerttesting-reallab", "source": "prometheus-alert-testing", "target": "prometheus-alert-real-lab-findings", "label": "真機結果", "animated": true},
+    {"id": "e-reallab-alertdesign", "source": "prometheus-alert-real-lab-findings", "target": "prometheus-alert-design", "label": "v2 修訂"},
+    {"id": "e-reallab-quorum", "source": "prometheus-alert-real-lab-findings", "target": "mon-quorum-loss-impact", "label": "stale exporter"},
     {"id": "e-bluestore-slowops", "source": "bluestore-deep-dive", "target": "slow-ops-and-bluestore-alerts", "label": "log_latency 5s"},
+    {"id": "e-reallab-slowops", "source": "prometheus-alert-real-lab-findings", "target": "slow-ops-and-bluestore-alerts", "label": "SLOW_OPS 實測"},
     {"id": "e-slowops-alerts", "source": "slow-ops-and-bluestore-alerts", "target": "prometheus-alert-design", "label": "補三層 alert"},
     {"id": "e-pghealth-slowops", "source": "pg-health-states", "target": "slow-ops-and-bluestore-alerts", "label": "SLOW_OPS check"},
     {"id": "e-alerttesting-incident", "source": "prometheus-alert-testing", "target": "incident-bundle-runbook", "label": "事故保全"},

@@ -1,0 +1,87 @@
+# Tier A — CephOSDLatencyOutlier：(latency > 100 絕對地板) and (latency > 3×中位數) 才 fire，10m warning。
+# 兩道門檻缺一不可：只有絕對地板會在「全叢集普遍慢」時對每顆都 fire（沒意義）；
+# 只有相對门檻會在「全部都很慢」時因中位數也拉高而抓不到真正的 outlier。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # 9 顆 OSD：8 顆 10ms、1 顆 400ms（中位數=10，3×10=30，400 兩道門檻都過）→ 9m 不 fire、10m 只有那顆 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.1"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.2"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.3"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.4"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.5"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.6"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.7"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.8"}'
+        values: '10x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.9"}'
+        values: '400x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="h1"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="h1"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.3", hostname="h1"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.4", hostname="h2"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.5", hostname="h2"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.6", hostname="h2"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.7", hostname="h3"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.8", hostname="h3"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.9", hostname="h3"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CephOSDLatencyOutlier
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CephOSDLatencyOutlier
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.9, hostname: h3, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD commit latency outlier: osd.9 on h3"}
+
+  # 全部 90ms：低於絕對地板 100 → 不管相對門檻，全程不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.1"}'
+        values: '90x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.2"}'
+        values: '90x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="h1"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="h1"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CephOSDLatencyOutlier
+        exp_alerts: []
+
+  # 全部 400ms：中位數也是 400，3×400=1200，400 不大於 1200 → 相對門檻不成立 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.1"}'
+        values: '400x20'
+      - series: 'ceph_osd_commit_latency_ms{ceph_daemon="osd.2"}'
+        values: '400x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.1", hostname="h1"}'
+        values: '1x20'
+      - series: 'ceph_osd_metadata{ceph_daemon="osd.2", hostname="h1"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CephOSDLatencyOutlier
+        exp_alerts: []

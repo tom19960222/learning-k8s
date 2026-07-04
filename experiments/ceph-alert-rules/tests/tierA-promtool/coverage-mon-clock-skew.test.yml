@@ -1,0 +1,27 @@
+# Tier A — CephMonClockSkew：MON_CLOCK_SKEW，2m critical（NTP/chrony 沒同步好，quorum 有風險）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="MON_CLOCK_SKEW", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CephMonClockSkew
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: CephMonClockSkew
+        exp_alerts:
+          - exp_labels: {name: MON_CLOCK_SKEW, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph MON clock skew detected"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="MON_CLOCK_SKEW", severity="HEALTH_WARN"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephMonClockSkew
+        exp_alerts: []

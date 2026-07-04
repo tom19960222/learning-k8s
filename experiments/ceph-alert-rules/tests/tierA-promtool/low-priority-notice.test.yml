@@ -1,11 +1,12 @@
-# Tier A — CephLowPriorityNotice：5 個低優先 name，30m，severity info（slack-only）。spec §4.7
+# Tier A — CephLowPriorityNotice：7 個低優先 name，30m，severity info（slack-only）。spec §4.7
 # 強化（analyzer I3）：跨規則一致性對 PG_DEGRADED 與 OSDMAP_FLAGS 雙驗——
 # 兩者都該 fire LowPriorityNotice(info) 但 NOT fire CephClientRisk(critical)。
+# v2：regex 加入 POOL_APP_NOT_ENABLED、POOL_NEARFULL（兩者都只是提醒，非 client 風險）。
 rule_files:
   - ../../rules/ceph-stability-first.yml
 evaluation_interval: 1m
 tests:
-  # 5 個 name 同時 active：for 邊界 29m 不 fire、30m fire 5 個實例（severity 被蓋成 info）
+  # 7 個 name 同時 active：for 邊界 29m 不 fire、30m fire 7 個實例（severity 被蓋成 info）
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="HOST_IN_MAINTENANCE", severity="HEALTH_WARN"}'
@@ -17,6 +18,10 @@ tests:
       - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'
         values: '1x35'
       - series: 'ceph_health_detail{name="PG_SLOW_SNAP_TRIMMING", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="POOL_APP_NOT_ENABLED", severity="HEALTH_WARN"}'
+        values: '1x35'
+      - series: 'ceph_health_detail{name="POOL_NEARFULL", severity="HEALTH_WARN"}'
         values: '1x35'
     alert_rule_test:
       - eval_time: 29m
@@ -35,6 +40,10 @@ tests:
             exp_annotations: {summary: "Ceph low-priority notice: PG_DEGRADED"}
           - exp_labels: {name: PG_SLOW_SNAP_TRIMMING, severity: info, source: ceph_stability}
             exp_annotations: {summary: "Ceph low-priority notice: PG_SLOW_SNAP_TRIMMING"}
+          - exp_labels: {name: POOL_APP_NOT_ENABLED, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: POOL_APP_NOT_ENABLED"}
+          - exp_labels: {name: POOL_NEARFULL, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: POOL_NEARFULL"}
 
   # 負向：PG_AVAILABILITY 不在低優先清單 → LowPriorityNotice 不 fire
   - interval: 1m

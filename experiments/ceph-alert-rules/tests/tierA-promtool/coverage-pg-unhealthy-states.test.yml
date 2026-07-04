@@ -1,0 +1,47 @@
+# Tier A — CephPGUnhealthyStates：PG down/incomplete/unknown/stale/peered per-pool 3m critical。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_pg_down{pool_id="2"}'
+        values: '1x8'
+      - series: 'ceph_pg_incomplete{pool_id="2"}'
+        values: '0x8'
+      - series: 'ceph_pg_unknown{pool_id="2"}'
+        values: '0x8'
+      - series: 'ceph_pg_stale{pool_id="2"}'
+        values: '0x8'
+      - series: 'ceph_pg_peered{pool_id="2"}'
+        values: '0x8'
+      - series: 'ceph_pool_metadata{pool_id="2", name="alert-pg-availability"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephPGUnhealthyStates
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CephPGUnhealthyStates
+        exp_alerts:
+          - exp_labels: {pool_id: "2", name: alert-pg-availability, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph pool alert-pg-availability has PGs in unhealthy states"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_pg_down{pool_id="3"}'
+        values: '0x8'
+      - series: 'ceph_pg_incomplete{pool_id="3"}'
+        values: '0x8'
+      - series: 'ceph_pg_unknown{pool_id="3"}'
+        values: '0x8'
+      - series: 'ceph_pg_stale{pool_id="3"}'
+        values: '0x8'
+      - series: 'ceph_pg_peered{pool_id="3"}'
+        values: '0x8'
+      - series: 'ceph_pool_metadata{pool_id="3", name="healthy"}'
+        values: '1x8'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephPGUnhealthyStates
+        exp_alerts: []

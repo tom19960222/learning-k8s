@@ -1,0 +1,27 @@
+# Tier A — CephMonDiskLow：MON_DISK_LOW，10m warning（mon store 磁碟空間偏低，早期提醒）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="MON_DISK_LOW", severity="HEALTH_WARN"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CephMonDiskLow
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CephMonDiskLow
+        exp_alerts:
+          - exp_labels: {name: MON_DISK_LOW, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph MON data disk space low"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="MON_DISK_LOW", severity="HEALTH_WARN"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: CephMonDiskLow
+        exp_alerts: []

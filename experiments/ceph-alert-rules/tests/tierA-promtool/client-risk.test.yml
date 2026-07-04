@@ -1,8 +1,13 @@
-# Tier A — CephClientRisk：catch-all（name!~ 10 個排除），5m page。spec §4.4（最關鍵）
+# Tier A — CephClientRisk：catch-all（name!~ 24 個排除），5m page。spec §4.4（最關鍵）
 # 強化（devil #1/#2 + analyzer I3）：除個別負向，加「完整排除清單完整性」測試——
-# 餵全部 10 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
+# 餵全部 24 個排除 name + 2 個非排除 name，斷言只為 2 個非排除 fire。
 # 若任何一個排除 name 被偷偷移出清單，這裡就會多出一個 alert 而 FAIL；
 # 若任何非排除 name 被誤加進清單，這裡就會少一個 alert 而 FAIL。
+# v2：排除清單擴充到 24 個（新增 OSD_FULL/POOL_FULL — 交給 CephClientBlocked；
+# POOL_APP_NOT_ENABLED/POOL_NEARFULL — 交給 CephLowPriorityNotice；
+# OSD_SLOW_PING_TIME_BACK/FRONT、MON_CLOCK_SKEW、RECENT_CRASH、OSD_NEARFULL、OSD_BACKFILLFULL、
+# MON_DISK_LOW、MON_DISK_CRIT、PG_DAMAGED、OSD_SCRUB_ERRORS、OBJECT_UNFOUND
+# — 這些現在都由 ceph-production-coverage 群組專責，避免 ClientRisk 重複 page 同一件事）。
 rule_files:
   - ../../rules/ceph-stability-first.yml
 evaluation_interval: 1m
@@ -22,12 +27,16 @@ tests:
           - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
             exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
 
-  # 完整排除清單完整性：10 排除 + 2 非排除 → 只有 2 非排除 fire
+  # 完整排除清單完整性：24 排除 + 2 非排除 → 只有 2 非排除 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="PG_AVAILABILITY", severity="HEALTH_WARN"}'
         values: '1x10'
       - series: 'ceph_health_detail{name="SLOW_OPS", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_FULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="POOL_FULL", severity="HEALTH_ERR"}'
         values: '1x10'
       - series: 'ceph_health_detail{name="OSD_DOWN", severity="HEALTH_WARN"}'
         values: '1x10'
@@ -45,9 +54,35 @@ tests:
         values: '1x10'
       - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
         values: '1x10'
+      - series: 'ceph_health_detail{name="POOL_APP_NOT_ENABLED", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="POOL_NEARFULL", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_SLOW_PING_TIME_BACK", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_SLOW_PING_TIME_FRONT", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="MON_CLOCK_SKEW", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_BACKFILLFULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="MON_DISK_LOW", severity="HEALTH_WARN"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="MON_DISK_CRIT", severity="HEALTH_ERR"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="PG_DAMAGED", severity="HEALTH_ERR"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OSD_SCRUB_ERRORS", severity="HEALTH_ERR"}'
+        values: '1x10'
+      - series: 'ceph_health_detail{name="OBJECT_UNFOUND", severity="HEALTH_ERR"}'
+        values: '1x10'
       - series: 'ceph_health_detail{name="POOL_NEAR_FULL", severity="HEALTH_WARN"}'
         values: '1x10'
-      - series: 'ceph_health_detail{name="POOL_FULL", severity="HEALTH_ERR"}'
+      - series: 'ceph_health_detail{name="OSD_NO_DOWN_OUT_INTERVAL", severity="HEALTH_WARN"}'
         values: '1x10'
     alert_rule_test:
       - eval_time: 6m
@@ -55,8 +90,8 @@ tests:
         exp_alerts:
           - exp_labels: {name: POOL_NEAR_FULL, severity: critical, source: ceph_stability}
             exp_annotations: {summary: "Ceph client-risk check active: POOL_NEAR_FULL"}
-          - exp_labels: {name: POOL_FULL, severity: critical, source: ceph_stability}
-            exp_annotations: {summary: "Ceph client-risk check active: POOL_FULL"}
+          - exp_labels: {name: OSD_NO_DOWN_OUT_INTERVAL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: OSD_NO_DOWN_OUT_INTERVAL"}
 
   # 頁面強調的三個排除 name 個別負向（換硬碟元兇 PG_DEGRADED / noout 的 OSDMAP_FLAGS / 維護繞回 MON_DOWN）
   - interval: 1m
@@ -84,20 +119,27 @@ tests:
         alertname: CephClientRisk
         exp_alerts: []
 
-  # 真實 ceph health check 正向（devil #5）：OSD_NEARFULL / RECENT_CRASH 都是 v19.2.3 實際 check，
-  # 不在排除清單 → catch-all 應各 fire 一個。確認 catch-all 對「排除清單外的真 check」確實接得到，
-  # 不是只會 round-trip 那 10 個已知 name。
+  # 真實 ceph health check 正向（devil #5）：OSD_NO_DOWN_OUT_INTERVAL 是 v19.2.3 實際 check、
+  # 不在排除清單 → catch-all 應該 fire。確認 catch-all 對「排除清單外的真 check」確實接得到，
+  # 不是只會 round-trip 那幾個已知 name。
   - interval: 1m
     input_series:
-      - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'
-        values: '1x10'
-      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+      - series: 'ceph_health_detail{name="OSD_NO_DOWN_OUT_INTERVAL", severity="HEALTH_WARN"}'
         values: '1x10'
     alert_rule_test:
       - eval_time: 6m
         alertname: CephClientRisk
         exp_alerts:
-          - exp_labels: {name: OSD_NEARFULL, severity: critical, source: ceph_stability}
-            exp_annotations: {summary: "Ceph client-risk check active: OSD_NEARFULL"}
-          - exp_labels: {name: RECENT_CRASH, severity: critical, source: ceph_stability}
-            exp_annotations: {summary: "Ceph client-risk check active: RECENT_CRASH"}
+          - exp_labels: {name: OSD_NO_DOWN_OUT_INTERVAL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client-risk check active: OSD_NO_DOWN_OUT_INTERVAL"}
+
+  # v2 新增：RECENT_CRASH 現在交給 ceph-production-coverage 的 CephDaemonRecentCrash 專責，
+  # 不再觸發 ClientRisk（避免同一件事被兩條規則重複 page）。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []

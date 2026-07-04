@@ -1,0 +1,30 @@
+# Tier A — CephDaemonSlowOps：ceph_daemon_health_metrics{type="SLOW_OPS"} > 0，3m warning。
+# 跟 CephClientBlocked 的 SLOW_OPS（cluster-wide health check）不同來源：這條是「哪個 daemon」有 slow ops
+# 的細粒度計數，兩者互補（daemon 級細節 vs cluster 級 page 主訊號）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_daemon_health_metrics{ceph_daemon="osd.3", type="SLOW_OPS"}'
+        values: '5x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephDaemonSlowOps
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: CephDaemonSlowOps
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.3, type: SLOW_OPS, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph daemon has slow ops: osd.3"}
+
+  # 值為 0（無 slow ops）→ > 0 為假 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_daemon_health_metrics{ceph_daemon="osd.3", type="SLOW_OPS"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephDaemonSlowOps
+        exp_alerts: []

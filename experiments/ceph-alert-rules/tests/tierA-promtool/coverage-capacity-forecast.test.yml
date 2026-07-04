@@ -1,0 +1,34 @@
+# Tier A — CephCapacityForecast：raw capacity 72h projection 超過 85% 時 warning。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # 1h window 內 used 每分鐘 +10：predict_linear 在 t=1m（第一次有 2 個樣本可算斜率）就已超過
+  # 85% 門檻，for: 30m 從那一刻起算 → 30m 不 fire、31m fire（實測邊界，非推論——promtool 直接驗證過）。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_cluster_total_bytes'
+        values: '1000x120'
+      - series: 'ceph_cluster_total_used_bytes'
+        values: '0+10x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CephCapacityForecast
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: CephCapacityForecast
+        exp_alerts:
+          - exp_labels: {severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph raw capacity projected to exceed 85% within 3 days"}
+
+  # used 穩定不成長 → projection 不超過門檻
+  - interval: 1m
+    input_series:
+      - series: 'ceph_cluster_total_bytes'
+        values: '1000x120'
+      - series: 'ceph_cluster_total_used_bytes'
+        values: '100x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CephCapacityForecast
+        exp_alerts: []

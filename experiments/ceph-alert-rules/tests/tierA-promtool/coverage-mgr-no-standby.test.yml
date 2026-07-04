@@ -1,0 +1,45 @@
+# Tier A — CephMgrNoStandby：(count(ceph_mgr_status) or vector(0)) < 2，5m warning。
+# 跟 CephMonQuorumLost 同款 or vector(0) idiom：連 ceph_mgr_status 這個 metric 都不存在時
+# （count(空) 空）也要 fire，不能因為 metric 缺席而靜默。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # 只有一個 mgr（無 standby）→ count=1 < 2 → 4m 不 fire、5m fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mgr_status{ceph_daemon="mgr.a"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephMgrNoStandby
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephMgrNoStandby
+        exp_alerts:
+          - exp_labels: {severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph mgr has no standby (failover capacity lost)"}
+
+  # 兩個 mgr（active+standby）→ count=2，不 < 2 → 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mgr_status{ceph_daemon="mgr.a"}'
+        values: '1x10'
+      - series: 'ceph_mgr_status{ceph_daemon="mgr.b"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephMgrNoStandby
+        exp_alerts: []
+
+  # 零個 mgr series（metric 完全缺席，只有無關 series）→ count(空) 空 → or vector(0) 退 0 → 0<2 → fire
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephMgrNoStandby
+        exp_alerts:
+          - exp_labels: {severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph mgr has no standby (failover capacity lost)"}

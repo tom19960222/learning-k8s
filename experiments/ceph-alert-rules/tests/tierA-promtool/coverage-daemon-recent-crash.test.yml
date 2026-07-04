@@ -1,0 +1,28 @@
+# Tier A — CephDaemonRecentCrash：RECENT_CRASH，5m warning。取代 ClientRisk 對 RECENT_CRASH 的 catch-all
+# page（見 client-risk.test.yml 的「RECENT_CRASH 不再觸發 ClientRisk」向量）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephDaemonRecentCrash
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephDaemonRecentCrash
+        exp_alerts:
+          - exp_labels: {name: RECENT_CRASH, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph daemon crash reported in the last two weeks"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="RECENT_CRASH", severity="HEALTH_WARN"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephDaemonRecentCrash
+        exp_alerts: []

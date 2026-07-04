@@ -454,7 +454,7 @@ rate(ceph_osd_op_latency_count[5m])
     summary: "ceph_healthcheck_slow_ops 不見了（mgr failover？prometheus module 沒開？）——slow ops 監控目前是盲區"
 ```
 
-這跟 alert 設計頁的 `CephExporterDown`（`up{job="ceph"} == 0`）是互補的：一個盯 exporter 連線，一個盯這個特定 metric 是否還在被產生。
+這跟 alert 設計頁的 `CephExporterTargetDown` / `CephExporterAllDown` 是互補的：一組盯 exporter 連線，一個盯這個特定 metric 是否還在被產生。
 
 ## 邊界與除錯
 

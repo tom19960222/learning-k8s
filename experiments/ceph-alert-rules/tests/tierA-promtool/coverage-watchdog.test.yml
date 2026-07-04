@@ -1,0 +1,17 @@
+# Tier A — Watchdog：expr: vector(1)，無 for，永遠 firing 的心跳。
+# 用途：接外部 dead-man switch（若 Alertmanager/Prometheus 本身掛了，這條也會跟著停止送達，
+# 外部監控看到「沒收到心跳」就知道整條 pipeline 出事）。severity 標成 none，不進一般 severity 分級。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels: {severity: none, source: ceph_coverage}
+            exp_annotations: {summary: "Always-firing heartbeat; wire to external dead-man switch"}

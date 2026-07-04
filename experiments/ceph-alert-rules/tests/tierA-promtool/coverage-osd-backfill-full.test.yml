@@ -1,0 +1,27 @@
+# Tier A — CephOSDBackfillFull：backfillfull 5m critical。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_BACKFILLFULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephOSDBackfillFull
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: CephOSDBackfillFull
+        exp_alerts:
+          - exp_labels: {name: OSD_BACKFILLFULL, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD(s) backfill-full: recovery is blocked"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_BACKFILLFULL", severity="HEALTH_ERR"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephOSDBackfillFull
+        exp_alerts: []

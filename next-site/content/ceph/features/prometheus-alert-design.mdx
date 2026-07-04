@@ -87,7 +87,7 @@ metrics['mon_quorum_status'] = Metric(
 | **Slack / ticket context** | 預設 aggregate rule、低優先 notice | 可以短時間 silence 降噪 |
 | **維護可 silence** | scoped host/daemon down（帶 `hostname`/`ceph_daemon`） | 維護時只 silence 目標那台 |
 
-對應地，這層補兩組 rule：`ceph-stability-first`（負責 client 風險，幾乎都不可 silence）與 `ceph-scoped-availability`（負責 MON/OSD 維度，帶 label 可精準 silence）。下面分別給 YAML。
+對應地，這層補兩組核心 rule：`ceph-stability-first`（負責 client 風險，幾乎都不可 silence）與 `ceph-scoped-availability`（負責 MON/OSD 維度，帶 label 可精準 silence）。真機故障注入後，又把「早期風險 / coverage」獨立成 `ceph-production-coverage`，避免 `CephClientRisk` 變成垃圾桶；完整修訂理由見 [Ceph - 真機故障注入後的 alert 韌性修訂](./prometheus-alert-real-lab-findings)。
 
 ## `ceph-stability-first`：client 風險，多數不可 silence
 
@@ -98,7 +98,7 @@ groups:
   - name: ceph-stability-first
     rules:
       - alert: CephClientBlocked
-        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS"} == 1
+        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL"} == 1
         for: 1m
         labels:
           severity: critical
@@ -109,7 +109,7 @@ groups:
       - alert: CephClientRisk
         expr: |
           ceph_health_detail{
-            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL|OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT|MON_CLOCK_SKEW|RECENT_CRASH|OSD_NEARFULL|OSD_BACKFILLFULL|MON_DISK_LOW|MON_DISK_CRIT|PG_DAMAGED|OSD_SCRUB_ERRORS|OBJECT_UNFOUND"
           } == 1
         for: 5m
         labels:
@@ -127,19 +127,28 @@ groups:
         annotations:
           summary: "Ceph MON quorum lost or below 3-mon majority"
 
-      - alert: CephExporterDown
-        expr: up{job="ceph"} == 0
+      - alert: CephExporterAllDown
+        expr: (count(up{job="ceph"} == 1) or vector(0)) == 0
         for: 5m
         labels:
           severity: critical
           source: ceph_stability
         annotations:
-          summary: "Ceph Prometheus exporter is down"
+          summary: "All Ceph Prometheus exporter targets are down"
+
+      - alert: CephExporterTargetDown
+        expr: up{job="ceph"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: "Ceph exporter target {{ $labels.instance }} is down"
 
       - alert: CephLowPriorityNotice
         expr: |
           ceph_health_detail{
-            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL"
           } == 1
         for: 30m
         labels:
@@ -151,8 +160,8 @@ groups:
 
 兩個設計重點：
 
-- **`CephClientBlocked` vs `CephClientRisk` 的分工**：前者只盯 `PG_AVAILABILITY` / `SLOW_OPS`（client I/O 已經被擋），1 分鐘就 page；後者是「其餘所有會危及 client 的 health check」的 catch-all，5 分鐘 page。
-- **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、以及 `HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING` / `PG_DEGRADED` / `OSDMAP_FLAGS`（這些是低優先，交給 `CephLowPriorityNotice`）。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
+- **`CephClientBlocked` vs `CephClientRisk` 的分工**：前者只盯 `PG_AVAILABILITY` / `SLOW_OPS` / `OSD_FULL` / `POOL_FULL`（client I/O 已經被擋或容量已到硬擋），1 分鐘就 page；後者是「其餘還沒被專屬 rule 接住、但會危及 client 的 health check」的 catch-all，5 分鐘 page。
+- **`CephClientRisk` 的 `name!~` 排除清單**很關鍵：它排掉了 `OSD_DOWN` / `OSD_HOST_DOWN` / `MON_DOWN`（這些交給下面 scoped rule，否則維護時會 cluster-wide 繞回來叫）、低優先 notice（`HOST_IN_MAINTENANCE` / `OBJECT_MISPLACED` / `PG_SLOW_SNAP_TRIMMING` / `PG_DEGRADED` / `OSDMAP_FLAGS` / `POOL_APP_NOT_ENABLED` / `POOL_NEARFULL`），以及已經由 `ceph-production-coverage` 專責的網路、容量、clock skew、crash、資料完整性訊號。把 `MON_DOWN` 排掉特別重要：否則 MON 維護時 `CephMonDownScoped` 雖能精準 silence，`CephClientRisk{name="MON_DOWN"}` 還是會 cluster-wide page。
 - **特別注意 `PG_DEGRADED` / `OSDMAP_FLAGS` —— 這兩個是「換硬碟一定會叫」的元兇**。停一顆 OSD 換硬碟時，它上面的 PG 副本掉一份 → ceph 升 `PG_DEGRADED`；如果維護前設了 `noout` 旗標，會升 `OSDMAP_FLAGS`。`CephClientRisk` 是 `name!~` 的 catch-all，**任何不在排除清單裡的 health check active 滿 5 分鐘都 page**——所以早期版本只 silence `CephOSDDaemonDownScoped` 是不夠的，`CephClientRisk{name="PG_DEGRADED"}` 還是會在 5 分鐘後叫。把這兩個排除掉、歸到 Slack-only 的 `CephLowPriorityNotice` 是對的：`PG_DEGRADED` 在 ceph 內部就是 `HEALTH_WARN`（`PGMap.cc:2578`，`sev = HEALTH_WARN`），而且 upstream ceph-mixin 預設**沒有任何 rule 直接 page 它**（degraded 只讓 `CephHealthWarning` 這條 Slack-only 的 warning 亮）。換句話說，把 degraded 排出 pager 不是「降級一個該叫的訊號」，是把它修回 ceph 預設本來的等級——真正擋到 I/O 的 `PG_AVAILABILITY` 仍由 `CephClientBlocked` page，生命線不動。
 - **`CephMonQuorumLost` 寫死 3-mon majority**（`(count(...) or vector(0)) < 2`）。`or vector(0)` 不是裝飾——少了它，全部 mon 掛掉時 `ceph_mon_quorum_status == 1` 過濾成空 vector、`count(空)` 在 PromQL 是**無 sample**（不是純量 0），`< 2` 算不出結果反而**不 fire**，剛好在 quorum 全失守的最壞情況靜默。非 3-mon 的改法見文末邊界。
 
@@ -163,7 +172,7 @@ groups:
 
   修法是標準 idiom `(count(...) or vector(0)) < 2`：左邊為空時 `or vector(0)` 退回一條值為 0 的 series，`0 < 2` 成立照樣 page。已驗證 healthy 不 fire、掉 2 台 fire、**掉 3 台也 fire**。對應的驗證見 [Ceph - 在開發環境驗證這套 alert](./prometheus-alert-testing)。
 
-  **一個誠實的 trade-off**：`or vector(0)` 分不出「3 台 mon 都回報 quorum_status=0」與「完全沒有 `ceph_mon_quorum_status` 這個 metric」（例如 mgr 剛重啟、module 還沒匯出），兩者它都會 fire。多數情況這可接受——連 quorum metric 都沒有本來就代表你對 quorum 盲了，值得叫；而 `CephExporterDown` 是「整個 ceph job 抓不到」的主訊號。若你想讓這條只在「真的有 mon 回報但不足額」時 fire，用文末 **metadata-anchored 動態版**：它的門檻 `floor(count(ceph_mon_metadata)/2)+1` 在 metadata 缺席時也變空，`0 < 空` 不成立 → 不會被 metric 缺席誤觸（測試計劃頁有寫死版 fire、動態版不 fire 的對照）。
+  **一個誠實的 trade-off**：`or vector(0)` 分不出「3 台 mon 都回報 quorum_status=0」與「完全沒有 `ceph_mon_quorum_status` 這個 metric」（例如 mgr 剛重啟、module 還沒匯出），兩者它都會 fire。多數情況這可接受——連 quorum metric 都沒有本來就代表你對 quorum 盲了，值得叫；而 `CephMetricsAbsent` / `CephExporterAllDown` 是「整個 Ceph metrics 管線抓不到」的主訊號。若你想讓這條只在「真的有 mon 回報但不足額」時 fire，用文末 **metadata-anchored 動態版**：它的門檻 `floor(count(ceph_mon_metadata)/2)+1` 在 metadata 缺席時也變空，`0 < 空` 不成立 → 不會被 metric 缺席誤觸（測試計劃頁有寫死版 fire、動態版不 fire 的對照）。
 </Callout>
 
 ## `ceph-scoped-availability`：帶 label，維護可精準 silence
@@ -249,26 +258,32 @@ File: `ceph/monitoring/ceph-mixin/prometheus_alerts.yml` (line 4)
 ```yaml
 route:
   receiver: slack-ceph
+  group_by: ['alertname', 'name', 'hostname', 'ceph_daemon']
   routes:
+    - receiver: watchdog-ceph
+      matchers:
+        - alertname="Watchdog"
+
+    - receiver: pager-ceph
+      matchers:
+        - severity="critical"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
+
     - receiver: pager-ceph
       matchers:
         - type="ceph_default"
         - alertname="CephHealthError"
 
-    - receiver: pager-ceph
-      matchers:
-        - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
-
     - receiver: slack-ceph
       matchers:
-        - alertname="CephLowPriorityNotice"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
 
     - receiver: slack-ceph
       matchers:
         - type="ceph_default"
 ```
 
-效果：Pager 的主訊號只來自**預設 `CephHealthError` + `ceph-stability-first` + `ceph-scoped-availability`**；預設 aggregate rule 仍保留在 Slack / ticket / Dashboard 當 context，跟 upstream 文件一致，但不吵 pager。
+效果：Pager 的主訊號只來自**自訂 critical rule + 預設 `CephHealthError`**；warning / info 級自訂 rule 與預設 aggregate rule 仍保留在 Slack / ticket / Dashboard 當 context，跟 upstream 文件一致，但不吵 pager。這裡刻意改成 label 導向，而不是 alertname regex：新增 `ceph-production-coverage` rule 時，只要 severity/source 正確，routing 就不會漏。
 
 ## 維護時怎麼 silence
 
@@ -441,9 +456,9 @@ ceph orch ps --daemon_type mon
 
 先確認是否還能拿到 quorum。若已失守，優先恢復 MON host 的網路、時間同步、磁碟空間與 mon daemon。**不要同時重啟多台 mon**；先讓一台已知健康的 mon 回 quorum。
 
-### `CephExporterDown`
+### `CephExporterAllDown`
 
-Prometheus 抓不到 Ceph metrics。它本身不是 client I/O failure，但會讓所有 Prometheus alert 變盲區，所以**不要 silence**。
+Prometheus 抓不到任何 Ceph exporter target。它本身不是 client I/O failure，但會讓所有 Prometheus alert 變盲區，所以**不要 silence**。
 
 ```bash
 ceph -s
@@ -452,6 +467,10 @@ ceph mgr module ls
 ```
 
 mgr/prometheus module 沒啟用就修 module；active mgr 掛掉就先恢復 mgr。這段期間改用 `ceph -s` / `ceph health detail` 人工確認，別只看 Prometheus。
+
+### `CephExporterTargetDown`
+
+單一 Ceph exporter target 抓不到，進 Slack / ticket。多 mgr scrape 之後，單點 exporter down 不一定等於全盲；先查對應 `instance` 是 planned maintenance、standby mgr、網路，還是 scrape config 問題。若同時 `CephMetricsAbsent` 或 `CephExporterAllDown` firing，就把它當監控生命線事故處理。
 
 ### `CephOSDHostDownScoped`
 
@@ -491,7 +510,7 @@ ceph orch ps --daemon_type mon
 
 ### `CephLowPriorityNotice`
 
-只進 Slack / ticket，不 page。典型是 `HOST_IN_MAINTENANCE`、`OBJECT_MISPLACED`、`PG_SLOW_SNAP_TRIMMING`。記錄、追蹤、看是否超過預期時間——不該把人叫醒，但也不該完全消失。
+只進 Slack / ticket，不 page。典型是 `HOST_IN_MAINTENANCE`、`OBJECT_MISPLACED`、`PG_SLOW_SNAP_TRIMMING`、`POOL_APP_NOT_ENABLED`。記錄、追蹤、看是否超過預期時間——不該把人叫醒，但也不該完全消失。
 
 ## 邊界
 
@@ -523,11 +542,12 @@ ceph orch ps --daemon_type mon
 
 ### Prometheus alert 的共同盲區：metric 缺席
 
-`up{job="ceph"} == 0`（`CephExporterDown`）與所有 `ceph_health_detail` 系列規則都要求**對應的 series 存在**才會 fire。如果某個 metric 從沒被抓過（scrape config 打錯、target 沒註冊），規則靜默、毫無 pager。要補這個盲區用 `absent()` 元規則，例如 `absent(up{job="ceph"})` 或 `absent(ceph_health_status)`——這超出本頁「在預設 rule 之上加一層」的範圍，但部署時值得一併補上。
+`up{job="ceph"} == 0`（`CephExporterTargetDown`）與所有 `ceph_health_detail` 系列規則都要求**對應的 series 存在**才會 fire。如果某個 metric 從沒被抓過（scrape config 打錯、target 沒註冊），規則靜默、毫無 pager。v2 以 `CephMetricsAbsent` 補 `ceph_health_status` 缺席，並以 `CephExporterAllDown` 捕捉整個 Ceph scrape job 全盲；更多真機發現與 coverage rule 見 [Ceph - 真機故障注入後的 alert 韌性修訂](./prometheus-alert-real-lab-findings)。
 
 ## 接下來 / 相關頁面
 
 - [Ceph - Node flapping](./osd-flapping)：理解 OSD 為什麼會被 mark down / up，以及 mon 的 laggy EMA 與 subtree_limit
 - [Ceph - PG health states](./pg-health-states)：active、clean、degraded、inactive 如何對應到 client 風險
+- [Ceph - 真機故障注入後的 alert 韌性修訂](./prometheus-alert-real-lab-findings)：`SLOW_OPS`、`PG_AVAILABILITY`、MON quorum/exporter stale 的實驗結果與 v2 更新
 - [Ceph - osd ok-to-stop](./osd-ok-to-stop)：進 OSD 維護前先模擬 PG 是否仍能 active
 - [Ceph - MON quorum loss](./mon-quorum-loss-impact)：3-mon / 5-mon quorum loss 對 client I/O 的影響

@@ -1,4 +1,5 @@
-# Tier A — CephClientBlocked：client I/O 已被擋（PG_AVAILABILITY / SLOW_OPS），1m page。spec §4.3
+# Tier A — CephClientBlocked：client I/O 已被擋（PG_AVAILABILITY / SLOW_OPS / OSD_FULL / POOL_FULL），1m page。spec §4.3
+# v2：regex 擴充加入 OSD_FULL / POOL_FULL（cluster 真的寫滿，client I/O 一定被擋）。
 rule_files:
   - ../../rules/ceph-stability-first.yml
 evaluation_interval: 1m
@@ -46,7 +47,31 @@ tests:
           - exp_labels: {name: SLOW_OPS, severity: critical, source: ceph_stability}
             exp_annotations: {summary: "Ceph client I/O blocked: SLOW_OPS"}
 
-  # 負向：非此規則該接的 name（PG_DEGRADED 不在 PG_AVAILABILITY|SLOW_OPS）→ 不 fire
+  # 正常 OSD_FULL（cluster 寫滿其中一種型態）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_FULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephClientBlocked
+        exp_alerts:
+          - exp_labels: {name: OSD_FULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: OSD_FULL"}
+
+  # 正常 POOL_FULL
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="POOL_FULL", severity="HEALTH_ERR"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephClientBlocked
+        exp_alerts:
+          - exp_labels: {name: POOL_FULL, severity: critical, source: ceph_stability}
+            exp_annotations: {summary: "Ceph client I/O blocked: POOL_FULL"}
+
+  # 負向：非此規則該接的 name（PG_DEGRADED 不在 PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL）→ 不 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="PG_DEGRADED", severity="HEALTH_WARN"}'

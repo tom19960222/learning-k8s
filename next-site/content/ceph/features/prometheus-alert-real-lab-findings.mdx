@@ -1,0 +1,416 @@
+---
+layout: doc
+title: Ceph — 真機故障注入後的 alert 韌性修訂
+description: 用既有 cephadm + Rook lab 製造 SLOW_OPS、PG_AVAILABILITY、MON quorum loss 三種真故障，檢查 CephClientBlocked 與 CephMonQuorumLost 是否真的 firing。結論：client-blocked 生命線有效；MON quorum rule 的 PromQL 修正有效但 exporter 視角會 stale，必須補 metrics absent、multi-mgr scrape、coverage rule 與獨立 MON 觀測面。
+---
+
+## 結論先講
+
+這次真機故障注入給了兩個好消息、一個壞消息。
+
+好消息是 `CephClientBlocked` 真的有用。用 cgroup v2 `io.max` 讓 OSD backing device 變慢，可以讓 Ceph 產生真 `SLOW_OPS`，Prometheus 裡 `CephClientBlocked{name="SLOW_OPS"}` 進入 `firing`，Alertmanager 也真的送到 pager receiver。停掉測試 pool acting set 裡兩顆 OSD，讓 PG 掉到 `min_size` 以下，也能讓 `CephClientBlocked{name="PG_AVAILABILITY"}` 進入 `firing`。
+
+壞消息是 `CephMonQuorumLost` 不能只靠單一 mgr exporter 視角。真實停止兩台 mon 後，`ceph quorum_status` 已經無法完成，但 Prometheus 查到的 `sum(ceph_mon_quorum_status)` 仍是 `3`。也就是說，這不是 PromQL 寫錯，而是**監控資料源還在回報舊世界**。最後 `CephMonQuorumLost` 是在 active mgr/exporter 也被停掉、`ceph_mon_quorum_status` 變成 empty series 後，靠 `(count(...) or vector(0)) < 2` 的 empty-series path 觸發。
+
+所以我的 alert 應該更新成 v2：保留 `CephClientBlocked` 當 client I/O 生命線，但把 `OSD_FULL` / `POOL_FULL` 併進去；把 `CephExporterDown` 拆成 all-down 與 single-target warning；新增 `CephMetricsAbsent`、`Watchdog` 與一組 `ceph-production-coverage` rule；最後，MON quorum 還要補一個不依賴 mgr exporter 的觀測面。
+
+## 實驗證據
+
+原始 result 目錄不進 git，所以 committed 摘要放在 `experiments/ceph-alert-real-lab/EVIDENCE-SUMMARY-2026-07-04.md`。下面只列 load-bearing 證據：
+
+| Alert | 真故障 | Ceph 證據 | Prometheus / pager 證據 | 結論 |
+|---|---|---|---|---|
+| `CephClientBlocked{name="SLOW_OPS"}` | cgroup v2 `io.max` 限速 `osd.6` backing device `/dev/sdb`，同時用 `rados bench` 打測試 pool | `health-check-SLOW_OPS.txt` 出現 `SLOW_OPS` 與 `BLUESTORE_SLOW_OP_ALERT` | `prometheus-alerts-CephClientBlocked-name.json` 顯示 `state="firing"`，`activeAt="2026-07-04T10:12:42.762155964Z"`，sink log 到 pager | 通過 |
+| `CephClientBlocked{name="PG_AVAILABILITY"}` | 停測試 pool acting set 的 `osd.5` / `osd.8` | `health-check-PG_AVAILABILITY.txt` 出現 `PG_AVAILABILITY`，PG `2.10` inactive | `state="firing"`，`activeAt="2026-07-04T10:28:57.762155964Z"`，sink log 到 pager | 通過 |
+| `CephMonQuorumLost` | 停 `ceph-lab-mon-01` / `ceph-lab-mon-03`，再停 `ceph-lab-mon-02` 與 active mgr 測 empty-series path | `ceph-quorum-after-stop.json` exit `255`；但 `prometheus-ceph-mon-quorum-status.json` 仍回 `3` | 停 active mgr/exporter 後 `CephMonQuorumLost` `state="firing"`，`activeAt="2026-07-04T10:34:37.762155964Z"`，sink log 到 pager | PromQL empty-series 修正有效，但單一 exporter 會 stale |
+
+這裡刻意不用最新時間戳的 fake/unit result，因為那些檔案裡有 `fake/io.max` 之類的測試痕跡，不是可以拿來證明真故障的 evidence。
+
+## `CephClientBlocked` 的結論
+
+`CephClientBlocked` 應該繼續是 critical page，而且 `for: 1m` 合理。這次兩種真故障都走完整管線：
+
+1. Ceph health check 真的 active。
+2. mgr/prometheus module 匯出 `ceph_health_detail{name="..."}`。
+3. Prometheus alert 真的 `firing`。
+4. Alertmanager routing 真的送到 pager receiver。
+
+我會把它從：
+
+```promql
+ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS"} == 1
+```
+
+擴成：
+
+```promql
+ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL"} == 1
+```
+
+理由很簡單：`PG_AVAILABILITY` 與 `SLOW_OPS` 是這次已真機簽收的 I/O blocked 訊號；`OSD_FULL` / `POOL_FULL` 則是容量硬擋，client write 一樣會被擋，不適合留在 5 分鐘 catch-all 裡。
+
+同時，`POOL_APP_NOT_ENABLED` 這種測試 pool 很容易觸發、但不代表 client I/O blocked 的 check，不能再讓 `CephClientRisk` page。它應該進 `CephLowPriorityNotice`。
+
+## `SLOW_OPS` 的額外發現
+
+這次 `SLOW_OPS` 是用現實世界會發生的故障做出來的：底層 disk path 變慢。做法不是硬插 `dm-delay` 改 live OSD block path，而是對 OSD systemd cgroup 的 `io.max` 下限速。這比較像 hypervisor / storage path 突然變慢，也比較容易回復。
+
+但 health detail 同時出現了兩個東西：
+
+- `SLOW_OPS`
+- `BLUESTORE_SLOW_OP_ALERT`
+
+這兩個不要合併成同一條 page。`SLOW_OPS` 是 client impact 生命線，應該 page；`BLUESTORE_SLOW_OP_ALERT` 更像 BlueStore engine / OSD local 狀態，應該有專屬 OSD runbook，並且可以先用 warning 或較長 `for:` 追蹤。否則一個慢 disk 會同時把 client-blocked、OSD engine、catch-all 都打醒，oncall 只會看到一團噪音。
+
+## MON quorum 的壞消息
+
+原本 `CephMonQuorumLost` 的 PromQL 是：
+
+```promql
+(count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+```
+
+這個修正本身是對的：當 `ceph_mon_quorum_status == 1` 過濾成 empty vector 時，`or vector(0)` 會讓規則得到 `0 < 2`，避免「所有 mon 都 down」時靜默。
+
+但真機實驗證明另一件事：如果 Prometheus 只 scrape 單一 mgr exporter，而那個 exporter 還在回舊資料，PromQL 再正確也沒用。這次停掉兩台 mon 後：
+
+- `ceph quorum_status` 已經 exit `255`。
+- Prometheus 查 `sum(ceph_mon_quorum_status)` 仍是 `3`。
+- `CephMonQuorumLost` 沒有在這一段直接 firing。
+- 停 active mgr/exporter 後，series 變空，才靠 `or vector(0)` 觸發。
+
+所以 `CephMonQuorumLost` 的結論不是「規則沒用」，而是「**mgr exporter 不是 MON quorum 的唯一可靠觀測面**」。
+
+## 我會怎麼更新 alert
+
+### 1. 保留 client-blocked 生命線，但縮小 catch-all
+
+v2 的 `ceph-stability-first` 讓 `CephClientBlocked` 接真正 I/O blocked 的 name，把其他已知類型交給專屬 rule：
+
+```yaml
+groups:
+  - name: ceph-stability-first
+    rules:
+      - alert: CephClientBlocked
+        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client I/O blocked: {{ $labels.name }}"
+
+      - alert: CephClientRisk
+        expr: |
+          ceph_health_detail{
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL|OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT|MON_CLOCK_SKEW|RECENT_CRASH|OSD_NEARFULL|OSD_BACKFILLFULL|MON_DISK_LOW|MON_DISK_CRIT|PG_DAMAGED|OSD_SCRUB_ERRORS|OBJECT_UNFOUND"
+          } == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client-risk check active: {{ $labels.name }}"
+
+      - alert: CephMonQuorumLost
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost or below 3-mon majority"
+
+      - alert: CephExporterAllDown
+        expr: (count(up{job="ceph"} == 1) or vector(0)) == 0
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "All Ceph Prometheus exporter targets are down"
+
+      - alert: CephExporterTargetDown
+        expr: up{job="ceph"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: "Ceph exporter target {{ $labels.instance }} is down"
+
+      - alert: CephLowPriorityNotice
+        expr: |
+          ceph_health_detail{
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL"
+          } == 1
+        for: 30m
+        labels:
+          severity: info
+          source: ceph_stability
+        annotations:
+          summary: "Ceph low-priority notice: {{ $labels.name }}"
+```
+
+### 2. 新增 production coverage group
+
+這組是韌性補強，不是要取代 `CephHealthError` 或 `CephClientBlocked`。它的目標是把原本會落進 catch-all 的訊號分門別類：網路、clock skew、容量、資料完整性、mgr failover 能力、metrics absent。
+
+```yaml
+groups:
+  - name: ceph-production-coverage
+    rules:
+      - alert: CephMetricsAbsent
+        expr: absent(ceph_health_status)
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph metrics absent from Prometheus (blind monitoring)"
+
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          source: ceph_coverage
+        annotations:
+          summary: "Always-firing heartbeat; wire to external dead-man switch"
+
+      - alert: CephOSDSlowHeartbeat
+        expr: ceph_health_detail{name=~"OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD heartbeat pings are slow: {{ $labels.name }}"
+
+      - alert: CephOSDFlapping
+        expr: |
+          (changes(ceph_osd_up[15m]) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata) >= 4
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD flapping: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephMonClockSkew
+        expr: ceph_health_detail{name="MON_CLOCK_SKEW"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON clock skew detected"
+
+      - alert: CephOSDLatencyOutlier
+        expr: |
+          (
+            ceph_osd_commit_latency_ms > 100
+            and
+            ceph_osd_commit_latency_ms > 3 * scalar(quantile(0.5, ceph_osd_commit_latency_ms))
+          ) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD commit latency outlier: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephDaemonSlowOps
+        expr: ceph_daemon_health_metrics{type="SLOW_OPS"} > 0
+        for: 3m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon has slow ops: {{ $labels.ceph_daemon }}"
+
+      - alert: CephDaemonRecentCrash
+        expr: ceph_health_detail{name="RECENT_CRASH"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon crash reported in the last two weeks"
+
+      - alert: CephMgrNoStandby
+        expr: (count(ceph_mgr_status) or vector(0)) < 2
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph mgr has no standby (failover capacity lost)"
+
+      - alert: CephOSDNearFull
+        expr: ceph_health_detail{name="OSD_NEARFULL"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) near full"
+
+      - alert: CephOSDBackfillFull
+        expr: ceph_health_detail{name="OSD_BACKFILLFULL"} == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) backfill-full: recovery is blocked"
+
+      - alert: CephMonDiskLow
+        expr: ceph_health_detail{name="MON_DISK_LOW"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space low"
+
+      - alert: CephMonDiskCritical
+        expr: ceph_health_detail{name="MON_DISK_CRIT"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space critically low"
+
+      - alert: CephPoolNearQuota
+        expr: |
+          (
+            ceph_pool_bytes_used > 0.8 * ceph_pool_quota_bytes
+            and
+            ceph_pool_quota_bytes > 0
+          ) * on (pool_id) group_left(name) ceph_pool_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} above 80% of quota"
+
+      - alert: CephCapacityForecast
+        expr: |
+          max(predict_linear(ceph_cluster_total_used_bytes[1h], 259200))
+          > 0.85 * max(ceph_cluster_total_bytes)
+        for: 30m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph raw capacity projected to exceed 85% within 3 days"
+
+      - alert: CephDataDamage
+        expr: ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair"
+
+      - alert: CephObjectUnfound
+        expr: ceph_health_detail{name="OBJECT_UNFOUND"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph objects unfound: latest replica unavailable"
+
+      - alert: CephPGUnhealthyStates
+        expr: |
+          (
+            (ceph_pg_down + ceph_pg_incomplete + ceph_pg_unknown + ceph_pg_stale + ceph_pg_peered)
+            * on (pool_id) group_left(name) ceph_pool_metadata
+          ) > 0
+        for: 3m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} has PGs in unhealthy states"
+```
+
+目前這組已用 `promtool test rules` 驗過邏輯與 `for:` 邊界；但除了 `SLOW_OPS` / `PG_AVAILABILITY` 相關路徑，還沒有逐條做真機故障注入。生產導入時我會把它當「v2 候選」：先部署到 non-paging receiver 觀察，再逐條故障注入簽收，最後才把 critical route 打到 pager。
+
+### 3. Routing 改成 label 導向
+
+v1 用 alertname regex，新增 rule 時很容易漏。v2 改成：
+
+```yaml
+route:
+  receiver: slack-ceph
+  group_by: ['alertname', 'name', 'hostname', 'ceph_daemon']
+  routes:
+    - receiver: watchdog-ceph
+      matchers:
+        - alertname="Watchdog"
+
+    - receiver: pager-ceph
+      matchers:
+        - severity="critical"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
+
+    - receiver: pager-ceph
+      matchers:
+        - type="ceph_default"
+        - alertname="CephHealthError"
+
+    - receiver: slack-ceph
+      matchers:
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
+
+    - receiver: slack-ceph
+      matchers:
+        - type="ceph_default"
+```
+
+這個順序的意思是：
+
+- `Watchdog` 走獨立 receiver，給外部 dead-man switch 消費。
+- 自訂 critical rule 走 pager。
+- upstream `CephHealthError` 仍走 pager。
+- warning / info 自訂 rule 與 upstream aggregate context 走 Slack。
+
+## MON quorum 還要再補一層
+
+這次真機結果讓我不建議把 `CephMonQuorumLost` 當唯一 quorum-loss detector。它仍然要留，但要補三個觀測面：
+
+| 補強 | 原因 | 建議 |
+|---|---|---|
+| multi-mgr scrape | 單一 mgr exporter 可以 stale，或 active mgr failover 後 scrape 到 standby / 空 metrics | Prometheus scrape 所有 mgr endpoint，並用 `CephMetricsAbsent` 檢查 `ceph_health_status` 是否消失 |
+| exporter all-down / target-down 分級 | 單 target down 不等於全盲；全 target down 才是 page | `CephExporterAllDown` page，`CephExporterTargetDown` Slack |
+| 獨立 MON process / systemd 視角 | mgr exporter 本身屬於 Ceph control plane，quorum loss 時可能失真 | 在生產環境加 node-exporter systemd collector 或等價 host agent，例如檢查 active mon systemd unit 數是否低於 majority |
+
+最後一個不能只用本 repo 的 mgr metrics 完成，因為它需要 node 層觀測。概念上會像這樣，但實際 metric name 要以你的 node-exporter collector 為準：
+
+```promql
+count(node_systemd_unit_state{name=~"ceph-.*@mon\\..*\\.service", state="active"} == 1) < 2
+```
+
+這條不是取代 `CephMonQuorumLost`；它是用不同資料源交叉檢查。如果 systemd 視角說只剩一個 mon，但 mgr exporter 還說 quorum sum 是 3，這就是 `CephMonTelemetryStale` 類型的事件，應該 page，因為監控面正在說謊。
+
+## 驗證狀態
+
+| 類別 | 狀態 |
+|---|---|
+| `CephClientBlocked{name="SLOW_OPS"}` | 真機已通過 |
+| `CephClientBlocked{name="PG_AVAILABILITY"}` | 真機已通過 |
+| `CephMonQuorumLost` PromQL empty-series path | 真機已通過 |
+| `CephMonQuorumLost` 直接用 mgr `ceph_mon_quorum_status` 偵測真 quorum loss | 真機發現 stale，不能單獨信任 |
+| `ceph-production-coverage` 新 rules | 本機 `promtool` 已驗規則邏輯；真機逐條注入尚待執行 |
+| MON systemd / node-exporter 視角 | 尚未在此 lab 部署；列為下一步 |
+
+## 相關頁面
+
+- [Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design)
+- [Ceph — 在開發環境驗證這套維護友善的 alert 設計](./prometheus-alert-testing)
+- [Ceph — slow ops 與 BlueStore 慢操作 alert 的 metric 來源](./slow-ops-and-bluestore-alerts)
+- [Ceph — MON quorum loss](./mon-quorum-loss-impact)

@@ -16,6 +16,8 @@ ALERTMANAGER="$(find_bin alertmanager)"; PROM="$(find_bin prometheus)"
 [ -z "$ALERTMANAGER" ] && { echo "FATAL: alertmanager not found"; exit 2; }
 [ -z "$PROM" ] && { echo "FATAL: prometheus not found"; exit 2; }
 
+# shellcheck disable=SC2329
+# Invoked by the EXIT trap.
 cleanup() {
   for p in "${PROM_PID:-}" "${AM_PID:-}" "${EXP_PID:-}" "${SINK_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   wait 2>/dev/null; rm -rf "$TMP" "$SINKLOG" 2>/dev/null
@@ -66,15 +68,22 @@ for _ in $(seq 1 40); do
   [ "$got_label" = "osd-host-a" ] && break
   sleep 0.5
 done
-[ "$got_label" = "osd-host-a" ] && ok "live Prometheus 產出 hostname=osd-host-a（與 Tier A 斷言一致）" || no "Prometheus 未產出預期 alert（got='$got_label'）"
+if [ "$got_label" = "osd-host-a" ]; then
+  ok "live Prometheus 產出 hostname=osd-host-a（與 Tier A 斷言一致）"
+else
+  no "Prometheus 未產出預期 alert（got='$got_label'）"
+fi
 
 echo "## 真實產出的 label 經真 AM routing 送到 pager sink"
 for _ in $(seq 1 40); do
   awk -F'\t' '$1=="pager"&&$2=="CephOSDHostDownScoped"&&$3=="osd-host-a"{f=1} END{exit !f}' "$SINKLOG" && break
   sleep 0.5
 done
-awk -F'\t' '$1=="pager"&&$2=="CephOSDHostDownScoped"&&$3=="osd-host-a"{f=1} END{exit !f}' "$SINKLOG" \
-  && ok "→ pager 收到（真 label 全鏈路路由正確）" || no "pager sink 未收到真實 alert"
+if awk -F'\t' '$1=="pager"&&$2=="CephOSDHostDownScoped"&&$3=="osd-host-a"{f=1} END{exit !f}' "$SINKLOG"; then
+  ok "→ pager 收到（真 label 全鏈路路由正確）"
+else
+  no "pager sink 未收到真實 alert"
+fi
 
 echo ""
 echo "Tier C3 e2e: $pass passed, $fail failed"

@@ -5,7 +5,7 @@ groups:
   - name: ceph-stability-first
     rules:
       - alert: CephClientBlocked
-        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS"} == 1
+        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL"} == 1
         for: 1m
         labels:
           severity: critical
@@ -16,7 +16,7 @@ groups:
       - alert: CephClientRisk
         expr: |
           ceph_health_detail{
-            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL|OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT|MON_CLOCK_SKEW|RECENT_CRASH|OSD_NEARFULL|OSD_BACKFILLFULL|MON_DISK_LOW|MON_DISK_CRIT|PG_DAMAGED|OSD_SCRUB_ERRORS|OBJECT_UNFOUND"
           } == 1
         for: 5m
         labels:
@@ -37,19 +37,28 @@ groups:
         annotations:
           summary: "Ceph MON quorum lost or below 3-mon majority"
 
-      - alert: CephExporterDown
-        expr: up{job="ceph"} == 0
+      - alert: CephExporterAllDown
+        expr: (count(up{job="ceph"} == 1) or vector(0)) == 0
         for: 5m
         labels:
           severity: critical
           source: ceph_stability
         annotations:
-          summary: "Ceph Prometheus exporter is down"
+          summary: "All Ceph Prometheus exporter targets are down"
+
+      - alert: CephExporterTargetDown
+        expr: up{job="ceph"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: "Ceph exporter target {{ $labels.instance }} is down"
 
       - alert: CephLowPriorityNotice
         expr: |
           ceph_health_detail{
-            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS"
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL"
           } == 1
         for: 30m
         labels:

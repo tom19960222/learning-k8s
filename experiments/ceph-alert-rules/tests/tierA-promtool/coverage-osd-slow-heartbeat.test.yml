@@ -1,0 +1,41 @@
+# Tier A — CephOSDSlowHeartbeat：OSD_SLOW_PING_TIME_BACK|FRONT，2m critical。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  # BACK ping 慢：1m 不 fire、2m fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_SLOW_PING_TIME_BACK", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CephOSDSlowHeartbeat
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: CephOSDSlowHeartbeat
+        exp_alerts:
+          - exp_labels: {name: OSD_SLOW_PING_TIME_BACK, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD heartbeat pings are slow: OSD_SLOW_PING_TIME_BACK"}
+
+  # FRONT ping 慢，同理
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_SLOW_PING_TIME_FRONT", severity="HEALTH_WARN"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephOSDSlowHeartbeat
+        exp_alerts:
+          - exp_labels: {name: OSD_SLOW_PING_TIME_FRONT, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD heartbeat pings are slow: OSD_SLOW_PING_TIME_FRONT"}
+
+  # 負向：health check inactive（值 0）→ 不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_SLOW_PING_TIME_BACK", severity="HEALTH_WARN"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephOSDSlowHeartbeat
+        exp_alerts: []

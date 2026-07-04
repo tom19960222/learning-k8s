@@ -1,0 +1,35 @@
+# Tier A — CephPoolNearQuota：pool 使用量超過 quota 80% 且 quota > 0 時 warning。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_pool_bytes_used{pool_id="1"}'
+        values: '90x15'
+      - series: 'ceph_pool_quota_bytes{pool_id="1"}'
+        values: '100x15'
+      - series: 'ceph_pool_metadata{pool_id="1", name="p1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CephPoolNearQuota
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CephPoolNearQuota
+        exp_alerts:
+          - exp_labels: {pool_id: "1", name: p1, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph pool p1 above 80% of quota"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_pool_bytes_used{pool_id="1"}'
+        values: '90x15'
+      - series: 'ceph_pool_quota_bytes{pool_id="1"}'
+        values: '0x15'
+      - series: 'ceph_pool_metadata{pool_id="1", name="p1"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: CephPoolNearQuota
+        exp_alerts: []

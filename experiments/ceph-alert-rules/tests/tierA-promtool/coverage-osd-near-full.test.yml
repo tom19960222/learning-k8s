@@ -1,0 +1,27 @@
+# Tier A — CephOSDNearFull：OSD_NEARFULL，10m warning（早期警訊，還沒到 CephClientBlocked 的 OSD_FULL）。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: CephOSDNearFull
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CephOSDNearFull
+        exp_alerts:
+          - exp_labels: {name: OSD_NEARFULL, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph OSD(s) near full"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_NEARFULL", severity="HEALTH_WARN"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: CephOSDNearFull
+        exp_alerts: []

@@ -1,0 +1,27 @@
+# Tier A — CephObjectUnfound：OBJECT_UNFOUND 1m critical。
+rule_files:
+  - ../../rules/ceph-production-coverage.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OBJECT_UNFOUND", severity="HEALTH_WARN"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: CephObjectUnfound
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CephObjectUnfound
+        exp_alerts:
+          - exp_labels: {name: OBJECT_UNFOUND, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph objects unfound: latest replica unavailable"}
+
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OBJECT_UNFOUND", severity="HEALTH_WARN"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephObjectUnfound
+        exp_alerts: []

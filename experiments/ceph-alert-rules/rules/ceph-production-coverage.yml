@@ -1,0 +1,182 @@
+# 逐字取自 docs/superpowers/plans/2026-07-04-ceph-alert-production-coverage.md 的 Task 3 段落。
+# 完整說明留給後續新頁面（Ceph - 真機故障注入後的 alert 韌性修訂）；被測物 — 不得改寫。
+# lib/check-rules-match-page.sh 會比對本檔與設計頁的 load-bearing invariants。
+groups:
+  - name: ceph-production-coverage
+    rules:
+      - alert: CephMetricsAbsent
+        expr: absent(ceph_health_status)
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph metrics absent from Prometheus (blind monitoring)"
+
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          source: ceph_coverage
+        annotations:
+          summary: "Always-firing heartbeat; wire to external dead-man switch"
+
+      - alert: CephOSDSlowHeartbeat
+        expr: ceph_health_detail{name=~"OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD heartbeat pings are slow: {{ $labels.name }}"
+
+      - alert: CephOSDFlapping
+        expr: |
+          (changes(ceph_osd_up[15m]) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata) >= 4
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD flapping: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephMonClockSkew
+        expr: ceph_health_detail{name="MON_CLOCK_SKEW"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON clock skew detected"
+
+      - alert: CephOSDLatencyOutlier
+        expr: |
+          (
+            ceph_osd_commit_latency_ms > 100
+            and
+            ceph_osd_commit_latency_ms > 3 * scalar(quantile(0.5, ceph_osd_commit_latency_ms))
+          ) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD commit latency outlier: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephDaemonSlowOps
+        expr: ceph_daemon_health_metrics{type="SLOW_OPS"} > 0
+        for: 3m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon has slow ops: {{ $labels.ceph_daemon }}"
+
+      - alert: CephDaemonRecentCrash
+        expr: ceph_health_detail{name="RECENT_CRASH"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon crash reported in the last two weeks"
+
+      - alert: CephMgrNoStandby
+        expr: (count(ceph_mgr_status) or vector(0)) < 2
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph mgr has no standby (failover capacity lost)"
+
+      - alert: CephOSDNearFull
+        expr: ceph_health_detail{name="OSD_NEARFULL"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) near full"
+
+      - alert: CephOSDBackfillFull
+        expr: ceph_health_detail{name="OSD_BACKFILLFULL"} == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) backfill-full: recovery is blocked"
+
+      - alert: CephMonDiskLow
+        expr: ceph_health_detail{name="MON_DISK_LOW"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space low"
+
+      - alert: CephMonDiskCritical
+        expr: ceph_health_detail{name="MON_DISK_CRIT"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space critically low"
+
+      - alert: CephPoolNearQuota
+        expr: |
+          (
+            ceph_pool_bytes_used > 0.8 * ceph_pool_quota_bytes
+            and
+            ceph_pool_quota_bytes > 0
+          ) * on (pool_id) group_left(name) ceph_pool_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} above 80% of quota"
+
+      - alert: CephCapacityForecast
+        expr: |
+          max(predict_linear(ceph_cluster_total_used_bytes[1h], 259200))
+          > 0.85 * max(ceph_cluster_total_bytes)
+        for: 30m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph raw capacity projected to exceed 85% within 3 days"
+
+      - alert: CephDataDamage
+        expr: ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair"
+
+      - alert: CephObjectUnfound
+        expr: ceph_health_detail{name="OBJECT_UNFOUND"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph objects unfound: latest replica unavailable"
+
+      - alert: CephPGUnhealthyStates
+        expr: |
+          (
+            (ceph_pg_down + ceph_pg_incomplete + ceph_pg_unknown + ceph_pg_stale + ceph_pg_peered)
+            * on (pool_id) group_left(name) ceph_pool_metadata
+          ) > 0
+        for: 3m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} has PGs in unhealthy states"
