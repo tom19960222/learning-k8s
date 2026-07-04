@@ -38,3 +38,11 @@ bash experiments/ceph-alert-real-lab/run/scenario-slow-ops.sh --yes-really-injec
 ```bash
 bash experiments/ceph-alert-real-lab/run/scenario-pg-availability.sh --yes-really-inject
 ```
+
+## CephMonQuorumLost
+
+這個情境會保留 active mgr 所在的 `ceph-lab-mon-02`，停止 `ceph-lab-mon-01` 與 `ceph-lab-mon-03`，等待 `CephMonQuorumLost` firing 並進 pager，最後自動 rollback。
+
+```bash
+bash experiments/ceph-alert-real-lab/run/scenario-mon-quorum-lost.sh --yes-really-inject
+```
