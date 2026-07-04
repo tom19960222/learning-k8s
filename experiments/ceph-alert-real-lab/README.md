@@ -30,3 +30,11 @@ SLOW_OPS_OSD_HOST=192.168.18.169 \
 SLOW_OPS_DEVICE=/dev/sdb \
 bash experiments/ceph-alert-real-lab/run/scenario-slow-ops.sh --yes-really-inject
 ```
+
+## PG_AVAILABILITY
+
+這個情境會建立測試 pool，找 sentinel object 的 acting set，停止兩顆 acting OSD，等待 `PG_AVAILABILITY` 與 `CephClientBlocked{name="PG_AVAILABILITY"}` 出現，再自動 rollback。
+
+```bash
+bash experiments/ceph-alert-real-lab/run/scenario-pg-availability.sh --yes-really-inject
+```
