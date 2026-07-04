@@ -1,237 +1,74 @@
-# Task 1 Report: Harness Skeleton, Inventory, and Test Runner
+# Task 1 報告：Scaffold And Common Helpers
 
-## What I implemented
+## RED
 
-- Added the initial Ceph incident bundle harness skeleton under `experiments/ceph-incident-bundle/`.
-- Created the test runner at `experiments/ceph-incident-bundle/tests/run-tests.sh`.
-- Added the required shell entrypoints and helper skeletons:
-  - `experiments/ceph-incident-bundle/run/collect.sh`
-  - `experiments/ceph-incident-bundle/lib/common.sh`
-  - `experiments/ceph-incident-bundle/lib/collect-cluster-cephadm.sh`
-  - `experiments/ceph-incident-bundle/lib/collect-cluster-rook.sh`
-  - `experiments/ceph-incident-bundle/lib/collect-node.sh`
-  - `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
-- Added the lab inventory example at `experiments/ceph-incident-bundle/inventory/ceph-lab.example.env`.
-- Added the results placeholder and ignore rules:
-  - `experiments/ceph-incident-bundle/results/.gitkeep`
-  - `experiments/ceph-incident-bundle/.gitignore`
-- Added a fixtures placeholder README at `experiments/ceph-incident-bundle/tests/fixtures/README.md`.
-
-## What I tested and test results
-
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
-  - Result: passes
-  - Output:
-    ```text
-    ok: required files exist
-    ```
-- `bash -n experiments/ceph-incident-bundle/run/collect.sh experiments/ceph-incident-bundle/lib/*.sh`
-  - Result: passes with exit 0
-
-## TDD Evidence
-
-### RED
-
-Command:
+先加入 `experiments/ceph-alert-real-lab/tests/run-tests.sh` 與 `experiments/ceph-alert-real-lab/tests/test-common.sh`，再執行：
 
 ```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
 ```
 
-Output:
+第一次失敗結果如下：
 
 ```text
-FAIL: missing /Users/ikaros/Documents/code/learning-k8s/.claude/worktrees/ceph-incident-bundle/experiments/ceph-incident-bundle/run/collect.sh
+FAIL: missing /Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-real-lab/lib/common.sh
 ```
 
-### GREEN
+這證明測試確實在等 `lib/common.sh`，RED 成立。
 
-Command:
+## GREEN
+
+補上以下檔案與目錄後，測試通過：
+
+- `experiments/ceph-alert-real-lab/.gitignore`
+- `experiments/ceph-alert-real-lab/lib/common.sh`
+- `experiments/ceph-alert-real-lab/README.md`
+- `experiments/ceph-alert-real-lab/results/.gitkeep`
+- `experiments/ceph-alert-real-lab/rendered/.gitkeep`
+- `experiments/ceph-alert-real-lab/run/`
+
+完成後重新執行：
 
 ```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
-bash -n experiments/ceph-incident-bundle/run/collect.sh experiments/ceph-incident-bundle/lib/*.sh
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
 ```
 
-Output:
+通過結果：
 
 ```text
-ok: required files exist
+[2026-07-04T03:02:00Z] PASS: counter reaches 2
+ok: common helpers
+ok: unit tests
 ```
 
-## Files changed
-
-- `experiments/ceph-incident-bundle/.gitignore`
-- `experiments/ceph-incident-bundle/inventory/ceph-lab.example.env`
-- `experiments/ceph-incident-bundle/results/.gitkeep`
-- `experiments/ceph-incident-bundle/tests/run-tests.sh`
-- `experiments/ceph-incident-bundle/tests/fixtures/README.md`
-- `experiments/ceph-incident-bundle/run/collect.sh`
-- `experiments/ceph-incident-bundle/lib/common.sh`
-- `experiments/ceph-incident-bundle/lib/collect-cluster-cephadm.sh`
-- `experiments/ceph-incident-bundle/lib/collect-cluster-rook.sh`
-- `experiments/ceph-incident-bundle/lib/collect-node.sh`
-- `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
-
-## Self-review findings
-
-- The harness test is narrowly scoped to file existence and executability, which matches Task 1.
-- The executable entrypoints use `set -euo pipefail`, a short English comment, and a `main "$@"` guard.
-- Helper scripts only define stub functions and do not implement collector logic yet.
-
-## Any concerns
-
-- None for this task slice. The bundle is still a skeleton by design; real collector behavior is intentionally deferred to later tasks.
-
-## Review fix addendum
-
-### What I changed
-
-- Updated `experiments/ceph-incident-bundle/run/collect.sh` so it fails closed for any non-empty argument list until real collection is implemented.
-- Updated `collect.sh` usage text to an option-based CLI shape:
-  - `--inventory`
-  - `--ssh-key`
-  - `--seed`
-  - `--help`
-- Expanded `experiments/ceph-incident-bundle/tests/run-tests.sh` with behavior checks for:
-  - `run/collect.sh` with no args
-  - `lib/verify-bundle.sh` with no args
-  - `run/collect.sh` with placeholder non-empty args
-
-### TDD Evidence for the fix
-
-#### RED
-
-Command:
+另外也跑了：
 
 ```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/common.sh experiments/ceph-alert-real-lab/tests/run-tests.sh experiments/ceph-alert-real-lab/tests/test-common.sh
+make validate
 ```
 
-Output:
+兩者都成功。
 
-```text
-FAIL: collect.sh placeholder args should not exit 0
-```
+## Files Changed
 
-#### GREEN
+- `experiments/ceph-alert-real-lab/.gitignore`
+- `experiments/ceph-alert-real-lab/lib/common.sh`
+- `experiments/ceph-alert-real-lab/tests/run-tests.sh`
+- `experiments/ceph-alert-real-lab/tests/test-common.sh`
+- `experiments/ceph-alert-real-lab/README.md`
+- `experiments/ceph-alert-real-lab/results/.gitkeep`
+- `experiments/ceph-alert-real-lab/rendered/.gitkeep`
 
-Command:
+## Self-review
 
-```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
-```
+- `lab_root` 回傳實驗目錄根目錄，與測試預期一致。
+- `new_result_dir` 會在 `results/` 下建立帶時間戳的目錄。
+- `ssh_base_opts` 以逐個 argv 項目輸出，符合 Bash 與 SSH 參數拆分要求。
+- `run_capture` 同時保留 stdout、stderr 與 exit code。
+- `poll_until` 會重試直到成功或逾時，並保留狀態訊息到 stderr。
+- `README.md` 只放 scaffold 階段能確定的安全界線與建議順序，沒有塞進未驗證的行為。
 
-Output:
+## Concerns
 
-```text
-ok: required files exist
-```
-
-### Direct behavior evidence
-
-- `bash experiments/ceph-incident-bundle/run/collect.sh`
-  - `STATUS=1`
-  - `Usage: collect.sh --inventory <path> [--ssh-key <path>] [--seed <host>] [--help]`
-- `bash experiments/ceph-incident-bundle/lib/verify-bundle.sh`
-  - `STATUS=1`
-  - `Usage: verify-bundle.sh <bundle-dir>`
-- `bash experiments/ceph-incident-bundle/run/collect.sh --inventory /tmp/example.env --ssh-key /tmp/id_ed25519 --seed 192.168.18.166`
-  - `STATUS=1`
-  - `Usage: collect.sh --inventory <path> [--ssh-key <path>] [--seed <host>] [--help]`
-  - `collect.sh: not implemented yet`
-
-### Validation evidence
-
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
-  - passed
-- `bash -n experiments/ceph-incident-bundle/run/collect.sh experiments/ceph-incident-bundle/lib/*.sh`
-  - passed
-- `make validate`
-  - passed all checks, including the Next.js build and exported HTML basePath validation
-
-### Files changed in the fix
-
-- `experiments/ceph-incident-bundle/run/collect.sh`
-- `experiments/ceph-incident-bundle/tests/run-tests.sh`
-- `.superpowers/sdd/task-1-report.md`
-
-### Self-review findings for the fix
-
-- `collect.sh` now fails closed on any non-empty argument list, which matches the review finding and avoids accidental success before implementation exists.
-- The tests now cover both no-argument usage behavior and the placeholder non-empty-argument case.
-- The option-based usage text matches the planned CLI shape from the review note.
-
-### Concerns after the fix
-
-- None. The scripts still remain skeletons, but they no longer report false success.
-
-## Second fix addendum
-
-### What I changed
-
-- Updated `experiments/ceph-incident-bundle/tests/run-tests.sh` to cover the remaining `verify-bundle.sh` behavior gap:
-  - `verify-bundle.sh /tmp/definitely-not-a-bundle` must fail closed
-  - the output must clearly indicate usage or not-implemented/error state
-- Updated `experiments/ceph-incident-bundle/lib/verify-bundle.sh` so any non-empty argument list fails closed with exit 1 until real verification is implemented in Task 3.
-
-### TDD Evidence for the second fix
-
-#### RED
-
-Command:
-
-```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
-```
-
-Output:
-
-```text
-FAIL: verify-bundle.sh placeholder args should not exit 0
-```
-
-#### GREEN
-
-Command:
-
-```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
-```
-
-Output:
-
-```text
-ok: required files exist
-```
-
-### Direct behavior evidence
-
-- `bash experiments/ceph-incident-bundle/lib/verify-bundle.sh /tmp/definitely-not-a-bundle`
-  - `STATUS=1`
-  - `Usage: verify-bundle.sh <bundle-dir>`
-  - `verify-bundle.sh: not implemented yet`
-
-### Validation evidence
-
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
-  - passed
-- `bash -n experiments/ceph-incident-bundle/run/collect.sh experiments/ceph-incident-bundle/lib/*.sh`
-  - passed
-- `make validate`
-  - passed all checks, including the Next.js build and exported HTML basePath validation
-
-### Files changed in the second fix
-
-- `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
-- `experiments/ceph-incident-bundle/tests/run-tests.sh`
-- `.superpowers/sdd/task-1-report.md`
-
-### Self-review findings for the second fix
-
-- `verify-bundle.sh` now behaves like `collect.sh` and fails closed until the real verifier exists.
-- The new test covers the concrete non-empty-argument path that was previously slipping through.
-
-### Concerns after the second fix
-
-- None. This keeps the skeleton honest until Task 3 fills in real bundle verification.
+- `require_destructive_ack` 在被 `source` 進來的測試環境中使用 `return 2`，而不是 `exit 2`，這樣測試才能接住失敗狀態並繼續跑後續斷言；對呼叫端來說仍然是失敗碼 2。
