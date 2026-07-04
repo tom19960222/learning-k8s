@@ -347,3 +347,46 @@ record_sink_checkpoint() {
   fi
   wc -l <"$output_file" | tr -d ' ' >"$line_file"
 }
+
+assert_prometheus_alert_not_firing() {
+  local alertname=$1 label_name=$2 label_value=$3 result_dir=$4
+  if prometheus_alert_is_firing "$alertname" "$label_name" "$label_value" "$result_dir"; then
+    log "FAIL: alert $alertname unexpectedly firing"
+    return 1
+  fi
+  log "PASS: alert $alertname not firing"
+  return 0
+}
+
+alertmanager_alert_is_inhibited() {
+  local alertname=$1 result_dir=$2 pod out
+  pod="$(kubectl_lab -n "$LAB_NAMESPACE" get pod -l app=alertmanager -o jsonpath='{.items[0].metadata.name}')"
+  out="$(kubectl_lab -n "$LAB_NAMESPACE" exec "$pod" -- wget -qO- http://127.0.0.1:9093/api/v2/alerts)"
+  printf '%s\n' "$out" >"$result_dir/alertmanager-alerts-${alertname}.json"
+  printf '%s\n' "$out" | jq -e --arg an "$alertname" \
+    '.[] | select(.labels.alertname==$an) | select((.status.inhibitedBy | length) > 0)' >/dev/null
+}
+
+wait_alertmanager_inhibited() {
+  local alertname=$1 result_dir=$2
+  poll_until "Alertmanager alert $alertname inhibited" "${ALERTMANAGER_WAIT_ATTEMPTS:-60}" "${ALERTMANAGER_WAIT_SLEEP:-5}" \
+    alertmanager_alert_is_inhibited "$alertname" "$result_dir"
+}
+
+assert_sink_absent() {
+  local receiver=$1 alertname=$2 label_name=$3 label_value=$4 result_dir=$5 checkpoint_file="${6:-}"
+  local start=0
+  kubectl_lab -n "$LAB_NAMESPACE" logs deploy/alert-sink >"$result_dir/sink-absent-check.log"
+  if [[ -n "$checkpoint_file" && -f "$checkpoint_file" ]]; then
+    start="$(cat "$checkpoint_file")"
+  fi
+  awk -v start="$start" 'NR > start' "$result_dir/sink-absent-check.log" >"$result_dir/sink-absent-since-checkpoint.log"
+  if jq -r . "$result_dir/sink-absent-since-checkpoint.log" 2>/dev/null \
+    | jq -e --arg r "$receiver" --arg an "$alertname" --arg ln "$label_name" --arg lv "$label_value" \
+      'select(.receiver==$r) | select(.alertname==$an) | select(($ln=="") or (.labels[$ln]==$lv))' >/dev/null; then
+    log "FAIL: sink $receiver unexpectedly received $alertname"
+    return 1
+  fi
+  log "PASS: sink $receiver did not receive $alertname"
+  return 0
+}
