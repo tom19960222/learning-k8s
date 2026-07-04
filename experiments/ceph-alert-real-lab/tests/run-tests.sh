@@ -20,6 +20,7 @@ for path in \
   "$ROOT/tests/test-scenario-mon-quorum-lost.sh" \
   "$ROOT/tests/test-scenario-osd-daemon-down.sh" \
   "$ROOT/tests/test-scenario-osd-host-down.sh" \
+  "$ROOT/tests/test-scenario-mon-down-single.sh" \
   "$ROOT/tests/test-scenario-framework.sh" \
   "$ROOT/tests/test-evidence.sh" \
   "$ROOT/tests/test-monitoring-render.sh"; do
@@ -35,6 +36,7 @@ bash "$ROOT/tests/test-scenario-pg-availability.sh"
 bash "$ROOT/tests/test-scenario-mon-quorum-lost.sh"
 bash "$ROOT/tests/test-scenario-osd-daemon-down.sh"
 bash "$ROOT/tests/test-scenario-osd-host-down.sh"
+bash "$ROOT/tests/test-scenario-mon-down-single.sh"
 bash "$ROOT/tests/test-scenario-framework.sh"
 bash "$ROOT/tests/test-evidence.sh"
 bash "$ROOT/tests/test-monitoring-render.sh"
