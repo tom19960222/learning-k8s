@@ -19,3 +19,14 @@ bash experiments/ceph-alert-real-lab/run/scenario-pg-availability.sh --yes-reall
 bash experiments/ceph-alert-real-lab/run/scenario-mon-quorum-lost.sh --yes-really-inject
 bash experiments/ceph-alert-real-lab/run/cleanup.sh
 ```
+
+## SLOW_OPS
+
+主測用 cgroup v2 `io.max` 對 OSD backing device 限速，然後用 `rados bench` 打測試 pool。
+
+```bash
+SLOW_OPS_OSD_ID=0 \
+SLOW_OPS_OSD_HOST=192.168.18.169 \
+SLOW_OPS_DEVICE=/dev/sdb \
+bash experiments/ceph-alert-real-lab/run/scenario-slow-ops.sh --yes-really-inject
+```
