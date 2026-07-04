@@ -12,6 +12,8 @@ for path in \
   "$ROOT/lib/monitoring.sh" \
   "$ROOT/lib/evidence.sh" \
   "$ROOT/tests/test-common.sh" \
+  "$ROOT/tests/test-all.sh" \
+  "$ROOT/tests/test-cleanup.sh" \
   "$ROOT/tests/test-scenario-commands.sh" \
   "$ROOT/tests/test-scenario-slow-ops.sh" \
   "$ROOT/tests/test-scenario-pg-availability.sh" \
@@ -22,6 +24,8 @@ for path in \
 done
 
 bash "$ROOT/tests/test-common.sh"
+bash "$ROOT/tests/test-all.sh"
+bash "$ROOT/tests/test-cleanup.sh"
 bash "$ROOT/tests/test-scenario-commands.sh"
 bash "$ROOT/tests/test-scenario-slow-ops.sh"
 bash "$ROOT/tests/test-scenario-pg-availability.sh"

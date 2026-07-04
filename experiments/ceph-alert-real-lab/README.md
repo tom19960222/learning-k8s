@@ -12,12 +12,27 @@
 ## 建議順序
 
 ```bash
+bash experiments/ceph-alert-real-lab/run/all.sh --yes-really-inject
+bash experiments/ceph-alert-real-lab/run/cleanup.sh
+```
+
+如果要逐步執行，再照下面順序跑：
+
+```bash
 bash experiments/ceph-alert-real-lab/run/deploy-monitoring.sh
 bash experiments/ceph-alert-real-lab/run/baseline.sh
 bash experiments/ceph-alert-real-lab/run/scenario-slow-ops.sh --yes-really-inject
 bash experiments/ceph-alert-real-lab/run/scenario-pg-availability.sh --yes-really-inject
 bash experiments/ceph-alert-real-lab/run/scenario-mon-quorum-lost.sh --yes-really-inject
 bash experiments/ceph-alert-real-lab/run/cleanup.sh
+```
+
+## 本機驗證 gate
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/*.sh experiments/ceph-alert-real-lab/run/*.sh experiments/ceph-alert-real-lab/tests/*.sh
+make validate
 ```
 
 ## SLOW_OPS
