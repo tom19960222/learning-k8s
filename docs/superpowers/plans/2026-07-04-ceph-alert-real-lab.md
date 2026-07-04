@@ -69,7 +69,7 @@
   - `pool_cleanup_commands(pool: string) -> newline-separated commands`
   - `osd_service_name(fsid: string, osd_id: string) -> string`
   - `mon_service_name(fsid: string, mon_name: string) -> string`
-  - `cgroup_io_max_path(fsid: string, osd_id: string) -> string`
+  - `cgroup_io_max_path_command(service_name: string) -> string`
   - `io_throttle_command(major_minor: string, bytes_per_second: string, io_max_path: string) -> string`
   - `io_unthrottle_command(major_minor: string, io_max_path: string) -> string`
 
@@ -451,12 +451,10 @@ Create `experiments/ceph-alert-real-lab/lib/monitoring.sh`:
 set -euo pipefail
 
 render_monitoring_manifest() {
-  local output_file=$1 root rules route
+  local output_file=$1 root rules
   root="$(lab_root)"
   rules="$root/../ceph-alert-rules/rules/ceph-stability-first.yml"
-  route="$root/../ceph-alert-rules/rules/alertmanager-route.yml"
   [[ -f "$rules" ]] || die "missing rules file: $rules"
-  [[ -f "$route" ]] || die "missing route file: $route"
 
   {
     cat <<YAML
@@ -738,13 +736,16 @@ prometheus_query() {
 }
 
 wait_prometheus_alert() {
-  local alertname=$1 label_name=$2 label_value=$3 result_dir=$4 pod output
+  local alertname=$1 label_name=$2 label_value=$3 result_dir=$4
+  poll_until "Prometheus alert $alertname $label_name=$label_value firing" 60 5 prometheus_alert_is_firing "$alertname" "$label_name" "$label_value" "$result_dir"
+}
+
+prometheus_alert_is_firing() {
+  local alertname=$1 label_name=$2 label_value=$3 result_dir=$4 pod out
   pod="$(kubectl_lab -n "$LAB_NAMESPACE" get pod -l app=prometheus -o jsonpath='{.items[0].metadata.name}')"
-  poll_until "Prometheus alert $alertname $label_name=$label_value firing" 60 5 bash -c '
-    out="$(kubectl "$@" exec "$0" -- wget -qO- http://127.0.0.1:9090/api/v1/alerts)"
-    printf "%s\n" "$out" >"$1/prometheus-alerts-$2-$3.json"
-    printf "%s\n" "$out" | jq -e --arg an "$2" --arg ln "$3" --arg lv "$4" '"'"'.data.alerts[] | select(.labels.alertname==$an) | select(($ln=="") or (.labels[$ln]==$lv)) | select(.state=="firing")'"'"' >/dev/null
-  ' "$pod" "$result_dir" "$alertname" "$label_name" "$label_value" --kubeconfig "$LAB_KUBECONFIG" -n "$LAB_NAMESPACE"
+  out="$(kubectl_lab -n "$LAB_NAMESPACE" exec "$pod" -- wget -qO- http://127.0.0.1:9090/api/v1/alerts)"
+  printf "%s\n" "$out" >"$result_dir/prometheus-alerts-${alertname}-${label_name:-none}.json"
+  printf "%s\n" "$out" | jq -e --arg an "$alertname" --arg ln "$label_name" --arg lv "$label_value" '.data.alerts[] | select(.labels.alertname==$an) | select(($ln=="") or (.labels[$ln]==$lv)) | select(.state=="firing")' >/dev/null
 }
 
 wait_sink_alert() {
@@ -936,7 +937,9 @@ ok() { printf 'ok: %s\n' "$*"; }
 
 [[ "$(osd_service_name "$LAB_FSID" 7)" == "ceph-${LAB_FSID}@osd.7.service" ]] || fail "bad OSD service"
 [[ "$(mon_service_name "$LAB_FSID" ceph-lab-mon-03)" == "ceph-${LAB_FSID}@mon.ceph-lab-mon-03.service" ]] || fail "bad mon service"
-[[ "$(cgroup_io_max_path "$LAB_FSID" 4)" == "/sys/fs/cgroup/system.slice/ceph-${LAB_FSID}@osd.4.service/io.max" ]] || fail "bad io.max path"
+io_path_cmd="$(cgroup_io_max_path_command "ceph-${LAB_FSID}@osd.4.service")"
+printf '%s\n' "$io_path_cmd" | grep -q 'systemctl show -p ControlGroup --value ceph-.*@osd.4.service' || fail "io.max discovery missing systemctl"
+printf '%s\n' "$io_path_cmd" | grep -q '/sys/fs/cgroup${cg}/io.max' || fail "io.max discovery missing cgroup path"
 
 throttle="$(io_throttle_command '8:16' 65536 '/sys/fs/cgroup/x/io.max')"
 [[ "$throttle" == "printf '%s\n' '8:16 rbps=65536 wbps=65536 riops=max wiops=max' | sudo tee /sys/fs/cgroup/x/io.max" ]] || fail "bad throttle command: $throttle"
@@ -989,9 +992,9 @@ mon_service_name() {
   printf 'ceph-%s@mon.%s.service\n' "$fsid" "$mon_name"
 }
 
-cgroup_io_max_path() {
-  local fsid=$1 osd_id=$2
-  printf '/sys/fs/cgroup/system.slice/ceph-%s@osd.%s.service/io.max\n' "$fsid" "$osd_id"
+cgroup_io_max_path_command() {
+  local service=$1
+  printf "cg=\$(systemctl show -p ControlGroup --value %s); test -n \"\$cg\"; printf '%%s\\n' \"/sys/fs/cgroup\${cg}/io.max\"\n" "$service"
 }
 
 io_throttle_command() {
@@ -1075,7 +1078,8 @@ OSD_HOST="${SLOW_OPS_OSD_HOST:-$LAB_OSD_01_HOST}"
 OSD_DEVICE="${SLOW_OPS_DEVICE:-/dev/sdb}"
 THROTTLE_BPS="${SLOW_OPS_THROTTLE_BPS:-65536}"
 RESULT_DIR="$(new_result_dir slow-ops)"
-IO_PATH="$(cgroup_io_max_path "$LAB_FSID" "$OSD_ID")"
+OSD_SERVICE="$(osd_service_name "$LAB_FSID" "$OSD_ID")"
+IO_PATH=""
 MAJMIN=""
 
 cleanup() {
@@ -1097,6 +1101,8 @@ ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL min
 MAJMIN="$(ssh_lab "$OSD_HOST" "lsblk -no MAJ:MIN $OSD_DEVICE | head -1")"
 [[ -n "$MAJMIN" ]] || die "could not resolve major:minor for $OSD_DEVICE on $OSD_HOST"
 ssh_lab "$OSD_HOST" "stat -fc %T /sys/fs/cgroup | grep -qx cgroup2fs"
+IO_PATH="$(ssh_lab "$OSD_HOST" "$(cgroup_io_max_path_command "$OSD_SERVICE")")"
+[[ -n "$IO_PATH" ]] || die "could not resolve io.max path for $OSD_SERVICE on $OSD_HOST"
 ssh_lab "$OSD_HOST" "$(io_throttle_command "$MAJMIN" "$THROTTLE_BPS" "$IO_PATH")"
 
 run_capture "$RESULT_DIR/rados-bench.txt" ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- rados bench -p $POOL 180 write -b 4194304 -t 16 --no-cleanup" || true
