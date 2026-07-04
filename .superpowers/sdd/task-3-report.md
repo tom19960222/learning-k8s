@@ -42,6 +42,53 @@ make validate
 - `shellcheck -x ...`：PASS
 - `make validate`：PASS
 
+## Fix Review Findings
+
+### What I fixed
+
+- Removed the capture suppression from `assert_ceph_health_check` so a failed Ceph health query now returns immediately instead of falling through to the grep.
+- Kept the literal health-name match as fixed-string grep with `grep -Fq --`.
+- Added a focused local regression test that overrides `ceph_seed_cmd` in shell to simulate both success and failure without live SSH.
+
+### RED evidence
+
+Command:
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+```
+
+Output:
+
+```text
+[2026-07-04T03:30:56Z] PASS: counter reaches 2
+ok: common helpers
+FAIL: assert_ceph_health_check should fail when ceph_seed_cmd fails
+```
+
+### GREEN evidence
+
+Command:
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+bash -n experiments/ceph-alert-real-lab/lib/evidence.sh experiments/ceph-alert-real-lab/run/baseline.sh experiments/ceph-alert-real-lab/tests/test-evidence.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/*.sh experiments/ceph-alert-real-lab/run/*.sh experiments/ceph-alert-real-lab/tests/*.sh
+make validate
+```
+
+Output:
+
+```text
+[2026-07-04T03:31:59Z] PASS: counter reaches 2
+ok: common helpers
+ok: evidence helpers
+ok: monitoring manifest render
+ok: unit tests
+```
+
+`bash -n`, `shellcheck`, and `make validate` all exited 0.
+
 `make validate` 內容包含：
 
 - MDX frontmatter 驗證

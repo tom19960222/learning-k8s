@@ -11,10 +11,12 @@ for path in \
   "$ROOT/lib/monitoring.sh" \
   "$ROOT/lib/evidence.sh" \
   "$ROOT/tests/test-common.sh" \
+  "$ROOT/tests/test-evidence.sh" \
   "$ROOT/tests/test-monitoring-render.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
 
 bash "$ROOT/tests/test-common.sh"
+bash "$ROOT/tests/test-evidence.sh"
 bash "$ROOT/tests/test-monitoring-render.sh"
 ok "unit tests"

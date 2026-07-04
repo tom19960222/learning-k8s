@@ -31,6 +31,6 @@ assert_ceph_health_check() {
   local result_dir=$2
   local output_file="$result_dir/health-check-${check_name}.txt"
 
-  run_capture "$output_file" ceph_seed_cmd health detail || true
+  run_capture "$output_file" ceph_seed_cmd health detail || return $?
   grep -Fq -- "$check_name" "$output_file"
 }
