@@ -2,10 +2,17 @@
 set -euo pipefail
 
 render_monitoring_manifest() {
-  local output_file=$1 root rules
+  local output_file=$1 root rules_dir stability_rules scoped_rules coverage_rules default_rules endpoint
   root="$(lab_root)"
-  rules="$root/../ceph-alert-rules/rules/ceph-stability-first.yml"
-  [[ -f "$rules" ]] || die "missing rules file: $rules"
+  rules_dir="$root/../ceph-alert-rules/rules"
+  stability_rules="$rules_dir/ceph-stability-first.yml"
+  scoped_rules="$rules_dir/ceph-scoped-availability.yml"
+  coverage_rules="$rules_dir/ceph-production-coverage.yml"
+  default_rules="$rules_dir/_default-mixin.yml"
+  [[ -f "$stability_rules" ]] || die "missing rules file: $stability_rules"
+  [[ -f "$scoped_rules" ]] || die "missing rules file: $scoped_rules"
+  [[ -f "$coverage_rules" ]] || die "missing rules file: $coverage_rules"
+  [[ -f "$default_rules" ]] || die "missing rules file: $default_rules"
 
   {
     cat <<YAML
@@ -22,7 +29,19 @@ metadata:
 data:
   ceph-stability-first.yml: |
 YAML
-    sed 's/^/    /' "$rules"
+    sed 's/^/    /' "$stability_rules"
+    cat <<YAML
+  ceph-scoped-availability.yml: |
+YAML
+    sed 's/^/    /' "$scoped_rules"
+    cat <<YAML
+  ceph-production-coverage.yml: |
+YAML
+    sed 's/^/    /' "$coverage_rules"
+    cat <<YAML
+  default-mixin.yml: |
+YAML
+    sed 's/^/    /' "$default_rules"
     cat <<YAML
 ---
 apiVersion: v1
@@ -73,6 +92,9 @@ data:
       evaluation_interval: 5s
     rule_files:
       - /etc/prometheus/rules/ceph-stability-first.yml
+      - /etc/prometheus/rules/ceph-scoped-availability.yml
+      - /etc/prometheus/rules/ceph-production-coverage.yml
+      - /etc/prometheus/rules/default-mixin.yml
     alerting:
       alertmanagers:
         - static_configs:
@@ -82,7 +104,11 @@ data:
       - job_name: ceph
         static_configs:
           - targets:
-              - "${LAB_MGR_ENDPOINT#http://}"
+YAML
+    for endpoint in $LAB_MGR_ENDPOINTS; do
+      printf '              - "%s"\n' "${endpoint#http://}"
+    done
+    cat <<YAML
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -100,18 +126,24 @@ data:
       group_interval: 5s
       repeat_interval: 30m
       routes:
+        - receiver: watchdog-ceph
+          group_wait: 0s
+          matchers:
+            - alertname="Watchdog"
+          repeat_interval: 1m
+        - receiver: pager-ceph
+          group_wait: 0s
+          matchers:
+            - severity="critical"
+            - source=~"ceph_stability|ceph_scoped|ceph_coverage"
         - receiver: pager-ceph
           group_wait: 0s
           matchers:
             - type="ceph_default"
             - alertname="CephHealthError"
-        - receiver: pager-ceph
-          group_wait: 0s
-          matchers:
-            - alertname=~"CephClientBlocked|CephClientRisk|CephMonQuorumLost|CephExporterDown|CephOSDHostDownScoped|CephOSDDaemonDownScoped|CephMonDownScoped"
         - receiver: slack-ceph
           matchers:
-            - alertname="CephLowPriorityNotice"
+            - source=~"ceph_stability|ceph_scoped|ceph_coverage"
         - receiver: slack-ceph
           matchers:
             - type="ceph_default"
@@ -122,6 +154,9 @@ data:
       - name: pager-ceph
         webhook_configs:
           - url: http://alert-sink.${LAB_NAMESPACE}.svc.cluster.local:8080/pager
+      - name: watchdog-ceph
+        webhook_configs:
+          - url: http://alert-sink.${LAB_NAMESPACE}.svc.cluster.local:8080/watchdog
 ---
 apiVersion: apps/v1
 kind: Deployment

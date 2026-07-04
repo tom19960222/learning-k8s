@@ -10,14 +10,17 @@ ceph_seed_cmd() {
 }
 
 collect_baseline() {
-  local result_dir=$1
+  local result_dir=$1 endpoint safe_endpoint
   mkdir -p "$result_dir"
 
   run_capture "$result_dir/ceph-s.txt" ceph_seed_cmd -s || true
   run_capture "$result_dir/ceph-health-detail.txt" ceph_seed_cmd health detail || true
   run_capture "$result_dir/ceph-osd-tree.txt" ceph_seed_cmd osd tree || true
   run_capture "$result_dir/ceph-quorum-status.json" ceph_seed_cmd quorum_status --format json || true
-  run_capture "$result_dir/mgr-metrics-health-detail.txt" curl -fsS "$LAB_MGR_ENDPOINT/metrics" || true
+  for endpoint in $LAB_MGR_ENDPOINTS; do
+    safe_endpoint="$(printf '%s' "$endpoint" | sed 's#^https\{0,1\}://##; s#[/:]#-#g')"
+    run_capture "$result_dir/mgr-metrics-${safe_endpoint}.txt" curl -fsS "$endpoint/metrics" || true
+  done
   run_capture "$result_dir/rook-cephcluster.txt" kubectl_lab -n rook-ceph-external get cephcluster -o wide || true
   run_capture "$result_dir/rook-pods.txt" kubectl_lab -n rook-ceph get pods -o wide || true
 }
