@@ -1,203 +1,72 @@
-# Task 3 Report: Bundle Verifier with TDD
+# Task 3 報告：Evidence Collection Helpers
 
-## What I implemented
+## 目標
 
-- Implemented `experiments/ceph-incident-bundle/lib/verify-bundle.sh` as a real bundle verifier.
-- The verifier now accepts either an extracted directory or a `.tar.gz` bundle.
-- For `.tar.gz` input, it first runs `tar -tzf` to validate gzip integrity, then extracts to a temporary directory for inspection.
-- It verifies the required bundle shape:
-  - `manifest.jsonl`
-  - `summary.txt`
-  - `README-FIRST.txt`
-  - at least one file under `cluster/`
-  - at least one file under `nodes/`
-- It rejects bundle member paths containing any of:
-  - `keyring`
-  - `.ssh`
-  - `id_ed25519`
-  - `private_key`
-- On success, it prints `VERIFY PASS: <path>`.
-- I also created `experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` and wired it into `experiments/ceph-incident-bundle/tests/run-tests.sh`.
+為 `experiments/ceph-alert-real-lab` 補上 evidence collection helper，提供 baseline / postcheck 收集與 Ceph health check assertion，並保留本地可跑的 smoke / syntax / lint 驗證。
 
-## What I tested and test results
+## RED 證據
 
-- Ran the verifier test script directly:
-  - `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh`
-  - Result: passed
-- Ran the full test entrypoint:
-  - `bash experiments/ceph-incident-bundle/tests/run-tests.sh`
-  - Result: passed
-- Ran repo validation:
-  - `make validate`
-  - Result: passed
-
-## TDD Evidence
-
-### RED
-
-Command:
+先依 TDD 加入 `tests/run-tests.sh` 的檔案存在檢查：
 
 ```bash
-bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
+[[ -f "$ROOT/lib/evidence.sh" ]] || fail "missing $ROOT/lib/evidence.sh"
 ```
 
-Output:
+執行：
+
+```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+```
+
+結果：
 
 ```text
-FAIL: expected success for /var/folders/0r/03g4qs0s1p75k5tsvwpk_41c0000gn/T/tmp.lKjfVbg4zv/valid-dir, got status 1: Usage: verify-bundle.sh <bundle-dir>
-verify-bundle.sh: not implemented yet
+FAIL: missing /Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-real-lab/lib/evidence.sh
 ```
 
-### GREEN
+## GREEN 證據
 
-Command:
+實作後完成以下驗證：
 
 ```bash
-bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
-```
-
-Output:
-
-```text
-```
-
-Command:
-
-```bash
-bash experiments/ceph-incident-bundle/tests/run-tests.sh
-```
-
-Output:
-
-```text
-ok: required files exist
-```
-
-Command:
-
-```bash
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+bash -n experiments/ceph-alert-real-lab/lib/evidence.sh experiments/ceph-alert-real-lab/run/baseline.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/*.sh experiments/ceph-alert-real-lab/run/*.sh experiments/ceph-alert-real-lab/tests/*.sh
 make validate
 ```
 
-Output:
+結果摘要：
 
-```text
-✓ All checks passed!
-```
+- `tests/run-tests.sh`：PASS
+- `bash -n ...`：PASS
+- `shellcheck -x ...`：PASS
+- `make validate`：PASS
 
-## Files changed
+`make validate` 內容包含：
 
-- `experiments/ceph-incident-bundle/lib/verify-bundle.sh`
-- `experiments/ceph-incident-bundle/tests/test-verify-bundle.sh`
-- `experiments/ceph-incident-bundle/tests/run-tests.sh`
+- MDX frontmatter 驗證
+- 圖片引用驗證
+- QuizQuestion syntax 驗證
+- quiz.json 驗證
+- `projects.ts` 對應檢查
+- Next.js build 與 `/learning-k8s` basePath 驗證
 
-## Self-review findings
+## 變更檔案
 
-- I found and fixed a shell cleanup bug while verifying the archive path: a `RETURN` trap referenced an out-of-scope local variable and triggered `set -u`.
-- I updated the shared test runner so its placeholder check now matches the verifier's real failure style.
-- I expanded the verifier tests to cover the full forbidden-path set, not just `keyring`.
+- `experiments/ceph-alert-real-lab/lib/evidence.sh`
+- `experiments/ceph-alert-real-lab/run/baseline.sh`
+- `experiments/ceph-alert-real-lab/tests/run-tests.sh`
 
-## Any concerns
+## 自我檢查
 
-- The verifier assumes bundle contents are rooted directly at the archive top level, matching the test fixtures and current task brief.
-- I did not push the branch, per instruction.
+- Bash 3.2 相容：未使用 `mapfile`、nameref、process substitution 以外的新版語法
+- 沒有執行真實 lab 的 `ssh` / `kubectl` / `curl` evidence collection
+- 沒有加入破壞性 cluster 指令
+- 沒有碰 `linux` submodule
+- `baseline.sh` 只負責初始化結果目錄與呼叫 `collect_baseline`
+- `evidence.sh` 只提供 helper，不直接觸發真實環境操作
 
-## Fix addendum
+## 風險與注意事項
 
-### What I fixed
-
-- Propagated failures explicitly inside `verify_bundle_tree` so archive verification cannot keep going after a validator fails.
-- Added archive-negative coverage for:
-  - `.tar.gz` missing `manifest.jsonl`
-  - `.tar.gz` containing `keyring`
-  - `.tar.gz` containing `.ssh`
-  - `.tar.gz` containing `id_ed25519`
-  - `.tar.gz` containing `private_key`
-  - corrupt `.tar.gz`
-- Rejected extra arguments with usage and a non-zero exit status.
-
-### TDD evidence
-
-RED command:
-
-```bash
-bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
-```
-
-RED output:
-
-```text
-FAIL: expected failure for /var/folders/0r/03g4qs0s1p75k5tsvwpk_41c0000gn/T/tmp.htLTVAN3d6/missing-manifest.tar.gz
-```
-
-GREEN command:
-
-```bash
-bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh
-```
-
-GREEN output:
-
-```text
-```
-
-### Follow-up verification
-
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
-- `make validate` passed
-
-## Second fix addendum
-
-### What I fixed
-
-- Made the directory branch in `verify_bundle_path` explicitly propagate `verify_bundle_tree` failures with `|| return 1`.
-- Removed the dead `lib/common.sh` import from `verify-bundle.sh`, since the verifier does not use shared helpers.
-- Added an isolated `id_ed25519` negative case outside `.ssh` and covered both the extracted directory and `.tar.gz` forms.
-
-### Test update
-
-- Added a focused fixture that places `id_ed25519` at `cluster/ceph/id_ed25519`.
-- Kept the existing `.ssh/id_ed25519` coverage so both the token and the path shape remain exercised.
-
-### Verification
-
-- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
-- `make validate` passed
-
-## Third fix addendum
-
-### What I fixed
-
-- Changed the invalid path guard in `verify_bundle_path` to explicitly return after `verify_fail`, rather than relying on `set -e`.
-- Removed the unused `ROOT` variable from `verify-bundle.sh`.
-- Wrapped archive list/extract failures with `verify_fail "invalid archive: ..."` and suppressed tar's own stderr so corrupt archive output is consistent.
-
-### Test update
-
-- Updated the corrupt archive expectation from a tar-specific substring to `invalid archive`.
-
-### Verification
-
-- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
-- `make validate` passed
-
-## Second fix addendum
-
-### What I fixed
-
-- Made the directory branch in `verify_bundle_path` explicitly propagate `verify_bundle_tree` failures with `|| return 1`.
-- Removed the unused `lib/common.sh` import from `verify-bundle.sh`.
-- Added an isolated `id_ed25519` negative case outside `.ssh`, plus archive coverage for the same token.
-
-### Test update
-
-- Added a fixture at `cluster/ceph/id_ed25519` so the forbidden token is tested independently of `.ssh`.
-- Kept the existing `.ssh/id_ed25519` case so both the token and the path shape remain covered.
-
-### Verification
-
-- `bash experiments/ceph-incident-bundle/tests/test-verify-bundle.sh` passed
-- `bash experiments/ceph-incident-bundle/tests/run-tests.sh` passed
-- `make validate` passed
+- 這次只做本地驗證；`collect_baseline` / `collect_postcheck` / `assert_ceph_health_check` 尚未在真 lab 上跑過
+- `assert_ceph_health_check` 目前以 `ceph health detail` 的輸出內容做 literal grep，符合目前 Task 3 需求，但未額外擴充比對邏輯
