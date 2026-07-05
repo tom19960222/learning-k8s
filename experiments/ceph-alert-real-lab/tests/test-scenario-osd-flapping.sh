@@ -34,6 +34,24 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/que
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
   exit 0
 fi
+# osd.1's ceph_osd_up scraped-metric state, mirrored off the SAME trace file
+# make_fake_ssh derives "ceph osd tree" status from: more stops than starts
+# for osd.1's systemctl unit means Prometheus's own scrape has also caught
+# up to "down" (value "0"); otherwise "up" (value "1"). This lets
+# wait_prometheus_osd_up's poll in scenario-osd-flapping.sh observe the
+# expected value on its very first attempt once the mon-view state (\`ceph
+# osd tree\`) has already flipped, without needing a separate counter.
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=ceph_osd_up%7Bceph_daemon%3D%22osd.1%22%7D"* ]]; then
+  stops=\$(grep -c '^ssh:sudo systemctl stop ceph-.*@osd\.1\.service$' "$trace_file" || true)
+  starts=\$(grep -c '^ssh:sudo systemctl start ceph-.*@osd\.1\.service$' "$trace_file" || true)
+  if [[ "\$stops" -gt "\$starts" ]]; then
+    value=0
+  else
+    value=1
+  fi
+  printf '{"data":{"result":[{"value":[1,"%s"]}]}}\n' "\$value"
+  exit 0
+fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"watchdog","alertname":"Watchdog","labels":{}}'
   starts=\$(grep -c 'systemctl start ceph-.*@osd\.1\.service' "$trace_file" || true)
@@ -71,6 +89,20 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/ale
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
   printf '%s\n' '{"data":{"result":[{"value":[1,"1"]}]}}'
+  exit 0
+fi
+# Same osd.1 ceph_osd_up derivation as make_fake_kubectl -- scenario_inject's
+# transitions must still succeed here so scenario_verify is what fails (and
+# proves rollback still runs), not the metric-pacing wait.
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=ceph_osd_up%7Bceph_daemon%3D%22osd.1%22%7D"* ]]; then
+  stops=\$(grep -c '^ssh:sudo systemctl stop ceph-.*@osd\.1\.service$' "$trace_file" || true)
+  starts=\$(grep -c '^ssh:sudo systemctl start ceph-.*@osd\.1\.service$' "$trace_file" || true)
+  if [[ "\$stops" -gt "\$starts" ]]; then
+    value=0
+  else
+    value=1
+  fi
+  printf '{"data":{"result":[{"value":[1,"%s"]}]}}\n' "\$value"
   exit 0
 fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
@@ -240,6 +272,7 @@ make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file"
 set +e
 PATH="$fake_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=2 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
   OSD_FLAP_POLL_ATTEMPTS=2 OSD_FLAP_POLL_SLEEP=0 \
+  OSD_FLAP_METRIC_ATTEMPTS=2 OSD_FLAP_METRIC_SLEEP=0 \
   bash "$ROOT/run/scenario-osd-flapping.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
 rc=$?
 set -e
@@ -274,9 +307,35 @@ start2_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.1\.service$' "$li
 tree_poll_count="$(grep -c '^ssh:sudo -n cephadm shell -- ceph osd tree --format json$' "$live_trace_file" || true)"
 [[ "$tree_poll_count" -ge 4 ]] || fail "expected at least 4 osd tree polls (one per transition), got $tree_poll_count"
 
+# Between-transition Prometheus ceph_osd_up metric-pacing wait: proves the
+# scenario now blocks on Prometheus's OWN scraped view of the OSD's
+# up/down state (not just the mon's `ceph osd tree` view) before advancing
+# to the next transition -- this is the fix for the real-lab bug where
+# changes(ceph_osd_up[15m]) under-counted 2 instead of 4 because a ~4s
+# transition window never landed as its own scraped sample.
+osdup_query_pattern='query=ceph_osd_up%7Bceph_daemon%3D%22osd.1%22%7D'
+osdup_poll_count="$(grep -c "$osdup_query_pattern" "$live_trace_file" || true)"
+[[ "$osdup_poll_count" -ge 4 ]] || fail "expected at least 4 prometheus ceph_osd_up polls (one per transition), got $osdup_poll_count"
+
+osdup1_line="$(grep -n "$osdup_query_pattern" "$live_trace_file" | sed -n '1p' | cut -d: -f1)"
+osdup2_line="$(grep -n "$osdup_query_pattern" "$live_trace_file" | sed -n '2p' | cut -d: -f1)"
+osdup3_line="$(grep -n "$osdup_query_pattern" "$live_trace_file" | sed -n '3p' | cut -d: -f1)"
+osdup4_line="$(grep -n "$osdup_query_pattern" "$live_trace_file" | sed -n '4p' | cut -d: -f1)"
+[[ -n "$osdup1_line" && -n "$osdup2_line" && -n "$osdup3_line" && -n "$osdup4_line" ]] || fail "missing prometheus ceph_osd_up poll trace lines for ordering checks"
+
+(( osdup1_line > stop1_line )) || fail "1st prometheus ceph_osd_up poll happened before 1st systemctl stop"
+(( osdup1_line < start1_line )) || fail "1st prometheus ceph_osd_up poll happened after 1st systemctl start (must gate transition 1 before transition 2 begins)"
+(( osdup2_line > start1_line )) || fail "2nd prometheus ceph_osd_up poll happened before 1st systemctl start"
+(( osdup2_line < stop2_line )) || fail "2nd prometheus ceph_osd_up poll happened after 2nd systemctl stop (must gate transition 2 before transition 3 begins)"
+(( osdup3_line > stop2_line )) || fail "3rd prometheus ceph_osd_up poll happened before 2nd systemctl stop"
+(( osdup3_line < start2_line )) || fail "3rd prometheus ceph_osd_up poll happened after 2nd systemctl start (must gate transition 3 before transition 4 begins)"
+(( osdup4_line > start2_line )) || fail "4th prometheus ceph_osd_up poll happened before 2nd systemctl start"
+
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'osd-flapping-*' | sort | tail -1)"
 [[ -f "$result_dir/osd-tree-poll-1.json" ]] || fail "missing osd-tree-poll-1.json evidence file"
 [[ -f "$result_dir/osd-tree-poll-4.json" ]] || fail "missing osd-tree-poll-4.json evidence file"
+[[ -f "$result_dir/prometheus-osd-up-poll-1.json" ]] || fail "missing prometheus-osd-up-poll-1.json evidence file"
+[[ -f "$result_dir/prometheus-osd-up-poll-4.json" ]] || fail "missing prometheus-osd-up-poll-4.json evidence file"
 grep -q '"alertname":"CephOSDFlapping"' "$result_dir/sink.log" || fail "missing CephOSDFlapping entry in captured sink log"
 grep -q '"fresh":"true"' "$result_dir/sink.log" || fail "missing fresh (post-transition) pager delivery evidence for CephOSDFlapping"
 
@@ -294,6 +353,7 @@ make_fake_ssh "$fail_bin_dir/ssh" "$fail_trace_file"
 set +e
 PATH="$fail_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=1 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=1 SINK_WAIT_SLEEP=0 \
   OSD_FLAP_POLL_ATTEMPTS=2 OSD_FLAP_POLL_SLEEP=0 \
+  OSD_FLAP_METRIC_ATTEMPTS=2 OSD_FLAP_METRIC_SLEEP=0 \
   bash "$ROOT/run/scenario-osd-flapping.sh" --yes-really-inject >"$fail_stdout_file" 2>"$fail_stderr_file"
 rc=$?
 set -e
