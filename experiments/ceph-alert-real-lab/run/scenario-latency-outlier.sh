@@ -19,6 +19,22 @@ source "$ROOT/lib/scenario-framework.sh"
 # of that, so bump it up to 200 attempts * 5s = 1000s.
 PROMETHEUS_WAIT_ATTEMPTS="${PROMETHEUS_WAIT_ATTEMPTS:-200}"
 export PROMETHEUS_WAIT_ATTEMPTS
+PROMETHEUS_WAIT_SLEEP="${PROMETHEUS_WAIT_SLEEP:-5}"
+export PROMETHEUS_WAIT_SLEEP
+
+# The rados bench workload driving the latency spike must itself outlast the
+# wait window it is meant to sustain (previously it ran a fixed 300s while
+# the wait window above is 1000s, so the bench could die out from under a
+# still-waiting Prometheus poll). LATENCY_BENCH_SECONDS therefore defaults to
+# one full wait_prometheus_alert window (PROMETHEUS_WAIT_ATTEMPTS *
+# PROMETHEUS_WAIT_SLEEP) plus 120s of headroom for ssh/cephadm-shell startup
+# latency and scheduling jitter: 200*5+120 = 1120s with the defaults above.
+# scenario_verify's retry branch (tighter throttle after a first-window
+# timeout) kills the original bench and launches a fresh one sized the same
+# way, so the retried wait window is spanned by its own bench rather than
+# reusing one that may have already exited.
+LATENCY_BENCH_SECONDS="${LATENCY_BENCH_SECONDS:-$((PROMETHEUS_WAIT_ATTEMPTS * PROMETHEUS_WAIT_SLEEP + 120))}"
+export LATENCY_BENCH_SECONDS
 
 POOL="${LATENCY_OUTLIER_POOL:-alert-latency-outlier}"
 OBJECT="${LATENCY_OUTLIER_OBJECT:-sentinel}"
@@ -37,6 +53,7 @@ OSD_DEVICE=""
 OSD_SERVICE=""
 IO_PATH=""
 MAJMIN=""
+BENCH_PID=""
 pool_step=1
 cleanup_step=1
 
@@ -109,13 +126,83 @@ select_latency_target() {
   printf '%s\n' "$CEPH_VOLUME_METHOD" >"$RESULT_DIR/ceph-volume-method.txt"
 }
 
-# Launched with nohup on the seed host itself (not backgrounded locally like
-# scenario-slow-ops.sh's start_background_capture): the 5-minute write needs
-# to keep running independent of this script's own ssh round-trip, so we
-# fire-and-forget and record only the launch confirmation as evidence.
+# Mirrors scenario-slow-ops.sh's start_background_capture/stop_bench_workload
+# exactly. The cephadm shell container is a foreground `podman run --rm`
+# without --pid=host (verified against the vendored cephadm source): if
+# rados bench were launched as a backgrounded child of a `sh -c '... &
+# echo started'` entrypoint, that entrypoint exits immediately, the
+# container's PID namespace is torn down, and the nohup'd bench dies with
+# it. Running rados bench itself as the foreground command of the ssh +
+# cephadm-shell invocation keeps the container alive for the workload's
+# full lifetime; backgrounding happens locally (in this script's process),
+# not inside the container.
+start_background_capture() {
+  local output_file=$1 child_pid_file=$2
+  shift 2
+  (
+    local started ended rc child
+    started="$(date -u +%FT%TZ)"
+    {
+      printf '# started: %s\n' "$started"
+      printf '# command:'
+      printf ' %q' "$@"
+      printf '\n'
+    } >"$output_file"
+
+    set +e
+    "$@" >>"$output_file" 2>&1 &
+    child=$!
+    printf '%s\n' "$child" >"$child_pid_file"
+    trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
+    wait "$child"
+    rc=$?
+    trap - TERM INT
+    set -e
+
+    ended="$(date -u +%FT%TZ)"
+    {
+      printf '\n# ended: %s\n' "$ended"
+      printf '# exit_code: %s\n' "$rc"
+    } >>"$output_file"
+    exit "$rc"
+  ) &
+  BENCH_PID=$!
+  printf '%s\n' "$BENCH_PID" >"$RESULT_DIR/rados-bench.pid"
+}
+
 start_bench_workload() {
-  run_live_step "start-bench" "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- sh -c 'nohup rados bench -p $POOL 300 write -b 4194304 -t 16 --no-cleanup >/dev/null 2>&1 & echo started'"
+  start_background_capture "$RESULT_DIR/rados-bench.txt" "$RESULT_DIR/rados-bench.child.pid" \
+    ssh_lab "$LAB_MON_01_HOST" \
+    "sudo -n cephadm shell -- rados bench -p $POOL $LATENCY_BENCH_SECONDS write -b 4194304 -t 16 --no-cleanup"
+}
+
+stop_bench_workload() {
+  local reason=$1 child_pid_file="$RESULT_DIR/rados-bench.child.pid" child_pid="" i
+  if [[ -z "$BENCH_PID" ]]; then
+    return 0
+  fi
+
+  log "stop rados bench workload ($reason)"
+  if [[ -f "$child_pid_file" ]]; then
+    child_pid="$(cat "$child_pid_file")"
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill "$child_pid" 2>/dev/null || true
+      i=0
+      while [[ "$i" -lt 20 ]] && kill -0 "$child_pid" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      if kill -0 "$child_pid" 2>/dev/null; then
+        kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if kill -0 "$BENCH_PID" 2>/dev/null; then
+    kill "$BENCH_PID" 2>/dev/null || true
+  fi
+  wait "$BENCH_PID" 2>/dev/null || true
+  BENCH_PID=""
+  return 0
 }
 
 scenario_setup() {
@@ -139,6 +226,8 @@ scenario_verify() {
   if ! wait_prometheus_alert CephOSDLatencyOutlier ceph_daemon "$ceph_daemon" "$RESULT_DIR"; then
     log "CephOSDLatencyOutlier did not fire within the first throttle window; retrying once with a tighter limit (${LATENCY_RETRY_BPS} bps)"
     run_live_step "retry-throttle" "$OSD_HOST" "$(io_throttle_command "$MAJMIN" "$LATENCY_RETRY_BPS" "$IO_PATH")"
+    stop_bench_workload "before retry relaunch"
+    start_bench_workload
     wait_prometheus_alert CephOSDLatencyOutlier ceph_daemon "$ceph_daemon" "$RESULT_DIR"
   fi
 
@@ -149,9 +238,12 @@ scenario_verify() {
 scenario_rollback() {
   local rc=0
 
+  stop_bench_workload "before unthrottle"
+
   if [[ -n "$MAJMIN" && -n "$IO_PATH" ]]; then
     run_live_step "rollback-unthrottle" "$OSD_HOST" "$(io_unthrottle_command "$MAJMIN" "$IO_PATH")" || rc=1
   fi
+  stop_bench_workload "after unthrottle"
   run_live_step "rollback-kill-rados-bench" "$LAB_MON_01_HOST" \
     "sudo -n cephadm shell -- sh -c 'pkill -f \"[r]ados bench -p $POOL\" || true'" || rc=1
 

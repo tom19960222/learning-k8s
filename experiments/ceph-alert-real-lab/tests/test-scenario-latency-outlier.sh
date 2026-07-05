@@ -141,12 +141,21 @@ case "\$command" in
     printf '{"quorum":[0,1,2]}\n'
     exit 0
     ;;
-  *"nohup rados bench -p alert-latency-outlier 300 write"*)
-    printf 'started\n'
-    exit 0
-    ;;
   *"pkill -f \"[r]ados bench -p alert-latency-outlier\""*)
     printf 'pkill-live-noise\n'
+    exit 0
+    ;;
+  *"rados bench -p "*)
+    if [[ -n "\${FAKE_BENCH_STARTED_FILE:-}" ]]; then
+      printf 'started\n' >"\$FAKE_BENCH_STARTED_FILE"
+    fi
+    if [[ -n "\${FAKE_BENCH_BLOCK_FILE:-}" ]]; then
+      trap 'printf terminated >"\${FAKE_BENCH_TERMINATED_FILE:-/dev/null}"; exit 143' TERM INT
+      while [[ ! -f "\$FAKE_BENCH_BLOCK_FILE" ]]; do
+        sleep 1
+      done
+    fi
+    printf 'bench-live-noise\n'
     exit 0
     ;;
   *"sudo tee "*)
@@ -173,6 +182,13 @@ live_stdout_file="$(mktemp)"
 live_stderr_file="$(mktemp)"
 live_trace_file="$(mktemp)"
 fake_bin_dir="$(mktemp -d)"
+async_stdout_file="$(mktemp)"
+async_stderr_file="$(mktemp)"
+async_trace_file="$(mktemp)"
+bench_started_file="$(mktemp)"
+bench_block_file="$(mktemp)"
+bench_terminated_file="$(mktemp)"
+async_bin_dir="$(mktemp -d)"
 retry_stdout_file="$(mktemp)"
 retry_stderr_file="$(mktemp)"
 retry_trace_file="$(mktemp)"
@@ -186,9 +202,11 @@ real_jq="$(command -v jq)"
 cleanup() {
   rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" \
     "$live_stdout_file" "$live_stderr_file" "$live_trace_file" \
+    "$async_stdout_file" "$async_stderr_file" "$async_trace_file" \
+    "$bench_started_file" "$bench_block_file" "$bench_terminated_file" \
     "$retry_stdout_file" "$retry_stderr_file" "$retry_trace_file" \
     "$pager_leak_stdout_file" "$pager_leak_stderr_file" "$pager_leak_trace_file"
-  rm -rf "$fake_bin_dir" "$retry_bin_dir" "$pager_leak_bin_dir"
+  rm -rf "$fake_bin_dir" "$async_bin_dir" "$retry_bin_dir" "$pager_leak_bin_dir"
 }
 
 trap cleanup EXIT
@@ -264,11 +282,20 @@ fi
 if grep -q 'retrying once with a tighter limit' "$live_stderr_file"; then
   fail "immediate-success path should not have logged a retry"
 fi
-grep -q "^ssh:sudo -n cephadm shell -- sh -c 'nohup rados bench -p alert-latency-outlier 300 write -b 4194304 -t 16 --no-cleanup >/dev/null 2>&1 & echo started'\$" "$live_trace_file" || fail "missing nohup bench launch on seed host"
+# The bench must run as the FOREGROUND command of the ssh + cephadm-shell
+# invocation (no "& echo started" tail backgrounding it inside the
+# container) — that is the fix: the container now stays alive for the
+# workload's full lifetime instead of tearing down its PID namespace the
+# instant a "nohup ... & echo started" entrypoint returns. Local
+# backgrounding happens in this script's own process via start_background_capture.
+grep -Eq '^ssh:sudo -n cephadm shell -- rados bench -p alert-latency-outlier [0-9]+ write -b 4194304 -t 16 --no-cleanup$' "$live_trace_file" ||
+  fail "missing foreground bench launch on seed host"
+bench_launch_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-latency-outlier [0-9]+ write -b 4194304 -t 16 --no-cleanup$' "$live_trace_file" || true)"
+[[ "$bench_launch_count" -eq 1 ]] || fail "expected exactly one bench launch on the immediate-success path, got $bench_launch_count"
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'latency-outlier-*' | sort | tail -1)"
-[[ -f "$result_dir/start-bench.txt" ]] || fail "missing bench-launch evidence file"
-grep -q 'started' "$result_dir/start-bench.txt" || fail "bench-launch evidence file missing started confirmation"
+[[ -f "$result_dir/rados-bench.txt" ]] || fail "missing bench evidence file"
+grep -q '# exit_code: 0' "$result_dir/rados-bench.txt" || fail "bench evidence file missing successful exit code"
 grep -q 'osd_id=4' "$result_dir/selected-target.env" || fail "selected target did not record osd.4"
 
 # assert_sink_absent always writes sink-absent-check.log before the pass/fail branch, regardless of
@@ -285,8 +312,73 @@ pool_delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- sh -c '"'"'ceph confi
 
 ok "latency-outlier destructive ack guard, injection/setup sequence, and rollback ordering"
 
+# --- Async lifetime: the whole point of the fix is that the bench keeps running
+# independent of the ssh round-trip that launched it (previously it ran *inside* the
+# cephadm shell container as a nohup'd background job, which died the instant the
+# container's foreground `sh -c '... & echo started'` entrypoint returned). Block the
+# fake bench open until explicitly released, confirm the scenario proceeds past the
+# launch (on to sink checks) while the bench is still running, then confirm rollback
+# explicitly terminates it (captured as exit_code 143 in the evidence file).
+rm -f "$bench_started_file" "$bench_block_file" "$bench_terminated_file"
+make_fake_jq "$async_bin_dir/jq" "$real_jq" "$async_trace_file"
+make_fake_kubectl "$async_bin_dir/kubectl" "$async_trace_file"
+make_fake_curl "$async_bin_dir/curl" "$async_trace_file"
+make_fake_ssh "$async_bin_dir/ssh" "$async_trace_file"
+
+set +e
+PATH="$async_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=2 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  FAKE_BENCH_STARTED_FILE="$bench_started_file" \
+  FAKE_BENCH_BLOCK_FILE="$bench_block_file" \
+  FAKE_BENCH_TERMINATED_FILE="$bench_terminated_file" \
+  bash "$ROOT/run/scenario-latency-outlier.sh" --yes-really-inject >"$async_stdout_file" 2>"$async_stderr_file" &
+async_pid=$!
+set -e
+
+started_wait=0
+while [[ "$started_wait" -lt 20 && ! -f "$bench_started_file" ]]; do
+  sleep 0.2
+  started_wait=$((started_wait + 1))
+done
+[[ -f "$bench_started_file" ]] || fail "fake bench did not start"
+
+# record_sink_checkpoint (which runs before scenario_inject/the bench launch) also hits
+# "logs deploy/alert-sink", so that string alone can't prove progress past the bench start.
+# Poll instead for the Prometheus alert check, which only runs inside scenario_verify —
+# strictly after scenario_inject (throttle + bench launch) has returned.
+poll_wait=0
+while [[ "$poll_wait" -lt 20 ]] && ! grep -q 'wget -qO- http://127.0.0.1:9090/api/v1/alerts' "$async_trace_file"; do
+  sleep 0.2
+  poll_wait=$((poll_wait + 1))
+done
+if ! grep -q 'wget -qO- http://127.0.0.1:9090/api/v1/alerts' "$async_trace_file"; then
+  kill "$async_pid" 2>/dev/null || true
+  wait "$async_pid" 2>/dev/null || true
+  fail "scenario did not proceed to alert polling while rados bench was still running"
+fi
+
+exit_wait=0
+while [[ "$exit_wait" -lt 30 ]] && kill -0 "$async_pid" 2>/dev/null; do
+  sleep 0.2
+  exit_wait=$((exit_wait + 1))
+done
+if kill -0 "$async_pid" 2>/dev/null; then
+  kill "$async_pid" 2>/dev/null || true
+  wait "$async_pid" 2>/dev/null || true
+  fail "scenario left the async fake bench running"
+fi
+wait "$async_pid"
+rc=$?
+[[ "$rc" -eq 0 ]] || fail "expected async fake bench scenario success, got $rc"
+
+async_result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'latency-outlier-*' | sort | tail -1)"
+grep -Fq '# exit_code: 143' "$async_result_dir/rados-bench.txt" ||
+  fail "rollback did not terminate and capture the still-running fake bench"
+
+ok "latency-outlier keeps the bench alive independent of the ssh round-trip, and rollback kills it explicitly"
+
 # --- Retry path: primary throttle is (simulated as) insufficient within the first wait window;
-# scenario_verify must log the retry, re-throttle tighter, and succeed on the second wait.
+# scenario_verify must log the retry, re-throttle tighter, kill the stale bench, relaunch a
+# fresh one, and succeed on the second wait.
 rm -rf "$retry_bin_dir"
 retry_bin_dir="$(mktemp -d)"
 make_fake_jq "$retry_bin_dir/jq" "$real_jq" "$retry_trace_file"
@@ -310,7 +402,22 @@ retry_line="$(grep -n "rbps=1048576" "$retry_trace_file" | head -1 | cut -d: -f1
 [[ -n "$primary_line" && -n "$retry_line" ]] || fail "missing throttle trace lines for retry ordering check"
 (( retry_line > primary_line )) || fail "retry throttle happened before primary throttle"
 
-ok "latency-outlier retries once with a tighter throttle when the first wait window times out"
+# The retry branch is a no-op if it only re-throttles without also killing the stale bench
+# and launching a fresh one sized for the new wait window — assert both bench launches are
+# present in the trace, and that the second one happens after the retry throttle (i.e. the
+# retry actually kills-then-relaunches, not just re-applies io.max).
+bench_launch_lines_file="$(mktemp)"
+grep -nE '^ssh:sudo -n cephadm shell -- rados bench -p alert-latency-outlier [0-9]+ write -b 4194304 -t 16 --no-cleanup$' \
+  "$retry_trace_file" >"$bench_launch_lines_file" || true
+bench_launch_count="$(wc -l <"$bench_launch_lines_file" | tr -d ' ')"
+[[ "$bench_launch_count" -eq 2 ]] || fail "expected the retry path to relaunch the bench exactly once (2 total launches), got $bench_launch_count"
+first_bench_line="$(sed -n '1p' "$bench_launch_lines_file" | cut -d: -f1)"
+second_bench_line="$(sed -n '2p' "$bench_launch_lines_file" | cut -d: -f1)"
+rm -f "$bench_launch_lines_file"
+(( first_bench_line < retry_line )) || fail "primary bench launch should have preceded the retry throttle"
+(( second_bench_line > retry_line )) || fail "retry did not relaunch the bench after re-throttling"
+
+ok "latency-outlier retries once with a tighter throttle when the first wait window times out, killing and relaunching the bench"
 
 # --- Failure path: alert-sink also delivers CephOSDLatencyOutlier via the pager receiver.
 # This proves assert_sink_absent's pass/fail branches are both reachable (not vacuously
