@@ -155,7 +155,34 @@ case "\$command" in
     exit 0
     ;;
   *"ceph health detail"*)
-    printf 'HEALTH_WARN 1 slow ops, oldest one blocked for 99 sec (SLOW_OPS)\n'
+    base_msg='HEALTH_WARN 1 slow ops, oldest one blocked for 99 sec (SLOW_OPS)'
+    # FAKE_BLUESTORE_HEALTH_COUNT_FILE + FAKE_BLUESTORE_CLEAR_AFTER simulate
+    # BLUESTORE_SLOW_OP_ALERT being present for the first N \`ceph health
+    # detail\` calls in a run, then aging out (real-lab evidence: shrinking
+    # bluestore_slow_ops_warn_lifetime/threshold clears the latch
+    # cluster-wide in ~20s). FAKE_BLUESTORE_ALWAYS_ALERT simulates it never
+    # clearing, to exercise the poll_until timeout path. Unset/0 for both
+    # preserves the original plain-SLOW_OPS-only response used by every
+    # other test below.
+    bluestore_count_file="\${FAKE_BLUESTORE_HEALTH_COUNT_FILE:-}"
+    clear_after="\${FAKE_BLUESTORE_CLEAR_AFTER:-0}"
+    if [[ -n "\$bluestore_count_file" && "\$clear_after" -gt 0 ]]; then
+      bcount=0
+      [[ -f "\$bluestore_count_file" ]] && bcount="\$(cat "\$bluestore_count_file")"
+      bcount=\$((bcount + 1))
+      printf '%s' "\$bcount" >"\$bluestore_count_file"
+      if [[ "\$bcount" -le "\$clear_after" ]]; then
+        printf '%s\n%s\n' "\$base_msg" 'BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)'
+        exit 0
+      fi
+      printf '%s\n' "\$base_msg"
+      exit 0
+    fi
+    if [[ "\${FAKE_BLUESTORE_ALWAYS_ALERT:-0}" == "1" ]]; then
+      printf '%s\n%s\n' "\$base_msg" 'BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)'
+      exit 0
+    fi
+    printf '%s\n' "\$base_msg"
     exit 0
     ;;
   *"quorum_status --format json"*)
@@ -184,6 +211,10 @@ case "\$command" in
     exit 0
     ;;
   *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*)
+    printf 'ssh-live-noise\n'
+    exit 0
+    ;;
+  *"ceph config set osd bluestore_slow_ops_warn_"*|*"ceph config rm osd bluestore_slow_ops_warn_"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -290,9 +321,14 @@ grep -q 'PASS: sink slack received CephDaemonSlowOps ceph_daemon=osd.4' "$live_s
 # ramp-up under continuous load (real-lab evidence: a 180s bench let the
 # per-daemon SLOW_OPS gauge drop to 0 before ever sustaining 3 continuous
 # minutes, so the for: clock kept resetting). Assert >= 360s so a future
-# shortening of SLOW_OPS_BENCH_SECONDS regresses this test.
-bench_line="$(grep -E '^ssh:sudo -n cephadm shell -- rados bench -p alert-slow-ops [0-9]+ write -b 4194304 -t 16 --no-cleanup$' "$live_trace_file" | head -1)"
-[[ -n "$bench_line" ]] || fail "missing rados bench invocation with expected command shape in trace"
+# shortening of SLOW_OPS_BENCH_SECONDS regresses this test. The thread count
+# (-t) must also be high enough to keep the throttled OSD's queue
+# continuously saturated (real-lab evidence: -t 16 let SLOW_OPS oscillate
+# 1->0->1 between bench write bursts even across a 420s run, resetting both
+# alerts' for: clocks) -- assert -t 64 so a future drop back to a low
+# concurrency regresses this test too.
+bench_line="$(grep -E '^ssh:sudo -n cephadm shell -- rados bench -p alert-slow-ops [0-9]+ write -b 4194304 -t 64 --no-cleanup$' "$live_trace_file" | head -1)"
+[[ -n "$bench_line" ]] || fail "missing rados bench invocation with expected command shape (including -t 64) in trace"
 bench_duration="$(printf '%s\n' "$bench_line" | grep -oE '[0-9]+' | head -1)"
 [[ "$bench_duration" -ge 360 ]] || fail "expected slow-ops bench duration >= 360s to outlast CephDaemonSlowOps for:3m + ramp-up, got ${bench_duration}s"
 
@@ -460,5 +496,81 @@ set -e
 
 [[ "$rc" -ne 0 ]] || fail "expected CephDaemonSlowOps firing on the 90th poll to exceed the 84-attempt budget and fail"
 grep -q 'TIMEOUT: Prometheus alert CephDaemonSlowOps ceph_daemon=osd.4 firing' "$slow_ops_timeout_stderr_file" || fail "missing TIMEOUT evidence for CephDaemonSlowOps prometheus wait"
+
+# clear_bluestore_slow_ops used to restart every OSD still reporting
+# BLUESTORE_SLOW_OP_ALERT; real-lab evidence showed that rolling restart is
+# disruptive and repeatedly left cephadm's daemon inventory in a stale
+# "unknown" state. The verified replacement shrinks
+# bluestore_slow_ops_warn_lifetime/threshold to age the latch out
+# cluster-wide (~20s) instead. FAKE_BLUESTORE_CLEAR_AFTER makes the fake
+# `ceph health detail` keep reporting BLUESTORE_SLOW_OP_ALERT for the first
+# few polls (so the scenario must actually loop, not just check once) before
+# clearing, proving clear_bluestore_slow_ops polls until it observes the
+# alert gone.
+bluestore_clear_stdout_file="$(mktemp)"
+bluestore_clear_stderr_file="$(mktemp)"
+bluestore_clear_trace_file="$(mktemp)"
+bluestore_clear_count_file="$(mktemp)"
+rm -f "$bluestore_clear_count_file"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$bluestore_clear_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$bluestore_clear_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$bluestore_clear_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$bluestore_clear_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_BLUESTORE_HEALTH_COUNT_FILE="$bluestore_clear_count_file" \
+  FAKE_BLUESTORE_CLEAR_AFTER=5 \
+  BLUESTORE_CLEAR_SLEEP=0 \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$bluestore_clear_stdout_file" 2>"$bluestore_clear_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -eq 0 ]] || fail "expected scenario to survive BLUESTORE_SLOW_OP_ALERT aging out mid-poll, got $rc"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_lifetime 1$' "$bluestore_clear_trace_file" || fail "missing bluestore_slow_ops_warn_lifetime=1 config set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_threshold 1$' "$bluestore_clear_trace_file" || fail "missing bluestore_slow_ops_warn_threshold=1 config set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$bluestore_clear_trace_file" || fail "missing bluestore_slow_ops_warn_lifetime restore"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$bluestore_clear_trace_file" || fail "missing bluestore_slow_ops_warn_threshold restore"
+grep -q 'PASS: BLUESTORE_SLOW_OP_ALERT cleared' "$bluestore_clear_stderr_file" || fail "missing PASS evidence that clear_bluestore_slow_ops polled until the alert cleared"
+if grep -Eq 'systemctl restart ceph-.*@osd\.' "$bluestore_clear_trace_file"; then
+  fail "clear_bluestore_slow_ops should no longer restart OSDs to clear BLUESTORE_SLOW_OP_ALERT"
+fi
+health_detail_polls="$(grep -c '^ssh:sudo -n cephadm shell -- ceph health detail$' "$bluestore_clear_trace_file" || true)"
+[[ "$health_detail_polls" -ge 4 ]] || fail "expected clear_bluestore_slow_ops to poll ceph health detail repeatedly before it cleared, saw $health_detail_polls"
+
+# Prove the config rm restores ALWAYS run, even when the poll times out
+# (FAKE_BLUESTORE_ALWAYS_ALERT never clears the fake alert): a lingering
+# bluestore_slow_ops_warn_lifetime=1 would silently suppress the real alert
+# later, so the restore must not be skipped just because the poll failed.
+bluestore_timeout_stdout_file="$(mktemp)"
+bluestore_timeout_stderr_file="$(mktemp)"
+bluestore_timeout_trace_file="$(mktemp)"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$bluestore_timeout_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$bluestore_timeout_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$bluestore_timeout_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$bluestore_timeout_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_BLUESTORE_ALWAYS_ALERT=1 \
+  BLUESTORE_CLEAR_ATTEMPTS=2 \
+  BLUESTORE_CLEAR_SLEEP=0 \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$bluestore_timeout_stdout_file" 2>"$bluestore_timeout_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected scenario to fail when BLUESTORE_SLOW_OP_ALERT never clears"
+grep -q 'TIMEOUT: BLUESTORE_SLOW_OP_ALERT cleared' "$bluestore_timeout_stderr_file" || fail "missing TIMEOUT evidence for the BLUESTORE_SLOW_OP_ALERT poll"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_lifetime 1$' "$bluestore_timeout_trace_file" || fail "missing bluestore_slow_ops_warn_lifetime=1 config set on timeout path"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_threshold 1$' "$bluestore_timeout_trace_file" || fail "missing bluestore_slow_ops_warn_threshold=1 config set on timeout path"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$bluestore_timeout_trace_file" || fail "config rm for bluestore_slow_ops_warn_lifetime must still run after a poll timeout"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$bluestore_timeout_trace_file" || fail "config rm for bluestore_slow_ops_warn_threshold must still run after a poll timeout"
+if grep -Eq 'systemctl restart ceph-.*@osd\.' "$bluestore_timeout_trace_file"; then
+  fail "clear_bluestore_slow_ops should no longer restart OSDs to clear BLUESTORE_SLOW_OP_ALERT"
+fi
 
 ok "slow-ops destructive ack guard"

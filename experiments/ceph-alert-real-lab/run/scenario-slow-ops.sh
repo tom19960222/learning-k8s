@@ -27,6 +27,20 @@ THROTTLE_BPS="${SLOW_OPS_THROTTLE_BPS:-262144}"
 # though the metric genuinely spiked to 16). 420s gives ~60s ramp + 180s
 # for: + scrape/evaluation margin, all under continuous load.
 SLOW_OPS_BENCH_SECONDS="${SLOW_OPS_BENCH_SECONDS:-420}"
+# Duration alone isn't sufficient: real-lab evidence at this same 262144
+# throttle with the previous -t 16 bench threads showed SLOW_OPS is BURSTY
+# -- the op queue drains between bench write bursts, so
+# ceph_health_detail{name="SLOW_OPS"} and
+# ceph_daemon_health_metrics{type="SLOW_OPS"} oscillate 1->0->1, resetting
+# both alerts' for: clocks (one run fired CephClientBlocked, an identical
+# rerun of the same throttle did not). The fix is higher write concurrency,
+# not a harder throttle: more in-flight ops keep the throttled device's
+# queue continuously non-empty, so SLOW_OPS stays > 0 across both the
+# for:1m and for:3m windows without any added flap risk (a harder 128KB/s
+# throttle was tested and made the OSD flap DOWN because its own
+# housekeeping IO got throttled too -- so the throttle rate itself must
+# stay unchanged; only concurrency goes up).
+SLOW_OPS_BENCH_THREADS="${SLOW_OPS_BENCH_THREADS:-64}"
 CEPH_VOLUME_METHOD=""
 OSD_ID=""
 OSD_HOST=""
@@ -43,59 +57,43 @@ run_live_step() {
   run_capture "$RESULT_DIR/${label}.txt" ssh_lab "$host" "$command"
 }
 
-osd_ok_to_stop() {
-  local osd=$1
-  run_capture "$RESULT_DIR/bluestore-ok-to-stop-osd-${osd}.txt" ceph_seed_cmd osd ok-to-stop "$osd"
+bluestore_slow_op_alert_cleared() {
+  local output_file="$RESULT_DIR/bluestore-slow-ops-health-poll.txt"
+  run_capture "$output_file" ceph_seed_cmd health detail || return 1
+  ! grep -Fq 'BLUESTORE_SLOW_OP_ALERT' "$output_file"
 }
 
-osd_up_in() {
-  local osd=$1 output_file
-  output_file="$RESULT_DIR/bluestore-osd-${osd}-dump.json"
-  ceph_seed_cmd osd dump --format json >"$output_file"
-  jq -e --arg osd "$osd" '.osds[] | select(.osd|tostring==$osd) | select(.up==1 and .in==1)' "$output_file" >/dev/null
-}
-
-pgs_active_clean() {
-  local output_file
-  output_file="$RESULT_DIR/bluestore-pg-status.json"
-  ceph_seed_cmd status --format json >"$output_file"
-  jq -e '.pgmap.pgs_by_state | length == 1 and .[0].state_name == "active+clean"' "$output_file" >/dev/null
-}
-
+# clear_bluestore_slow_ops clears the 24h-latched BLUESTORE_SLOW_OP_ALERT
+# warning. This used to restart every OSD still reporting it, but on the real
+# cluster that rolling restart was disruptive and repeatedly left cephadm's
+# daemon inventory in a stale "unknown" state (CEPHADM_FAILED_DAEMON ->
+# HEALTH_WARN -> recovery gate timeout). Verified cleaner method: temporarily
+# shrink the warning's lifetime/threshold so the latch ages out cluster-wide
+# in ~20s (no daemon restart involved), then restore the defaults.
 clear_bluestore_slow_ops() {
-  local health_file osds_file osd find_json host_name host_ip service rc=0
+  local health_file rc=0
 
   health_file="$RESULT_DIR/bluestore-slow-ops-health.txt"
-  osds_file="$RESULT_DIR/bluestore-slow-ops-osds.txt"
   run_capture "$health_file" ceph_seed_cmd health detail || return 0
-  grep -Eo 'osd\.[0-9]+ observed slow operation' "$health_file" |
-    sed 's/^osd\.//; s/ observed slow operation$//' |
-    sort -nu >"$osds_file" || true
+  grep -Fq 'BLUESTORE_SLOW_OP_ALERT' "$health_file" || return 0
 
-  if [[ ! -s "$osds_file" ]]; then
-    return 0
-  fi
+  log "age out latched BLUESTORE_SLOW_OP_ALERT via bluestore_slow_ops_warn_lifetime=1"
+  run_capture "$RESULT_DIR/bluestore-warn-lifetime-set.txt" \
+    ceph_seed_cmd config set osd bluestore_slow_ops_warn_lifetime 1 || rc=1
+  run_capture "$RESULT_DIR/bluestore-warn-threshold-set.txt" \
+    ceph_seed_cmd config set osd bluestore_slow_ops_warn_threshold 1 || rc=1
 
-  while IFS= read -r osd; do
-    [[ -n "$osd" ]] || continue
-    log "clear BlueStore slow-op health by restarting osd.$osd"
-    find_json="$RESULT_DIR/bluestore-osd-find-${osd}.json"
-    ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd find $osd --format json" >"$find_json"
-    host_name="$(jq -r '.crush_location.host' "$find_json")"
-    host_ip="$(lab_osd_host_ip "$host_name")"
-    service="$(osd_service_name "$LAB_FSID" "$osd")"
+  poll_until "BLUESTORE_SLOW_OP_ALERT cleared" \
+    "${BLUESTORE_CLEAR_ATTEMPTS:-18}" "${BLUESTORE_CLEAR_SLEEP:-5}" \
+    bluestore_slow_op_alert_cleared || rc=1
 
-    poll_until "osd.$osd ok-to-stop" 30 5 osd_ok_to_stop "$osd" || {
-      rc=1
-      continue
-    }
-    run_live_step "bluestore-restart-osd-${osd}" "$host_ip" "sudo systemctl restart $service" || {
-      rc=1
-      continue
-    }
-    poll_until "osd.$osd up/in after BlueStore slow-op restart" 30 5 osd_up_in "$osd" || rc=1
-    poll_until "PGs active+clean after osd.$osd restart" 30 5 pgs_active_clean || rc=1
-  done <"$osds_file"
+  # Always restore defaults, even on poll timeout above: a lingering
+  # bluestore_slow_ops_warn_lifetime=1 would silently suppress this warning
+  # for real incidents later.
+  run_capture "$RESULT_DIR/bluestore-warn-lifetime-rm.txt" \
+    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_lifetime || rc=1
+  run_capture "$RESULT_DIR/bluestore-warn-threshold-rm.txt" \
+    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_threshold || rc=1
 
   return "$rc"
 }
@@ -137,7 +135,7 @@ start_background_capture() {
 start_bench_workload() {
   start_background_capture "$RESULT_DIR/rados-bench.txt" "$RESULT_DIR/rados-bench.child.pid" \
     ssh_lab "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- rados bench -p $POOL $SLOW_OPS_BENCH_SECONDS write -b 4194304 -t 16 --no-cleanup"
+    "sudo -n cephadm shell -- rados bench -p $POOL $SLOW_OPS_BENCH_SECONDS write -b 4194304 -t $SLOW_OPS_BENCH_THREADS --no-cleanup"
 }
 
 stop_bench_workload() {
@@ -278,14 +276,14 @@ scenario_verify() {
   with_sink_wait_attempts 84 wait_sink_alert slack CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
-# Note: clear_bluestore_slow_ops (restarting OSDs still reporting BlueStore
-# slow-op health warnings) must run as part of rollback so HEALTH_OK can be
-# reached before scenario_main's assert_lab_recovered polls. Previously this
-# ran after collect_postcheck but before assert_lab_recovered; the framework
-# now always runs collect_postcheck immediately after scenario_rollback
-# returns, so the postcheck evidence snapshot is taken slightly later (after
-# the BlueStore OSD restart) than before. Final pass/fail behavior of
-# recovery is unchanged.
+# Note: clear_bluestore_slow_ops (aging out the latched BLUESTORE_SLOW_OP_ALERT
+# warning) must run as part of rollback so HEALTH_OK can be reached before
+# scenario_main's assert_lab_recovered polls. Previously this ran after
+# collect_postcheck but before assert_lab_recovered; the framework now always
+# runs collect_postcheck immediately after scenario_rollback returns, so the
+# postcheck evidence snapshot is taken slightly later (after the BlueStore
+# warning is cleared) than before. Final pass/fail behavior of recovery is
+# unchanged.
 scenario_rollback() {
   local rc=0
 
