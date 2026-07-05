@@ -65,6 +65,8 @@ scenario_verify() {
   wait_ceph_health_check PG_AVAILABILITY "$RESULT_DIR"
   wait_prometheus_alert CephClientBlocked name PG_AVAILABILITY "$RESULT_DIR"
   wait_sink_alert pager CephClientBlocked name PG_AVAILABILITY "$RESULT_DIR" "$SINK_CHECKPOINT"
+  wait_prometheus_alert CephPGUnhealthyStates name "$POOL" "$RESULT_DIR"
+  wait_sink_alert pager CephPGUnhealthyStates name "$POOL" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
 scenario_rollback() {

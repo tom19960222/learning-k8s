@@ -15,6 +15,18 @@ source "$ROOT/lib/scenario-framework.sh"
 
 ACTIVE_MGR_HOST=""
 ACTIVE_MGR_SERVICE=""
+
+# Real-cluster timing caveat: during full quorum loss the mgr exporter
+# telemetry FREEZES (verified against the real lab -- quorum_status stayed
+# stale after stopping 2 mons), so CephMonDownScoped may only coexist with
+# CephMonQuorumLost inside Alertmanager's resolve window, after the empty
+# metrics-series path is what actually fires CephMonQuorumLost. Give the
+# inhibited-wait a generous attempts budget for that window. If this proves
+# flaky in the real lab, the documented decision is to downgrade this
+# check to amtool-level verification instead -- that downgrade is NOT
+# implemented here.
+ALERTMANAGER_WAIT_ATTEMPTS="${ALERTMANAGER_WAIT_ATTEMPTS:-90}"
+export ALERTMANAGER_WAIT_ATTEMPTS
 stop_step=1
 restart_step=1
 
@@ -84,6 +96,7 @@ EOF
 scenario_verify() {
   wait_prometheus_alert CephMonQuorumLost "" "" "$RESULT_DIR"
   wait_sink_alert pager CephMonQuorumLost "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
+  wait_alertmanager_inhibited CephMonDownScoped "$RESULT_DIR"
 }
 
 scenario_rollback() {

@@ -27,7 +27,7 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
-  printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"}]}}'
+  printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"},{"labels":{"alertname":"CephDaemonSlowOps","ceph_daemon":"osd.4"},"state":"firing"}]}}'
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
@@ -38,6 +38,7 @@ if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"SLOW_OPS","labels":{"name":"SLOW_OPS"}}'
   if grep -q 'rbps=262144' "$trace_file"; then
     printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"SLOW_OPS","labels":{"name":"SLOW_OPS","fresh":"true"}}'
+    printf '%s\n' '{"receiver":"slack","alertname":"CephDaemonSlowOps","labels":{"ceph_daemon":"osd.4"}}'
   fi
   exit 0
 fi
@@ -253,6 +254,14 @@ if grep -q '/dev/sdb' "$live_trace_file"; then
   fail "slow-ops used hard-coded /dev/sdb"
 fi
 grep -q 'osd_id=4' "$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_file")")/selected-target.env" || fail "selected target did not record osd.4"
+
+# prometheus_alert_is_firing writes prometheus-alerts-<alertname>-<label|none>.json
+# keyed on the CALLER's requested alertname/label, not the fake endpoint's response
+# body -- its existence proves the scenario itself issued a wait_prometheus_alert
+# call for CephDaemonSlowOps scoped to the dynamically-selected osd.4.
+result_dir="$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_file")")"
+[[ -f "$result_dir/prometheus-alerts-CephDaemonSlowOps-ceph_daemon.json" ]] || fail "missing CephDaemonSlowOps prometheus wait evidence"
+grep -q 'PASS: sink slack received CephDaemonSlowOps ceph_daemon=osd.4' "$live_stderr_file" || fail "missing evidence that slack received CephDaemonSlowOps for osd.4"
 
 cephadm_fallback_stdout_file="$(mktemp)"
 cephadm_fallback_stderr_file="$(mktemp)"

@@ -235,6 +235,8 @@ scenario_verify() {
   wait_ceph_health_check SLOW_OPS "$RESULT_DIR"
   wait_prometheus_alert CephClientBlocked name SLOW_OPS "$RESULT_DIR"
   wait_sink_alert pager CephClientBlocked name SLOW_OPS "$RESULT_DIR" "$SINK_CHECKPOINT"
+  wait_prometheus_alert CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR"
+  wait_sink_alert slack CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
 # Note: clear_bluestore_slow_ops (restarting OSDs still reporting BlueStore

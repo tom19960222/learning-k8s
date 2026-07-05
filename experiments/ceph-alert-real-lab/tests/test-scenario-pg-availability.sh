@@ -27,7 +27,7 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
-  printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"PG_AVAILABILITY"},"state":"firing"}]}}'
+  printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"PG_AVAILABILITY"},"state":"firing"},{"labels":{"alertname":"CephPGUnhealthyStates","name":"alert-pg-availability"},"state":"firing"}]}}'
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
@@ -38,6 +38,7 @@ if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"PG_AVAILABILITY","labels":{"name":"PG_AVAILABILITY"}}'
   if grep -q 'systemctl stop ceph-' "$trace_file"; then
     printf '%s\n' '{"receiver":"pager","alertname":"CephClientBlocked","name":"PG_AVAILABILITY","labels":{"name":"PG_AVAILABILITY","fresh":"true"}}'
+    printf '%s\n' '{"receiver":"pager","alertname":"CephPGUnhealthyStates","labels":{"name":"alert-pg-availability"}}'
   fi
   exit 0
 fi
@@ -211,5 +212,13 @@ delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete ale
 (( start0_line > stop0_line )) || fail "rollback start for osd.0 happened before stop"
 (( start1_line > stop1_line )) || fail "rollback start for osd.1 happened before stop"
 (( delete_line > start0_line && delete_line > start1_line )) || fail "pool delete should happen after restarting stopped OSDs"
+
+# prometheus_alert_is_firing writes prometheus-alerts-<alertname>-<label|none>.json
+# keyed on the CALLER's requested alertname/label, not the fake endpoint's response
+# body -- its existence proves the scenario itself issued a wait_prometheus_alert
+# call for CephPGUnhealthyStates scoped to the $POOL pool name.
+result_dir="$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_file")")"
+[[ -f "$result_dir/prometheus-alerts-CephPGUnhealthyStates-name.json" ]] || fail "missing CephPGUnhealthyStates prometheus wait evidence"
+grep -q 'PASS: sink pager received CephPGUnhealthyStates name=alert-pg-availability' "$live_stderr_file" || fail "missing evidence that pager received CephPGUnhealthyStates for alert-pg-availability"
 
 ok "pg-availability destructive ack guard"
