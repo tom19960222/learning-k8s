@@ -36,7 +36,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/que
 fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"watchdog","alertname":"Watchdog","labels":{}}'
-  if grep -q 'sudo kill -SEGV' "$trace_file"; then
+  if grep -q 'ceph crash post -i -' "$trace_file"; then
     printf '%s\n' '{"receiver":"slack","alertname":"CephDaemonRecentCrash","labels":{"fresh":"true"}}'
   fi
   exit 0
@@ -64,8 +64,19 @@ EOF
 # OSD's unit during rollback: "active" simulates systemd's on-failure
 # restart already having brought it back; anything else forces the
 # scenario's explicit `systemctl start` fallback branch.
+#
+# crash_poll_empty_calls controls how many times the crash-spool `ls`
+# reports only the pre-existing ("existing-crash-id") entry before the new
+# crash id ("new-crash-id") shows up -- modeling the real lab's crash dir
+# appearing a poll cycle or two after the SEGV, per the mgr-standby fake's
+# call-counter pattern in test-scenario-mgr-failover.sh. The very first `ls`
+# call (the pre-injection snapshot in scenario_setup) always sees only
+# "existing-crash-id", proving the scenario diffs against that baseline
+# instead of assuming an empty spool.
 make_fake_ssh() {
-  local path=$1 trace_file=$2 osd_status=${3:-active}
+  local path=$1 trace_file=$2 osd_status=${3:-active} crash_poll_empty_calls=${4:-0}
+  local counter_file="${trace_file}.crash-ls-calls"
+  printf '0\n' >"$counter_file"
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -92,8 +103,26 @@ case "\$command" in
     printf '0\n'
     exit 0
     ;;
-  *"systemctl show -p MainPID --value ceph-"*)
-    printf '424242\n'
+  *"podman inspect --format '{{.State.Pid}}' ceph-"*)
+    printf '555555\n'
+    exit 0
+    ;;
+  *"pgrep -P 555555 ceph-osd"*)
+    printf '666666\n'
+    exit 0
+    ;;
+  *"ls -1 /var/lib/ceph/"*"/crash/"*)
+    call_count="\$(cat "$counter_file")"
+    call_count=\$((call_count + 1))
+    printf '%s\n' "\$call_count" >"$counter_file"
+    printf 'existing-crash-id\n'
+    if [[ "\$call_count" -gt \$((1 + $crash_poll_empty_calls)) ]]; then
+      printf 'new-crash-id\n'
+    fi
+    exit 0
+    ;;
+  *"base64 -w0 /var/lib/ceph/"*"/crash/new-crash-id/meta"*)
+    printf 'ZmFrZS1jcmFzaC1tZXRh\n'
     exit 0
     ;;
   *"systemctl is-active ceph-"*)
@@ -112,7 +141,7 @@ case "\$command" in
     printf '{"quorum":[0,1,2]}\n'
     exit 0
     ;;
-  *"ceph osd tree"*|*"sudo kill -SEGV "*|*"ceph crash archive-all"*|*"systemctl start ceph-"*)
+  *"ceph osd tree"*|*"kill -SEGV 666666"*|*"echo ZmFrZS1jcmFzaC1tZXRh | base64 -d | sudo -n cephadm shell -- ceph crash post -i -"*|*"ceph crash archive new-crash-id"*|*"systemctl start ceph-"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -136,11 +165,17 @@ fallback_stdout_file="$(mktemp)"
 fallback_stderr_file="$(mktemp)"
 fallback_trace_file="$(mktemp)"
 fallback_bin_dir="$(mktemp -d)"
+timeout_stdout_file="$(mktemp)"
+timeout_stderr_file="$(mktemp)"
+timeout_trace_file="$(mktemp)"
+timeout_bin_dir="$(mktemp -d)"
 real_jq="$(command -v jq)"
 
 cleanup() {
-  rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" "$live_stdout_file" "$live_stderr_file" "$live_trace_file" "$fallback_stdout_file" "$fallback_stderr_file" "$fallback_trace_file"
-  rm -rf "$fake_bin_dir" "$fallback_bin_dir"
+  rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" "$live_stdout_file" "$live_stderr_file" "$live_trace_file" "$live_trace_file.crash-ls-calls" \
+    "$fallback_stdout_file" "$fallback_stderr_file" "$fallback_trace_file" "$fallback_trace_file.crash-ls-calls" \
+    "$timeout_stdout_file" "$timeout_stderr_file" "$timeout_trace_file" "$timeout_trace_file.crash-ls-calls"
+  rm -rf "$fake_bin_dir" "$fallback_bin_dir" "$timeout_bin_dir"
 }
 
 trap cleanup EXIT
@@ -188,10 +223,14 @@ fake_bin_dir="$(mktemp -d)"
 make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$live_trace_file"
 make_fake_kubectl "$fake_bin_dir/kubectl" "$live_trace_file"
 make_fake_curl "$fake_bin_dir/curl" "$live_trace_file"
-make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file" active
+# crash_poll_empty_calls=2 exercises the crash-dir discovery poll surviving
+# two transient "not there yet" cycles before succeeding on the third --
+# matching the real lab's crash dir appearing a beat or two after the SEGV.
+make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file" active 2
 
 set +e
-PATH="$fake_bin_dir:$PATH" bash "$ROOT/run/scenario-daemon-crash.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
+PATH="$fake_bin_dir:$PATH" DAEMON_CRASH_SPOOL_SLEEP=0 \
+  bash "$ROOT/run/scenario-daemon-crash.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
 rc=$?
 set -e
 
@@ -204,36 +243,57 @@ if grep -Eq 'ssh-live-noise|kubectl-noise-for-' "$live_stdout_file"; then
 fi
 
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd ls-tree ceph-lab-osd-01$' "$live_trace_file" || fail "missing OSD discovery via ls-tree"
-grep -q '^ssh:systemctl show -p MainPID --value ceph-.*@osd\.0\.service$' "$live_trace_file" || fail "missing MainPID lookup for osd.0"
-grep -q '^ssh:sudo kill -SEGV 424242$' "$live_trace_file" || fail "missing kill -SEGV of the resolved PID"
-grep -q '^ssh:sudo -n cephadm shell -- ceph crash archive-all$' "$live_trace_file" || fail "missing rollback ceph crash archive-all"
+grep -q "^ssh:sudo -n podman inspect --format '{{.State.Pid}}' ceph-.*-osd-0\$" "$live_trace_file" || fail "missing podman inspect for the OSD container"
+grep -q '^ssh:sudo -n pgrep -P 555555 ceph-osd$' "$live_trace_file" || fail "missing pgrep -P of podman-init for the real ceph-osd PID"
+grep -q '^ssh:sudo -n kill -SEGV 666666$' "$live_trace_file" || fail "missing kill -SEGV of the resolved ceph-osd PID (not conmon/podman-init)"
+grep -q '^ssh:echo ZmFrZS1jcmFzaC1tZXRh | base64 -d | sudo -n cephadm shell -- ceph crash post -i -$' "$live_trace_file" || fail "missing crash post via seed admin shell"
+grep -q '^ssh:sudo -n cephadm shell -- ceph crash archive new-crash-id$' "$live_trace_file" || fail "missing rollback ceph crash archive of the specific crash id"
+if grep -q 'ceph crash archive-all' "$live_trace_file"; then
+  fail "rollback must archive the specific crash id, not archive-all"
+fi
 grep -q '^ssh:systemctl is-active ceph-.*@osd\.0\.service$' "$live_trace_file" || fail "missing rollback is-active poll for osd.0"
 if grep -q '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$live_trace_file"; then
   fail "explicit systemctl start should not run when the OSD already recovered on its own"
 fi
 
-discover_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd ls-tree ceph-lab-osd-01$' "$live_trace_file" | head -1 | cut -d: -f1)"
-pid_line="$(grep -n '^ssh:systemctl show -p MainPID --value ceph-.*@osd\.0\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
-kill_line="$(grep -n '^ssh:sudo kill -SEGV 424242$' "$live_trace_file" | head -1 | cut -d: -f1)"
-archive_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph crash archive-all$' "$live_trace_file" | head -1 | cut -d: -f1)"
+ls_calls="$(grep -c '^ssh:sudo -n ls -1 /var/lib/ceph/' "$live_trace_file")"
+[[ "$ls_calls" -ge 4 ]] || fail "expected at least 4 crash-spool ls calls (1 baseline + 3 poll cycles), got $ls_calls"
+
+inspect_line="$(grep -n "^ssh:sudo -n podman inspect --format '{{.State.Pid}}' ceph-.*-osd-0\$" "$live_trace_file" | head -1 | cut -d: -f1)"
+pgrep_line="$(grep -n '^ssh:sudo -n pgrep -P 555555 ceph-osd$' "$live_trace_file" | head -1 | cut -d: -f1)"
+kill_line="$(grep -n '^ssh:sudo -n kill -SEGV 666666$' "$live_trace_file" | head -1 | cut -d: -f1)"
+first_ls_line="$(grep -n '^ssh:sudo -n ls -1 /var/lib/ceph/' "$live_trace_file" | head -1 | cut -d: -f1)"
+last_ls_line="$(grep -n '^ssh:sudo -n ls -1 /var/lib/ceph/' "$live_trace_file" | tail -1 | cut -d: -f1)"
+post_line="$(grep -n '^ssh:echo ZmFrZS1jcmFzaC1tZXRh | base64 -d | sudo -n cephadm shell -- ceph crash post -i -$' "$live_trace_file" | head -1 | cut -d: -f1)"
+archive_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph crash archive new-crash-id$' "$live_trace_file" | head -1 | cut -d: -f1)"
 active_poll_line="$(grep -n '^ssh:systemctl is-active ceph-.*@osd\.0\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 
-[[ -n "$discover_line" && -n "$pid_line" && -n "$kill_line" && -n "$archive_line" && -n "$active_poll_line" ]] || fail "missing trace lines for ordering checks"
-(( pid_line > discover_line )) || fail "MainPID lookup happened before OSD discovery"
-(( kill_line > pid_line )) || fail "kill -SEGV happened before MainPID lookup"
-(( archive_line > kill_line )) || fail "rollback crash archive-all happened before kill -SEGV"
-(( active_poll_line > archive_line )) || fail "rollback is-active poll happened before crash archive-all"
+[[ -n "$inspect_line" && -n "$pgrep_line" && -n "$kill_line" && -n "$first_ls_line" && -n "$last_ls_line" && -n "$post_line" && -n "$archive_line" && -n "$active_poll_line" ]] \
+  || fail "missing trace lines for ordering checks"
+(( pgrep_line > inspect_line )) || fail "pgrep -P happened before podman inspect"
+(( kill_line > pgrep_line )) || fail "kill -SEGV happened before pgrep -P"
+(( first_ls_line < kill_line )) || fail "crash-spool baseline snapshot did not happen before kill -SEGV"
+(( last_ls_line > kill_line )) || fail "crash-spool poll (spool diff) did not happen after kill -SEGV"
+(( post_line > last_ls_line )) || fail "crash post happened before the new crash dir was discovered"
+(( archive_line > post_line )) || fail "rollback crash archive happened before crash post"
+(( active_poll_line > archive_line )) || fail "rollback is-active poll happened before crash archive"
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'daemon-crash-*' | sort | tail -1)"
+[[ -f "$result_dir/target-osd-container.txt" ]] || fail "missing target-osd-container.txt evidence file"
+grep -Eq '^ceph-.*-osd-0$' "$result_dir/target-osd-container.txt" || fail "target-osd-container.txt content mismatch: $(cat "$result_dir/target-osd-container.txt" 2>/dev/null)"
 [[ -f "$result_dir/target-osd-pid.txt" ]] || fail "missing target-osd-pid.txt evidence file"
-[[ "$(cat "$result_dir/target-osd-pid.txt")" == "424242" ]] || fail "target-osd-pid.txt content mismatch: $(cat "$result_dir/target-osd-pid.txt" 2>/dev/null)"
+[[ "$(cat "$result_dir/target-osd-pid.txt")" == "666666" ]] || fail "target-osd-pid.txt content mismatch: $(cat "$result_dir/target-osd-pid.txt" 2>/dev/null)"
+[[ -f "$result_dir/crash-id.txt" ]] || fail "missing crash-id.txt evidence file"
+[[ "$(cat "$result_dir/crash-id.txt")" == "new-crash-id" ]] || fail "crash-id.txt content mismatch: $(cat "$result_dir/crash-id.txt" 2>/dev/null)"
+[[ -f "$result_dir/crash-spool-before.txt" ]] || fail "missing crash-spool-before.txt evidence file"
+[[ "$(cat "$result_dir/crash-spool-before.txt")" == "existing-crash-id" ]] || fail "crash-spool-before.txt must only contain the pre-existing crash id"
 
 # assert_sink_absent always writes sink-absent-check.log before the pass/fail branch, regardless of
 # outcome. Assert it exists to prove the pager-absence check for CephDaemonRecentCrash actually ran
 # (RECENT_CRASH is warning severity and must route to slack only, never pager).
 [[ -f "$result_dir/sink-absent-check.log" ]] || fail "missing negative-assertion evidence file for sink pager absence"
 
-ok "daemon-crash destructive ack guard, kill -SEGV injection sequence, and rollback ordering"
+ok "daemon-crash destructive ack guard, podman-inspect/pgrep/kill/spool-diff/post injection sequence, and rollback ordering"
 
 # --- Fallback path: the OSD unit never reports "active" on its own (systemd's
 # on-failure restart did not bring it back), so scenario_rollback must fall
@@ -243,20 +303,50 @@ ok "daemon-crash destructive ack guard, kill -SEGV injection sequence, and rollb
 make_fake_jq "$fallback_bin_dir/jq" "$real_jq" "$fallback_trace_file"
 make_fake_kubectl "$fallback_bin_dir/kubectl" "$fallback_trace_file"
 make_fake_curl "$fallback_bin_dir/curl" "$fallback_trace_file"
-make_fake_ssh "$fallback_bin_dir/ssh" "$fallback_trace_file" failed
+make_fake_ssh "$fallback_bin_dir/ssh" "$fallback_trace_file" failed 0
 
 set +e
-PATH="$fallback_bin_dir:$PATH" DAEMON_CRASH_RESTART_ATTEMPTS=1 DAEMON_CRASH_RESTART_SLEEP=0 \
+PATH="$fallback_bin_dir:$PATH" DAEMON_CRASH_SPOOL_SLEEP=0 DAEMON_CRASH_RESTART_ATTEMPTS=1 DAEMON_CRASH_RESTART_SLEEP=0 \
   bash "$ROOT/run/scenario-daemon-crash.sh" --yes-really-inject >"$fallback_stdout_file" 2>"$fallback_stderr_file"
 rc=$?
 set -e
 
 [[ "$rc" -eq 0 ]] || fail "expected success even when the OSD needs an explicit restart, got $rc"
 grep -q '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$fallback_trace_file" || fail "missing explicit systemctl start fallback when OSD did not self-recover"
+grep -q '^ssh:sudo -n cephadm shell -- ceph crash archive new-crash-id$' "$fallback_trace_file" || fail "missing rollback crash archive in fallback path"
 
 start_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$fallback_trace_file" | head -1 | cut -d: -f1)"
-fallback_archive_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph crash archive-all$' "$fallback_trace_file" | head -1 | cut -d: -f1)"
+fallback_archive_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph crash archive new-crash-id$' "$fallback_trace_file" | head -1 | cut -d: -f1)"
 [[ -n "$start_line" && -n "$fallback_archive_line" ]] || fail "missing trace lines for fallback ordering checks"
-(( start_line > fallback_archive_line )) || fail "explicit systemctl start happened before crash archive-all"
+(( start_line > fallback_archive_line )) || fail "explicit systemctl start happened before crash archive"
 
 ok "daemon-crash falls back to an explicit systemctl start when the OSD does not self-recover"
+
+# --- Failure path: no new crash dir ever appears under the crash spool (the
+# SEGV somehow didn't produce one, or ceph-osd's crash-dump path is broken).
+# scenario_inject must `die` instead of silently proceeding into verify with
+# an empty crash id, and the EXIT trap must still run scenario_rollback,
+# which must still ensure the OSD service is active (even though there is no
+# crash id to archive).
+make_fake_jq "$timeout_bin_dir/jq" "$real_jq" "$timeout_trace_file"
+make_fake_kubectl "$timeout_bin_dir/kubectl" "$timeout_trace_file"
+make_fake_curl "$timeout_bin_dir/curl" "$timeout_trace_file"
+make_fake_ssh "$timeout_bin_dir/ssh" "$timeout_trace_file" active 99
+
+set +e
+PATH="$timeout_bin_dir:$PATH" DAEMON_CRASH_SPOOL_ATTEMPTS=2 DAEMON_CRASH_SPOOL_SLEEP=0 \
+  bash "$ROOT/run/scenario-daemon-crash.sh" --yes-really-inject >"$timeout_stdout_file" 2>"$timeout_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected failure when no new crash dir ever appears under the spool"
+grep -q 'FATAL: no new crash dir appeared under /var/lib/ceph/' "$timeout_stderr_file" || fail "missing die message for crash-spool poll timeout"
+if grep -q 'ceph crash post -i -' "$timeout_trace_file"; then
+  fail "crash post must not run when no new crash dir was ever discovered"
+fi
+if grep -q 'ceph crash archive new-crash-id' "$timeout_trace_file"; then
+  fail "rollback must not attempt to archive a crash id that was never discovered"
+fi
+grep -q '^ssh:systemctl is-active ceph-.*@osd\.0\.service$' "$timeout_trace_file" || fail "rollback must still ensure the OSD service is active even when crash discovery failed"
+
+ok "daemon-crash dies when no new crash dir appears, and rollback still ensures the OSD is active"
