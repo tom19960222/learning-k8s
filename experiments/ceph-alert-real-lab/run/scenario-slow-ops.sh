@@ -16,6 +16,17 @@ source "$ROOT/lib/scenario-framework.sh"
 POOL="${SLOW_OPS_POOL:-alert-slow-ops}"
 OBJECT="${SLOW_OPS_OBJECT:-sentinel}"
 THROTTLE_BPS="${SLOW_OPS_THROTTLE_BPS:-262144}"
+# ceph_daemon_health_metrics{type="SLOW_OPS"} is a gauge of *currently*
+# slow ops that oscillates as the throttled OSD's op queue drains and
+# refills, while CephDaemonSlowOps requires it to sit CONTINUOUSLY > 0
+# for 3m (its `for: 3m`). Slow ops only start ramping up ~30-60s after
+# the throttle+bench begin, so the bench must keep the queue backed up
+# well past ramp-up + the 3m for: window (real-lab evidence: a 180s
+# bench let the gauge drop to 0 before ever sustaining 3 continuous
+# minutes, so the for: clock kept resetting and the alert timed out even
+# though the metric genuinely spiked to 16). 420s gives ~60s ramp + 180s
+# for: + scrape/evaluation margin, all under continuous load.
+SLOW_OPS_BENCH_SECONDS="${SLOW_OPS_BENCH_SECONDS:-420}"
 CEPH_VOLUME_METHOD=""
 OSD_ID=""
 OSD_HOST=""
@@ -126,7 +137,7 @@ start_background_capture() {
 start_bench_workload() {
   start_background_capture "$RESULT_DIR/rados-bench.txt" "$RESULT_DIR/rados-bench.child.pid" \
     ssh_lab "$LAB_MON_01_HOST" \
-    "sudo -n cephadm shell -- rados bench -p $POOL 180 write -b 4194304 -t 16 --no-cleanup"
+    "sudo -n cephadm shell -- rados bench -p $POOL $SLOW_OPS_BENCH_SECONDS write -b 4194304 -t 16 --no-cleanup"
 }
 
 stop_bench_workload() {
@@ -216,6 +227,27 @@ select_slow_ops_target() {
   printf '%s\n' "$CEPH_VOLUME_METHOD" >"$RESULT_DIR/ceph-volume-method.txt"
 }
 
+# with_sink_wait_attempts <attempts> <cmd...> mirrors lib/monitoring.sh's
+# with_prometheus_wait_attempts, but overrides SINK_WAIT_ATTEMPTS instead
+# (kept scenario-local like scenario-data-damage.sh's helper of the same
+# name -- see that script's own comment for why this isn't hoisted into
+# lib/monitoring.sh). Needed alongside the elevated CephDaemonSlowOps
+# prometheus wait below: real-lab evidence showed the per-daemon SLOW_OPS
+# gauge only sustains > 0 continuously late in a long bench run, so both
+# the alert-firing wait and the sink-delivery wait for CephDaemonSlowOps
+# need the same generous budget as SLOW_OPS_BENCH_SECONDS.
+with_sink_wait_attempts() {
+  local attempts=$1
+  shift
+  local saved="${SINK_WAIT_ATTEMPTS:-60}" rc=0
+  SINK_WAIT_ATTEMPTS="$attempts"
+  export SINK_WAIT_ATTEMPTS
+  "$@" || rc=$?
+  SINK_WAIT_ATTEMPTS="$saved"
+  export SINK_WAIT_ATTEMPTS
+  return "$rc"
+}
+
 scenario_setup() {
   while IFS= read -r pool_cmd; do
     run_live_step "pool-setup-$((pool_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $pool_cmd"
@@ -235,8 +267,15 @@ scenario_verify() {
   wait_ceph_health_check SLOW_OPS "$RESULT_DIR"
   wait_prometheus_alert CephClientBlocked name SLOW_OPS "$RESULT_DIR"
   wait_sink_alert pager CephClientBlocked name SLOW_OPS "$RESULT_DIR" "$SINK_CHECKPOINT"
-  wait_prometheus_alert CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR"
-  wait_sink_alert slack CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR" "$SINK_CHECKPOINT"
+  # CephDaemonSlowOps' for:3m needs the per-daemon SLOW_OPS gauge to stay
+  # continuously > 0 for a full 3 minutes; that window can start late into
+  # the bench run (after the two CephClientBlocked waits above already ate
+  # into it), so give both the firing wait and the sink-delivery wait the
+  # same 84*5s=420s budget as SLOW_OPS_BENCH_SECONDS instead of the default
+  # 60*5s=300s -- otherwise the wait can time out even though the bench
+  # keeps the throttled OSD backed up long enough for the alert to fire.
+  with_prometheus_wait_attempts 84 wait_prometheus_alert CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR"
+  with_sink_wait_attempts 84 wait_sink_alert slack CephDaemonSlowOps ceph_daemon "osd.$OSD_ID" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
 # Note: clear_bluestore_slow_ops (restarting OSDs still reporting BlueStore

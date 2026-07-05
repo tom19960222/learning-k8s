@@ -27,7 +27,30 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
-  printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"},{"labels":{"alertname":"CephDaemonSlowOps","ceph_daemon":"osd.4"},"state":"firing"}]}}'
+  # FAKE_ALERTS_COUNT_FILE + FAKE_SLOW_OPS_ALERT_DELAY simulate the
+  # CephDaemonSlowOps gauge only starting to fire after N alerts-endpoint
+  # polls (real-lab evidence: it only sustains > 0 continuously well into
+  # a long bench run). Only the CephDaemonSlowOps entry is delayed;
+  # CephClientBlocked always fires immediately, matching the real for:1m
+  # rule already validated on the real lab. Unset/0 preserves the
+  # original always-both-firing behavior for every other test below.
+  count_file="\${FAKE_ALERTS_COUNT_FILE:-}"
+  delay="\${FAKE_SLOW_OPS_ALERT_DELAY:-0}"
+  include_slow_ops=1
+  if [[ -n "\$count_file" && "\$delay" -gt 0 ]]; then
+    count=0
+    [[ -f "\$count_file" ]] && count="\$(cat "\$count_file")"
+    count=\$((count + 1))
+    printf '%s' "\$count" >"\$count_file"
+    if [[ "\$count" -lt "\$delay" ]]; then
+      include_slow_ops=0
+    fi
+  fi
+  if [[ "\$include_slow_ops" -eq 1 ]]; then
+    printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"},{"labels":{"alertname":"CephDaemonSlowOps","ceph_daemon":"osd.4"},"state":"firing"}]}}'
+  else
+    printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephClientBlocked","name":"SLOW_OPS"},"state":"firing"}]}}'
+  fi
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22ceph%22%7D"* ]]; then
@@ -263,6 +286,16 @@ result_dir="$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_fi
 [[ -f "$result_dir/prometheus-alerts-CephDaemonSlowOps-ceph_daemon.json" ]] || fail "missing CephDaemonSlowOps prometheus wait evidence"
 grep -q 'PASS: sink slack received CephDaemonSlowOps ceph_daemon=osd.4' "$live_stderr_file" || fail "missing evidence that slack received CephDaemonSlowOps for osd.4"
 
+# The rados bench must outlast CephDaemonSlowOps' for:3m window plus ~60s
+# ramp-up under continuous load (real-lab evidence: a 180s bench let the
+# per-daemon SLOW_OPS gauge drop to 0 before ever sustaining 3 continuous
+# minutes, so the for: clock kept resetting). Assert >= 360s so a future
+# shortening of SLOW_OPS_BENCH_SECONDS regresses this test.
+bench_line="$(grep -E '^ssh:sudo -n cephadm shell -- rados bench -p alert-slow-ops [0-9]+ write -b 4194304 -t 16 --no-cleanup$' "$live_trace_file" | head -1)"
+[[ -n "$bench_line" ]] || fail "missing rados bench invocation with expected command shape in trace"
+bench_duration="$(printf '%s\n' "$bench_line" | grep -oE '[0-9]+' | head -1)"
+[[ "$bench_duration" -ge 360 ]] || fail "expected slow-ops bench duration >= 360s to outlast CephDaemonSlowOps for:3m + ramp-up, got ${bench_duration}s"
+
 cephadm_fallback_stdout_file="$(mktemp)"
 cephadm_fallback_stderr_file="$(mktemp)"
 cephadm_fallback_trace_file="$(mktemp)"
@@ -369,5 +402,63 @@ if grep -q '^result:' "$recovery_fail_stdout_file"; then
   fail "recovery failure printed misleading result line"
 fi
 grep -q 'TIMEOUT: Ceph/Rook/Prometheus recovered' "$recovery_fail_stderr_file" || fail "missing recovery failure timeout evidence"
+
+# CephDaemonSlowOps has for:3m, and real-lab evidence showed its
+# per-daemon SLOW_OPS gauge only starts sustaining continuously well past
+# the default 60*5s=300s wait budget every other alert in this lab uses.
+# FAKE_SLOW_OPS_ALERT_DELAY makes the alerts endpoint withhold the
+# CephDaemonSlowOps entry until its 70th poll (needs >60 attempts, still
+# fits the scenario's elevated 84-attempt budget for that one wait) to
+# prove scenario-slow-ops.sh actually raises the attempts budget for it.
+slow_ops_delay_stdout_file="$(mktemp)"
+slow_ops_delay_stderr_file="$(mktemp)"
+slow_ops_delay_trace_file="$(mktemp)"
+slow_ops_delay_count_file="$(mktemp)"
+rm -f "$slow_ops_delay_count_file"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$slow_ops_delay_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$slow_ops_delay_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$slow_ops_delay_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$slow_ops_delay_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_ALERTS_COUNT_FILE="$slow_ops_delay_count_file" \
+  FAKE_SLOW_OPS_ALERT_DELAY=70 \
+  PROMETHEUS_WAIT_SLEEP=0 \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$slow_ops_delay_stdout_file" 2>"$slow_ops_delay_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -eq 0 ]] || fail "expected scenario to survive CephDaemonSlowOps firing only on the 70th poll (needs the elevated attempts budget), got $rc"
+grep -q 'PASS: Prometheus alert CephDaemonSlowOps ceph_daemon=osd.4 firing' "$slow_ops_delay_stderr_file" || fail "missing PASS evidence for delayed CephDaemonSlowOps prometheus wait"
+
+# Prove the budget is elevated but still bounded (not e.g. an unrelated
+# infinite-ish default): the same delay pushed past the 84-attempt budget
+# must time out.
+slow_ops_timeout_stdout_file="$(mktemp)"
+slow_ops_timeout_stderr_file="$(mktemp)"
+slow_ops_timeout_trace_file="$(mktemp)"
+slow_ops_timeout_count_file="$(mktemp)"
+rm -f "$slow_ops_timeout_count_file"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$slow_ops_timeout_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$slow_ops_timeout_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$slow_ops_timeout_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$slow_ops_timeout_trace_file"
+
+set +e
+PATH="$fake_bin_dir:$PATH" \
+  FAKE_ALERTS_COUNT_FILE="$slow_ops_timeout_count_file" \
+  FAKE_SLOW_OPS_ALERT_DELAY=90 \
+  PROMETHEUS_WAIT_SLEEP=0 \
+  bash "$ROOT/run/scenario-slow-ops.sh" --yes-really-inject >"$slow_ops_timeout_stdout_file" 2>"$slow_ops_timeout_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected CephDaemonSlowOps firing on the 90th poll to exceed the 84-attempt budget and fail"
+grep -q 'TIMEOUT: Prometheus alert CephDaemonSlowOps ceph_daemon=osd.4 firing' "$slow_ops_timeout_stderr_file" || fail "missing TIMEOUT evidence for CephDaemonSlowOps prometheus wait"
 
 ok "slow-ops destructive ack guard"
