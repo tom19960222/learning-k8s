@@ -168,7 +168,7 @@ scenario_rollback() {
   flag_count="$(grep -c 'norecover' "$dump_output" || true)"
   if [[ "$flag_count" -ne 0 ]]; then
     log "norecover flag still set during rollback; unsetting defensively"
-    run_capture "$RESULT_DIR/rollback-unset-norecover.txt" ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd unset norecover" || true
+    run_capture "$RESULT_DIR/rollback-unset-norecover.txt" ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd unset norecover" || rc=1
   fi
 
   while IFS= read -r cleanup_cmd; do

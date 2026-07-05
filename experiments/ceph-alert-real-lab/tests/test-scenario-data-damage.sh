@@ -260,7 +260,7 @@ fi
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd map alert-damage victim --format json$' "$live_trace_file" || fail "missing dynamic osd map"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd find 5 --format json$' "$live_trace_file" || fail "missing osd find for selected non-primary OSD"
 grep -q '^ssh:sudo systemctl stop ceph-.*@osd\.5\.service$' "$live_trace_file" || fail "missing stop for osd.5"
-grep -q '^ssh:sudo cephadm shell --name osd\.5 -- ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3\.0 victim remove$' "$live_trace_file" || fail "missing ceph-objectstore-tool invocation on the OSD's own host"
+grep -q '^ssh:sudo -n cephadm shell --name osd\.5 -- ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3\.0 victim remove$' "$live_trace_file" || fail "missing ceph-objectstore-tool invocation on the OSD's own host"
 start_count="$(grep -c '^ssh:sudo systemctl start ceph-.*@osd\.5\.service$' "$live_trace_file" || true)"
 [[ "$start_count" -ge 1 ]] || fail "missing restart for osd.5"
 grep -q '^ssh:sudo -n cephadm shell -- ceph pg 3\.0 query --format json$' "$live_trace_file" || fail "missing PG-active poll after restart"
@@ -270,7 +270,7 @@ delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete al
 [[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
 
 stop_line="$(grep -n '^ssh:sudo systemctl stop ceph-.*@osd\.5\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
-objtool_line="$(grep -n '^ssh:sudo cephadm shell --name osd\.5 -- ceph-objectstore-tool' "$live_trace_file" | head -1 | cut -d: -f1)"
+objtool_line="$(grep -n '^ssh:sudo -n cephadm shell --name osd\.5 -- ceph-objectstore-tool' "$live_trace_file" | head -1 | cut -d: -f1)"
 start_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.5\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 scrub_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph pg deep-scrub 3\.0$' "$live_trace_file" | head -1 | cut -d: -f1)"
 repair_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph pg repair 3\.0$' "$live_trace_file" | head -1 | cut -d: -f1)"

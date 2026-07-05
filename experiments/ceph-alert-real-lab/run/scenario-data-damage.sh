@@ -137,7 +137,7 @@ scenario_inject() {
   # the object store while its daemon is still running against it -- the
   # poll above is not optional, it is what makes this safe.
   run_capture "$RESULT_DIR/objectstore-tool-remove.txt" ssh_lab "$OSD_HOST" \
-    "sudo cephadm shell --name osd.$OSD_ID -- ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-$OSD_ID --pgid $PGID $OBJECT remove"
+    "sudo -n cephadm shell --name osd.$OSD_ID -- ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-$OSD_ID --pgid $PGID $OBJECT remove"
 
   run_live_step "start-osd" "$OSD_HOST" "sudo systemctl start $OSD_SERVICE"
   poll_until "osd.$OSD_ID up after objectstore-tool" "${DATA_DAMAGE_POLL_ATTEMPTS:-24}" "${DATA_DAMAGE_POLL_SLEEP:-5}" osd_tree_status_is up
