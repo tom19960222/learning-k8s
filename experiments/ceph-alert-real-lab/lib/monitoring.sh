@@ -351,6 +351,24 @@ wait_prometheus_alert() {
   poll_until "Prometheus alert $alertname $label_name=$label_value firing" "${PROMETHEUS_WAIT_ATTEMPTS:-60}" "${PROMETHEUS_WAIT_SLEEP:-5}" prometheus_alert_is_firing "$alertname" "$label_name" "$label_value" "$result_dir"
 }
 
+# with_prometheus_wait_attempts <attempts> <cmd...> temporarily overrides
+# PROMETHEUS_WAIT_ATTEMPTS for a single call (e.g. one wait_prometheus_alert
+# invocation) whose `for:` window differs from this scenario's other stages,
+# then restores whatever value (or absence) was in effect before. Used by
+# multi-stage scenarios (e.g. capacity-ladder, pool-quota) where different
+# ladder rungs correspond to alerts with different `for:` durations.
+with_prometheus_wait_attempts() {
+  local attempts=$1
+  shift
+  local saved="${PROMETHEUS_WAIT_ATTEMPTS:-60}" rc=0
+  PROMETHEUS_WAIT_ATTEMPTS="$attempts"
+  export PROMETHEUS_WAIT_ATTEMPTS
+  "$@" || rc=$?
+  PROMETHEUS_WAIT_ATTEMPTS="$saved"
+  export PROMETHEUS_WAIT_ATTEMPTS
+  return "$rc"
+}
+
 prometheus_alert_is_firing() {
   local alertname=$1 label_name=$2 label_value=$3 result_dir=$4 pod out
   pod="$(kubectl_lab -n "$LAB_NAMESPACE" get pod -l app=prometheus -o jsonpath='{.items[0].metadata.name}')"
