@@ -32,10 +32,20 @@ mgr_failover_continuity_probe() {
   jq -e '.data.result | length > 0' "$output_file" >/dev/null
 }
 
+standby_mgr_present() {
+  ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph mgr dump --format json" >"$RESULT_DIR/mgr-dump-after-fail.json"
+  jq -e '.standbys | length > 0' "$RESULT_DIR/mgr-dump-after-fail.json" >/dev/null
+}
+
 discover_standby_mgr() {
   local mgr_dump standby_name host_prefix
   mgr_dump="$RESULT_DIR/mgr-dump-after-fail.json"
-  ssh_lab "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph mgr dump --format json" >"$mgr_dump"
+  # The demoted mgr from phase (a)'s `ceph mgr fail` takes seconds to tens of
+  # seconds to re-register as a standby, so a single query can race it and
+  # observe an empty `.standbys` list. Poll instead of querying once.
+  poll_until "standby mgr re-registration after ceph mgr fail" \
+    "${MGR_STANDBY_ATTEMPTS:-24}" "${MGR_STANDBY_SLEEP:-5}" standby_mgr_present \
+    || die "no standby mgr found after ceph mgr fail"
   standby_name="$(jq -r '.standbys[0].name // empty' "$mgr_dump")"
   [[ -n "$standby_name" ]] || die "no standby mgr found after ceph mgr fail"
   host_prefix="${standby_name%%.*}"
