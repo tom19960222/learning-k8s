@@ -61,7 +61,7 @@ EOF
 }
 
 make_fake_ssh() {
-  local path=$1 trace_file=$2 kill0_rc="${3:-0}"
+  local path=$1 trace_file=$2 kill0_rc="${3:-0}" tcdel_rc="${4:-0}" netem_stuck="${5:-0}"
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -107,7 +107,32 @@ case "\$command" in
     printf '{"quorum":[0,1,2]}\n'
     exit 0
     ;;
-  *"ceph osd tree"*|*"sudo tc qdisc add dev eth0 root netem delay 1200ms"*|*"sudo tc qdisc del dev eth0 root || true"*|*"sudo pkill -f 'sleep 900' || true"*)
+  *"sudo tc qdisc del dev eth0 root || true"*)
+    # This command's own ssh transport rides over the interface it is
+    # deleting the netem delay from -- tcdel_rc models that the ssh exit
+    # code here is unreliable (e.g. self-disruption returns non-zero) even
+    # though the remote deletion (guarded by \`|| true\` server-side) still
+    # took effect, which the later "tc qdisc show" branch below reflects.
+    printf 'ssh-live-noise\n'
+    exit $tcdel_rc
+    ;;
+  *"tc qdisc show dev eth0"*)
+    # netem_stuck models a rollback that never actually removes the qdisc
+    # (verification must keep failing). Otherwise, report netem present
+    # until the explicit rollback del command has actually appeared in the
+    # trace (distinguishing it from the unrelated auto-revert nohup command,
+    # which also mentions "tc qdisc del dev eth0 root" but is only an armed
+    # future timer, not a completed deletion), then netem-free after.
+    if [[ "$netem_stuck" -eq 1 ]]; then
+      printf 'qdisc netem 1: root refcnt 2 limit 1000 delay 1.2s\n'
+    elif grep -Fq 'tc qdisc del dev eth0 root || true' "$trace_file"; then
+      printf 'qdisc noqueue 0: root refcnt 2\n'
+    else
+      printf 'qdisc netem 1: root refcnt 2 limit 1000 delay 1.2s\n'
+    fi
+    exit 0
+    ;;
+  *"ceph osd tree"*|*"sudo tc qdisc add dev eth0 root netem delay 1200ms"*|*"sudo pkill -f 'sleep 900' || true"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -256,3 +281,76 @@ dead_result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'net-slow-hear
 rm -f "$dead_stdout_file" "$dead_stderr_file" "$dead_trace_file"
 
 ok "net-slow-heartbeat dies before netem injection when armed-revert liveness check fails, rollback stays safe"
+
+# --- Rollback exit-code hygiene: `tc qdisc del`'s own ssh session rides over
+# the very interface whose netem delay it is removing, so it can self-disrupt
+# and make ssh itself exit non-zero (modeled here as 255) EVEN THOUGH the
+# remote deletion (guarded by `|| true` server-side) actually succeeded. The
+# scenario must NOT fail rollback on that transport hiccup -- it must instead
+# observe, via a fresh ssh, that the qdisc is actually gone, and succeed on
+# that basis.
+selfdisrupt_stdout_file="$(mktemp)"
+selfdisrupt_stderr_file="$(mktemp)"
+selfdisrupt_trace_file="$(mktemp)"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$selfdisrupt_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$selfdisrupt_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$selfdisrupt_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$selfdisrupt_trace_file" 0 255 0
+
+set +e
+PATH="$fake_bin_dir:$PATH" bash "$ROOT/run/scenario-net-slow-heartbeat.sh" --yes-really-inject >"$selfdisrupt_stdout_file" 2>"$selfdisrupt_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -eq 0 ]] || fail "expected success despite tc-del ssh transport self-disruption, got $rc, stderr: $(cat "$selfdisrupt_stderr_file")"
+grep -Fq 'sudo tc qdisc del dev eth0 root || true' "$selfdisrupt_trace_file" || fail "missing rollback qdisc delete attempt in self-disruption run"
+grep -Fq 'tc qdisc show dev eth0' "$selfdisrupt_trace_file" || fail "missing fresh-ssh netem verification poll in self-disruption run"
+
+selfdisrupt_result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'net-slow-heartbeat-*' | sort | tail -1)"
+[[ -f "$selfdisrupt_result_dir/rollback-tc-qdisc-del.txt" ]] || fail "missing rollback-tc-qdisc-del.txt evidence file"
+grep -Fq '# exit_code: 255' "$selfdisrupt_result_dir/rollback-tc-qdisc-del.txt" \
+  || fail "tc-del evidence should record the self-disrupted ssh's non-zero exit code (255), proving the fix tolerates it"
+[[ -f "$selfdisrupt_result_dir/rollback-verify-tc-qdisc-show.txt" ]] || fail "missing rollback-verify-tc-qdisc-show.txt evidence file"
+if grep -Fq netem "$selfdisrupt_result_dir/rollback-verify-tc-qdisc-show.txt"; then
+  fail "netem verification evidence should show the qdisc is gone, found: $(cat "$selfdisrupt_result_dir/rollback-verify-tc-qdisc-show.txt")"
+fi
+
+rm -f "$selfdisrupt_stdout_file" "$selfdisrupt_stderr_file" "$selfdisrupt_trace_file"
+
+ok "net-slow-heartbeat rollback succeeds even when tc-del's own ssh self-disrupts (non-zero exit), because netem removal is verified via a fresh ssh"
+
+# --- Rollback failure: netem genuinely never disappears after the tc-del
+# attempt (fake ssh forced stuck via netem_stuck=1), even though the tc-del
+# command's own ssh exit code is a clean 0 here. The verification poll must
+# time out and scenario_rollback must return non-zero -- proving success is
+# gated on the observed qdisc state, not on the tc-del command's transport
+# exit code either way.
+stuck_stdout_file="$(mktemp)"
+stuck_stderr_file="$(mktemp)"
+stuck_trace_file="$(mktemp)"
+rm -rf "$fake_bin_dir"
+fake_bin_dir="$(mktemp -d)"
+make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$stuck_trace_file"
+make_fake_kubectl "$fake_bin_dir/kubectl" "$stuck_trace_file"
+make_fake_curl "$fake_bin_dir/curl" "$stuck_trace_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$stuck_trace_file" 0 0 1
+
+set +e
+PATH="$fake_bin_dir:$PATH" NET_SLOW_HEARTBEAT_ROLLBACK_ATTEMPTS=2 NET_SLOW_HEARTBEAT_ROLLBACK_SLEEP=0 \
+  bash "$ROOT/run/scenario-net-slow-heartbeat.sh" --yes-really-inject >"$stuck_stdout_file" 2>"$stuck_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected failure when netem never actually clears after rollback"
+grep -Fq 'sudo tc qdisc del dev eth0 root || true' "$stuck_trace_file" || fail "missing rollback qdisc delete attempt in stuck-netem run"
+grep -Fq 'TIMEOUT: netem qdisc removed from eth0' "$stuck_stderr_file" || fail "missing timeout log for netem verification poll"
+
+stuck_result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'net-slow-heartbeat-*' | sort | tail -1)"
+[[ -f "$stuck_result_dir/rollback-verify-tc-qdisc-show.txt" ]] || fail "missing rollback-verify-tc-qdisc-show.txt evidence file on failure path"
+grep -Fq netem "$stuck_result_dir/rollback-verify-tc-qdisc-show.txt" || fail "netem verification evidence should still show netem present on failure path"
+
+rm -f "$stuck_stdout_file" "$stuck_stderr_file" "$stuck_trace_file"
+
+ok "net-slow-heartbeat rollback fails when netem genuinely never clears, not merely when tc-del's ssh exit is nonzero"

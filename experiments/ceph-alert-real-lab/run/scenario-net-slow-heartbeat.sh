@@ -65,10 +65,33 @@ scenario_verify() {
   wait_sink_alert pager CephOSDSlowHeartbeat "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
+# netem_removed_from_iface polls a FRESH ssh session (captured to
+# $RESULT_DIR as evidence) for whether the netem qdisc is still present on
+# $_iface. Used by scenario_rollback below instead of trusting the tc-del
+# command's own ssh exit code -- see the comment there for why.
+netem_removed_from_iface() {
+  local output_file="$RESULT_DIR/rollback-verify-tc-qdisc-show.txt"
+  ssh_lab "$_host_ip" "tc qdisc show dev $_iface" >"$output_file" 2>&1 || return 1
+  ! grep -q netem "$output_file"
+}
+
 scenario_rollback() {
   local rc=0
-  run_capture "$RESULT_DIR/rollback-tc-qdisc-del.txt" ssh_lab "$_host_ip" "sudo tc qdisc del dev $_iface root || true" || rc=1
-  run_capture "$RESULT_DIR/rollback-kill-armed-sleeper.txt" ssh_lab "$_host_ip" "sudo pkill -f 'sleep $NET_SLOW_HEARTBEAT_ARM_SLEEP' || true" || rc=1
+  # `tc qdisc del` rides over the very ssh session whose transport runs
+  # through $_iface. Deleting the netem delay mid-command can self-disrupt
+  # that ssh session and make it exit non-zero (e.g. 255) EVEN THOUGH the
+  # remote `tc qdisc del` (guarded by `|| true`) already succeeded --
+  # so this command's own ssh exit code is not trustworthy and must NOT
+  # gate rc. The verification poll below, over a fresh ssh session started
+  # after the delay is gone, is what actually decides rollback success.
+  run_capture "$RESULT_DIR/rollback-tc-qdisc-del.txt" ssh_lab "$_host_ip" "sudo tc qdisc del dev $_iface root || true" || true
+  # A pkill that finds no matching process (armed sleeper already fired, or
+  # never needed) exits 1 even though nothing is wrong; don't gate rc on it.
+  run_capture "$RESULT_DIR/rollback-kill-armed-sleeper.txt" ssh_lab "$_host_ip" "sudo pkill -f 'sleep $NET_SLOW_HEARTBEAT_ARM_SLEEP' || true" || true
+  poll_until "netem qdisc removed from $_iface on $_host_ip" \
+    "${NET_SLOW_HEARTBEAT_ROLLBACK_ATTEMPTS:-6}" "${NET_SLOW_HEARTBEAT_ROLLBACK_SLEEP:-5}" \
+    netem_removed_from_iface \
+    || rc=1
   return "$rc"
 }
 
