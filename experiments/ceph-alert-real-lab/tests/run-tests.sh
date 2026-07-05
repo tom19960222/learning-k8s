@@ -34,6 +34,7 @@ for path in \
   "$ROOT/tests/test-scenario-pool-quota.sh" \
   "$ROOT/tests/test-scenario-capacity-forecast.sh" \
   "$ROOT/tests/test-scenario-data-damage.sh" \
+  "$ROOT/tests/test-scenario-object-unfound.sh" \
   "$ROOT/tests/test-scenario-framework.sh" \
   "$ROOT/tests/test-evidence.sh" \
   "$ROOT/tests/test-monitoring-render.sh"; do
@@ -63,6 +64,7 @@ bash "$ROOT/tests/test-scenario-capacity-ladder.sh"
 bash "$ROOT/tests/test-scenario-pool-quota.sh"
 bash "$ROOT/tests/test-scenario-capacity-forecast.sh"
 bash "$ROOT/tests/test-scenario-data-damage.sh"
+bash "$ROOT/tests/test-scenario-object-unfound.sh"
 bash "$ROOT/tests/test-scenario-framework.sh"
 bash "$ROOT/tests/test-evidence.sh"
 bash "$ROOT/tests/test-monitoring-render.sh"
