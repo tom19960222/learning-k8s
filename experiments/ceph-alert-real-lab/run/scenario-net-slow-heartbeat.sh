@@ -35,12 +35,23 @@ scenario_setup() {
 # back. Its stdout/stderr are redirected to /dev/null so this ssh_lab call
 # returns as soon as the remote shell backgrounds it and echoes its PID,
 # instead of blocking on an inherited pipe for the life of the sleeper.
+#
+# A non-empty PID only proves the remote fork succeeded, not that the sleeper
+# is actually running -- sudo or the backgrounded `sh -c` can still fail right
+# after `&`, and `$!` from that shell is echoed regardless. Because this timer
+# is the only safety net once the netem delay makes SSH unreliable, arming it
+# silently and moving on would leave the destructive qdisc applied with no
+# way to auto-revert. So immediately after recording the PID we confirm it is
+# alive with `sudo kill -0 <pid>` over the same SSH path and `die` -- before
+# any qdisc is ever added -- if that confirmation fails.
 arm_auto_revert() {
   local pid
   pid="$(ssh_lab "$_host_ip" "sudo nohup sh -c 'sleep $NET_SLOW_HEARTBEAT_ARM_SLEEP; tc qdisc del dev $_iface root' >/dev/null 2>&1 & echo \$!")"
   pid="$(printf '%s' "$pid" | tr -d '[:space:]')"
   [[ -n "$pid" ]] || die "failed to arm auto-revert sleeper on $_host_ip"
   printf '%s\n' "$pid" >"$RESULT_DIR/armed-revert.pid"
+  run_capture "$RESULT_DIR/armed-revert-liveness.txt" ssh_lab "$_host_ip" "sudo kill -0 $pid" \
+    || die "auto-revert sleeper pid $pid on $_host_ip failed liveness check -- refusing to apply netem delay with no confirmed safety net"
 }
 
 scenario_inject() {
