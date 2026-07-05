@@ -75,3 +75,11 @@ bash experiments/ceph-alert-real-lab/run/scenario-mon-quorum-lost.sh --yes-reall
 ```bash
 bash experiments/ceph-alert-real-lab/run/scenario-low-priority-notice.sh --yes-really-inject
 ```
+
+## CephCapacityForecast
+
+這個情境會用一個「本機背景迴圈」持續打 `rados bench` 到測試 pool（最多 45 輪、每輪 60 秒），讓 `ceph_cluster_total_used_bytes` 累積出足夠的成長斜率，等待 `predict_linear(...)` 推算 3 天後會超過 85% 容量並觸發 `CephCapacityForecast`，確認只進 Slack、不進 pager，最後 kill 掉背景迴圈並刪除 pool rollback。**注意：`for: 30m`，真的跑（`--yes-really-inject`）wall-clock 可能超過 45 分鐘，且會在測試 pool 寫入數十 GiB 的資料（這個 lab 叢集有 900GiB 可用空間，足夠安全）。**
+
+```bash
+bash experiments/ceph-alert-real-lab/run/scenario-capacity-forecast.sh --yes-really-inject
+```
