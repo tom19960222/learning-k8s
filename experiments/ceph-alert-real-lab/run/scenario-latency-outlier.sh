@@ -235,6 +235,15 @@ scenario_verify() {
   assert_sink_absent pager CephOSDLatencyOutlier "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
+# Note: clear_bluestore_slow_ops (lib/evidence.sh; aging out the latched
+# BLUESTORE_SLOW_OP_ALERT warning) must run as part of rollback so HEALTH_OK
+# can be reached before scenario_main's assert_lab_recovered polls. Real-lab
+# evidence (S11): this scenario's tighter 1MB/s retry throttle (see
+# scenario_verify above) latched BLUESTORE_SLOW_OP_ALERT on 9 OSDs even though
+# CephOSDLatencyOutlier fired and delivered to slack correctly -- the
+# recovery gate then timed out on that lingering HEALTH_WARN. Shared with
+# scenario-slow-ops.sh, which hits the same latch via its harder 256KB/s
+# throttle and validated this fix on the real cluster (S1).
 scenario_rollback() {
   local rc=0
 
@@ -251,6 +260,7 @@ scenario_rollback() {
     run_live_step "rollback-pool-cleanup-$((cleanup_step))" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $cleanup_cmd" || rc=1
     cleanup_step=$((cleanup_step + 1))
   done < <(pool_cleanup_commands "$POOL")
+  clear_bluestore_slow_ops "$RESULT_DIR" || rc=1
   return "$rc"
 }
 

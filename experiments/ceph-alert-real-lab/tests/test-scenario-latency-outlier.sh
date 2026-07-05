@@ -134,7 +134,34 @@ case "\$command" in
     exit 0
     ;;
   *"ceph health detail"*)
-    printf 'HEALTH_OK\n'
+    base_msg='HEALTH_OK'
+    # FAKE_BLUESTORE_HEALTH_COUNT_FILE + FAKE_BLUESTORE_CLEAR_AFTER and
+    # FAKE_BLUESTORE_ALWAYS_ALERT mirror test-scenario-slow-ops.sh's fixture:
+    # this scenario's tighter (1MB/s retry) throttle also latches
+    # BLUESTORE_SLOW_OP_ALERT cluster-wide (real-lab evidence: S11 fired
+    # CephOSDLatencyOutlier correctly, then the recovery gate timed out on
+    # this warning because rollback never cleared it). Unset/0 for both
+    # preserves the original plain-HEALTH_OK response used by every other
+    # test below.
+    bluestore_count_file="\${FAKE_BLUESTORE_HEALTH_COUNT_FILE:-}"
+    clear_after="\${FAKE_BLUESTORE_CLEAR_AFTER:-0}"
+    if [[ -n "\$bluestore_count_file" && "\$clear_after" -gt 0 ]]; then
+      bcount=0
+      [[ -f "\$bluestore_count_file" ]] && bcount="\$(cat "\$bluestore_count_file")"
+      bcount=\$((bcount + 1))
+      printf '%s' "\$bcount" >"\$bluestore_count_file"
+      if [[ "\$bcount" -le "\$clear_after" ]]; then
+        printf '%s\n%s\n' "\$base_msg" 'BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)'
+        exit 0
+      fi
+      printf '%s\n' "\$base_msg"
+      exit 0
+    fi
+    if [[ "\${FAKE_BLUESTORE_ALWAYS_ALERT:-0}" == "1" ]]; then
+      printf '%s\n%s\n' "\$base_msg" 'BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)'
+      exit 0
+    fi
+    printf '%s\n' "\$base_msg"
     exit 0
     ;;
   *"quorum_status --format json"*)
@@ -163,6 +190,10 @@ case "\$command" in
     exit 0
     ;;
   *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*)
+    printf 'ssh-live-noise\n'
+    exit 0
+    ;;
+  *"ceph config set osd bluestore_slow_ops_warn_"*|*"ceph config rm osd bluestore_slow_ops_warn_"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -440,3 +471,80 @@ grep -q "rbps=max" "$pager_leak_trace_file" || fail "rollback unthrottle missing
 grep -q "^ssh:sudo -n cephadm shell -- sh -c 'pkill -f \"\[r\]ados bench -p alert-latency-outlier\" || true'\$" "$pager_leak_trace_file" || fail "rollback pkill missing after pager-leak failure"
 
 ok "latency-outlier assert_sink_absent fails and still rolls back when pager leaks CephOSDLatencyOutlier"
+
+# --- BlueStore cleanup: real-lab evidence (S11) showed this scenario's tighter
+# (1MB/s retry) throttle leaves BLUESTORE_SLOW_OP_ALERT latched on 9 OSDs even
+# though CephOSDLatencyOutlier fired correctly -- the alert path worked, but
+# scenario_rollback never cleared the BlueStore warning, so assert_lab_recovered
+# timed out waiting for HEALTH_OK. Reuses the shared clear_bluestore_slow_ops
+# helper (lib/evidence.sh) already proven by scenario-slow-ops.sh. Mirrors that
+# scenario's own bluestore_clear_* test: FAKE_BLUESTORE_CLEAR_AFTER makes the
+# fake `ceph health detail` keep reporting BLUESTORE_SLOW_OP_ALERT for the
+# first few polls before clearing, proving rollback actually loops rather than
+# checking once.
+bluestore_clear_stdout_file="$(mktemp)"
+bluestore_clear_stderr_file="$(mktemp)"
+bluestore_clear_trace_file="$(mktemp)"
+bluestore_clear_count_file="$(mktemp)"
+bluestore_clear_bin_dir="$(mktemp -d)"
+rm -f "$bluestore_clear_count_file"
+make_fake_jq "$bluestore_clear_bin_dir/jq" "$real_jq" "$bluestore_clear_trace_file"
+make_fake_kubectl "$bluestore_clear_bin_dir/kubectl" "$bluestore_clear_trace_file"
+make_fake_curl "$bluestore_clear_bin_dir/curl" "$bluestore_clear_trace_file"
+make_fake_ssh "$bluestore_clear_bin_dir/ssh" "$bluestore_clear_trace_file"
+
+set +e
+PATH="$bluestore_clear_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=2 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  FAKE_BLUESTORE_HEALTH_COUNT_FILE="$bluestore_clear_count_file" \
+  FAKE_BLUESTORE_CLEAR_AFTER=5 \
+  BLUESTORE_CLEAR_SLEEP=0 \
+  bash "$ROOT/run/scenario-latency-outlier.sh" --yes-really-inject >"$bluestore_clear_stdout_file" 2>"$bluestore_clear_stderr_file"
+rc=$?
+set -e
+rm -rf "$bluestore_clear_bin_dir"
+
+[[ "$rc" -eq 0 ]] || fail "expected scenario to survive BLUESTORE_SLOW_OP_ALERT aging out mid-poll during rollback, got $rc"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_lifetime 1$' "$bluestore_clear_trace_file" || fail "rollback missing bluestore_slow_ops_warn_lifetime=1 config set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_threshold 1$' "$bluestore_clear_trace_file" || fail "rollback missing bluestore_slow_ops_warn_threshold=1 config set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$bluestore_clear_trace_file" || fail "rollback missing bluestore_slow_ops_warn_lifetime restore"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$bluestore_clear_trace_file" || fail "rollback missing bluestore_slow_ops_warn_threshold restore"
+grep -q 'PASS: BLUESTORE_SLOW_OP_ALERT cleared' "$bluestore_clear_stderr_file" || fail "missing evidence that rollback polled until BLUESTORE_SLOW_OP_ALERT cleared"
+health_detail_polls="$(grep -c '^ssh:sudo -n cephadm shell -- ceph health detail$' "$bluestore_clear_trace_file" || true)"
+[[ "$health_detail_polls" -ge 4 ]] || fail "expected rollback to poll ceph health detail repeatedly before it cleared, saw $health_detail_polls"
+rm -f "$bluestore_clear_stdout_file" "$bluestore_clear_stderr_file" "$bluestore_clear_trace_file" "$bluestore_clear_count_file"
+
+ok "latency-outlier rollback clears a latched BLUESTORE_SLOW_OP_ALERT before the recovery gate polls"
+
+# Prove the config rm restores ALWAYS run during rollback, even when the poll
+# times out (FAKE_BLUESTORE_ALWAYS_ALERT never clears the fake alert): a
+# lingering bluestore_slow_ops_warn_lifetime=1 would silently suppress the
+# real alert later, so the restore must not be skipped just because the poll
+# failed.
+bluestore_timeout_stdout_file="$(mktemp)"
+bluestore_timeout_stderr_file="$(mktemp)"
+bluestore_timeout_trace_file="$(mktemp)"
+bluestore_timeout_bin_dir="$(mktemp -d)"
+make_fake_jq "$bluestore_timeout_bin_dir/jq" "$real_jq" "$bluestore_timeout_trace_file"
+make_fake_kubectl "$bluestore_timeout_bin_dir/kubectl" "$bluestore_timeout_trace_file"
+make_fake_curl "$bluestore_timeout_bin_dir/curl" "$bluestore_timeout_trace_file"
+make_fake_ssh "$bluestore_timeout_bin_dir/ssh" "$bluestore_timeout_trace_file"
+
+set +e
+PATH="$bluestore_timeout_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=2 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  FAKE_BLUESTORE_ALWAYS_ALERT=1 \
+  BLUESTORE_CLEAR_ATTEMPTS=2 \
+  BLUESTORE_CLEAR_SLEEP=0 \
+  bash "$ROOT/run/scenario-latency-outlier.sh" --yes-really-inject >"$bluestore_timeout_stdout_file" 2>"$bluestore_timeout_stderr_file"
+rc=$?
+set -e
+rm -rf "$bluestore_timeout_bin_dir"
+
+[[ "$rc" -ne 0 ]] || fail "expected scenario to fail (nonzero exit) when rollback's BLUESTORE_SLOW_OP_ALERT poll never clears"
+grep -q 'TIMEOUT: BLUESTORE_SLOW_OP_ALERT cleared' "$bluestore_timeout_stderr_file" || fail "missing TIMEOUT evidence for rollback's BLUESTORE_SLOW_OP_ALERT poll"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_lifetime 1$' "$bluestore_timeout_trace_file" || fail "missing bluestore_slow_ops_warn_lifetime=1 config set on timeout path"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_threshold 1$' "$bluestore_timeout_trace_file" || fail "missing bluestore_slow_ops_warn_threshold=1 config set on timeout path"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$bluestore_timeout_trace_file" || fail "config rm for bluestore_slow_ops_warn_lifetime must still run after a rollback poll timeout"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$bluestore_timeout_trace_file" || fail "config rm for bluestore_slow_ops_warn_threshold must still run after a rollback poll timeout"
+rm -f "$bluestore_timeout_stdout_file" "$bluestore_timeout_stderr_file" "$bluestore_timeout_trace_file"
+
+ok "latency-outlier rollback always restores bluestore_slow_ops_warn_* defaults even when the clear poll times out"
