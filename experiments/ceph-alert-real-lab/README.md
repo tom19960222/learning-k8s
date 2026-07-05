@@ -67,3 +67,11 @@ bash experiments/ceph-alert-real-lab/run/scenario-pg-availability.sh --yes-reall
 ```bash
 bash experiments/ceph-alert-real-lab/run/scenario-mon-quorum-lost.sh --yes-really-inject
 ```
+
+## CephLowPriorityNotice
+
+這個情境會 `ceph osd set noout` 觸發 `OSDMAP_FLAGS`，等待 `CephLowPriorityNotice{name="OSDMAP_FLAGS"}` 只進 Slack、不進 pager，最後 `ceph osd unset noout` rollback。**注意：`for: 30m`，真的跑（`--yes-really-inject`）wall-clock 會超過 30 分鐘。**
+
+```bash
+bash experiments/ceph-alert-real-lab/run/scenario-low-priority-notice.sh --yes-really-inject
+```
