@@ -98,7 +98,7 @@ Addressed two Important review findings on the S4/S5/S6 fake tests. Scope was te
 
 ### Gate results (fix round 1)
 
-- `bash experiments/ceph-alert-real-lab/tests/run-tests.sh`: all sub-checks `ok:` (22 total now, up from 19 — the new S5 failure-path case adds one).
+- `bash experiments/ceph-alert-real-lab/tests/run-tests.sh`: all sub-checks `ok:` (20 sub-checks now, up from 19, plus the final `ok: unit tests` summary line — the new S5 failure-path case adds one).
 - `shellcheck -x experiments/ceph-alert-real-lab/tests/*.sh` (and full `lib/*.sh run/*.sh tests/*.sh`): exit 0, zero findings.
 - `make validate`: exit 0.
 - Commit `Strengthen scenario tests for negative assertions and rollback` touches only the three named test files (`test-scenario-osd-daemon-down.sh`, `test-scenario-osd-host-down.sh`, `test-scenario-mon-down-single.sh`) plus this report; not pushed. Other pre-existing dirty files in the working tree (`task-1/2/3-report.md`, the `linux` submodule pointer) were left untouched per instructions.
