@@ -136,6 +136,14 @@ case "\$command" in
     else
       status=up
     fi
+    # Real cephadm shell prints this 4-line banner to STDERR on every
+    # invocation (fsid/config inference + image pull info); it is NOT
+    # '#'-prefixed. Modeling it here regression-tests that the JSON poll
+    # helper parses stdout only and never merges this banner into the JSON.
+    printf 'Inferring fsid 0c9bf37e-514a-11f1-b72a-bc24113f1375\n' >&2
+    printf 'Inferring config /var/lib/ceph/0c9bf37e-514a-11f1-b72a-bc24113f1375/mon.ceph-lab-mon-01/config\n' >&2
+    printf "Using ceph image with id 'abcdef123456' and tag 'v19.2.3' created on 2025-01-01 00:00:00 +0000 UTC\n" >&2
+    printf 'quay.io/ceph/ceph@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >&2
     printf '{"nodes":[{"id":1,"name":"osd.1","type":"osd","status":"%s"}]}\n' "\$status"
     exit 0
     ;;

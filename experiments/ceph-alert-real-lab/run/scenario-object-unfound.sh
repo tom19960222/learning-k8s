@@ -51,13 +51,19 @@ resolve_osd_host() {
 # osd_tree_status_is <osd-id> <up|down> mirrors scenario-osd-flapping.sh's
 # helper of the same name (kept scenario-local rather than shared -- see
 # that script's own comment on why), parameterized on OSD id since this
-# scenario alternates polling two different OSDs (A then B).
+# scenario alternates polling two different OSDs (A then B). Captures
+# stdout-only into $output_file so it holds clean, directly-jq-able JSON as
+# evidence -- `cephadm shell` prints a multi-line "Inferring fsid/config
+# .../Using ceph image ..." banner to stderr on every invocation, which is
+# NOT '#'-prefixed and would otherwise corrupt the JSON body if merged in
+# (e.g. via run_capture's 2>&1). That banner is preserved separately as
+# evidence in $output_file.log.
 osd_tree_status_is() {
   local osd=$1 expected=$2 output_file
   output_file="$RESULT_DIR/osd-tree-poll-$((transition_step)).json"
-  run_capture "$output_file" ceph_seed_cmd osd tree --format json || return 1
-  grep -v '^#' "$output_file" | jq -e --arg osd "$osd" --arg state "$expected" \
-    '.nodes[] | select(.id == ($osd|tonumber)) | select(.status == $state)' >/dev/null
+  ceph_seed_cmd osd tree --format json >"$output_file" 2>"$output_file.log" || return 1
+  jq -e --arg osd "$osd" --arg state "$expected" \
+    '.nodes[] | select(.id == ($osd|tonumber)) | select(.status == $state)' "$output_file" >/dev/null
 }
 
 health_detail_clear_of_unfound() {

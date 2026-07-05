@@ -39,17 +39,20 @@ scenario_setup() {
   _service="$(osd_service_name "$LAB_FSID" "$OSD_FLAP_ID")"
 }
 
-# osd_tree_status_is <up|down> polls `ceph osd tree --format json` (captured
-# via run_capture for evidence) and checks this scenario's target OSD status.
-# The run_capture output file also carries "# started/# command/# ended"
-# comment lines around the JSON body, so strip lines starting with '#'
-# before handing the rest to jq.
+# osd_tree_status_is <up|down> polls `ceph osd tree --format json` and checks
+# this scenario's target OSD status. Captures stdout-only into $output_file
+# so it holds clean, directly-jq-able JSON as evidence -- `cephadm shell`
+# prints a multi-line "Inferring fsid/config .../Using ceph image ..." banner
+# to stderr on every invocation, which is NOT '#'-prefixed and would
+# otherwise corrupt the JSON body if merged in (e.g. via run_capture's
+# 2>&1). That banner is preserved separately as evidence in
+# $output_file.log.
 osd_tree_status_is() {
   local expected=$1 output_file
   output_file="$RESULT_DIR/osd-tree-poll-$((transition_step)).json"
-  run_capture "$output_file" ceph_seed_cmd osd tree --format json || return 1
-  grep -v '^#' "$output_file" | jq -e --arg osd "$OSD_FLAP_ID" --arg state "$expected" \
-    '.nodes[] | select(.id == ($osd|tonumber)) | select(.status == $state)' >/dev/null
+  ceph_seed_cmd osd tree --format json >"$output_file" 2>"$output_file.log" || return 1
+  jq -e --arg osd "$OSD_FLAP_ID" --arg state "$expected" \
+    '.nodes[] | select(.id == ($osd|tonumber)) | select(.status == $state)' "$output_file" >/dev/null
 }
 
 scenario_inject() {

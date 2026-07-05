@@ -125,6 +125,14 @@ case "\$command" in
     else
       status=up
     fi
+    # Real cephadm shell prints this 4-line banner to STDERR on every
+    # invocation (fsid/config inference + image pull info); it is NOT
+    # '#'-prefixed. Modeling it here regression-tests that the JSON poll
+    # helper parses stdout only and never merges this banner into the JSON.
+    printf 'Inferring fsid 0c9bf37e-514a-11f1-b72a-bc24113f1375\n' >&2
+    printf 'Inferring config /var/lib/ceph/0c9bf37e-514a-11f1-b72a-bc24113f1375/mon.ceph-lab-mon-01/config\n' >&2
+    printf "Using ceph image with id 'abcdef123456' and tag 'v19.2.3' created on 2025-01-01 00:00:00 +0000 UTC\n" >&2
+    printf 'quay.io/ceph/ceph@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >&2
     printf '{"nodes":[{"id":5,"name":"osd.5","type":"osd","status":"%s"}]}\n' "\$status"
     exit 0
     ;;
@@ -137,6 +145,12 @@ case "\$command" in
     exit 0
     ;;
   *"ceph pg 3.0 query --format json"*)
+    # Same cephadm-shell stderr banner as the osd tree poll above -- see that
+    # branch's comment for why this is modeled here.
+    printf 'Inferring fsid 0c9bf37e-514a-11f1-b72a-bc24113f1375\n' >&2
+    printf 'Inferring config /var/lib/ceph/0c9bf37e-514a-11f1-b72a-bc24113f1375/mon.ceph-lab-mon-01/config\n' >&2
+    printf "Using ceph image with id 'abcdef123456' and tag 'v19.2.3' created on 2025-01-01 00:00:00 +0000 UTC\n" >&2
+    printf 'quay.io/ceph/ceph@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' >&2
     printf '{"state":"active+clean"}\n'
     exit 0
     ;;
