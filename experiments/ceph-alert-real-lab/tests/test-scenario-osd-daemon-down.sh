@@ -200,4 +200,11 @@ start_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.0\.service$' "$liv
 (( stop_line > discover_line )) || fail "stop happened before OSD discovery"
 (( start_line > stop_line )) || fail "rollback start happened before stop"
 
+# assert_prometheus_alert_not_firing always writes prometheus-alerts-<alertname>-<label_name|none>.json
+# via prometheus_alert_is_firing, regardless of the firing outcome. Assert the file exists to prove
+# the not-firing check for CephOSDHostDownScoped actually ran (a vacuous/never-called assertion would
+# also pass the "not firing" check but would leave no evidence file behind).
+result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'osd-daemon-down-*' | sort | tail -1)"
+[[ -f "$result_dir/prometheus-alerts-CephOSDHostDownScoped-hostname.json" ]] || fail "missing negative-assertion evidence file for CephOSDHostDownScoped"
+
 ok "osd-daemon-down destructive ack guard, injection sequence, and rollback ordering"
