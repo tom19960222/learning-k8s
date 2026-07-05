@@ -19,13 +19,17 @@ mgr_failover_continuity_probe() {
   # A bare instant-vector query (`ceph_health_status`) returns the query
   # evaluation time in each sample, not the scrape timestamp, so a stale or
   # absent series would still report a "fresh-looking" timestamp. Querying
-  # `(time() - timestamp(ceph_health_status)) < 30` instead only yields a
-  # series (value "1") when the most recent scrape is <30s old; a stale or
-  # absent series makes the result empty, so both branches of the jq check
-  # below are load-bearing.
+  # `(time() - timestamp(ceph_health_status)) < 30` uses PromQL FILTER
+  # semantics (no `bool` modifier): a series whose most recent scrape is
+  # <30s old is kept with its AGE in seconds as the value (e.g. "2", "4.83"
+  # — never "1"); a stale or absent series is dropped, leaving an empty
+  # result. So "result non-empty" alone encodes freshness — do not compare
+  # the value against "1" (that would require the `bool` modifier, which
+  # this query deliberately does not use so lingering stale series from the
+  # old mgr target are silently dropped instead of failing the probe).
   local output_file="$RESULT_DIR/mgr-failover-continuity.json"
   prometheus_query '(time() - timestamp(ceph_health_status)) < 30' >"$output_file"
-  jq -e '(.data.result | length > 0) and ([.data.result[].value[1] == "1"] | all)' "$output_file" >/dev/null
+  jq -e '.data.result | length > 0' "$output_file" >/dev/null
 }
 
 discover_standby_mgr() {

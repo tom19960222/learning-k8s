@@ -27,7 +27,11 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=%28time%28%29%20-%20timestamp%28ceph_health_status%29%29%20%3C%2030"* ]]; then
-  printf '%s\n' '{"status":"success","data":{"result":[{"metric":{},"value":[1700000000,"1"]}]}}'
+  # Realistic fixture: a PromQL comparison without the bool modifier is a
+  # filter that keeps the LHS value, so a matching series carries the AGE in
+  # seconds (here "2"), never "1". A probe comparing the value against "1"
+  # must fail here.
+  printf '%s\n' '{"status":"success","data":{"result":[{"metric":{},"value":[1700000000,"2"]}]}}'
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
