@@ -31,7 +31,7 @@ invariants=(
   'ceph_health_detail{name=~"OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT"} == 1'
   'changes(ceph_osd_up[15m])'
   'ceph_osd_commit_latency_ms > 3 * scalar(quantile(0.5, ceph_osd_commit_latency_ms))'
-  'ceph_daemon_health_metrics{type="SLOW_OPS"} > 0'
+  'max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[5m]) > 0'
   '(count(ceph_mgr_status) or vector(0)) < 2'
   'ceph_pool_bytes_used > 0.8 * ceph_pool_quota_bytes'
   'predict_linear(ceph_cluster_total_used_bytes[1h], 259200)'

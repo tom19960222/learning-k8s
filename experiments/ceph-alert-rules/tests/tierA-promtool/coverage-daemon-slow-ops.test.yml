@@ -1,30 +1,59 @@
-# Tier A — CephDaemonSlowOps：ceph_daemon_health_metrics{type="SLOW_OPS"} > 0，3m warning。
+# Tier A — CephDaemonSlowOps：max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[5m]) > 0，1m warning。
 # 跟 CephClientBlocked 的 SLOW_OPS（cluster-wide health check）不同來源：這條是「哪個 daemon」有 slow ops
 # 的細粒度計數，兩者互補（daemon 級細節 vs cluster 級 page 主訊號）。
+#
+# 真機故障注入證據（fix round 1）：ceph_daemon_health_metrics{type="SLOW_OPS"} 是一個
+# snapshot gauge（正在超過 30s complaint-time 的 op 數），即使在持續嚴重的 slow-ops 故障下，
+# 單一 daemon 上的值 max=30 min=0，只有 28.8% 的時間 >0（op 過門檻→被算到→完成→歸零，
+# slow ops 也會在多顆 daemon 間跳動）。舊版 `> 0` + `for: 3m` 要求連續 3 分鐘 >0，這種
+# spiky gauge 幾乎不可能在單一 daemon 上滿足，所以真故障期間這條規則永遠不會 fire。
+# 改成 max_over_time(...[5m]) > 0 撐住視窗、for: 1m 只當防單次 scrape 抖動的 debounce，
+# 才能在真故障下可靠地 fire，且視窗讓 alert 在最後一次 slow op 後還會停留約 5 分鐘方便 oncall 觀察。
 rule_files:
   - ../../rules/ceph-production-coverage.yml
 evaluation_interval: 1m
 tests:
+  # (a) firing：osd.3 在 t=2m 故障開始，SLOW_OPS 值在接下來幾分鐘內時有時無
+  # （5 0 3 0 8 0 2 0，模擬真機證據的 spiky gauge），t=9m 之後故障結束、恢復全 0。
+  # max_over_time([5m]) 撐住這段期間的視窗，讓 for:1m 在故障開始 1 分鐘後就能 fire，
+  # 且持續到最後一次 slow op（t=8m）之後 5 分鐘（t=13m）才 resolve。
   - interval: 1m
     input_series:
       - series: 'ceph_daemon_health_metrics{ceph_daemon="osd.3", type="SLOW_OPS"}'
-        values: '5x10'
+        values: '0 0 5 0 3 0 8 0 2 0 0 0 0 0 0 0'
     alert_rule_test:
+      # 故障前：全 0，未 firing
+      - eval_time: 1m
+        alertname: CephDaemonSlowOps
+        exp_alerts: []
+      # t=2m 出現第一個 spike，[5m] 視窗內已 >0，但 for:1m 尚未跨滿 1 分鐘 → pending，未 firing
       - eval_time: 2m
         alertname: CephDaemonSlowOps
         exp_alerts: []
+      # t=3m：pending 已滿 1 分鐘 → firing（驗證過的確切 firing eval_time）
       - eval_time: 3m
         alertname: CephDaemonSlowOps
         exp_alerts:
           - exp_labels: {ceph_daemon: osd.3, type: SLOW_OPS, severity: warning, source: ceph_coverage}
             exp_annotations: {summary: "Ceph daemon has slow ops: osd.3"}
+      # t=12m：雖然當下讀數是 0，但 t=8m 的 spike 仍在 [5m] 視窗內 → 持續 firing
+      # （證明對 spiky gauge 的韌性：不需要「現在」剛好 >0）
+      - eval_time: 12m
+        alertname: CephDaemonSlowOps
+        exp_alerts:
+          - exp_labels: {ceph_daemon: osd.3, type: SLOW_OPS, severity: warning, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph daemon has slow ops: osd.3"}
+      # t=13m：最後一次 slow op（t=8m）已經超出 [5m] 視窗（8+5=13）→ resolve
+      - eval_time: 13m
+        alertname: CephDaemonSlowOps
+        exp_alerts: []
 
-  # 值為 0（無 slow ops）→ > 0 為假 → 不 fire
+  # (b) non-firing：全程無 slow ops（值恆為 0）→ max_over_time 恆為 0 → 永不 fire
   - interval: 1m
     input_series:
       - series: 'ceph_daemon_health_metrics{ceph_daemon="osd.3", type="SLOW_OPS"}'
-        values: '0x10'
+        values: '0x16'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 10m
         alertname: CephDaemonSlowOps
         exp_alerts: []

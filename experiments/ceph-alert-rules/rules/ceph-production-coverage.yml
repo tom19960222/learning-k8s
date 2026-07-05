@@ -63,8 +63,8 @@ groups:
           summary: "Ceph OSD commit latency outlier: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
 
       - alert: CephDaemonSlowOps
-        expr: ceph_daemon_health_metrics{type="SLOW_OPS"} > 0
-        for: 3m
+        expr: max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[5m]) > 0
+        for: 1m
         labels:
           severity: warning
           source: ceph_coverage
