@@ -28,6 +28,7 @@ for path in \
   "$ROOT/tests/test-scenario-latency-outlier.sh" \
   "$ROOT/tests/test-scenario-net-slow-heartbeat.sh" \
   "$ROOT/tests/test-scenario-mon-clock-skew.sh" \
+  "$ROOT/tests/test-scenario-daemon-crash.sh" \
   "$ROOT/tests/test-scenario-framework.sh" \
   "$ROOT/tests/test-evidence.sh" \
   "$ROOT/tests/test-monitoring-render.sh"; do
@@ -51,6 +52,7 @@ bash "$ROOT/tests/test-scenario-low-priority-notice.sh"
 bash "$ROOT/tests/test-scenario-latency-outlier.sh"
 bash "$ROOT/tests/test-scenario-net-slow-heartbeat.sh"
 bash "$ROOT/tests/test-scenario-mon-clock-skew.sh"
+bash "$ROOT/tests/test-scenario-daemon-crash.sh"
 bash "$ROOT/tests/test-scenario-framework.sh"
 bash "$ROOT/tests/test-evidence.sh"
 bash "$ROOT/tests/test-monitoring-render.sh"
