@@ -17,7 +17,7 @@ EOF
 }
 
 make_fake_kubectl() {
-  local path=$1 trace_file=$2
+  local path=$1 trace_file=$2 pager_leak_json=${3:-}
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -26,8 +26,8 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   printf 'prometheus-0\n'
   exit 0
 fi
-if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=ceph_health_status"* ]]; then
-  printf '%s\n' '{"data":{"result":[{"metric":{"instance":"192.168.18.166:9283"},"value":[1700000000,"0"]}]}}'
+if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/query?query=%28time%28%29%20-%20timestamp%28ceph_health_status%29%29%20%3C%2030"* ]]; then
+  printf '%s\n' '{"status":"success","data":{"result":[{"metric":{},"value":[1700000000,"1"]}]}}'
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
@@ -42,6 +42,13 @@ if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"watchdog","alertname":"Watchdog","labels":{}}'
   if grep -q 'systemctl stop ceph-.*@mgr\.' "$trace_file"; then
     printf '%s\n' '{"receiver":"slack","alertname":"CephMgrNoStandby","labels":{"fresh":"true"}}'
+EOF
+  if [[ -n "$pager_leak_json" ]]; then
+    cat >>"$path" <<MIDEOF
+    printf '%s\n' '$pager_leak_json'
+MIDEOF
+  fi
+  cat >>"$path" <<EOF
   fi
   exit 0
 fi
@@ -124,11 +131,15 @@ live_stdout_file="$(mktemp)"
 live_stderr_file="$(mktemp)"
 live_trace_file="$(mktemp)"
 fake_bin_dir="$(mktemp -d)"
+pager_leak_stdout_file="$(mktemp)"
+pager_leak_stderr_file="$(mktemp)"
+pager_leak_trace_file="$(mktemp)"
+pager_leak_bin_dir="$(mktemp -d)"
 real_jq="$(command -v jq)"
 
 cleanup() {
-  rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" "$live_stdout_file" "$live_stderr_file" "$live_trace_file"
-  rm -rf "$fake_bin_dir"
+  rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" "$live_stdout_file" "$live_stderr_file" "$live_trace_file" "$pager_leak_stdout_file" "$pager_leak_stderr_file" "$pager_leak_trace_file"
+  rm -rf "$fake_bin_dir" "$pager_leak_bin_dir"
 }
 
 trap cleanup EXIT
@@ -219,3 +230,23 @@ result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'mgr-failover-*' | 
 [[ -f "$result_dir/sink-absent-check.log" ]] || fail "missing negative-assertion evidence file for sink pager absence"
 
 ok "mgr-failover destructive ack guard, two-phase injection sequence, and rollback ordering"
+
+# --- Failure path: alert-sink also delivers CephMgrNoStandby via the pager receiver.
+# This proves assert_sink_absent's pass/fail branches are both reachable (not vacuously
+# true): a leaked pager alert must make scenario_verify fail, which must still let
+# scenario_main's EXIT trap run scenario_rollback (restarting the standby mgr).
+make_fake_jq "$pager_leak_bin_dir/jq" "$real_jq" "$pager_leak_trace_file"
+make_fake_kubectl "$pager_leak_bin_dir/kubectl" "$pager_leak_trace_file" '{"receiver":"pager","alertname":"CephMgrNoStandby","labels":{"fresh":"true"}}'
+make_fake_curl "$pager_leak_bin_dir/curl" "$pager_leak_trace_file"
+make_fake_ssh "$pager_leak_bin_dir/ssh" "$pager_leak_trace_file"
+
+set +e
+PATH="$pager_leak_bin_dir:$PATH" bash "$ROOT/run/scenario-mgr-failover.sh" --yes-really-inject >"$pager_leak_stdout_file" 2>"$pager_leak_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected non-zero exit when pager sink leaks CephMgrNoStandby"
+grep -q 'FAIL: sink pager unexpectedly received CephMgrNoStandby' "$pager_leak_stderr_file" || fail "missing assert_sink_absent failure log for leaked pager alert"
+grep -q '^ssh:sudo systemctl start ceph-.*@mgr\.ceph-lab-mon-02\.wmkpax\.service$' "$pager_leak_trace_file" || fail "rollback start missing for standby mgr after pager-leak failure"
+
+ok "mgr-failover assert_sink_absent fails and still rolls back when pager leaks CephMgrNoStandby"

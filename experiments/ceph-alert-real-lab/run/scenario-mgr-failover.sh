@@ -16,9 +16,16 @@ STOPPED_MGR_HOST=""
 STOPPED_MGR_SERVICE=""
 
 mgr_failover_continuity_probe() {
+  # A bare instant-vector query (`ceph_health_status`) returns the query
+  # evaluation time in each sample, not the scrape timestamp, so a stale or
+  # absent series would still report a "fresh-looking" timestamp. Querying
+  # `(time() - timestamp(ceph_health_status)) < 30` instead only yields a
+  # series (value "1") when the most recent scrape is <30s old; a stale or
+  # absent series makes the result empty, so both branches of the jq check
+  # below are load-bearing.
   local output_file="$RESULT_DIR/mgr-failover-continuity.json"
-  prometheus_query 'ceph_health_status' >"$output_file"
-  jq -e '.data.result | length > 0' "$output_file" >/dev/null
+  prometheus_query '(time() - timestamp(ceph_health_status)) < 30' >"$output_file"
+  jq -e '(.data.result | length > 0) and ([.data.result[].value[1] == "1"] | all)' "$output_file" >/dev/null
 }
 
 discover_standby_mgr() {
