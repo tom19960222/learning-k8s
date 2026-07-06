@@ -65,7 +65,7 @@ KubeVirt 的 disk driver 欄位定義在 `schema.go` 的 `DiskDevice` / disk dri
 - **作用機制**：決定 host 端開 `/dev/rbdX` 時走不走 page cache。`cache=none` 會讓 QEMU 用 `O_DIRECT` 開檔（datapath §④ `raw_co_prw` 的 O_DIRECT 分支），繞過 host page cache 直接打 block device；這也是 `io=native` 的前提。`writethrough` / `writeback` 則經 host page cache。
 - **impact**：🔴 高 —— 它同時決定「走不走 page cache」與「能不能用 native AIO」，是這一層影響最大的單一旋鈕。
 - **來源**：`File: kubevirt/staging/src/kubevirt.io/api/core/v1/types.go`（`CacheNone = "none"` 等常數，約 L1846-1860）。
-- **風險 / 前提**：對 RBD block device，`cache=none` 是最常見且語意最乾淨的選擇；改成 writeback 會把 correctness 賭在 host page cache 與 flush 行為上，與下面 `io` 的 auto 推導交互（見第 ② 層 `SetOptimalIOMode`）。
+- **風險 / 前提**：對 RBD block device，`cache=none` 是最常見且語意最乾淨的選擇；改成 writeback 會把 correctness 賭在 host page cache 與 flush 行為上，與下面 `io` 的 auto 推導交互（見第 ② 層 `SetOptimalIOMode`）。**注意：此欄位留空不等於「無 cache 意圖」**——converter 的 `SetDriverCacheMode` 對支援 direct IO 的 block device 會自動補成 `none`（`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go` 約 L371-429，`manager.go` 約 L838-842 對每顆 disk 無條件執行），所以「全留空」在 RBD 上實際得到 `cache=none` + `io=native`。
 
 ### io（對應 datapath 第 ④ 跳 / ① 層）
 - **在哪設**：VMI spec `spec.domain.devices.disks[].io`，合法值 `native` / `default` / `threads`（`DriverIO`：`IONative = "native"`、`IOThreads = "threads"`）。
@@ -83,7 +83,7 @@ KubeVirt 的 disk driver 欄位定義在 `schema.go` 的 `DiskDevice` / disk dri
 
 ### blockMultiQueue（virtio 多 queue，對應 datapath 第 ① 跳 / ① 層）
 - **在哪設**：VMI spec `spec.domain.devices.blockMultiQueue: true`。
-- **作用機制**：開啟後 converter 把 disk 的 `driver.queues` 設成 vCPU 數，讓 guest virtio-blk 協商出多條 virtqueue（datapath §① guest 把 request 放進 vring、§② 每條 queue 各自 kick）。多 queue 讓不同 vCPU 各走一條 vring，減少 §② kick 路徑的鎖爭用。converter 只對 `Bus == virtio` 的 disk 設 `Driver.Queues`。
+- **作用機制**：開啟後 converter 把 disk 的 `driver.queues` 設成 vCPU 數，讓 guest virtio-blk 協商出多條 virtqueue（datapath §① guest 把 request 放進 vring、§② 每條 queue 各自 kick）。converter 只對 `Bus == virtio` 的 disk 設 `Driver.Queues`。**但注意：不開它也不是單 queue**——QEMU ≥5.2 的 virtio-blk `num-queues` 預設是 AUTO、realize 時解析成 vCPU 數（`File: qemu/hw/block/virtio-blk.c` 約 L1997-1998、`qemu/hw/virtio/virtio-blk-pci.c` 約 L56-58），且 libvirt 在 queues 未設時不輸出該屬性（`File: libvirt/src/qemu/qemu_command.c` 約 L1692 的 `p:` 修飾詞）、預設直通。所以此旋鈕在新 QEMU 上是「把 queues 明確設成與 auto 相同的值」，機制上傾向 no-op——實際差異待實驗反向對照（強制 queues=1 vs auto）驗證。
 - **impact**：🟡 中 —— 對多 vCPU、多並行 IO 的 workload 有感（拉開 §①② 的並行度）；單 vCPU 或低並行時幾乎沒差。
 - **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`disk.Driver.Queues = numQueues` 僅在 virtio bus，約 L205-206；`blockMultiQueue` 推導出 `numBlkQueues = &vcpus` 約 L1580-1588）；欄位定義 `File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`BlockMultiQueue` 約 L493）。
 - **風險 / 前提**：注意 converter 裡那個 `multiQueueMaxQueues = uint32(256)`（約 L74）是**網路介面** multi-queue 的上限（用在 `network.go` 的 `NetworkQueuesCapacity`），不是 block 路徑的 cap；block 路徑直接用 vCPU 數，別把 256 當成 block queue 上限。
@@ -152,7 +152,7 @@ KubeVirt 的 disk driver 欄位定義在 `schema.go` 的 `DiskDevice` / disk dri
 - **作用機制**：VMI 沒指定 `io` 時，只要 `cache=none` 且後端是 block device（RBD `/dev/rbdX` 即是），converter 自動把 `io` 設成 `native`。這解釋了「我只設了 `cache=none`，最後卻跑 native AIO」。若使用者已明設 `io`，函式開頭直接 return、不覆蓋。
 - **impact**：🔴 高（理解它，而非調它）—— 它是第 ① 層 `cache` 與 host 端 AIO 模型之間的隱形連結；不懂這條推導，就會誤以為要手動填 `io`。
 - **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`SetOptimalIOMode` 約 L441-470，O_DIRECT 註解與 `disk.Driver.IO = v1.IONative` 約 L457-462）。
-- **風險 / 前提**：推導只在「使用者沒指定 `io`」時發生；一旦手填 `io`，這條 auto 路徑就被跳過。註解也明說目前對 sparse file 不主動設 `io=threads`，所以非 block / 非 preallocated 後端可能留空。
+- **風險 / 前提**：推導只在「使用者沒指定 `io`」時發生；一旦手填 `io`，這條 auto 路徑就被跳過。註解也明說目前對 sparse file 不主動設 `io=threads`，所以非 block / 非 preallocated 後端可能留空。另外這條推導的上游還有一層：`cache` 留空時 `SetDriverCacheMode` 會先把它補成 `none`（block device 支援 direct IO 時），兩層自動化疊起來就是「什麼都不寫，最後跑 `cache=none` + `io=native`」——實驗計畫頁 v1 的 baseline 幻覺正是沒看到這條鏈。
 
 ## ③ guest virtio 層
 
