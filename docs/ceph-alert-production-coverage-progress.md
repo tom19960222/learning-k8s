@@ -9,8 +9,8 @@
 |---|---|
 | 設計/修訂的 alert rule | **28** |
 | 真機故障注入場景 | **22** |
-| 已真機驗證 firing | **17** |
-| 真機才抓到的 bug/發現 | **12** |
+| 已真機驗證 firing | **18** |
+| 真機才抓到的 bug/發現 | **13** |
 
 ---
 
@@ -110,7 +110,7 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 
 ## 04 — 真機驗證進度看板（即時）
 
-**17 / 22 通過 · 0 執行中 · 5 待跑**（S18 剛啟動）
+**18 / 22 通過 · 0 執行中 · 4 待跑**（S18 通過，下一個 S19）
 
 | # | 場景 | 驗證的 alert | 真實注入手法 | 狀態 |
 |---|---|---|---|---|
@@ -131,7 +131,7 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 | S2 | pg-availability | CephClientBlocked{PG_AVAILABILITY} + CephPGUnhealthyStates → 🔴 | 停測試 pool 兩顆 acting OSD | ✅ |
 | S17 | pool-quota | CephPoolNearQuota → 🔵 · CephClientBlocked{POOL_FULL} → 🔴 | 寫爆 pool max_bytes quota | ✅ |
 | S16 | capacity-ladder | CephOSDNearFull → 🔵 · CephOSDBackfillFull → 🔴 · CephClientBlocked{OSD_FULL} + CephHealthError → 🔴 | 動態量測 OSD 使用率 → 逐級調低 full-ratio | ✅ |
-| S18 | capacity-forecast | CephCapacityForecast → 🔵 | 持續寫入 ~40 分鐘走趨勢預測 | ⏳ 執行中 |
+| S18 | capacity-forecast | CephCapacityForecast → 🔵 | 3 條連續 rados bench 平行流持續寫入，72h 趨勢預測越過 85% | ✅ |
 | S19 | data-damage | CephDataDamage + CephHealthError → 🔴 | objectstore-tool 弄壞單一 object 副本 | ⏳ 待跑 |
 | S20 | object-unfound | CephObjectUnfound → 🔴 | size=2/min_size=1 誘發 unfound 標準手法 | ⏳ 待跑 |
 | S10 | low-priority-notice | CephLowPriorityNotice → 🔵（pager 靜默） | noout flag → OSDMAP_FLAGS，等 for:30m | ⏳ 待跑 |
@@ -172,6 +172,13 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 - **症狀**：CephPoolNearQuota 正常 fire，但寫過 quota 後 POOL_FULL 6.5 分鐘都不出現。
 - **根因**：手動實驗驗證 pool 超過 max_bytes 確實升 POOL_FULL，但只在 client 持續嘗試寫入（寫到被 block）時 mon 才 flag。腳本在剛過 quota 那次 put 就停手，沒有持續壓力。
 - **修法**：past-quota 階段改用 remote `timeout 30 rados put`（bounded，被 block 不 hang，exit 124 當「pool 滿」訊號）持續寫過 quota 並輪詢 POOL_FULL。
+
+### 13 · capacity-forecast 六輪纏鬥：真正的兇手是 rados bench 覆寫 objects（S18）
+- **症狀**：CephCapacityForecast 連五輪不 fire——趨勢預測（predict_linear）始終爬不到 85% 門檻。
+- **層層剝開**：表面是「寫入吞吐不夠」。連換三個假設都沒解決：(1) pool PG 數太少 → 加到 16/32 PG；(2) 並發不夠 → 加到 -t 128、3 條平行流；(3) 3× 複寫吃掉成長 → 想改 size=1（結果 v19 EPERM 擋掉，且發現指標本來就是 raw、複寫其實有算）。每輪都靠即時 TSDB `deriv()` 量測才知道還是不夠。
+- **真根因**：一次 10 分鐘的受控 probe（單一連續 `rados bench 600`）實測到 **6.9 MB/s**，但場景的 round-loop 卻只有 0.1 MB/s 甚至負成長。差別在 **`rados bench` 的 round-loop 每輪都用固定 `--run-name streamN`，第二輪起就覆寫掉前一輪的同名 objects，pool 填滿第一輪後就不再成長**。probe 用單一連續 bench 所以 objects 持續累積。
+- **修法**：讓場景完全照 probe——每條 stream 一個連續 `rados bench 4500`（不分 round）。第六輪成長率衝到 **9.15 MB/s**，projection 爬到 2046 GB（門檻 821），alert 真的 fire → slack。
+- **教訓**：這是整輪最硬的除錯。「每條 alert 都要真機驗證」的鐵律逼我把一個看似「lab 太弱」的失敗，一路挖到「rados bench 物件命名語意」這麼底層——而 rule 本身從頭到尾都是對的（它正確地拒絕在不夠陡的趨勢上 fire）。
 
 ### 07 · capacity 想寫 27GiB 太慢；改用動態 ratio 貼合真實使用率（S16）
 - **症狀**：setup 想寫到 27GiB raw used 才調閾值，10 輪只寫到 ~940MB 且不累積 → FATAL。
@@ -215,7 +222,7 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 
 ## 07 — 接下來
 
-- **S18 capacity-forecast**（執行中）→ **S19 data-damage** → **S20 object-unfound** → **S10 low-priority-notice** → **S3 mon-quorum-lost**（含 inhibit 真機斷言）。
+- **S19 data-damage** → **S20 object-unfound** → **S10 low-priority-notice** → **S3 mon-quorum-lost**（含 inhibit 真機斷言）。
 - **硬化 deploy 腳本**：apply 後自動 `rollout restart` Prometheus，讓 rule 變更可重現載入。
 - **文件收尾**：更新 `prometheus-alert-design` 頁 + 新增 production coverage / 真機證據頁（每條 rule × 注入手法 × firing 證據 × 回退）。
 - **最終多視角 review**：整條 branch 交給 code-reviewer 做 whole-branch 複查。
