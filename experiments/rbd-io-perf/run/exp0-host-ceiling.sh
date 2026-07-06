@@ -36,12 +36,16 @@ for engine in libaio io_uring; do
   for r in $(seq 1 "$ROUNDS"); do
     rd="$b/$engine-r$r"; mkdir -p "$rd"
     collect_ceph_status "$rd/ceph-pre.txt"
+    [ -s "$b/ceph-baseline.txt" ] || cp "$rd/ceph-pre.txt" "$b/ceph-baseline.txt"
+    guard_check "$rd/ceph-pre.txt" "$b/ceph-baseline.txt"
     for entry in $FIO_PATTERNS; do
       name="${entry%%:*}"
       cmd="$(fio_cmd "$entry" "$DEV" | sed "s/--ioengine=libaio/--ioengine=$engine/")"
       pve_ssh "sudo -n $cmd" > "$rd/$name.json" || die "fio $name ($engine) 失敗"
     done
     collect_ceph_status "$rd/ceph-post.txt"
+    guard_check "$rd/ceph-post.txt" "$b/ceph-baseline.txt"
+    taint_check "$rd/ceph-post.txt" || log "警示: ${engine}-r${r} 輪有背景活動（host 天花板輪不重試，僅標記）"
   done
 done
 

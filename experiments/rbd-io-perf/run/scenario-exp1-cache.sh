@@ -37,10 +37,13 @@ ip="$(vm_guest_ip)"
 for r in $(seq 1 "$ROUNDS"); do
   rd="$b/buffered-r$r"; mkdir -p "$rd"
   collect_ceph_status "$rd/ceph-pre.txt"
+  [ -s "$b/ceph-baseline.txt" ] || cp "$rd/ceph-pre.txt" "$b/ceph-baseline.txt"
+  guard_check "$rd/ceph-pre.txt" "$b/ceph-baseline.txt"
   cmd_nodirect="$(fio_cmd "rw-4k-qd1:randwrite:4k:1" /dev/vdb | sed 's/--direct=1/--direct=0/')"
   guest_ssh "$ip" "sudo $cmd_nodirect" > "$rd/nodirect.json" || die "buffered（無 fsync）fio 失敗"
   guest_ssh "$ip" "sudo $cmd_nodirect --fsync=1" > "$rd/nodirect-fsync.json" || die "buffered（fsync=1）fio 失敗"
   collect_ceph_status "$rd/ceph-post.txt"
+  guard_check "$rd/ceph-post.txt" "$b/ceph-baseline.txt"
 done
 vm_set --virtio1 "$BASE"
 vm_cold_restart
