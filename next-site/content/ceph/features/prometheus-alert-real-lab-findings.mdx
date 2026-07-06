@@ -1,10 +1,18 @@
 ---
 layout: doc
-title: Ceph — 真機故障注入後的 alert 韌性修訂
-description: 用既有 cephadm + Rook lab 製造 SLOW_OPS、PG_AVAILABILITY、MON quorum loss 三種真故障，檢查 CephClientBlocked 與 CephMonQuorumLost 是否真的 firing。結論：client-blocked 生命線有效；MON quorum rule 的 PromQL 修正有效但 exporter 視角會 stale，必須補 metrics absent、multi-mgr scrape、coverage rule 與獨立 MON 觀測面。
+title: Ceph — 22 個真機故障注入場景全數驗證的 alert 韌性報告
+description: 28 條 alert rule、22 個真實故障注入場景，在 cephadm v19.2.3 lab 上 22/22 全數驗證 firing 並送達正確 receiver。過程中「每條 alert 都要真機驗證」的鐵律逼出 16 個 fake/promtool 測試全部綠燈、只有真機才現形的 bug——從 crash sidecar 缺 keyring、指標本質是 spiky snapshot gauge，到 rados bench 的物件命名語意。
 ---
 
 ## 結論先講
+
+這頁最早只記錄 3 個場景（SLOW_OPS、PG_AVAILABILITY、MON quorum）的真機驗證，是專案中期的快照。專案完成後的最終結果是：**28 條 alert rule、22 個真實故障注入場景，22/22 全數在真 cephadm v19.2.3 lab 上驗證 firing 並送達正確 receiver**。每一輪注入後叢集都復原到 `HEALTH_OK`，沒有殘留的 crash、pool 設定或 ratio 變更。這組 alert 已經可以視為生產就緒。
+
+比「全數通過」本身更值得記下的是過程裡的 meta-finding：驗收鐵律「每條 alert 都必須用真實故障注入讓它 firing，不接受模擬或假 metric」，逼出了 **16 個 fake / promtool / unit 測試全部綠燈、只有真機才會現形的 bug**——指標本質是 spiky snapshot gauge、cephadm shell 的 stderr banner 污染 JSON 解析、`rados bench` 的物件命名語意，一路到「rule 邏輯完全正確，但真故障的動態讓斷言觀察不到」這種更難分類的失效模式。這些發現全部發生在 **rule 本身沒有寫錯**的前提下；如果只靠 promtool 測 expr 與 `for:` 邊界，這 16 個問題一個都不會被看見。完整場景清單見〈22 個場景全數真機驗證〉，16 個發現的細節見〈真機才抓到的 16 個發現〉；下面先保留最初 3 個場景（SLOW_OPS / PG_AVAILABILITY / MON quorum）的原始詳細記錄。
+
+<Callout type="warning" title="為什麼「每條都要真機驗證」這條鐵律,比多寫幾條 rule 更重要">
+  這 16 個 bug 沒有一個是 PromQL 寫錯——`promtool test rules` 全部綠燈。真正的問題出在 rule 之外：mgr 匯出的 gauge 是 spiky snapshot、cephadm shell 的 stderr 污染腳本解析的 JSON、`rados bench` 覆寫同名 object、真 quorum loss 時監控資料源本身會說謊。fake 測試測的是「expr 邏輯對不對」，真機測的是「這條 expr 接到的資料源，在真故障當下到底長什麼樣子」——兩者是完全不同的驗證面，只做前者永遠測不到後者。
+</Callout>
 
 這次真機故障注入給了兩個好消息、一個壞消息。
 
@@ -397,16 +405,154 @@ count(node_systemd_unit_state{name=~"ceph-.*@mon\\..*\\.service", state="active"
 
 這條不是取代 `CephMonQuorumLost`；它是用不同資料源交叉檢查。如果 systemd 視角說只剩一個 mon，但 mgr exporter 還說 quorum sum 是 3，這就是 `CephMonTelemetryStale` 類型的事件，應該 page，因為監控面正在說謊。
 
+## 22 個場景全數真機驗證
+
+上面三節是專案中期的詳細記錄；完整專案跑完 28 條 rule、22 個真實故障注入場景，**22/22 全數驗證 firing 並送達正確 receiver**。下表依場景編號排序，「類別」對應 rule 設計時的六個故障模式分類：**A** 監控系統自身失明、**B** 硬體（磁碟延遲／容量）、**C** 網路（心跳／抖動／時鐘）、**D** 軟體／daemon（crash／failover／可用性）、**E** 資料完整性、**F** client I/O 生命線＋監控核心。
+
+| # | 場景 | 類別 | 驗證的 alert | 真實注入手法 | 結果 |
+|---|---|---|---|---|---|
+| S1 | slow-ops | F/B | `CephClientBlocked{SLOW_OPS}` → 🔴 · `CephDaemonSlowOps` → 🔵 | cgroup v2 `io.max` 限速 backing device + 高並發 `rados bench` 撐滿 op queue | ✅ |
+| S2 | pg-availability | F/E | `CephClientBlocked{PG_AVAILABILITY}` → 🔴 · `CephPGUnhealthyStates` → 🔴 | 停測試 pool acting set 裡兩顆 OSD | ✅ |
+| S3 | mon-quorum-lost | F | `CephMonQuorumLost` → 🔴（含 inhibit 確定性驗證） | 停 2 台 mon（保留 active mgr 那台，之後再停 active mgr 測 empty-series path） | ✅ |
+| S4 | osd-daemon-down | D | `CephOSDDaemonDownScoped` → 🔴（host-scoped 不誤叫） | 停單顆 OSD service | ✅ |
+| S5 | osd-host-down | D | `CephOSDHostDownScoped` → 🔴（3 顆 daemon-scoped 都不誤叫，驗 `unless` 去重） | 停整台 host 全部 OSD | ✅ |
+| S6 | mon-down-single | D | `CephMonDownScoped` → 🔴（`CephMonQuorumLost` 不誤叫） | 停單台 mon | ✅ |
+| S7 | exporter-blind | A | `CephMetricsAbsent` + `CephExporterAllDown` → 🔴 | disable `prometheus` mgr module | ✅ |
+| S8 | mgr-failover | D | metrics 不中斷 · `CephMgrNoStandby` → 🔵 | `ceph mgr fail` + 停 standby mgr | ✅ |
+| S9 | catch-all-risk | D | `CephClientRisk{OSD_NO_DOWN_OUT_INTERVAL}` → 🔴 | `config set mon_osd_down_out_interval 0` | ✅ |
+| S10 | low-priority-notice | D | `CephLowPriorityNotice` → 🔵（pager 靜默） | 設 `noout` flag 升 `OSDMAP_FLAGS`，等 `for:30m` | ✅ |
+| S11 | latency-outlier | B | `CephOSDLatencyOutlier` → 🔵 | 輕度限速 + 高並發寫入 | ✅ |
+| S12 | net-slow-heartbeat | C | `CephOSDSlowHeartbeat` → 🔴 | `tc netem delay 1200ms` | ✅ |
+| S13 | mon-clock-skew | C | `CephMonClockSkew` → 🔴 | 停時間同步 + `date` 手動 step +2s | ✅ |
+| S14 | daemon-crash | D | `CephDaemonRecentCrash` → 🔵 | 真 `SIGSEGV` 打進容器內的 ceph-osd 行程 | ✅ |
+| S15 | osd-flapping | C | `CephOSDFlapping` → 🔴 | OSD 停/啟 ×2（4 次 transition） | ✅ |
+| S16 | capacity-ladder | B/F | `CephOSDNearFull` → 🔵 · `CephOSDBackfillFull` → 🔴 · `CephClientBlocked{OSD_FULL}` + `CephHealthError` → 🔴 | 動態量測最滿 OSD 使用率，逐級調低 full-ratio | ✅ |
+| S17 | pool-quota | B/F | `CephPoolNearQuota` → 🔵 · `CephClientBlocked{POOL_FULL}` → 🔴 | 持續寫爆 pool `max_bytes` quota | ✅ |
+| S18 | capacity-forecast | B | `CephCapacityForecast` → 🔵 | 3 條連續 `rados bench` 平行流持續寫入，72h 趨勢預測越過 85% | ✅ |
+| S19 | data-damage | E | `CephDataDamage` → 🔴 | `objectstore-tool set-bytes` 損毀單一 object 內容 → deep-scrub | ✅ |
+| S20 | object-unfound | E | `CephObjectUnfound` → 🔴 | `size=2/min_size=1` 誘發 unfound 的標準手法 | ✅ |
+| S21 | mon-disk-low | B | `CephMonDiskLow` → 🔵 · `CephMonDiskCritical` → 🔴 | 調低 `mon_data_avail_warn`／`mon_data_avail_crit` 閾值 | ✅ |
+| S22 | watchdog baseline | A | `Watchdog` → watchdog receiver | 部署後即斷言心跳必達 | ✅ |
+
+驗證全數結束後，叢集復原至 `HEALTH_OK`：ratio、config、flag 全部還原，沒有殘留的 crash report 或測試 pool。
+
+## 真機才抓到的 16 個發現
+
+這 16 個 bug，fake 測試（`promtool`、unit test）全部綠燈，只有接上真硬體、真 mgr、真 cephadm shell 才會現形。它們是「每條 alert 都要真機驗證」這條鐵律逼出來的環境真相，而不是 rule 邏輯本身寫錯——這點值得反覆強調，因為它說明了 fake 測試與真機驗證測的其實是兩件不同的事。
+
+### 01 · daemon crash 打錯行程，而且這個 lab 的 crash sidecar 本身是壞的（S14）
+
+- **症狀**：`kill -SEGV` 打 systemd `MainPID`，OSD 乾淨重啟但沒有產生 crash report，`RECENT_CRASH` 永遠不出現。
+- **根因**：`MainPID` 是 `conmon`（容器監控器）不是 ceph-osd；容器內 PID 1 是 `podman-init`、ceph-osd 是 PID 7，`podman-init` 不轉發 `SIGSEGV`。更深一層：這個 lab 的 `ceph-crash` sidecar 根本沒有 keyring（`client.crash` auth 不存在），物理上 post 不了 crash。
+- **修法**：對 host 上 ceph-osd 真實 PID（`pgrep -P $(podman inspect .State.Pid)`）送 `SIGSEGV`，讓真 crash meta 寫進 spool，再透過 seed 節點 admin 執行 `ceph crash post`（真 crash 資料，只繞過壞掉的傳輸 daemon）。`RECENT_CRASH` 真的亮、alert 真的 fire。
+
+### 02 · `CephDaemonSlowOps` 的指標太 spiky，`for:` 永遠湊不滿（S1 · rule 重設計）
+
+- **症狀**：製造了真實且持續的 slow-ops，cluster 級的 `CephClientBlocked` 正常 fire，但 per-daemon 的 `CephDaemonSlowOps` 逾時不 fire。
+- **根因**：對照 TSDB ground truth 發現 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 峰值 30、但 min 是 0，整個觀察視窗只有約 28.8% 的時間 `>0`——它是「當下超過 complaint-time 的 op 數」snapshot gauge，本質就是 spiky。原本 `for:` 要求連續多分鐘為真，在這種指標上永遠不可能滿足。
+- **修法**：rule 改用時間窗聚合 `max_over_time(...[5m]) > 0` 搭配較短的 `for:`——語意變成「該 daemon 近 5 分鐘內有過 slow op」，符合設計意圖，也對 spiky gauge 穩健。
+
+### 03 · 節流太硬會讓 OSD 直接 flap；要「持續」的 slow-ops 得靠並發，不是靠更硬的限速（S1）
+
+- **症狀**：同樣的限速參數，一次讓 `SLOW_OPS` 訊號穩定持續，一次卻是爆發式、高變異。
+- **根因**：受控實驗證明把節流調得更硬，被限速的 OSD 連自己的 housekeeping I/O（心跳、metadata）都被卡住，直接 flap down——調硬節流換不到「持續」的訊號，只會換到 OSD 掉線。
+- **修法**：保持原本的節流強度（flap-safe），改用高並發寫入把 op queue 持續撐滿——queue 不排空，`SLOW_OPS` 就連續，也不會增加 OSD flap 的風險。
+
+### 04 · cephadm shell 的 stderr banner 污染 JSON，`jq` 直接 parse error（S15 · S19 · S20）
+
+- **症狀**：osd-flapping 場景的 down/up 狀態輪詢永遠逾時。
+- **根因**：擷取指令的實作用 `2>&1` 把 cephadm 的 banner（`Inferring fsid…` 之類的提示行）併進了要被 `jq` 解析的 JSON 檔，這幾行不是以 `#` 開頭，既有的過濾規則濾不掉，導致 `jq` 回報 `Invalid numeric literal`、輪詢永遠失敗。fake 測試回傳的是乾淨 JSON，測不到這個問題。
+- **修法**：JSON 解析改成純 stdout 重導（banner 走 stderr 到旁路的 log 檔）。同一個修正一次補掉了尚未真機跑的 S19、S20 潛在的同款問題。
+
+### 05 · flapping 太快，5 秒 scrape 抓不到中間狀態，`changes()` 只數到 2（S15）
+
+- **症狀**：腳本用 `ceph osd tree` 確認 4 次 up/down transition 都完成了，但 `CephOSDFlapping` 不 fire。
+- **根因**：`ceph osd tree`（mon 視角）比 mgr exporter 快；某個 up 狀態只維持了 4 秒，5 秒的 scrape 間隔沒有把它記成獨立樣本，`changes()` 實際上只數到 2 次變化。
+- **修法**：每次 transition 改成等 Prometheus 的 `ceph_osd_up` 真的反映該值之後再前進下一步，確保 4 個真實狀態各被 scrape 成獨立樣本。OSD 真的 flap 了 4 次，只是配速讓監控 pipeline 觀測到每一個狀態。
+
+### 06 · pool 超過 quota 要「持續的寫入壓力」才會升 `POOL_FULL`（S17）
+
+- **症狀**：`CephPoolNearQuota` 正常 fire，但寫過 quota 之後 `POOL_FULL` 超過 6 分鐘都不出現。
+- **根因**：手動實驗證明 pool 超過 `max_bytes` 確實會升 `POOL_FULL`，但只有在 client 持續嘗試寫入（寫到被 block 為止）時 mon 才會 flag；腳本原本在剛超過 quota 的那次寫入就停手，沒有維持壓力。
+- **修法**：過 quota 之後改用 `timeout 30 rados put`（bounded，被 block 也不會 hang，逾時的 exit code 就當「pool 已滿」的訊號），持續寫過 quota 並輪詢 `POOL_FULL`。
+
+### 07 · 想寫滿容量太慢；改用動態 ratio 貼合真實使用率（S16）
+
+- **症狀**：setup 原本想把某顆 OSD 寫到特定容量水位才調閾值，跑了多輪只累積到很小的量，且不再成長。
+- **根因**：叢集幾乎全空（最滿的 OSD 使用率極低），低並發的短時間 bench 太慢；而固定的 ratio 閾值對這麼低的使用率本來就不會 trip。
+- **修法**：不追固定容量數字，改成高並發寫入到「最滿 OSD 到達某個使用率」，再動態量測該使用率、把 `nearfull` / `backfillfull` / `full` 三級 ratio 設成它的某個比例——自動保證低於實際使用率且三級有序，三級都能 trip。
+
+### 08 · BlueStore slow-op 是 24 小時的 latch，用 restart OSD 清除會弄壞 cephadm 的 inventory（S1 · S11 · S16）
+
+- **症狀**：限速類場景結束後留下 `BLUESTORE_SLOW_OP_ALERT`（多顆 OSD）卡住收尾要求的 `HEALTH_OK` gate；舊的清理方式靠 restart OSD，卻讓 cephadm 把 daemon 狀態標成 `unknown`。
+- **根因**：這個警告有 24 小時的 latch 生命週期；rolling restart 手法太粗暴，還會讓 orchestrator 的追蹤狀態不同步。
+- **修法**：暫時把 `bluestore_slow_ops_warn_lifetime` 調到很短，讓警告在幾十秒內老化清除後再還原設定，不對任何 OSD 做 restart。這個手法抽成共用 helper，供多個場景共用。
+
+### 09 · rollback 移除網路延遲時，自己把自己那條 SSH 連線弄斷（S12）
+
+- **症狀**：`CephOSDSlowHeartbeat` 正常 fire、`netem` 也確認移除、叢集回到 `HEALTH_OK`，但腳本本身回報失敗。
+- **根因**：rollback 用來移除延遲的指令，是透過那條「正被延遲 1200ms 的介面」下 SSH 去執行；delete 那一刻的網路狀態變化擾亂了當下這條 SSH，連線異常斷開回傳非零，儘管 host 端其實已經成功清除延遲。
+- **修法**：rollback 的成功判斷改成事後用一條全新的 SSH 連線輪詢「延遲確實不見了」，而不是相信那條會自我擾亂的刪除指令的退出碼。
+
+### 10 · mgr failover 之後，standby 要幾十秒才重新註冊（S8）
+
+- **症狀**：`ceph mgr fail` 之後立刻查詢 mgr 狀態，standby 欄位是空的，判定失敗。
+- **根因**：被降級的 mgr 需要數秒到數十秒才會重新以 standby 身分註冊；腳本只查一次、沒有重試就直接下結論。
+- **修法**：改用有時間預算的輪詢，反覆檢查 standby 清單直到非空為止。這也順帶真機驗證了 multi-mgr scrape 的效果——failover 過程中 metrics 沒有中斷。
+
+### 11 · 真 quorum loss 時，mgr exporter 的遙測會「凍結」在舊世界（S3 · 早期發現）
+
+- **症狀**：真實停掉多台 mon 後，`ceph quorum_status` 已經無法完成，但 Prometheus 查到的 `ceph_mon_quorum_status` 加總仍是原本的數字。
+- **根因**：不是 PromQL 寫錯，而是**監控資料源還在回報舊世界**——單一 mgr exporter 視角在 quorum 崩潰時會 stale。`CephMonQuorumLost` 最後是靠 `or vector(0)` 的 empty-series path（exporter 也死掉、series 變空）才觸發。
+- **修法**：這正是後來補 `CephMetricsAbsent` 與 multi-mgr scrape 的理由——不能只靠單一 exporter 視角當 quorum-loss 偵測器。
+
+### 12 · 部署腳本只改 configmap，Prometheus 不會自動重載 rule（harness gap）
+
+- **症狀**：改完 rule 的 expr、重新部署監控，Prometheus 卻還在跑舊的 expr。
+- **根因**：套用設定變更的動作在 Deployment spec 沒變時不會重啟 pod；configmap 內容改了，但運行中的 Prometheus 行程不會自動重讀掛載的 rule 檔。
+- **修法**：任何 rule 變更之後都要手動重啟 Prometheus 的 deployment，才能保證新 rule 被載入；已記入待辦，準備把部署腳本硬化成 apply 後自動 reload。
+
+### 13 · capacity-forecast 六輪纏鬥：真正的兇手是 `rados bench` 覆寫同名 object（S18）
+
+- **症狀**：`CephCapacityForecast` 連續五輪不 fire——`predict_linear` 的趨勢預測始終爬不到 85% 門檻。
+- **層層剝開**：表面看像是「寫入吞吐不夠」，換了三個假設都沒解決：(1) pool 的 PG 數太少；(2) 並發不夠；(3) 複寫倍數吃掉了成長。每一輪都要靠即時查詢 TSDB 的成長率才知道還是不夠。
+- **真根因**：一次連續跑 10 分鐘的受控測試量到了明顯高很多的成長率，但場景原本的做法是分輪跑、每輪結束再重來，成長率卻低到接近零。差別在於：**`rados bench` 的分輪迴圈每輪都用固定的 run 名稱，第二輪起就會覆寫掉前一輪的同名 object**，pool 填滿第一輪之後就不再成長；連續跑的單一 bench 沒有這個問題，object 會持續累積。
+- **修法**：讓場景改成跟受控測試一樣的連續寫入方式（不分輪、不重複用同一組 run 名稱）。成長率立刻回到高位，projection 順利越過門檻，alert 真的 fire。
+- **教訓**：這是整輪最耗工的一次除錯。鐵律把一個看似「lab 寫入能力太弱」的失敗，一路挖到「`rados bench` 物件命名語意」這麼底層的細節——而 rule 本身從頭到尾都是對的，它正確地拒絕在不夠陡的趨勢上 fire。
+
+### 14 · data-damage 三層疊：health_detail 閃爍 + objectstore 的 remove 被 recovery 治好 + `HEALTH_ERR` 本身也閃爍（S19）
+
+- **症狀**：`CephDataDamage` 連續兩輪不 fire。
+- **第一層（指標閃爍）**：用 `objectstore-tool` 弄壞副本、deep-scrub 也確實抓到了，CLI 端的健康檢查持續顯示錯誤，但 mgr 匯出的 `ceph_health_detail` metric 在整個觀察視窗裡只有極少數 scrape 是 1，其餘全是 0——跟發現 02 的 `CephDaemonSlowOps` 是同一類 spiky snapshot gauge 問題。**修法**：rule 改成窗化的 `max_over_time(...[5m]) > 0`（同一次修正順便預先套用到 `CephObjectUnfound`）。
+- **第二層（recovery race）**：改成窗化後仍然不穩，原因是用 `remove` 讓副本**缺少**object 的手法，OSD 重啟後 PG 會 recovery 自動補回，跟 deep-scrub 之間形成競態，誰先誰後不一定。**修法**：改用 `set-bytes` **損毀內容**而不是刪除物件——內容錯誤的副本 recovery 不會自動治好，能確定性觸發 scrub mismatch。
+- **第三層（`HEALTH_ERR` 也閃爍）**：`CephDataDamage` 終於順利 fire，但額外斷言的 `CephHealthError` 卻逾時——scrub-error 的 `HEALTH_ERR` 隨底層 health_detail 指標在 ERR 與 WARN 之間跳動，`for:` 撐不住連續判定。而 `CephHealthError` 早就已經被別的場景（穩定的 `OSD_FULL` 觸發 `HEALTH_ERR`）驗證過。**修法**：移除這個場景裡重複且不穩定的 `CephHealthError` 斷言。
+- **教訓**：一個「資料損毀 alert」的真機驗證，牽出了 mgr 指標匯出的統計特性、Ceph recovery 與 scrub 之間的時序競態、以及 health status 傳導性閃爍這三件互不相關的事，而 rule 邏輯全程正確。
+
+### 15 · `CephObjectUnfound` 預先套用窗化修正，省下一輪失敗（S20）
+
+- **判斷**：修發現 14 時認出 `OBJECT_UNFOUND` 跟 `PG_DAMAGED` / `OSD_SCRUB_ERRORS` 同屬 mgr health_detail 匯出的資料完整性類檢查，判斷它很可能同樣閃爍，於是在同一個修正裡把 `CephObjectUnfound` 也一併改成窗化。
+- **結果**：這個場景直接一次通過，省掉了原本預期的一輪失敗、診斷、修正的來回。這正是「把真機發現抽象成一整類問題、而不是逐案修」的價值——同一種 mgr 匯出行為，只要抓到一次就能預先套用到所有同類 rule。
+
+### 16 · 真 quorum loss 當下，inhibit 觀察不到——exporter 凍結讓兩條 alert 永遠不重疊（S3）
+
+- **症狀**：`CephMonQuorumLost` fire 並成功送到 pager，但「`CephMonQuorumLost` 應該 inhibit `CephMonDownScoped`」這個斷言逾時。
+- **根因**：這是發現 11（exporter 遙測凍結）的延伸後果。真 quorum loss 時 mgr exporter 會先凍結（回報過期的 quorum 數字）、再徹底死掉；`CephMonQuorumLost` 只能靠 exporter 死後的 empty-series path 觸發。但那個時間點 `ceph_mon_quorum_status` 已經整個消失，`CephMonDownScoped` 的 expr 無資料可算，根本不會被判定 active——兩條 alert 在真實故障過程中永遠不會有時間上的重疊，inhibit 關係也就無從被「觀察」到。
+- **修法**：inhibit 設定本身沒有問題——改成直接送出兩筆合成的 alert 到 Alertmanager，確認 `CephMonDownScoped` 立刻被判定為 suppressed、且指向 `CephMonQuorumLost` 為抑制來源。於是把「在真故障中觀察 inhibit」改成「驗證 Alertmanager 設定本身的行為」，主 alert `CephMonQuorumLost` 仍然由真 quorum loss 完整驗證。
+- **教訓**：跟發現 14 的第三層是同一種模式——「機制完全正確，但真故障的動態讓它在真機上觀察不到」。誠實的做法是把不可觀察的斷言換成確定性驗證、並把原因記下來，而不是硬湊條件或造假資料。
+
 ## 驗證狀態
+
+**22 / 22 全數通過**，叢集已復原至 `HEALTH_OK`（ratio、config、flag 全部還原，無殘留 crash report 或測試 pool）。
 
 | 類別 | 狀態 |
 |---|---|
-| `CephClientBlocked{name="SLOW_OPS"}` | 真機已通過 |
-| `CephClientBlocked{name="PG_AVAILABILITY"}` | 真機已通過 |
-| `CephMonQuorumLost` PromQL empty-series path | 真機已通過 |
-| `CephMonQuorumLost` 直接用 mgr `ceph_mon_quorum_status` 偵測真 quorum loss | 真機發現 stale，不能單獨信任 |
-| `ceph-production-coverage` 新 rules | 本機 `promtool` 已驗規則邏輯；真機逐條注入尚待執行 |
-| MON systemd / node-exporter 視角 | 尚未在此 lab 部署；列為下一步 |
+| 28 條 alert rule（`ceph-stability-first` / `ceph-scoped-availability` / `ceph-production-coverage`） | 設計完成，`promtool` 邏輯與 `for:` 邊界已驗 |
+| 22 個真實故障注入場景（S1–S22） | **22/22 真機驗證通過**，詳見〈22 個場景全數真機驗證〉 |
+| `CephClientBlocked`（`SLOW_OPS` / `PG_AVAILABILITY` / `OSD_FULL` / `POOL_FULL`） | 真機已通過（S1、S2、S16、S17） |
+| `CephMonQuorumLost`（PromQL empty-series path） | 真機已通過（S3）；不能只靠單一 mgr exporter 視角偵測真 quorum loss（發現 11） |
+| `ceph-production-coverage` 全部 14 條 rule | 真機逐條注入完成（S4–S22 涵蓋），詳見上方場景表 |
+| Alertmanager routing（label 導向 + inhibit + watchdog） | 真機驗證：label 導向 routing 隨新 rule 自動生效；inhibit 以確定性 synthetic alert 驗證（發現 16） |
+| 真機才抓到的發現 | **16 個**，全部已修正並回歸驗證，詳見〈真機才抓到的 16 個發現〉 |
 
 ## 相關頁面
 
