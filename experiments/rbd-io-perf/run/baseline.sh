@@ -20,7 +20,7 @@ require_inject_flag "$@"
 ROUNDS="${BASELINE_ROUNDS:-5}"
 CLOUDIMG="${CLOUDIMG:-/mnt/pve/cephfs/template/iso/noble-server-cloudimg-amd64.img}"
 
-pve_ssh "ls $CLOUDIMG" >/dev/null 2>&1 || die "cloud image 不存在: $CLOUDIMG（下載: wget -O $CLOUDIMG https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img）"
+pve_ssh "ls $CLOUDIMG" >/dev/null 2>&1 || die "cloud image 不存在: ${CLOUDIMG}（下載: wget -O ${CLOUDIMG} https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img）"
 
 b="$(new_bundle baseline)"
 write_prediction "$b" "E-03: 量噪音帶（CoV）與虛擬化稅占比（H-003 無先驗預測）。guest /sys/block/vdb/mq 預期 = vCPU 數（H-026）。"
@@ -50,9 +50,15 @@ for entry in $FIO_PATTERNS; do
   name="${entry%%:*}"
   files=""
   for r in $(seq 1 "$ROUNDS"); do
-    f="$b/base-r$r/$name.json"
-    [ -s "$f" ] && files="$files $f"
+    # tainted rounds land in base-r<N>-retry; pick up whichever attempt survived
+    for f in "$b/base-r$r/$name.json" "$b/base-r$r-retry/$name.json"; do
+      [ -s "$f" ] && files="$files $f"
+    done
   done
+  if [ -z "$files" ]; then
+    log "警示: pattern ${name} 無有效輪次，noise.json 略過該點"
+    continue
+  fi
   # shellcheck disable=SC2086  # word-splitting files list is intended
   s="$(python3 "$RBDPERF_ROOT/lib/verdict.py" summarize $files)"
   printf '{"pattern": "%s", "summary": %s}\n' "$name" "$s" >> "$b/noise.json"

@@ -17,7 +17,7 @@ taint_check() {
 guard_check() {
   local cur="$1" base="$2"
   if grep -q 'HEALTH_ERR' "$cur"; then
-    die "guardrail: HEALTH_ERR 出現，立即中止（見 $cur）"
+    die "guardrail: HEALTH_ERR 出現，立即中止（見 ${cur}）"
   fi
   if grep -qi 'slow ops' "$cur" && ! grep -qi 'slow ops' "$base"; then
     die "guardrail: 新增 slow ops（baseline 無），立即中止"
@@ -33,7 +33,7 @@ collect_dmesg_delta() {
   local marker="$1" out="$2"
   pve_ssh "sudo -n dmesg | tail -n +$((marker + 1))" > "$out" || true
   if grep -qiE 'bad crc|socket closed' "$out"; then
-    log "警示: dmesg 出現 bad crc / socket closed（rxbounce 徵兆，見 $out）"
+    log "警示: dmesg 出現 bad crc / socket closed（rxbounce 徵兆，見 ${out}）"
   fi
 }
 

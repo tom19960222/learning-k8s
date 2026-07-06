@@ -34,7 +34,7 @@
 ### 網路查證 v2（使用者要求確認「應該只有 management 是 1G 其他都 10G」）
 
 - **實體層**：pve3 有三張卡——Intel 82599ES 10G ×2（enp1s0f0 → vmbr1 guest 網、enp1s0f1 → vmbr2 ceph cluster net，皆 MTU 9000、協商 10G ✅）+ Realtek RTL8111 **1G**（enp5s0 → vmbr0 management）。
-- **enp5s0 兩側（本卡與 switch link partner）都 advertise 1000baseT，卻協商在 100Mb/s** → 幾乎可確定是線材問題（斷對）或埠接觸不良；換線應可回 1G。
+- **enp5s0 兩側（本卡與 switch link partner）都 advertise 1000baseT，卻協商在 100Mb/s** → 幾乎可確定是線材問題（斷對）或埠接觸不良；換線應可回 1G。**【2026-07-07 更新】使用者已換線，ethtool 確認回到 1000Mb/s Full**——client IO 封頂由 ~11 MB/s 回到 ~112 MB/s；seq 類實驗（E-09/E-13）仍會被 1G 壓縮差異，結論標註「public net = 1G」。
 - **架構層**：`ceph.conf` 的 `public_network = 192.168.16.0/24` 就是 management 網段 → **client→OSD/mon 的資料流量走 management NIC**。「ceph 走 10G」只對 OSD 複寫（cluster_network，vmbr2）成立；所有 VM 磁碟 IO 到遠端 OSD 的 client 流量其實走這張 1G（現況 100Mb）卡。要把 client IO 搬到 10G 需改 ceph `public_network` + mon 重新定址——invasive 的 ceph 變更，不在本實驗邊界內（僅告知使用者）。
 - **對實驗的影響**：修回 1G 後，遠端 primary（osd.0）的 client IO 上限 ~112 MB/s——高 QD 4k 與 seq 實驗可能觸頂（E-02 量化）；旋鈕對照實驗（cache / aio / iothread / 雙軸）不受影響（各變體走同一條網）。所有結論標註「public net = 1G（management 共用）」。
 
