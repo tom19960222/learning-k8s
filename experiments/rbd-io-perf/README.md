@@ -19,7 +19,7 @@ harness 只做**自有資源的讀寫與量測**：自建的 `ioperf-` 前綴 RB
 - 任何一輪量測前後的 `ceph -s` 若出現 `HEALTH_ERR` → 立即 `die`，整支腳本中止。
 - 若本輪 `ceph -s` 出現 `slow ops` 而 baseline 快照沒有 → 視為新增的 slow ops，立即中止（既有的基線 WARN，例如 `osd.0` 的 BlueStore slow ops，不會誤觸發）。
 - 若 `ceph -s` 顯示 `recovery` / `backfill` / `degraded` 字樣 → 該輪判定 taint，重跑一次（`baseline.sh` 的 tainted-round retry 邏輯），非 abort。
-- Pool 容量：`ioperf` pool 只在 SSD class 上（僅 `osd.0` + `osd.8` 兩顆），操作前後手動確認占用維持在 20–30% 可用空間之內；磁碟預算固定為 boot 10G + data 16G，每個實驗逐顆建立、測完就刪（不同時堆疊多顆）。
+- Pool 容量：`ioperf` pool 只在 SSD class 上（僅 `osd.0` + `osd.8` 兩顆），操作前後確認 SSD class **至少留 20–30% 可用空間**（使用者要求的下限；目前預算峰值 ~42% 用量，餘裕充足）；磁碟預算固定為 boot 10G + data 16G，每個實驗逐顆建立、測完就刪（不同時堆疊多顆）。
 - krbd 相關實驗（E-01、E-04 的 krbd 軸、host 層 map options 系列）會在 PVE node 上額外吃記憶體（kernel rbd client cache + host page cache），跑 krbd 變體前後留意 `free -g`，若逼近上限先降 `--numjobs` / 縮小測試 image。
 
 **只動自有資源**：
@@ -31,7 +31,7 @@ harness 只做**自有資源的讀寫與量測**：自建的 `ioperf-` 前綴 RB
 ## 前置需求
 
 - **PVE node**：`pve3`（`192.168.16.7`），登入帳號 `ioperf`（有 sudo）。
-- **測試 pool**：`ioperf`（SSD-only，`size=2`），保持 20–30% 可用空間；每個實驗的磁碟需求固定 boot 10G + data 16G，循序建立、用完刪除，不長期占用。
+- **測試 pool**：`ioperf`（SSD-only，`size=2`），至少留 20–30% 可用空間（下限，非用量上限）；每個實驗的磁碟需求固定 boot 10G + data 16G，循序建立、用完刪除，不長期占用。
 - **VMID**：`1031`，guest 網路走 bridge `vmbr1`（`192.168.18.0/24`，DHCP）。
 - **node 上先裝 `fio`**（E-02 host 層天花板實驗直接對 `/dev/rbdX` 跑 fio，需要 host 有這個指令；guest 端的 fio 由 `baseline.sh` 自動 `apt-get install`，不用手動處理）：
 
@@ -51,7 +51,7 @@ harness 只做**自有資源的讀寫與量測**：自建的 `ioperf-` 前綴 RB
 
 ## 環境變數一覽
 
-全部有預設值（見 `lib/common.sh`），需要時可覆寫：
+全部有預設值（見 `lib/common.sh`），需要時可覆寫（另有 `GUEST_USER`，預設 `ubuntu`，`guest_ssh` 使用）：
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
