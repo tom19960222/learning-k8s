@@ -76,7 +76,7 @@ emit_verdict() {
   if ! out="$(python3 "$RBDPERF_ROOT/lib/verdict.py" compare \
     --metric "$metric" --expect "$expect" --noise-cov "$cov" \
     --baseline "$base" --variant "$var")"; then
-    die "verdict.py 執行失敗（pattern: $pattern）"
+    die "verdict.py 執行失敗（pattern: ${pattern}）"
   fi
   printf '%s\n' "$out" > "$bundle/verdict-$pattern.json"
   printf '%s\n' "$out"
