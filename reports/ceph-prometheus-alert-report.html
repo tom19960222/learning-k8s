@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ceph 儲存叢集告警系統：設計、驗證與真機故障演練報告</title>
+<style>
+  :root {
+    --ink: #1a2233;
+    --muted: #5b6472;
+    --line: #dde3ea;
+    --bg: #ffffff;
+    --soft: #f5f7fa;
+    --accent: #0b5cad;
+    --red: #c62828;
+    --amber: #b26a00;
+    --blue: #1565c0;
+    --green: #1b7f3b;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", -apple-system, sans-serif;
+    font-size: 16px; line-height: 1.85;
+  }
+  .page { max-width: 900px; margin: 0 auto; padding: 48px 28px 96px; }
+  header.report { border-bottom: 3px solid var(--accent); padding-bottom: 24px; margin-bottom: 32px; }
+  h1 { font-size: 1.9rem; line-height: 1.4; margin: 0 0 12px; }
+  .meta { color: var(--muted); font-size: .95rem; }
+  .meta b { color: var(--ink); }
+  h2 { font-size: 1.45rem; margin: 56px 0 16px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--accent); }
+  h3 { font-size: 1.15rem; margin: 32px 0 10px; }
+  h4 { font-size: 1.0rem; margin: 24px 0 8px; }
+  p { margin: 12px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--soft); font-weight: 700; }
+  tr:nth-child(even) td { background: #fbfcfe; }
+  code { font-family: var(--mono); font-size: .85em; background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  pre { background: #0f1723; color: #e6edf3; border-radius: 8px; padding: 16px; overflow-x: auto; line-height: 1.6; }
+  pre code { background: none; border: none; color: inherit; padding: 0; font-size: .82rem; }
+  .badge { display: inline-block; border-radius: 999px; padding: 0 10px; font-size: .78rem; font-weight: 700; line-height: 1.7; white-space: nowrap; }
+  .b-red { background: #fdecea; color: var(--red); }
+  .b-amber { background: #fdf3e0; color: var(--amber); }
+  .b-blue { background: #e8f1fb; color: var(--blue); }
+  .b-grey { background: #eceff3; color: var(--muted); }
+  .b-green { background: #e8f5ec; color: var(--green); }
+  .kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0; }
+  .kpi .card { background: var(--soft); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .kpi .num { font-size: 1.7rem; font-weight: 800; color: var(--accent); line-height: 1.2; }
+  .kpi .lbl { font-size: .82rem; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+  .callout { border-left: 4px solid var(--accent); background: var(--soft); border-radius: 0 8px 8px 0; padding: 12px 18px; margin: 18px 0; }
+  .callout.warn { border-left-color: var(--red); background: #fdf6f5; }
+  details { border: 1px solid var(--line); border-radius: 10px; margin: 18px 0; background: #fff; }
+  details > summary { cursor: pointer; padding: 14px 18px; font-weight: 700; background: var(--soft); border-radius: 10px; list-style: none; }
+  details[open] > summary { border-bottom: 1px solid var(--line); border-radius: 10px 10px 0 0; }
+  details > summary::before { content: "▸ "; color: var(--accent); }
+  details[open] > summary::before { content: "▾ "; }
+  details .inner { padding: 6px 18px 18px; }
+  nav.toc { background: var(--soft); border: 1px solid var(--line); border-radius: 10px; padding: 16px 22px; margin: 24px 0; }
+  nav.toc ol { margin: 8px 0 0; padding-left: 22px; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+  ul, ol { padding-left: 26px; }
+  li { margin: 6px 0; }
+  .small { font-size: .88rem; color: var(--muted); }
+  a { color: var(--accent); }
+  @media print {
+    details { break-inside: avoid; }
+    details:not([open]) { display: block; }
+    pre { white-space: pre-wrap; }
+    h2 { break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="report">
+  <h1>Ceph 儲存叢集告警系統<br><span style="font-size:1.2rem;color:var(--muted);font-weight:600">設計、驗證與真機故障演練報告</span></h1>
+  <div class="meta">
+    <b>日期</b>：2026-07-07 ｜ <b>狀態</b>：全部驗證完成（27 條 alert rule、22 個真機故障場景 22/22 通過）<br>
+    <b>對象讀者</b>：技術與非技術主管、全體同事——前半部不需要儲存或監控背景即可閱讀；技術細節集中在後半與附錄。<br>
+    <b>驗證聲明</b>：本報告所有數字與宣稱已逐一對照原始實驗數據複核（<code>experiments/*/results/</code> 原始 JSON、orchestrator 進度記錄、promtool / amtool 輸出）；無法由現有數據支撐的項目統一標記於附錄 E「待補實驗」。
+  </div>
+</header>
+
+<nav class="toc">
+  <b>目錄</b>
+  <ol>
+    <li><a href="#s1">執行摘要</a></li>
+    <li><a href="#s2">給非技術讀者的 60 秒背景</a></li>
+    <li><a href="#s3">前言：我們為什麼要做這件事</a></li>
+    <li><a href="#s4">我們設計了什麼（含完整 rules set）</a></li>
+    <li><a href="#s5">我們怎麼驗證：四層測試</a></li>
+    <li><a href="#s6">做了哪些實驗、結果如何</a></li>
+    <li><a href="#s7">結果與預想的落差</a></li>
+    <li><a href="#s8">能解決什麼、不能解決什麼</a></li>
+    <li><a href="#s9">總結與上線建議</a></li>
+    <li><a href="#appA">附錄 A–E（預設折疊）</a></li>
+  </ol>
+</nav>
+
+<h2 id="s1">1. 執行摘要</h2>
+<p>我們為 Ceph 儲存叢集重新設計了一套 Prometheus 告警（alert）系統，解決「例行維護會半夜誤叫值班人員、真正的故障卻可能靜默」這個長期痛點。這套系統不是紙上設計：每一條規則都先在開發環境用工具逐條驗證邏輯，再到真實叢集上<b>製造 22 種真實故障</b>（磁碟變慢、節點斷線、資料損毀、容量寫爆、時鐘偏移……），親眼確認告警真的響、而且送到正確的人手上。</p>
+
+<div class="kpi">
+  <div class="card"><div class="num">27</div><div class="lbl">自訂 alert rule<br>（6 穩定性 + 3 精準靜音 + 18 生產覆蓋）</div></div>
+  <div class="card"><div class="num">22/22</div><div class="lbl">真機故障注入場景<br>全數通過</div></div>
+  <div class="card"><div class="num">1</div><div class="lbl">開發階段抓到的致命設計 bug<br>（最壞情況反而不叫，上線前修復）</div></div>
+  <div class="card"><div class="num">16</div><div class="lbl">只有真機演練才現形的問題<br>（工具測試全綠，全部已修正）</div></div>
+  <div class="card"><div class="num">HEALTH_OK</div><div class="lbl">實驗後叢集完全復原<br>無任何殘留變更</div></div>
+</div>
+
+<div class="callout"><b>一句話總結</b>：這套告警現在做得到——例行維護時不吵人、真故障時一定叫人、連「監控系統自己壞掉」都會被發現；同時我們也誠實列出了它做不到的事（見第 8 節）。</div>
+
+<h2 id="s2">2. 給非技術讀者的 60 秒背景</h2>
+<p>讀這份報告只需要知道六個名詞：</p>
+<table>
+  <tr><th style="width:22%">名詞</th><th>白話說明</th></tr>
+  <tr><td><b>Ceph</b></td><td>我們的共用儲存底座。許多虛擬機與服務的資料都放在它上面，它出問題等於上層全部受影響。</td></tr>
+  <tr><td><b>Prometheus</b></td><td>持續收集系統量測數據（metrics）的工具，例如「這顆硬碟延遲多少」「還剩多少容量」。</td></tr>
+  <tr><td><b>Alert rule</b></td><td>寫在 Prometheus 裡的判斷式，例如「延遲連續 5 分鐘超標就發告警」。本報告的核心產出就是 27 條這種規則。</td></tr>
+  <tr><td><b>Alertmanager</b></td><td>收到告警後決定「通知誰、用什麼管道」的元件。</td></tr>
+  <tr><td><b>Pager vs Slack</b></td><td>兩種通知等級。<b>Pager = 半夜也會把值班人員叫醒</b>；Slack = 上班時間看到再處理。把訊號分對等級，是這個專案的靈魂。</td></tr>
+  <tr><td><b>Silence（靜音）</b></td><td>計畫性維護時暫時關掉特定告警。本專案的關鍵改進之一：讓靜音可以<b>精準到只蓋住維護中的那一台機器</b>，而不是整類告警全關。</td></tr>
+</table>
+
+<h2 id="s3">3. 前言：我們為什麼要做這件事</h2>
+<p>Ceph 官方其實已附帶一套預設告警規則（ceph-mixin）。拿來「看叢集健不健康」夠用，但拿來<b>當值班人員的 pager 訊號</b>，在實務上有三個痛點：</p>
+
+<h3>痛點一：例行維護的噪音，無法精準靜音</h3>
+<p>換一顆硬碟、重開一台機器，是儲存叢集的日常。但預設告警是「叢集級」的：維護任何一台機器，<code>CephOSDHostDown</code>、<code>CephMonDown</code> 這類告警就會響，而且——這是根本原因——<b>Ceph 匯出的健康狀態指標（<code>ceph_health_detail</code>）只有事件名稱，沒有「是哪一台機器」的標籤（label）</b>。Alertmanager 的靜音只能依 label 比對，所以你<b>無法只靜音維護中的那一台</b>。結果只剩兩個壞選項：忍受維護噪音，或粗暴地把整類告警全部靜音——後者等於維護那兩小時裡，其他機器真的壞了也沒人知道。</p>
+
+<h3>痛點二：告警疲勞——狼來了</h3>
+<p>一次換硬碟會連鎖觸發一整串告警（副本暫時少一份、保護旗標升起……）。當值班人員習慣了「告警響 = 大概又是維護」，真正的故障就會被淹沒。告警系統最貴的成本不是漏報，是<b>訓練出忽視告警的團隊</b>。</p>
+
+<h3>痛點三：最壞的情況，反而可能靜默</h3>
+<p>這是最反直覺、也最危險的一類問題。舉兩個本專案實際抓到的例子：</p>
+<ul>
+  <li>監控叢集共識（MON quorum）的規則，一種常見寫法在「所有 MON 全部掛掉」——最嚴重的情況——<b>反而算不出結果、不會觸發</b>（詳見第 6.1 節，這是我們在開發階段用測試抓到的真 bug）。</li>
+  <li>如果監控資料的匯出端（exporter）自己壞了，所有告警規則都沒有資料可算，整個告警系統會<b>無聲失明</b>——沒有任何一條規則會告訴你「我瞎了」。</li>
+</ul>
+<div class="callout"><b>所以這個專案要做的事</b>：在保留官方預設規則（當作背景參考資訊）的前提下，加上一層維護友善、經過完整驗證的告警，並且把「監控系統自身的失效」也納入監控。</div>
+
+<h2 id="s4">4. 我們設計了什麼</h2>
+
+<h3>4.1 設計原則：不重寫，加一層；每條告警先分好「角色」</h3>
+<p>我們沒有丟掉官方預設規則，而是在它之上加一層。每一條告警在設計時就先回答：它屬於哪種角色？</p>
+<table>
+  <tr><th>角色</th><th>意思</th><th>例行維護時可以靜音嗎</th></tr>
+  <tr><td><b>Pager 主訊號</b></td><td>使用者的讀寫已被擋住、叢集共識失守、監控失明、明確的機器/服務下線</td><td>只有「帶機器標籤」的可以按目標精準靜音；其餘<b>不可</b>靜音</td></tr>
+  <tr><td><b>Slack / 工單參考</b></td><td>官方預設的叢集級告警、低優先提示</td><td>可短時間靜音降噪</td></tr>
+  <tr><td><b>維護可精準靜音</b></td><td>帶 <code>hostname</code> / <code>ceph_daemon</code> label 的機器級告警</td><td>維護時<b>只靜音目標那一台</b></td></tr>
+</table>
+
+<h3>4.2 三組規則 + 一張路由表</h3>
+<p><b>第一組 <code>ceph-stability-first</code>（6 條）——使用者風險，多數不可靜音。</b> 核心是 <code>CephClientBlocked</code>：只要使用者的讀寫實際被擋（PG 不可用、操作嚴重變慢、容量寫死），1 分鐘內 page。搭配一條 catch-all <code>CephClientRisk</code> 接住「還沒被專屬規則接手、但會危及使用者」的其他健康檢查，以及 MON quorum 生命線、監控失明偵測、低優先提示。</p>
+<p><b>第二組 <code>ceph-scoped-availability</code>（3 條 + 2 條 recording rule）——解決「無法精準靜音」的那一組。</b> 技術關鍵：Ceph 的 metadata 指標（<code>ceph_osd_metadata</code> / <code>ceph_mon_metadata</code>）其實帶有 <code>hostname</code>，我們用 PromQL join 把「機器/服務下線」狀態接上機器名稱，讓告警 label 裡有 <code>hostname</code> / <code>ceph_daemon</code>——維護時就能只靜音那一台。同時用 <code>unless</code> 去重：整台機器掛掉時只發一條「host down」，不會該機器上每顆硬碟服務各叫一次。</p>
+<p><b>第三組 <code>ceph-production-coverage</code>（18 條）——生產環境覆蓋面。</b> 依六大故障模式分類補齊：<b>監控自身失明</b>（<code>CephMetricsAbsent</code>、永遠心跳的 <code>Watchdog</code> 接 dead-man switch）、<b>硬體</b>（延遲離群、容量三級警戒、3 天容量趨勢預測）、<b>網路</b>（心跳變慢、服務反覆上下線、時鐘偏移）、<b>軟體</b>（daemon crash、mgr 無備援）、<b>資料完整性</b>（資料損毀、物件遺失）、<b>PG 健康狀態</b>。</p>
+<p><b>路由（routing）</b>：label 導向而非逐條列名——自訂規則中 <code>severity=critical</code> 的進 pager；warning/info 進 Slack；官方預設規則一律只進 Slack（唯一例外：<code>CephHealthError</code> 保留當 pager 總開關）；<code>Watchdog</code> 走獨立管道給外部的 dead-man switch 監視「告警系統本身還活著」。新增規則時只要 label 標對，路由自動正確。</p>
+
+<h3>4.3 完整的 27 條 alert rule 總覽</h3>
+<p class="small">圖例：<span class="badge b-red">pager</span> 叫醒值班 ｜ <span class="badge b-blue">Slack</span> 上班時間處理 ｜ <span class="badge b-grey">watchdog</span> 專用管道。「驗證場景」對應第 6 節的真機故障注入編號。</p>
+<table>
+  <tr><th>#</th><th>Alert</th><th>白話意義</th><th>等級 / 去向</th><th>持續門檻</th><th>驗證場景</th></tr>
+  <tr><td>1</td><td><code>CephClientBlocked</code></td><td>使用者讀寫已被擋（PG 不可用 / 操作過慢 / 容量寫死）</td><td><span class="badge b-red">critical · pager</span></td><td>1m</td><td>S1·S2·S16·S17</td></tr>
+  <tr><td>2</td><td><code>CephClientRisk</code></td><td>其餘會危及使用者的健康檢查（catch-all）</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S9</td></tr>
+  <tr><td>3</td><td><code>CephMonQuorumLost</code></td><td>叢集共識（quorum）失守的生命線</td><td><span class="badge b-red">critical · pager</span></td><td>1m</td><td>S3</td></tr>
+  <tr><td>4</td><td><code>CephExporterAllDown</code></td><td>監控資料來源全部失聯（告警失明）</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S7</td></tr>
+  <tr><td>5</td><td><code>CephExporterTargetDown</code></td><td>單一監控來源失聯</td><td><span class="badge b-amber">warning · Slack</span></td><td>15m</td><td>⚠️ 無專屬場景（附錄 E）</td></tr>
+  <tr><td>6</td><td><code>CephLowPriorityNotice</code></td><td>低優先提示（維護旗標、資料搬移中…）</td><td><span class="badge b-blue">info · Slack</span></td><td>30m</td><td>S10</td></tr>
+  <tr><td>7</td><td><code>CephOSDHostDownScoped</code></td><td>整台儲存機器下線（帶 hostname，可精準靜音）</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S5</td></tr>
+  <tr><td>8</td><td><code>CephOSDDaemonDownScoped</code></td><td>單顆儲存服務（OSD）下線（帶 daemon 名）</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S4</td></tr>
+  <tr><td>9</td><td><code>CephMonDownScoped</code></td><td>單台共識節點（MON）下線（帶 hostname）</td><td><span class="badge b-red">critical · pager</span></td><td>30s</td><td>S6</td></tr>
+  <tr><td>10</td><td><code>CephMetricsAbsent</code></td><td>Ceph 指標從監控中消失（盲飛偵測）</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S7</td></tr>
+  <tr><td>11</td><td><code>Watchdog</code></td><td>永遠觸發的心跳，供外部 dead-man switch 反向監視告警系統</td><td><span class="badge b-grey">none · watchdog</span></td><td>—</td><td>S22</td></tr>
+  <tr><td>12</td><td><code>CephOSDSlowHeartbeat</code></td><td>儲存節點間網路心跳變慢</td><td><span class="badge b-red">critical · pager</span></td><td>2m</td><td>S12</td></tr>
+  <tr><td>13</td><td><code>CephOSDFlapping</code></td><td>OSD 反覆上下線（15 分鐘內 ≥4 次）</td><td><span class="badge b-red">critical · pager</span></td><td>—</td><td>S15</td></tr>
+  <tr><td>14</td><td><code>CephMonClockSkew</code></td><td>節點時鐘偏移</td><td><span class="badge b-red">critical · pager</span></td><td>2m</td><td>S13</td></tr>
+  <tr><td>15</td><td><code>CephOSDLatencyOutlier</code></td><td>單顆 OSD 延遲明顯高於群體（壞碟前兆）</td><td><span class="badge b-amber">warning · Slack</span></td><td>10m</td><td>S11</td></tr>
+  <tr><td>16</td><td><code>CephDaemonSlowOps</code></td><td>個別 daemon 有慢操作（5 分鐘窗化）</td><td><span class="badge b-amber">warning · Slack</span></td><td>1m</td><td>S1</td></tr>
+  <tr><td>17</td><td><code>CephDaemonRecentCrash</code></td><td>daemon 近兩週內曾 crash</td><td><span class="badge b-amber">warning · Slack</span></td><td>5m</td><td>S14</td></tr>
+  <tr><td>18</td><td><code>CephMgrNoStandby</code></td><td>管理服務（mgr）失去備援</td><td><span class="badge b-amber">warning · Slack</span></td><td>5m</td><td>S8</td></tr>
+  <tr><td>19</td><td><code>CephOSDNearFull</code></td><td>OSD 接近容量警戒線</td><td><span class="badge b-amber">warning · Slack</span></td><td>10m</td><td>S16</td></tr>
+  <tr><td>20</td><td><code>CephOSDBackfillFull</code></td><td>OSD 已滿到無法進行資料修復</td><td><span class="badge b-red">critical · pager</span></td><td>5m</td><td>S16</td></tr>
+  <tr><td>21</td><td><code>CephMonDiskLow</code></td><td>MON 資料磁碟空間偏低</td><td><span class="badge b-amber">warning · Slack</span></td><td>10m</td><td>S21</td></tr>
+  <tr><td>22</td><td><code>CephMonDiskCritical</code></td><td>MON 資料磁碟空間危急</td><td><span class="badge b-red">critical · pager</span></td><td>1m</td><td>S21</td></tr>
+  <tr><td>23</td><td><code>CephPoolNearQuota</code></td><td>儲存池用量超過配額 80%</td><td><span class="badge b-amber">warning · Slack</span></td><td>10m</td><td>S17</td></tr>
+  <tr><td>24</td><td><code>CephCapacityForecast</code></td><td>依趨勢預測 3 天內容量將超過 85%</td><td><span class="badge b-amber">warning · Slack</span></td><td>30m</td><td>S18</td></tr>
+  <tr><td>25</td><td><code>CephDataDamage</code></td><td>偵測到資料損毀（scrub 錯誤，5 分鐘窗化）</td><td><span class="badge b-red">critical · pager</span></td><td>1m</td><td>S19</td></tr>
+  <tr><td>26</td><td><code>CephObjectUnfound</code></td><td>有物件的最新版本找不到任何副本</td><td><span class="badge b-red">critical · pager</span></td><td>1m</td><td>S20</td></tr>
+  <tr><td>27</td><td><code>CephPGUnhealthyStates</code></td><td>資料分片（PG）處於不健康狀態</td><td><span class="badge b-red">critical · pager</span></td><td>3m</td><td>S2</td></tr>
+</table>
+<p class="small">另保留官方 ceph-mixin 預設規則做為 Slack 參考資訊，其中 <code>CephHealthError</code>（叢集進入 <code>HEALTH_ERR</code>）保留為 pager 總開關。</p>
+
+<details>
+<summary>📄 完整 Prometheus rules set（點開展開，5 個檔案、逐字與版本庫一致）</summary>
+<div class="inner">
+
+<h4><code>ceph-stability-first.yml</code> — 使用者風險（6 條）</h4>
+<pre><code># 逐字取自 next-site/content/ceph/features/prometheus-alert-design.mdx
+# §「ceph-stability-first：client 風險，多數不可 silence」
+# 被測物 — 不得改寫。lib/check-rules-match-page.sh 會比對。
+groups:
+  - name: ceph-stability-first
+    rules:
+      - alert: CephClientBlocked
+        expr: ceph_health_detail{name=~&quot;PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL&quot;} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph client I/O blocked: {{ $labels.name }}&quot;
+
+      - alert: CephClientRisk
+        expr: |
+          ceph_health_detail{
+            name!~&quot;PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL|OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT|MON_CLOCK_SKEW|RECENT_CRASH|OSD_NEARFULL|OSD_BACKFILLFULL|MON_DISK_LOW|MON_DISK_CRIT|PG_DAMAGED|OSD_SCRUB_ERRORS|OBJECT_UNFOUND&quot;
+          } == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph client-risk check active: {{ $labels.name }}&quot;
+
+      - alert: CephMonQuorumLost
+        # FIX (F1)：原 `count(ceph_mon_quorum_status == 1) &lt; 2` 在全部 mon 掛掉時，
+        # 內層 ==1 過濾為空，count(空) 無 sample，&lt; 2 算不出結果 → 不 fire（最壞情況靜默）。
+        # `or vector(0)` 讓空 count 退回 0，quorum 全失守照樣 page。promtool 實證見測試。
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) &lt; 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph MON quorum lost or below 3-mon majority&quot;
+
+      - alert: CephExporterAllDown
+        expr: (count(up{job=&quot;ceph&quot;} == 1) or vector(0)) == 0
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: &quot;All Ceph Prometheus exporter targets are down&quot;
+
+      - alert: CephExporterTargetDown
+        expr: up{job=&quot;ceph&quot;} == 0
+        for: 15m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph exporter target {{ $labels.instance }} is down&quot;
+
+      - alert: CephLowPriorityNotice
+        expr: |
+          ceph_health_detail{
+            name=~&quot;HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL&quot;
+          } == 1
+        for: 30m
+        labels:
+          severity: info
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph low-priority notice: {{ $labels.name }}&quot;</code></pre>
+
+<h4><code>ceph-scoped-availability.yml</code> — 可精準靜音的機器級告警（3 條 alert + 2 條 recording rule）</h4>
+<pre><code># 逐字取自 next-site/content/ceph/features/prometheus-alert-design.mdx
+# §「ceph-scoped-availability：帶 label，維護可精準 silence」
+# 被測物 — 不得改寫。lib/check-rules-match-page.sh 會比對。
+groups:
+  - name: ceph-scoped-availability
+    rules:
+      - record: ceph:osd_up:with_hostname
+        expr: |
+          ceph_osd_up
+            * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+
+      - record: ceph:osd_host_down:scoped
+        expr: |
+          count by (hostname) (ceph:osd_up:with_hostname == 0)
+          ==
+          count by (hostname) (ceph:osd_up:with_hostname)
+
+      - alert: CephOSDHostDownScoped
+        expr: ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: &quot;Ceph OSD host down: {{ $labels.hostname }}&quot;
+          runbook: &quot;ceph osd tree; ceph health detail; check host power/network/systemd&quot;
+
+      - alert: CephOSDDaemonDownScoped
+        expr: |
+          (ceph:osd_up:with_hostname == 0)
+          unless on (hostname) ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: &quot;Ceph OSD down: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}&quot;
+          runbook: &quot;ceph osd tree; ceph osd ok-to-stop {{ $labels.ceph_daemon }}; inspect daemon log&quot;
+
+      - alert: CephMonDownScoped
+        expr: |
+          (
+            (1 - ceph_mon_quorum_status)
+              * on (ceph_daemon) group_left(hostname) ceph_mon_metadata
+          ) == 1
+        for: 30s
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: &quot;Ceph MON down or out of quorum: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}&quot;
+          runbook: &quot;ceph quorum_status; ceph health detail; inspect mon log and host network&quot;</code></pre>
+
+<h4><code>ceph-production-coverage.yml</code> — 生產覆蓋（18 條）</h4>
+<pre><code># 逐字取自 docs/superpowers/plans/2026-07-04-ceph-alert-production-coverage.md 的 Task 3 段落。
+# 完整說明留給後續新頁面（Ceph - 真機故障注入後的 alert 韌性修訂）；被測物 — 不得改寫。
+# lib/check-rules-match-page.sh 會比對本檔與設計頁的 load-bearing invariants。
+groups:
+  - name: ceph-production-coverage
+    rules:
+      - alert: CephMetricsAbsent
+        expr: absent(ceph_health_status)
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph metrics absent from Prometheus (blind monitoring)&quot;
+
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Always-firing heartbeat; wire to external dead-man switch&quot;
+
+      - alert: CephOSDSlowHeartbeat
+        expr: ceph_health_detail{name=~&quot;OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT&quot;} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph OSD heartbeat pings are slow: {{ $labels.name }}&quot;
+
+      - alert: CephOSDFlapping
+        expr: |
+          (changes(ceph_osd_up[15m]) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata) &gt;= 4
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph OSD flapping: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}&quot;
+
+      - alert: CephMonClockSkew
+        expr: ceph_health_detail{name=&quot;MON_CLOCK_SKEW&quot;} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph MON clock skew detected&quot;
+
+      - alert: CephOSDLatencyOutlier
+        expr: |
+          (
+            ceph_osd_commit_latency_ms &gt; 100
+            and
+            ceph_osd_commit_latency_ms &gt; 3 * scalar(quantile(0.5, ceph_osd_commit_latency_ms))
+          ) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph OSD commit latency outlier: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}&quot;
+
+      - alert: CephDaemonSlowOps
+        expr: max_over_time(ceph_daemon_health_metrics{type=&quot;SLOW_OPS&quot;}[5m]) &gt; 0
+        for: 1m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph daemon has slow ops: {{ $labels.ceph_daemon }}&quot;
+
+      - alert: CephDaemonRecentCrash
+        expr: ceph_health_detail{name=&quot;RECENT_CRASH&quot;} == 1
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph daemon crash reported in the last two weeks&quot;
+
+      - alert: CephMgrNoStandby
+        expr: (count(ceph_mgr_status) or vector(0)) &lt; 2
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph mgr has no standby (failover capacity lost)&quot;
+
+      - alert: CephOSDNearFull
+        expr: ceph_health_detail{name=&quot;OSD_NEARFULL&quot;} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph OSD(s) near full&quot;
+
+      - alert: CephOSDBackfillFull
+        expr: ceph_health_detail{name=&quot;OSD_BACKFILLFULL&quot;} == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph OSD(s) backfill-full: recovery is blocked&quot;
+
+      - alert: CephMonDiskLow
+        expr: ceph_health_detail{name=&quot;MON_DISK_LOW&quot;} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph MON data disk space low&quot;
+
+      - alert: CephMonDiskCritical
+        expr: ceph_health_detail{name=&quot;MON_DISK_CRIT&quot;} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph MON data disk space critically low&quot;
+
+      - alert: CephPoolNearQuota
+        expr: |
+          (
+            ceph_pool_bytes_used &gt; 0.8 * ceph_pool_quota_bytes
+            and
+            ceph_pool_quota_bytes &gt; 0
+          ) * on (pool_id) group_left(name) ceph_pool_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph pool {{ $labels.name }} above 80% of quota&quot;
+
+      - alert: CephCapacityForecast
+        expr: |
+          max(predict_linear(ceph_cluster_total_used_bytes[1h], 259200))
+          &gt; 0.85 * max(ceph_cluster_total_bytes)
+        for: 30m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph raw capacity projected to exceed 85% within 3 days&quot;
+
+      # fix round 1（real-lab, S19 資料損壞情境）：mgr 的 health_detail 匯出對 scrub/damage
+      # 類 check 是 transient 的——objectstore-tool 破壞副本、deep-scrub 偵測到後，CLI
+      # `ceph health detail` 持續顯示 OSD_SCRUB_ERRORS 約 6 分鐘，但同一段時間 Prometheus
+      # 裡 ceph_health_detail{name=&quot;OSD_SCRUB_ERRORS&quot;} 採了 97 個樣本、avg=0.031——值 1 只
+      # 出現在約 3 次零星 scrape，其餘全是 0。舊版 `== 1` + `for: 1m` 永遠無法連續 1 分鐘為
+      # 1，真故障期間規則永遠停在 pending、不會 fire（跟已修正的 CephDaemonSlowOps 同一種
+      # spiky snapshot gauge 問題）。改成 max_over_time(...[5m]) &gt; 0 撐住這段 flicker，
+      # for:1m 只當單次 scrape 抖動的 debounce；一旦偵測到損壞，alert 會撐住約 5 分鐘（即使
+      # repair 已經讓 health check 清除），方便 oncall 觀察，這對 pager alert 是好事。
+      - alert: CephDataDamage
+        expr: max_over_time(ceph_health_detail{name=~&quot;PG_DAMAGED|OSD_SCRUB_ERRORS&quot;}[5m]) &gt; 0
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair&quot;
+
+      # fix round 1（preemptive）：OBJECT_UNFOUND 跟上面的 PG_DAMAGED / OSD_SCRUB_ERRORS
+      # 同屬 mgr health_detail 匯出的資料完整性類 check，S20（object-unfound 情境）幾乎必定
+      # 重現同樣的 transient-export flicker，所以先套用同一套視窗化修正，理由與
+      # CephDataDamage 相同。
+      - alert: CephObjectUnfound
+        expr: max_over_time(ceph_health_detail{name=&quot;OBJECT_UNFOUND&quot;}[5m]) &gt; 0
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph objects unfound: latest replica unavailable&quot;
+
+      - alert: CephPGUnhealthyStates
+        expr: |
+          (
+            (ceph_pg_down + ceph_pg_incomplete + ceph_pg_unknown + ceph_pg_stale + ceph_pg_peered)
+            * on (pool_id) group_left(name) ceph_pool_metadata
+          ) &gt; 0
+        for: 3m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: &quot;Ceph pool {{ $labels.name }} has PGs in unhealthy states&quot;</code></pre>
+
+<h4><code>alertmanager-route.yml</code> — Alertmanager 路由</h4>
+<pre><code># Alertmanager routing（被測物）。route 區塊逐字取自 prometheus-alert-design.mdx
+# §「Alertmanager routing：把角色映射到 receiver」。receivers 補成 amtool 可吃的最小定義。
+# 效果：pager 收 severity=critical 的自訂 Ceph rules + CephHealthError；
+#       warning/info 自訂 rules 與預設 aggregate（type=ceph_default，除 CephHealthError）進 slack；
+#       Watchdog 走獨立 receiver，方便接外部 dead-man switch。
+route:
+  receiver: slack-ceph
+  group_by: [&#x27;alertname&#x27;, &#x27;name&#x27;, &#x27;hostname&#x27;, &#x27;ceph_daemon&#x27;]
+  routes:
+    - receiver: watchdog-ceph
+      matchers:
+        - alertname=&quot;Watchdog&quot;
+
+    - receiver: pager-ceph
+      matchers:
+        - severity=&quot;critical&quot;
+        - source=~&quot;ceph_stability|ceph_scoped|ceph_coverage&quot;
+
+    - receiver: pager-ceph
+      matchers:
+        - type=&quot;ceph_default&quot;
+        - alertname=&quot;CephHealthError&quot;
+
+    - receiver: slack-ceph
+      matchers:
+        - source=~&quot;ceph_stability|ceph_scoped|ceph_coverage&quot;
+
+    - receiver: slack-ceph
+      matchers:
+        - type=&quot;ceph_default&quot;
+
+receivers:
+  - name: slack-ceph
+  - name: pager-ceph
+  - name: watchdog-ceph</code></pre>
+
+<h4><code>ceph-mon-quorum-dynamic.yml</code> — 非 3-MON 叢集用的動態多數決版本（替代選項）</h4>
+<pre><code># 頁面「邊界 / 3-mon hard-code」提供的動態 majority 版本（已套 F1 的 or vector(0) 修正）。
+# 來源：next-site/content/ceph/features/prometheus-alert-design.mdx §邊界。
+groups:
+  - name: ceph-mon-quorum-dynamic
+    rules:
+      - alert: CephMonQuorumLostDynamic
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) &lt; (floor(count(ceph_mon_metadata) / 2) + 1)
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: &quot;Ceph MON quorum lost or below dynamic majority&quot;</code></pre>
+
+</div>
+</details>
+
+<h2 id="s5">5. 我們怎麼驗證：四層測試</h2>
+<p>告警規則最危險的地方是「看起來對」。一條寫錯的規則平常展示都正常，偏偏在最壞情況那一刻靜默——你不會在上線時發現，你會在<b>該被叫醒卻沒被叫醒的那個凌晨</b>發現。所以我們把驗證拆成四層，每層回答一個不同的問題：</p>
+<table>
+  <tr><th>層級</th><th>工具 / 環境</th><th>回答的問題</th><th>性質</th></tr>
+  <tr><td><b>A — 規則邏輯</b></td><td><code>promtool test rules</code>（官方單元測試工具，可凍結時間）</td><td>每條規則的判斷式、持續時間門檻、輸出 label 是否精確正確？</td><td>自動化、每次改動必跑</td></tr>
+  <tr><td><b>B — 路由</b></td><td><code>amtool config routes test</code></td><td>每種告警到底會送到 pager 還是 Slack？官方預設告警是否確定進不了 pager？</td><td>自動化、每次改動必跑</td></tr>
+  <tr><td><b>C — 整合</b></td><td>真的 Prometheus + Alertmanager + 接收端模擬</td><td>規則真的載得進去嗎？告警真的送得到嗎？靜音真的壓得住嗎？</td><td>自動化</td></tr>
+  <tr><td><b>D — 真機故障注入</b></td><td>真實 cephadm v19.2.3 叢集（3 MON + 9 OSD）</td><td>Ceph 在真實故障時<b>到底會不會</b>產生規則所假設的那些訊號？</td><td>22 個場景逐場注入、腳本自動斷言、逐一簽收</td></tr>
+</table>
+<div class="callout">這四層有一條重要的分工線：<b>A/B/C 證明的是「如果 Ceph 在故障時匯出了這些訊號，規則的行為就正確」；而「Ceph 到底會不會匯出那些訊號」只有 D 層的真機能回答。</b> 第 6 節會看到，這條線正是 16 個「工具測試全綠、真機才現形」問題的來源——兩者驗的是完全不同的東西，缺一不可。</div>
+
+<h2 id="s6">6. 做了哪些實驗、結果如何</h2>
+
+<h3>6.1 開發階段就抓到一個致命 bug：quorum 生命線在最壞情況反而靜默</h3>
+<p><code>CephMonQuorumLost</code> 的早期版本寫的是直覺式的 <code>count(ceph_mon_quorum_status == 1) &lt; 2</code>——「在共識中的 MON 少於 2 台就叫」。看起來完全合理，日常情境也都正確。</p>
+<p>但 PromQL 的 <code>count()</code> 是對「存在的資料」計數：當<b>所有</b> MON 全部掛掉、沒有任何一台回報「我在 quorum 中」時，過濾後一筆資料都不剩，<code>count(空)</code> 回傳的不是 0，而是「無資料」——整條判斷式<b>算不出結果，告警不會觸發</b>。也就是說，這條生命線在它最該叫的最壞情況（一台不剩）反而靜默，只有「還剩一台」時才叫。</p>
+<p>這個 bug 是 A 層測試餵入「3 台全掛」的合成資料時抓到的。撰寫本報告時我們又用 promtool 重現了一次修正前的紅燈作為存證：對舊寫法餵入「3 台 MON 全部為 0」的合成資料，promtool 回報預期 1 筆告警、實得 <code>got:[]</code>（零告警）——工具輸出的空結果就是證據。修法是標準寫法 <code>(count(...) or vector(0)) &lt; 2</code>：資料為空時退回 0，<code>0 &lt; 2</code> 成立照樣觸發。修正後三種情境（健康不叫、掉 2 台叫、<b>掉 3 台也叫</b>）全數通過；目前版本庫內最近一次完整執行結果為 Tier A promtool <code>SUCCESS</code>（31 個測試斷言）、Tier B routing <b>22 passed / 0 failed</b>（<code>experiments/ceph-alert-rules/results/</code>）。</p>
+<p>我們也誠實記錄了修正的副作用：修正版在「quorum 指標完全不存在」（例如 mgr 剛重啟）時也會觸發——它分不出「MON 全掛」與「指標缺席」。多數情況這可接受（連 quorum 指標都沒有，本來就等於對 quorum 失明，值得叫），若要避免，rules set 中另附一個以 metadata 為錨的動態多數決版本，天生免疫這個誤觸，且自動適應 5-MON 等不同規模的叢集。</p>
+<p>另外，A 層對 <code>CephClientRisk</code> 的 25 項排除清單做了「完整性測試」：一次餵入全部排除項 + 2 個非排除項，斷言只有非排除項觸發——之後任何人不小心改動排除清單，測試都會擋下來。B 層則把「官方預設的 critical 告警也只能進 Slack、不得進 pager」這條最容易寫錯的路由規則釘死。</p>
+
+<h3>6.2 真機故障注入：22 個場景，22/22 通過</h3>
+<p>在真實的 cephadm v19.2.3 實驗叢集（3 MON + 9 OSD）上，我們對每一條告警<b>製造對應的真實故障</b>，驗收鐵律是：<b>必須用真故障讓告警實際觸發並送達正確接收端，不接受模擬或假資料。</b> 注入手法包括：</p>
+<ul>
+  <li>用 cgroup v2 <code>io.max</code> 對 OSD 底層磁碟限速，重現「硬碟變慢」（S1、S11）</li>
+  <li>真的停掉 OSD / MON / mgr 服務（S3–S6、S8）</li>
+  <li>用 <code>tc netem</code> 注入 1200ms 網路延遲、手動撥快時鐘（S12、S13）</li>
+  <li>對 ceph-osd 行程送真的 <code>SIGSEGV</code> 製造 crash（S14）</li>
+  <li>用 <code>objectstore-tool</code> 真的損毀單一物件的副本內容，再觸發 deep-scrub（S19）</li>
+  <li>持續寫入直到容量三級警戒與儲存池配額全數觸發（S16–S18）</li>
+</ul>
+<p><b>結果：22 個場景全數通過</b>——每個場景預期的告警都真的觸發、送到正確的接收端（pager / Slack / watchdog）；每輪注入後叢集都復原到 <code>HEALTH_OK</code>，沒有殘留任何設定變更或測試資料。完整場景表見附錄 A。</p>
+<p>精確地說：27 條自訂規則中有 <b>26 條</b>在這 22 個場景裡完成了真機 firing 驗證。唯一的例外是 <code>CephExporterTargetDown</code>（單一監控來源失聯 15 分鐘的 warning）——它通過了路由層驗證（確認會進 Slack、不進 pager），但沒有專屬的真機注入場景，已標記為待補實驗（附錄 E）。</p>
+<div class="callout warn">其中最重要的單一發現來自 S3（quorum 失守）：真實停掉兩台 MON 後，<code>ceph quorum_status</code> 指令已經無法完成，但 Prometheus 從單一 mgr exporter 查到的 quorum 數<b>仍然是 3</b>——<b>監控資料來源在叢集共識崩潰時會凍結在舊世界、回報過期資料</b>。這不是規則寫錯（PromQL 完全正確），而是資料來源在說謊。最終告警是在 exporter 也停掉、資料變空後，靠 6.1 節那個 <code>or vector(0)</code> 修正觸發的。這個發現直接推導出第 8 節的限制與第 9 節的補強建議（multi-mgr scrape + 獨立觀測面）。</div>
+
+<h3>6.3 十六個「工具測試全綠、只有真機才現形」的問題</h3>
+<p>真機驗證過程中共發現 16 個問題——<b>沒有任何一個是 PromQL 寫錯</b>（promtool 全綠）。它們全部出在規則之外的真實世界：指標的統計特性、容器執行環境、工具的隱藏語意、故障當下的時序動態。依類型歸納：</p>
+<table>
+  <tr><th style="width:20%">類型</th><th>代表發現</th><th style="width:30%">教訓</th></tr>
+  <tr><td><b>指標的統計特性</b></td><td>多個健康指標本質是「瞬間快照」型，真故障期間只有零星時間點為 1——資料損毀場景中 CLI 持續顯示錯誤的同一時段，TSDB 的 97 個取樣只有約 3 個為 1（平均值 0.031）；slow-ops 指標在持續故障下也只有約 28.8% 的時間 &gt;0。「持續 N 分鐘為真」的門檻永遠湊不滿，告警永遠不觸發（發現 02、14）</td><td>對這類 spiky 指標一律改用時間窗聚合 <code>max_over_time(...[5m])</code>；一次抓到後預先套用到同類規則，S20 因此一次通過（發現 15）</td></tr>
+  <tr><td><b>容器 / 執行環境</b></td><td>對 systemd <code>MainPID</code> 送 SIGSEGV 打到的是容器監控器而不是 ceph-osd；且 lab 的 crash 回報 sidecar 本身缺 keyring，物理上回報不了 crash（發現 01）</td><td>「訊號鏈的每一環」都要真機驗過，包括你以為理所當然的部分</td></tr>
+  <tr><td><b>工具的隱藏語意</b></td><td><code>rados bench</code> 分輪執行時每輪覆寫同名物件，容量根本沒有累積成長——趨勢預測告警連續五輪不觸發，追了六輪才找到真兇（發現 13）</td><td>規則從頭到尾是對的，它正確地拒絕在不夠陡的趨勢上觸發；錯的是實驗假設</td></tr>
+  <tr><td><b>故障當下的時序動態</b></td><td>真 quorum 崩潰時 exporter 先凍結再死亡，兩條告警在時間上永遠不重疊，設計好的抑制（inhibit）關係在真故障中「觀察不到」（發現 11、16）</td><td>機制正確但不可觀察時，改用確定性方法驗證機制本身，並誠實記錄原因</td></tr>
+  <tr><td><b>自動化細節</b></td><td>cephadm shell 的提示文字污染 JSON 解析、rollback 指令自斷 SSH 連線、mgr failover 後備援需數十秒才重新註冊……（發現 04、09、10 等）</td><td>故障演練的自動化腳本本身也需要與生產同等的工程品質</td></tr>
+</table>
+<p class="small">全部 16 個發現的完整記錄（症狀 → 根因 → 修法）見附錄 B。</p>
+
+<h2 id="s7">7. 結果與預想的落差</h2>
+<table>
+  <tr><th style="width:38%">我們原本以為</th><th>實際發生的事</th></tr>
+  <tr><td>promtool 單元測試全綠 ≈ 可以上線</td><td>全綠之後真機仍暴露 16 個問題。工具測的是「規則邏輯對不對」，真機測的是「規則接到的資料在真故障當下長什麼樣」——是兩個不同的驗證面</td></tr>
+  <tr><td>mgr exporter 會即時反映 quorum 狀態</td><td>真 quorum 崩潰時 exporter 凍結、回報舊資料；告警最終靠「資料變空」的路徑觸發。單一 exporter 不可當唯一的 quorum 偵測器</td></tr>
+  <tr><td>健康指標是穩定的 0/1 狀態</td><td>多個指標是 spiky 快照：CLI 持續顯示錯誤的同一時段，Prometheus 只在 3% 的取樣點看到 1</td></tr>
+  <tr><td>把磁碟限速調得更狠，slow-ops 訊號會更持續</td><td>限速太狠 OSD 連心跳都發不出去、直接掉線；「持續」要靠高並發把佇列撐滿，不是靠更硬的限速</td></tr>
+  <tr><td>設計好的 inhibit 關係可在真故障中觀察到</td><td>exporter 凍結使兩條告警永遠不同時存在；改以合成告警確定性驗證 Alertmanager 設定本身</td></tr>
+</table>
+<div class="callout"><b>共同的模式</b>：預想的落差幾乎都不在「規則寫錯」，而在<b>真實系統在故障當下的行為與教科書假設不同</b>。這正是「每條告警都要真機驗證」這條鐵律的價值——它逼出的不是更多綠燈，而是這些只有真實世界才會給的答案。</div>
+
+<h2 id="s8">8. 最終我們能解決什麼、不能解決什麼</h2>
+<h3>✅ 能解決</h3>
+<ol>
+  <li><b>例行維護不再吵醒值班人員</b>：維護單台機器時，只精準靜音該台的告警（附 SOP 指令）；維護必然引起的連鎖訊號（副本暫少、保護旗標）已預先分流到 Slack，不進 pager。（噪音分流與帶 label 的 scoped 告警均已真機驗證；silence 壓制已在真 Alertmanager 整合測試驗證；完整維護 SOP 的真機演練列入附錄 E 待補。）</li>
+  <li><b>維護期間的保護不打折</b>：靜音只蓋目標機器——維護 A 台時 B 台壞掉照樣 page；「維護第一台 MON 時第二台也掉」的 quorum 生命線永遠不被靜音。</li>
+  <li><b>真故障可靠送達</b>：22 種故障模式（含磁碟慢、斷線、資料損毀、容量、網路、時鐘）逐一真機簽收過「故障 → 告警觸發 → 送達正確接收端」的完整鏈路。</li>
+  <li><b>監控系統自身的失效會被發現</b>：exporter 全滅、指標消失有專屬 critical 告警；<code>Watchdog</code> 心跳讓外部系統能偵測「告警系統本身死掉」。</li>
+  <li><b>容量問題從「事後救火」變「事前預警」</b>：接近配額、接近警戒線、3 天趨勢預測三個梯度，在寫死之前給出行動時間。</li>
+</ol>
+<h3>❌ 不能解決（與對應緩解）</h3>
+<ol>
+  <li><b>單一 mgr exporter 視角的「凍結說謊」</b>：真 quorum 崩潰時 exporter 會回報過期資料，quorum 告警要等資料完全消失才觸發（有延遲）。緩解：Prometheus 應 scrape 所有 mgr；根治需要 Ceph 之外的獨立觀測面（如 node-exporter 的 systemd 視角），屬後續工作。</li>
+  <li><b>「指標從未存在」的盲區只補了關鍵處</b>：規則只在對應指標存在時才可能觸發；scrape 設定打錯這類「從未有資料」的失效，目前由 <code>CephMetricsAbsent</code>（鎖 <code>ceph_health_status</code>）與 <code>CephExporterAllDown</code> 涵蓋核心，並非每一個指標都有 absent 保護。</li>
+  <li><b>門檻值不是普世常數</b>：延遲 100ms、配額 80%、預測 85% 等門檻來自本實驗叢集的合理值，導入不同規模的生產環境需依基線重新校準。</li>
+  <li><b>quorum 生命線的固定門檻假設 3-MON 叢集</b>：其他規模需改用附帶的動態多數決版本（rules set 內已附）。</li>
+  <li><b>告警只負責「叫對人」，不負責修復</b>：每條 pager 告警附有第一步 runbook 指令，但診斷與修復仍需值班人員執行。</li>
+</ol>
+
+<h2 id="s9">9. 總結與上線建議</h2>
+<p>這個專案交付的不只是 27 條規則，而是三件可長期複用的資產：</p>
+<ol>
+  <li><b>一套已完成閉環驗證的告警系統</b>——設計、邏輯測試、路由測試、整合測試、22 個真機故障場景，每一環都有可重跑的自動化證據。</li>
+  <li><b>一套可重複執行的故障演練工具</b>——所有注入腳本可重跑、自動回滾、跑完自動驗證叢集復原，未來規則調整後可隨時回歸。</li>
+  <li><b>一組方法論教訓</b>——最重要的一條：<b>工具測試與真機演練驗的是兩件不同的事，16 個真機發現沒有一個能被工具測試抓到</b>。這條經驗適用於任何監控告警系統，不限於 Ceph。</li>
+</ol>
+<p><b>建議的生產導入路徑</b>（依序）：</p>
+<ol>
+  <li>全部規則先接到<b>非 paging 接收端</b>觀察 1–2 週，確認誤報率。</li>
+  <li>配置 Prometheus scrape <b>所有 mgr</b> endpoint（緩解 exporter 凍結）。</li>
+  <li>把 <code>Watchdog</code> 接上外部 dead-man switch（如 healthchecks.io 或既有值班系統）。</li>
+  <li>依生產基線校準門檻值（延遲、容量、預測窗）。</li>
+  <li>逐條開啟 pager 路由；有條件時在生產環境重放關鍵注入場景簽收。</li>
+  <li>後續工作：以 node-exporter systemd collector 建立 MON 的獨立觀測面，交叉檢查 mgr exporter。</li>
+</ol>
+
+<h2 id="appA">附錄（預設折疊）</h2>
+
+<details>
+<summary>附錄 A：22 個真機故障注入場景完整記錄</summary>
+<div class="inner">
+<p class="small">故障模式六分類：<b>A</b> 監控系統自身失明、<b>B</b> 硬體（磁碟延遲／容量）、<b>C</b> 網路（心跳／抖動／時鐘）、<b>D</b> 軟體／daemon、<b>E</b> 資料完整性、<b>F</b> client I/O 生命線。圖例：🔴 pager、🔵 Slack。</p>
+<table>
+  <tr><th>#</th><th>場景</th><th>類別</th><th>驗證的 alert</th><th>真實注入手法</th><th>結果</th></tr>
+  <tr><td>S1</td><td>slow-ops</td><td>F/B</td><td><code>CephClientBlocked{SLOW_OPS}</code> 🔴 · <code>CephDaemonSlowOps</code> 🔵</td><td>cgroup v2 <code>io.max</code> 限速 backing device + 高並發 <code>rados bench</code> 撐滿 op queue</td><td>✅</td></tr>
+  <tr><td>S2</td><td>pg-availability</td><td>F/E</td><td><code>CephClientBlocked{PG_AVAILABILITY}</code> 🔴 · <code>CephPGUnhealthyStates</code> 🔴</td><td>停測試 pool acting set 裡兩顆 OSD</td><td>✅</td></tr>
+  <tr><td>S3</td><td>mon-quorum-lost</td><td>F</td><td><code>CephMonQuorumLost</code> 🔴（含 inhibit 確定性驗證）</td><td>停 2 台 MON（保留 active mgr 那台，再停 active mgr 測 empty-series path）</td><td>✅</td></tr>
+  <tr><td>S4</td><td>osd-daemon-down</td><td>D</td><td><code>CephOSDDaemonDownScoped</code> 🔴（host 級不誤叫）</td><td>停單顆 OSD service</td><td>✅</td></tr>
+  <tr><td>S5</td><td>osd-host-down</td><td>D</td><td><code>CephOSDHostDownScoped</code> 🔴（3 顆 daemon 級都不誤叫，驗 <code>unless</code> 去重）</td><td>停整台 host 全部 OSD</td><td>✅</td></tr>
+  <tr><td>S6</td><td>mon-down-single</td><td>D</td><td><code>CephMonDownScoped</code> 🔴（<code>CephMonQuorumLost</code> 不誤叫）</td><td>停單台 MON</td><td>✅</td></tr>
+  <tr><td>S7</td><td>exporter-blind</td><td>A</td><td><code>CephMetricsAbsent</code> + <code>CephExporterAllDown</code> 🔴</td><td>disable <code>prometheus</code> mgr module</td><td>✅</td></tr>
+  <tr><td>S8</td><td>mgr-failover</td><td>D</td><td>metrics 不中斷 · <code>CephMgrNoStandby</code> 🔵</td><td><code>ceph mgr fail</code> + 停 standby mgr</td><td>✅</td></tr>
+  <tr><td>S9</td><td>catch-all-risk</td><td>D</td><td><code>CephClientRisk{OSD_NO_DOWN_OUT_INTERVAL}</code> 🔴</td><td><code>config set mon_osd_down_out_interval 0</code></td><td>✅</td></tr>
+  <tr><td>S10</td><td>low-priority-notice</td><td>D</td><td><code>CephLowPriorityNotice</code> 🔵（pager 靜默）</td><td>設 <code>noout</code> flag 升 <code>OSDMAP_FLAGS</code>，等滿 <code>for: 30m</code></td><td>✅</td></tr>
+  <tr><td>S11</td><td>latency-outlier</td><td>B</td><td><code>CephOSDLatencyOutlier</code> 🔵</td><td>輕度限速 + 高並發寫入</td><td>✅</td></tr>
+  <tr><td>S12</td><td>net-slow-heartbeat</td><td>C</td><td><code>CephOSDSlowHeartbeat</code> 🔴</td><td><code>tc netem delay 1200ms</code>（預先武裝 auto-revert 計時器）</td><td>✅</td></tr>
+  <tr><td>S13</td><td>mon-clock-skew</td><td>C</td><td><code>CephMonClockSkew</code> 🔴</td><td>停時間同步 + <code>date</code> 手動 step +2s</td><td>✅</td></tr>
+  <tr><td>S14</td><td>daemon-crash</td><td>D</td><td><code>CephDaemonRecentCrash</code> 🔵</td><td>真 <code>SIGSEGV</code> 打進容器內的 ceph-osd 行程</td><td>✅</td></tr>
+  <tr><td>S15</td><td>osd-flapping</td><td>C</td><td><code>CephOSDFlapping</code> 🔴</td><td>OSD 停/啟 ×2（4 次 transition，等 Prometheus 取樣到每個狀態）</td><td>✅</td></tr>
+  <tr><td>S16</td><td>capacity-ladder</td><td>B/F</td><td><code>CephOSDNearFull</code> 🔵 · <code>CephOSDBackfillFull</code> 🔴 · <code>CephClientBlocked{OSD_FULL}</code> + <code>CephHealthError</code> 🔴</td><td>動態量測最滿 OSD 使用率，逐級調低 full-ratio</td><td>✅</td></tr>
+  <tr><td>S17</td><td>pool-quota</td><td>B/F</td><td><code>CephPoolNearQuota</code> 🔵 · <code>CephClientBlocked{POOL_FULL}</code> 🔴</td><td>持續寫爆 pool <code>max_bytes</code> quota</td><td>✅</td></tr>
+  <tr><td>S18</td><td>capacity-forecast</td><td>B</td><td><code>CephCapacityForecast</code> 🔵</td><td>3 條連續 <code>rados bench</code> 平行 stream 持續寫入（約 27GiB），72h 趨勢預測越過 85%</td><td>✅</td></tr>
+  <tr><td>S19</td><td>data-damage</td><td>E</td><td><code>CephDataDamage</code> 🔴</td><td><code>objectstore-tool set-bytes</code> 損毀單一 object 內容 → deep-scrub</td><td>✅</td></tr>
+  <tr><td>S20</td><td>object-unfound</td><td>E</td><td><code>CephObjectUnfound</code> 🔴</td><td><code>size=2/min_size=1</code> 誘發 unfound 的標準手法</td><td>✅</td></tr>
+  <tr><td>S21</td><td>mon-disk-low</td><td>B</td><td><code>CephMonDiskLow</code> 🔵 · <code>CephMonDiskCritical</code> 🔴</td><td>動態調低 <code>mon_data_avail_warn</code>／<code>mon_data_avail_crit</code> 閾值</td><td>✅</td></tr>
+  <tr><td>S22</td><td>watchdog baseline</td><td>A</td><td><code>Watchdog</code> → watchdog receiver</td><td>部署後即斷言心跳必達</td><td>✅</td></tr>
+</table>
+
+<p><b>中期關鍵場景的原始證據</b>（committed evidence index：<code>experiments/ceph-alert-real-lab/EVIDENCE-SUMMARY-2026-07-04.md</code>）：</p>
+<table>
+  <tr><th>Alert</th><th>真故障</th><th>Ceph 端證據</th><th>Prometheus / pager 證據</th></tr>
+  <tr><td><code>CephClientBlocked{name="SLOW_OPS"}</code></td><td><code>io.max</code> 限速 <code>osd.6</code>（<code>192.168.18.174</code> 的 <code>/dev/sdb</code>）+ <code>rados bench</code></td><td>health check 出現 <code>SLOW_OPS</code> 與 <code>BLUESTORE_SLOW_OP_ALERT</code></td><td><code>state="firing"</code>，<code>activeAt=2026-07-04T10:12:42Z</code>，sink 收到 pager 通知</td></tr>
+  <tr><td><code>CephClientBlocked{name="PG_AVAILABILITY"}</code></td><td>停測試 pool acting set 的 <code>osd.5</code> / <code>osd.8</code></td><td><code>PG_AVAILABILITY</code> 升起、PG <code>2.10</code> inactive</td><td><code>state="firing"</code>，<code>activeAt=2026-07-04T10:28:57Z</code>，sink 收到 pager 通知</td></tr>
+  <tr><td><code>CephMonQuorumLost</code></td><td>停 mon-01/mon-03，再停 mon-02 與 active mgr</td><td><code>ceph quorum_status</code> exit 255；但 exporter 仍回報 quorum 數 = 3（凍結證據）</td><td>停 active mgr 後 <code>state="firing"</code>，<code>activeAt=2026-07-04T10:34:37Z</code>，sink 收到 pager 通知</td></tr>
+</table>
+<p><b>最終輪次的補充原始數據</b>（撰寫本報告時直接從 <code>results/</code> 原始檔複核）：</p>
+<ul>
+  <li><b>S3 最終 run</b>（<code>mon-quorum-lost-20260706T121047Z</code>）：<code>CephMonQuorumLost</code> <code>state="firing"</code>、<code>activeAt=2026-07-06T12:12:07Z</code>、sink 收到 <code>receiver=pager</code>；規則運算式的 TSDB 即時值為 <code>0</code>（empty-series path 生效）；inhibit 以合成 alert 對真 Alertmanager 驗證——<code>CephMonDownScoped</code> 回報 <code>state: suppressed</code>、<code>inhibitedBy</code> 指向 <code>CephMonQuorumLost</code> 的 fingerprint；postcheck <code>HEALTH_OK</code>。</li>
+  <li><b>S18 通過數據</b>：3 條連續 stream 量測到 <b>9.15MB/s</b> 的成長率（分輪版趨近 0.1MB/s），實際寫入 <b>27.6GB</b>，<code>predict_linear</code> 的 72 小時預測值達 <b>2046GB</b>、越過門檻 <b>821GB</b>（= 85% 總容量）→ firing 進 Slack、pager 確認 absent。</li>
+  <li><b>S19 spiky 指標數據</b>：注入後 CLI 持續顯示 <code>OSD_SCRUB_ERRORS</code> 的同一時段，TSDB 97 個取樣平均值僅 <b>0.031</b>（約 3 個取樣為 1）——窗化修法的直接依據。</li>
+</ul>
+<p class="small">驗證全數結束後，叢集復原至 <code>HEALTH_OK</code>：ratio、config、flag 全部還原，無殘留 crash report 或測試 pool。</p>
+</div>
+</details>
+
+<details>
+<summary>附錄 B：16 個「只有真機才現形」的發現完整記錄</summary>
+<div class="inner">
+<p class="small">以下每一項在 promtool / unit test 層全部綠燈，只有接上真硬體、真 mgr、真 cephadm shell 才暴露。編號後括號為對應場景。</p>
+<ol>
+  <li><b>daemon crash 打錯行程，且 lab 的 crash sidecar 本身是壞的（S14）</b>——<code>kill -SEGV</code> 打 systemd <code>MainPID</code> 其實打到容器監控器 <code>conmon</code>，容器內 PID 1 的 <code>podman-init</code> 不轉發訊號；更深一層 <code>ceph-crash</code> sidecar 缺 <code>client.crash</code> keyring，物理上回報不了 crash。修法：對 host 上 ceph-osd 真實 PID 送 <code>SIGSEGV</code>，crash meta 落 spool 後由 admin 節點 <code>ceph crash post</code>。</li>
+  <li><b><code>CephDaemonSlowOps</code> 指標太 spiky，<code>for:</code> 永遠湊不滿（S1）</b>——<code>ceph_daemon_health_metrics{type="SLOW_OPS"}</code> 是瞬間快照 gauge，觀察窗內只有約 28.8% 時間 &gt;0。修法：改 <code>max_over_time(...[5m]) &gt; 0</code> + 短 <code>for:</code>。</li>
+  <li><b>節流太硬 OSD 直接 flap（S1）</b>——太狠的限速連 OSD 自身心跳 I/O 都卡住，直接掉線。「持續的 slow-ops」要靠高並發把 op queue 撐滿，不是更硬的限速。</li>
+  <li><b>cephadm shell 的 stderr banner 污染 JSON（S15/S19/S20）</b>——<code>2&gt;&amp;1</code> 把 <code>Inferring fsid…</code> 等提示行併進 <code>jq</code> 要解析的 JSON，parse error 導致輪詢永遠逾時。修法：JSON 只取 stdout，banner 走 stderr 旁路 log。</li>
+  <li><b>flapping 太快，5 秒 scrape 抓不到中間狀態（S15）</b>——某個 up 狀態只維持 4 秒，<code>changes()</code> 只數到 2。修法：每次 transition 等 Prometheus 真的取樣到該值再前進。</li>
+  <li><b>pool 超過 quota 要「持續寫入壓力」才升 <code>POOL_FULL</code>（S17）</b>——mon 只在 client 持續嘗試寫入（寫到被 block）時才 flag。修法：過 quota 後用 <code>timeout 30 rados put</code> 持續施壓並輪詢。</li>
+  <li><b>寫滿容量太慢；改用動態 ratio 貼合真實使用率（S16）</b>——叢集近乎全空時固定閾值不可能 trip。修法：量測最滿 OSD 的實際使用率，把三級 ratio 設為它的 0.6/0.7/0.8 倍，動態推導。</li>
+  <li><b>BlueStore slow-op 警告是 24 小時 latch，restart 清除會弄壞 cephadm inventory（S1/S11/S16）</b>——修法：暫調 <code>bluestore_slow_ops_warn_lifetime</code> 讓警告約 20 秒內老化清除，不 restart 任何 OSD；抽成共用 helper（其後在 S16、S18 的真機 run 中實際使用並通過）。</li>
+  <li><b>移除網路延遲時自斷 SSH（S12）</b>——rollback 指令走的正是被延遲 1200ms 的介面，delete 當下連線異常斷開、回傳非零。修法：改用全新 SSH 連線事後輪詢「延遲確實消失」。（告警本身已由真機 firing 驗證；此回滾判斷修正以自動化測試回歸，未重跑完整場景。）</li>
+  <li><b>mgr failover 後 standby 要數十秒才重新註冊（S8）</b>——單次查詢判失敗是誤判。修法：有時間預算的輪詢。順帶真機驗證了 multi-mgr scrape：failover 過程 metrics 不中斷。</li>
+  <li><b>真 quorum loss 時 mgr exporter 遙測凍結在舊世界（S3）</b>——<code>ceph quorum_status</code> 已失敗，exporter 仍回報 quorum 數 = 3。這是「不能只靠單一 exporter 視角」與新增 <code>CephMetricsAbsent</code> 的直接理由。</li>
+  <li><b>只改 configmap，Prometheus 不會自動重載 rule（harness gap）</b>——rule 變更後必須重啟 Prometheus deployment；已列入部署腳本硬化待辦。</li>
+  <li><b>capacity-forecast 六輪纏鬥：真兇是 <code>rados bench</code> 覆寫同名 object（S18）</b>——分輪執行時每輪用固定 run 名稱，第二輪起覆寫前一輪物件，容量成長趨近零（量測值約 0.1MB/s、甚至為負）；受控對照的連續寫入則量到 6.9MB/s（門檻推算需 ≥3.2MB/s）。規則正確地拒絕在不夠陡的趨勢上觸發。修法：改為連續 stream 寫入，成長率達 9.15MB/s、第 6 輪通過。整輪最耗工的除錯（前 5 輪失敗）。</li>
+  <li><b>data-damage 三層疊（S19）</b>——(a) <code>ceph_health_detail</code> 對 scrub 類 check 是 spiky 匯出（97 個樣本 avg=0.031）→ 窗化；(b) 用 <code>remove</code> 刪副本會被 recovery 自動補回、與 deep-scrub 形成競態 → 改 <code>set-bytes</code> 損毀內容（recovery 治不好，確定性觸發）；(c) <code>HEALTH_ERR</code> 本身也閃爍 → 移除該場景中重複且不穩定的 <code>CephHealthError</code> 斷言（它已由 S16 穩定驗證）。</li>
+  <li><b><code>CephObjectUnfound</code> 預先套用窗化修正（S20）</b>——認出它與發現 14 同類後在同一修正中一併窗化，該場景一次通過。「把發現抽象成一類問題再預先套用」的價值。</li>
+  <li><b>真 quorum loss 當下 inhibit 觀察不到（S3）</b>——exporter 先凍結再死亡，<code>CephMonQuorumLost</code> 與 <code>CephMonDownScoped</code> 在時間上永遠不重疊。修法：以合成 alert 確定性驗證 Alertmanager 的 inhibit 設定本身（確認 <code>CephMonDownScoped</code> 被標記 suppressed 且指向正確來源），主 alert 仍由真故障驗證。</li>
+</ol>
+</div>
+</details>
+
+<details>
+<summary>附錄 C：測試 harness 與重跑方式</summary>
+<div class="inner">
+<h4>開發環境四層測試（<code>experiments/ceph-alert-rules/</code>）</h4>
+<pre><code>bash experiments/ceph-alert-rules/run/all.sh    # Tier A→B→C 依序，任一非 0 即整體 FAIL
+bash experiments/ceph-alert-rules/run/tierA.sh  # 防漂移 guard + promtool lint + 單元測試
+bash experiments/ceph-alert-rules/run/tierB.sh  # amtool routing 斷言
+bash experiments/ceph-alert-rules/run/tierC.sh  # 起真 Prometheus / Alertmanager 的整合測試</code></pre>
+<ul>
+  <li>規則檔逐字抽自設計文件，<code>lib/check-rules-match-page.sh</code> 自動比對防止漂移。</li>
+  <li>PASS 判準：各 tier 印 <code>TIER X PASS</code>、<code>all.sh</code> 印 <code>ALL PASS</code> 且 exit 0。</li>
+  <li>Tier C 分三段：C1 規則載入檢查、C2 真 Alertmanager 的 routing + silence、C3 合成 metric → 真 Prometheus → 真 Alertmanager → webhook sink 全鏈路。</li>
+  <li>已知邊界：Tier C 不驗 <code>for:</code> 時長（C2 直接 POST 已成形 alert、C3 用縮短 <code>for:</code> 的副本）；<code>for:</code> 精確語意只由 Tier A 保證。</li>
+</ul>
+<h4>真機故障注入 harness（<code>experiments/ceph-alert-real-lab/</code>）</h4>
+<pre><code># 全鏈執行（內建 cleanup）
+bash experiments/ceph-alert-real-lab/run/all.sh --yes-really-inject
+
+# 本機測試 gate
+bash experiments/ceph-alert-real-lab/tests/run-tests.sh
+shellcheck -x experiments/ceph-alert-real-lab/lib/*.sh run/*.sh tests/*.sh</code></pre>
+<p>安全界線：每個注入腳本都要求 <code>--yes-really-inject</code>；每個場景完成後確認 <code>HEALTH_OK</code> 才進下一個；<code>run/cleanup.sh</code> best-effort、可重複執行；破壞性場景（quorum loss）排最後。長時場景注意：<code>low-priority-notice</code> 與 <code>capacity-forecast</code> 因 <code>for: 30m</code> 分別需 30+ 與 55–75 分鐘 wall-clock，後者會寫入約 27GiB 測試資料。</p>
+<h4>實驗環境</h4>
+<ul>
+  <li>真機叢集：cephadm Ceph v19.2.3（Squid LTS），3 MON + 9 OSD（3 台 OSD host × 3）</li>
+  <li>監控面：lab k8s 內臨時部署的 Prometheus + Alertmanager + webhook sink（<code>experiments/ceph-alert-real-lab/rendered/monitoring.yaml</code>）</li>
+  <li>原始 result 目錄不進版本庫（含機敏路徑與大量原始 JSON）；committed 證據索引為 <code>EVIDENCE-SUMMARY-2026-07-04.md</code></li>
+</ul>
+</div>
+</details>
+
+<details>
+<summary>附錄 D：參考資料與連結</summary>
+<div class="inner">
+<h4>本專案文件（GitHub：<a href="https://github.com/tom19960222/learning-k8s">tom19960222/learning-k8s</a>）</h4>
+<table>
+  <tr><th>文件</th><th>路徑</th><th>內容</th></tr>
+  <tr><td>設計篇</td><td><code>next-site/content/ceph/features/prometheus-alert-design.mdx</code></td><td>完整設計理由、每條規則的 PromQL 解讀、維護 silence SOP、發警時的第一步 runbook</td></tr>
+  <tr><td>開發驗證篇</td><td><code>next-site/content/ceph/features/prometheus-alert-testing.mdx</code></td><td>四層測試方法論、F1 bug 完整案例、逐條測試內容</td></tr>
+  <tr><td>真機驗證篇</td><td><code>next-site/content/ceph/features/prometheus-alert-real-lab-findings.mdx</code></td><td>22 場景全記錄、16 個真機發現、v2 規則修訂理由</td></tr>
+  <tr><td>Rules set（單一事實來源）</td><td><code>experiments/ceph-alert-rules/rules/*.yml</code></td><td>本報告第 4.3 節之 5 個規則檔</td></tr>
+  <tr><td>開發測試 harness</td><td><code>experiments/ceph-alert-rules/</code></td><td>Tier A/B/C 自動化測試</td></tr>
+  <tr><td>真機注入 harness</td><td><code>experiments/ceph-alert-real-lab/</code></td><td>22 個場景的注入 / 驗證 / 回滾腳本</td></tr>
+  <tr><td>真機證據索引</td><td><code>experiments/ceph-alert-real-lab/EVIDENCE-SUMMARY-2026-07-04.md</code></td><td>中期關鍵場景的 committed 證據</td></tr>
+</table>
+<h4>相關深入閱讀（同站 Ceph 專題頁）</h4>
+<ul>
+  <li><code>osd-ok-to-stop</code>：維護前的安全檢查在原始碼層做了什麼</li>
+  <li><code>mon-quorum-loss-impact</code>：3-MON / 5-MON quorum 失守對 client I/O 的影響</li>
+  <li><code>pg-health-states</code>：為什麼 <code>PG_AVAILABILITY</code> 要 page 而 <code>PG_DEGRADED</code> 只進 Slack</li>
+  <li><code>slow-ops-and-bluestore-alerts</code>：slow ops 與 BlueStore 告警的 metric 來源</li>
+  <li><code>osd-flapping</code>：OSD 為什麼會被反覆標記 down/up</li>
+</ul>
+<h4>上游 / 外部參考</h4>
+<ul>
+  <li>Ceph v19.2.3（Squid）原始碼，特別是 <code>src/pybind/mgr/prometheus/module.py</code>（metric 匯出定義）與 <code>monitoring/ceph-mixin/prometheus_alerts.yml</code>（官方預設 rules）：<a href="https://github.com/ceph/ceph/tree/v19.2.3">github.com/ceph/ceph/tree/v19.2.3</a></li>
+  <li>Ceph health checks 官方文件：<a href="https://docs.ceph.com/en/squid/rados/operations/health-checks/">docs.ceph.com/en/squid/rados/operations/health-checks</a></li>
+  <li>Prometheus 告警規則與單元測試（promtool）：<a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/">alerting_rules</a>、<a href="https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/">unit_testing_rules</a></li>
+  <li>Alertmanager（routing / silence / inhibition）：<a href="https://prometheus.io/docs/alerting/latest/alertmanager/">prometheus.io/docs/alerting/latest/alertmanager</a></li>
+  <li>cgroup v2 <code>io.max</code>（磁碟限速注入手法）：<a href="https://docs.kernel.org/admin-guide/cgroup-v2.html#io">docs.kernel.org/admin-guide/cgroup-v2.html#io</a></li>
+  <li><code>tc netem</code>（網路延遲注入手法）：<a href="https://man7.org/linux/man-pages/man8/tc-netem.8.html">man7.org/linux/man-pages/man8/tc-netem.8.html</a></li>
+</ul>
+</div>
+</details>
+
+<details>
+<summary>附錄 E：驗證狀態總表與待補實驗</summary>
+<div class="inner">
+<p>本報告完稿前，所有宣稱已逐一對照原始數據複核。複核方式與結果：</p>
+<table>
+  <tr><th>驗證項目</th><th>依據的原始數據</th><th>狀態</th></tr>
+  <tr><td>27 條 rule 數量與內容（6+3+18、排除清單 25 項、各 <code>for:</code> 門檻）</td><td>直接統計 <code>experiments/ceph-alert-rules/rules/*.yml</code></td><td><span class="badge b-green">相符</span></td></tr>
+  <tr><td>Tier A 規則邏輯測試</td><td><code>results/tierA.txt</code>：promtool <code>SUCCESS</code>（31 個測試斷言）</td><td><span class="badge b-green">相符</span></td></tr>
+  <tr><td>Tier B routing（含「預設 critical aggregate 只進 Slack」）</td><td><code>results/tierB.txt</code>：22 passed / 0 failed，含 <code>CephMonDownQuorumAtRisk</code> / <code>CephOSDDownHigh</code> → slack 斷言</td><td><span class="badge b-green">相符</span></td></tr>
+  <tr><td>F1 bug（舊寫法最壞情況靜默）</td><td>撰寫本報告時以 promtool 重現：舊 expr 餵 3 台全 0 → <code>got:[]</code>；修正版測試檔含「3 台全掉必須 fire」案例</td><td><span class="badge b-green">已重現存證</span></td></tr>
+  <tr><td>22 個場景 22/22、<code>HEALTH_OK</code> 復原</td><td>orchestrator 進度記錄逐場景 PASS 記錄 + 抽查原始 run 目錄（S1/S2/S3 的 firing JSON、sink log、postcheck）</td><td><span class="badge b-green">相符</span></td></tr>
+  <tr><td>S3 exporter 凍結 / empty-series / inhibit</td><td>原始 JSON：<code>ceph quorum_status</code> exit 255 同時 TSDB 查得 <code>3</code>；最終 run firing <code>2026-07-06T12:12:07Z</code> → pager；<code>CephMonDownScoped</code> <code>suppressed</code> + <code>inhibitedBy</code> fingerprint</td><td><span class="badge b-green">相符</span></td></tr>
+  <tr><td>S18 / S19 關鍵數字（9.15MB/s、2046GB vs 821GB、27.6GB、97 取樣 avg 0.031、28.8%）</td><td>orchestrator 進度記錄（含即時 TSDB 查詢結果）</td><td><span class="badge b-green">相符</span></td></tr>
+</table>
+<p><b>待補實驗（現有數據無法支撐、或尚未執行）：</b></p>
+<ol>
+  <li>⚠️ <b><code>CephExporterTargetDown</code> 的真機 firing 驗證</b>——22 個場景的注入腳本中沒有任何一個斷言這條 alert（僅 Tier B routing 驗證過它進 Slack）。待補做法：保留另一個 mgr target 存活的前提下，讓單一 exporter target 失聯超過 <code>for: 15m</code>，斷言 warning 送達 Slack 且 pager absent。</li>
+  <li>⚠️ <b>「maintenance enter + 精準 silence」端到端 SOP 真機演練</b>——組成元件都各自驗過（scoped label 真機驗證於 S4/S5/S6；silence 壓制驗證於 Tier C 真 Alertmanager；維護噪音分流驗證於 S10），但「<code>ceph orch host maintenance enter</code> + <code>amtool silence hostname=X</code> → 只有目標機靜音、其他機器故障照常 page」這條完整 SOP 尚未在真機串成一輪演練。</li>
+  <li>⚠️ <b>附錄 C 的各場景 wall-clock 時間</b>——為依 <code>for:</code> 條款與輪詢次數推算的設計估算值，僅 S10（30+ 分鐘）與 S18（55–75 分鐘）由實際執行大致印證，其餘未逐一計時。</li>
+  <li>ℹ️ <b>F1 當時的原始紅燈輸出未歸檔</b>——開發當下的 promtool 失敗輸出沒有留檔（僅文件敘述）；本次撰寫報告時已重現並記錄於本附錄，可視為已補。</li>
+</ol>
+</div>
+</details>
+
+<p class="small" style="margin-top:48px;border-top:1px solid var(--line);padding-top:16px">本報告由 learning-k8s 專案的三份技術文件（設計篇 / 開發驗證篇 / 真機驗證篇）與實驗 harness 彙整而成；規則 YAML 逐字取自版本庫的單一事實來源檔案。</p>
+
+</div>
+</body>
+</html>
