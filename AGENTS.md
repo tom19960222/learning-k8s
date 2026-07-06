@@ -81,6 +81,13 @@ GIT_SSH_COMMAND='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=n
 
 當需求是「深入研究某個既有 project 的 topic，並新增一個 feature page」時，優先使用 `skills/source-first-topic-page/SKILL.md`。這個 skill 會把 `$using-superpowers`、source-first evidence ledger、MDX 寫作規範、`projects.ts` / `feature-map.json` / `quiz.json` 整合檢查串成一個較小流程。
 
+### 系統行為研究的方法論
+
+當需求是「研究某個系統在故障／極限／未知情況下的行為，並產出報告 + script／alert rules 等 artifact」時，用 `skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize 迴圈、三閘門、`HYPOTHESES.md` backlog）。兩顆衛星 skill 可單獨使用：
+
+- `skills/enumerating-adversarial-boundaries/SKILL.md`：對任何設計／alert 集合做結構化邊界窮舉（review 把關可單用）。
+- `skills/designing-falsifiable-experiments/SKILL.md`：寫任何「可回退、prediction 先行」的實驗 scenario 時單用。
+
 ## Lab 指令的驗證等級
 
 30 天 lab 的指令必須先驗證才能寫進文件，但**驗證的等級依環境決定**：
