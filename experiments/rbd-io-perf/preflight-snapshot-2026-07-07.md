@@ -31,6 +31,17 @@
 - **pve3 的 public 介面 = vmbr0 → enp5s0，ethtool 協商 100Mb/s**（MAC 前綴 e8:9c:25 為 Realtek 2.5G 系列，疑似線/埠協商問題）。影響：從 pve3 出發、primary 在遠端 osd.0 的 PG（約半數），client IO 封頂 ~11 MB/s；primary 在本機 osd.8 的 PG 走 local + cluster net（10G）快路徑 → **所有延遲/吞吐預期雙峰**。已回報使用者裁示（先修線再測 vs 照現況測）。
 - vmbr1 → enp1s0f0（10G，Link yes）：測試 VM 的 guest 網路（192.168.18.0/24 DHCP）——只承載我們 ssh 進 guest 的流量，不在 ceph datapath 上。
 
+### 網路查證 v2（使用者要求確認「應該只有 management 是 1G 其他都 10G」）
+
+- **實體層**：pve3 有三張卡——Intel 82599ES 10G ×2（enp1s0f0 → vmbr1 guest 網、enp1s0f1 → vmbr2 ceph cluster net，皆 MTU 9000、協商 10G ✅）+ Realtek RTL8111 **1G**（enp5s0 → vmbr0 management）。
+- **enp5s0 兩側（本卡與 switch link partner）都 advertise 1000baseT，卻協商在 100Mb/s** → 幾乎可確定是線材問題（斷對）或埠接觸不良；換線應可回 1G。
+- **架構層**：`ceph.conf` 的 `public_network = 192.168.16.0/24` 就是 management 網段 → **client→OSD/mon 的資料流量走 management NIC**。「ceph 走 10G」只對 OSD 複寫（cluster_network，vmbr2）成立；所有 VM 磁碟 IO 到遠端 OSD 的 client 流量其實走這張 1G（現況 100Mb）卡。要把 client IO 搬到 10G 需改 ceph `public_network` + mon 重新定址——invasive 的 ceph 變更，不在本實驗邊界內（僅告知使用者）。
+- **對實驗的影響**：修回 1G 後，遠端 primary（osd.0）的 client IO 上限 ~112 MB/s——高 QD 4k 與 seq 實驗可能觸頂（E-02 量化）；旋鈕對照實驗（cache / aio / iothread / 雙軸）不受影響（各變體走同一條網）。所有結論標註「public net = 1G（management 共用）」。
+
+### cloud image
+
+- cephfs `template/iso/` 只有安裝 ISO（live-server / netinst），**無 cloud image** → Phase 2 依使用者指示下載 Ubuntu 24.04 cloud image（~600MB）至 cephfs。
+
 ## PVE 預設與其他
 
 - storage.cfg：`ioperf`（rbd、`krbd 0`、pool ioperf）已由使用者建好；**cluster 已有 `krbd 1` 的先例**（`ceph-ssd` storage，pool ssd）→ E-01 krbd 可行性風險大降；krbd 軸屆時新增 `ioperf-krbd` storage id。
