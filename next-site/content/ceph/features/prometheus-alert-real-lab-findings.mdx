@@ -1,12 +1,12 @@
 ---
 layout: doc
 title: Ceph — 22 個真機故障注入場景全數驗證的 alert 韌性報告
-description: 28 條 alert rule、22 個真實故障注入場景，在 cephadm v19.2.3 lab 上 22/22 全數驗證 firing 並送達正確 receiver。過程中「每條 alert 都要真機驗證」的鐵律逼出 16 個 fake/promtool 測試全部綠燈、只有真機才現形的 bug——從 crash sidecar 缺 keyring、指標本質是 spiky snapshot gauge，到 rados bench 的物件命名語意。
+description: 27 條自訂 alert rule、22 個真實故障注入場景，在 cephadm v19.2.3 lab 上 22/22 全數驗證 firing 並送達正確 receiver。過程中「每條 alert 都要真機驗證」的鐵律逼出 16 個 fake/promtool 測試全部綠燈、只有真機才現形的 bug——從 crash sidecar 缺 keyring、指標本質是 spiky snapshot gauge，到 rados bench 的物件命名語意。
 ---
 
 ## 結論先講
 
-這頁最早只記錄 3 個場景（SLOW_OPS、PG_AVAILABILITY、MON quorum）的真機驗證，是專案中期的快照。專案完成後的最終結果是：**28 條 alert rule、22 個真實故障注入場景，22/22 全數在真 cephadm v19.2.3 lab 上驗證 firing 並送達正確 receiver**。每一輪注入後叢集都復原到 `HEALTH_OK`，沒有殘留的 crash、pool 設定或 ratio 變更。這組 alert 已經可以視為生產就緒。
+這頁最早只記錄 3 個場景（SLOW_OPS、PG_AVAILABILITY、MON quorum）的真機驗證，是專案中期的快照。專案完成後的最終結果是：**27 條自訂 alert rule（6 條 stability-first + 3 條 scoped + 18 條 coverage）、22 個真實故障注入場景，22/22 全數在真 cephadm v19.2.3 lab 上驗證 firing 並送達正確 receiver**，另保留 ceph-mixin 預設如 `CephHealthError`。每一輪注入後叢集都復原到 `HEALTH_OK`，沒有殘留的 crash、pool 設定或 ratio 變更。這組 alert 已經可以視為生產就緒。
 
 比「全數通過」本身更值得記下的是過程裡的 meta-finding：驗收鐵律「每條 alert 都必須用真實故障注入讓它 firing，不接受模擬或假 metric」，逼出了 **16 個 fake / promtool / unit 測試全部綠燈、只有真機才會現形的 bug**——指標本質是 spiky snapshot gauge、cephadm shell 的 stderr banner 污染 JSON 解析、`rados bench` 的物件命名語意，一路到「rule 邏輯完全正確，但真故障的動態讓斷言觀察不到」這種更難分類的失效模式。這些發現全部發生在 **rule 本身沒有寫錯**的前提下；如果只靠 promtool 測 expr 與 `for:` 邊界，這 16 個問題一個都不會被看見。完整場景清單見〈22 個場景全數真機驗證〉，16 個發現的細節見〈真機才抓到的 16 個發現〉；下面先保留最初 3 個場景（SLOW_OPS / PG_AVAILABILITY / MON quorum）的原始詳細記錄。
 
@@ -407,7 +407,7 @@ count(node_systemd_unit_state{name=~"ceph-.*@mon\\..*\\.service", state="active"
 
 ## 22 個場景全數真機驗證
 
-上面三節是專案中期的詳細記錄；完整專案跑完 28 條 rule、22 個真實故障注入場景，**22/22 全數驗證 firing 並送達正確 receiver**。下表依場景編號排序，「類別」對應 rule 設計時的六個故障模式分類：**A** 監控系統自身失明、**B** 硬體（磁碟延遲／容量）、**C** 網路（心跳／抖動／時鐘）、**D** 軟體／daemon（crash／failover／可用性）、**E** 資料完整性、**F** client I/O 生命線＋監控核心。
+上面三節是專案中期的詳細記錄；完整專案跑完 27 條自訂 rule、22 個真實故障注入場景，**22/22 全數驗證 firing 並送達正確 receiver**。下表依場景編號排序，「類別」對應 rule 設計時的六個故障模式分類：**A** 監控系統自身失明、**B** 硬體（磁碟延遲／容量）、**C** 網路（心跳／抖動／時鐘）、**D** 軟體／daemon（crash／failover／可用性）、**E** 資料完整性、**F** client I/O 生命線＋監控核心。
 
 | # | 場景 | 類別 | 驗證的 alert | 真實注入手法 | 結果 |
 |---|---|---|---|---|---|
@@ -546,11 +546,11 @@ count(node_systemd_unit_state{name=~"ceph-.*@mon\\..*\\.service", state="active"
 
 | 類別 | 狀態 |
 |---|---|
-| 28 條 alert rule（`ceph-stability-first` / `ceph-scoped-availability` / `ceph-production-coverage`） | 設計完成，`promtool` 邏輯與 `for:` 邊界已驗 |
+| 27 條自訂 alert rule（6 條 stability-first + 3 條 scoped + 18 條 coverage），另保留 ceph-mixin 預設如 `CephHealthError` | 設計完成，`promtool` 邏輯與 `for:` 邊界已驗 |
 | 22 個真實故障注入場景（S1–S22） | **22/22 真機驗證通過**，詳見〈22 個場景全數真機驗證〉 |
 | `CephClientBlocked`（`SLOW_OPS` / `PG_AVAILABILITY` / `OSD_FULL` / `POOL_FULL`） | 真機已通過（S1、S2、S16、S17） |
 | `CephMonQuorumLost`（PromQL empty-series path） | 真機已通過（S3）；不能只靠單一 mgr exporter 視角偵測真 quorum loss（發現 11） |
-| `ceph-production-coverage` 全部 14 條 rule | 真機逐條注入完成（S4–S22 涵蓋），詳見上方場景表 |
+| `ceph-production-coverage` 全部 18 條 rule | 真機逐條注入完成（S4–S22 涵蓋），詳見上方場景表 |
 | Alertmanager routing（label 導向 + inhibit + watchdog） | 真機驗證：label 導向 routing 隨新 rule 自動生效；inhibit 以確定性 synthetic alert 驗證（發現 16） |
 | 真機才抓到的發現 | **16 個**，全部已修正並回歸驗證，詳見〈真機才抓到的 16 個發現〉 |
 

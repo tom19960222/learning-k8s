@@ -60,9 +60,9 @@ make validate
 | `net-slow-heartbeat` | `tc qdisc add ... netem delay 1200ms`（預先武裝 auto-revert 計時器） | `CephOSDSlowHeartbeat`（2m，pager） | 約 3–5 分鐘 | `NET_SLOW_HEARTBEAT_ARM_SLEEP` |
 | `pg-availability` | 停測試 pool sentinel object 的兩顆 acting OSD | `CephClientBlocked`{name=`PG_AVAILABILITY`}（1m）+ `CephPGUnhealthyStates`{name=pool}（3m），皆 pager | 約 5–8 分鐘 | `PG_AVAIL_POOL`、`PG_AVAIL_OBJECT` |
 | `pool-quota` | 受控 `rados put` 打到 81% quota，再打到滿 | `CephPoolNearQuota`（10m，Slack）→ `POOL_FULL`/`CephClientBlocked`（1m，pager） | 約 12–16 分鐘 | `QUOTA_POOL`、`QUOTA_MAX_BYTES`、`NEARQUOTA_TARGET_BYTES` |
-| `capacity-ladder` | 依序調低 nearfull/backfillfull/full ratio 三階 | `CephOSDNearFull`（10m，Slack）→ `CephOSDBackfillFull`（5m，pager）→ `CephClientBlocked`{name=`OSD_FULL`}（1m）→ `CephHealthError`（5m） | 約 25–30 分鐘 | `CAPACITY_POOL`、`CAPACITY_TARGET_RAW_BYTES`、`CAPACITY_MAX_ROUNDS` |
-| `capacity-forecast` | 背景迴圈持續 `rados bench`（最多 45 輪、每輪 60 秒）拉出成長斜率 | `CephCapacityForecast`（30m，Slack；pager 需 absent） | **注意：`for: 30m`，wall-clock 可能超過 45 分鐘**，且會寫入數十 GiB 測試資料 | `FORECAST_MAX_ROUNDS`、`FORECAST_ROUND_SECONDS` |
-| `data-damage` | 停 OSD → `ceph-objectstore-tool ... remove` 移除單一 replica → 重啟 → `deep-scrub` | `CephDataDamage`{name=`PG_DAMAGED`\|`OSD_SCRUB_ERRORS`}（1m，pager）+ `CephHealthError`（5m） | 約 8–15 分鐘（deep-scrub 排程時間不定） | `DATA_DAMAGE_POOL`、`DATA_DAMAGE_OBJECT` |
+| `capacity-ladder` | 動態量測最滿 OSD 的實際使用率，再依序調低 nearfull/backfillfull/full 三階 ratio（三個 ratio 分別是量到的使用率的 0.6／0.7／0.8 倍，動態推導、非固定門檻） | `CephOSDNearFull`（10m，Slack）→ `CephOSDBackfillFull`（5m，pager）→ `CephClientBlocked`{name=`OSD_FULL`}（1m）→ `CephHealthError`（5m） | 約 25–30 分鐘 | `CAPACITY_POOL`、`CAPACITY_TARGET_OSD_UTIL`（預設 0.5，即 0.5%）、`CAPACITY_MAX_ROUNDS` |
+| `capacity-forecast` | 3 條並行、各自連續執行到底的 `rados bench` stream（不是分輪迴圈，每條 stream 一次跑滿整個注入視窗）拉出成長斜率 | `CephCapacityForecast`（30m，Slack；pager 需 absent） | **注意：`for: 30m`，wall-clock 約 55–75 分鐘**，且會寫入約 27GiB 測試資料 | `FORECAST_STREAM_SECONDS`（預設 4500）、`FORECAST_BENCH_THREADS`、`FORECAST_POOL` |
+| `data-damage` | 停 OSD → `ceph-objectstore-tool ... set-bytes` 損毀單一 replica 的 object 內容（而非刪除，deterministic、不會被 recovery 自動治好）→ 重啟 → `deep-scrub` | `CephDataDamage`{name=`PG_DAMAGED`\|`OSD_SCRUB_ERRORS`}（1m，pager） | 約 8–15 分鐘（deep-scrub 排程時間不定） | `DATA_DAMAGE_POOL`、`DATA_DAMAGE_OBJECT` |
 | `object-unfound` | 6 步驟操作兩顆 acting OSD + `rados put` 造出兩個版本 + `norecover` | `CephObjectUnfound`（1m，pager） | 約 4–7 分鐘 | `UNFOUND_POOL`、`UNFOUND_OBJECT` |
 | `low-priority-notice` | `ceph osd set noout` | `CephLowPriorityNotice`{name=`OSDMAP_FLAGS`}（30m，Slack；pager 需 absent） | **注意：`for: 30m`，wall-clock 會超過 30 分鐘** | 無 |
 | `mon-quorum-lost` | 停 mon-01 與 mon-03（保留 active-mgr 所在的 mon-02） | `CephMonQuorumLost`（1m，pager）+ `CephMonDownScoped` 需在 Alertmanager 被 inhibit | 約 5–20 分鐘（真機 mgr exporter 在全 quorum 遺失時會凍結，見腳本內註解的時序風險） | 無 |
@@ -112,7 +112,7 @@ bash experiments/ceph-alert-real-lab/run/scenario-low-priority-notice.sh --yes-r
 
 ## CephCapacityForecast
 
-這個情境會用一個「本機背景迴圈」持續打 `rados bench` 到測試 pool（最多 45 輪、每輪 60 秒），讓 `ceph_cluster_total_used_bytes` 累積出足夠的成長斜率，等待 `predict_linear(...)` 推算 3 天後會超過 85% 容量並觸發 `CephCapacityForecast`，確認只進 Slack、不進 pager，最後 kill 掉背景迴圈並刪除 pool rollback。**注意：`for: 30m`，真的跑（`--yes-really-inject`）wall-clock 可能超過 45 分鐘，且會在測試 pool 寫入數十 GiB 的資料（這個 lab 叢集有 900GiB 可用空間，足夠安全）。**
+這個情境會啟動 3 條並行、各自連續執行到底的 `rados bench` stream（每條撐滿整個 `FORECAST_STREAM_SECONDS` 注入視窗，不是分輪迴圈、不會重啟），讓 `ceph_cluster_total_used_bytes` 累積出足夠的成長斜率，等待 `predict_linear(...)` 推算 3 天後會超過 85% 容量並觸發 `CephCapacityForecast`，確認只進 Slack、不進 pager，最後停掉 3 條 stream 並刪除 pool rollback。**注意：`for: 30m`，真的跑（`--yes-really-inject`）wall-clock 約 55–75 分鐘，且會在測試 pool 寫入約 27GiB 的資料（這個 lab 叢集有 900GiB 可用空間，足夠安全）。**
 
 ```bash
 bash experiments/ceph-alert-real-lab/run/scenario-capacity-forecast.sh --yes-really-inject

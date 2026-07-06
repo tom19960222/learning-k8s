@@ -278,6 +278,18 @@ scenario_rollback() {
   # assert_lab_recovered's HEALTH_OK gate doesn't time out (same latch
   # issue previously fixed in scenario-slow-ops.sh / scenario-latency-outlier.sh
   # / scenario-capacity-ladder.sh).
+  #
+  # This scenario writes far more than any other (~27GiB across 3
+  # continuous streams) and its BlueStore backlog drains slowly, re-latching
+  # the warning for minutes after the pool delete -- clear_bluestore_slow_ops's
+  # shared defaults were insufficient here and needed manual intervention on
+  # the real run. Give this heaviest scenario a bigger budget than the
+  # shared default (drain 90s, then up to 48 attempts * 5s ~= 4min per clear
+  # cycle) for roughly 5-6 minutes of total headroom.
+  BLUESTORE_CLEAR_DRAIN_SECONDS="${BLUESTORE_CLEAR_DRAIN_SECONDS:-90}"
+  export BLUESTORE_CLEAR_DRAIN_SECONDS
+  BLUESTORE_CLEAR_ATTEMPTS="${BLUESTORE_CLEAR_ATTEMPTS:-48}"
+  export BLUESTORE_CLEAR_ATTEMPTS
   clear_bluestore_slow_ops "$RESULT_DIR" || rc=1
 
   while IFS= read -r cleanup_cmd; do
