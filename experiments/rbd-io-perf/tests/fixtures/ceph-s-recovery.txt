@@ -1,0 +1,21 @@
+  cluster:
+    id:     abc1234
+    health: HEALTH_WARN
+
+  services:
+    mon: 3 daemons, quorum a,b,c (age 2w)
+    mgr: a(active, since 2w)
+    osd: 9 osds: 9 up (since 2w), 9 in (since 2w)
+
+  data:
+    pools:   18 pools, 289 pgs
+    objects: 2.50M objects, 1.6T
+    usage:   3.2T used, 6.8T / 10T avail
+    pgs:     289 active+clean
+
+  io:
+    client:   120 B/s rd, 240 B/s wr, 8 op/s rd, 16 op/s wr
+
+  progress:
+    recovery: 12 MiB/s, 3 objects/s
+    1 OSD(s) experiencing slow operations in BlueStore
