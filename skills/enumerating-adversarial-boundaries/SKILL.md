@@ -9,7 +9,7 @@ description: Use when a design, alert set, runbook, or research scope needs syst
 
 Open-ended "anything else to watch for?" questions produce mediocre lists — they lean on whatever the reviewer happens to remember, and they skip whole categories of failure nobody thought to ask about. Structured enumeration axes force coverage of the cells humans skip by turning "what else could go wrong" into a grid that has to be filled in, cell by cell.
 
-**Core claim:** a monitoring exporter that keeps reporting healthy metrics after real quorum loss lives in the cell "mon × real fault × observer lying". A matrix surfaces that cell — and forces someone to write a hypothesis for it — before any experiment is ever run. Free-form brainstorming almost never reaches it, because the failure is invisible from every signal the brainstormer trusts.
+**Core claim:** a monitoring exporter that keeps reporting healthy metrics after real quorum loss lives in the cell "mon × real fault × observer lying" (here "real fault" stands for the failure-mode value `crash` — the mons really stopped — as opposed to a synthetic injection). A matrix surfaces that cell — and forces someone to write a hypothesis for it — before any experiment is ever run. Free-form brainstorming almost never reaches it, because the failure is invisible from every signal the brainstormer trusts.
 
 ## When to Use
 

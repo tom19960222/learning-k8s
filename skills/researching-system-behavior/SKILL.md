@@ -22,7 +22,7 @@ One subsection per stage. Each subsection states: entry condition (backlog state
 - **Entry condition:** no backlog yet, or a new research question outside the current charter.
 - **What the AI does:** preliminary research FIRST (scan the pinned source/env so questions have substance), then a one-question-at-a-time dialog mapping the user's knowledge boundary across three zones (known / known-unknown / unknown-unknown). **Rule: any question the user cannot answer, or answers with "not sure", becomes a hypothesis in the backlog.**
 - **Exit condition:** charter header + seed hypotheses written into `HYPOTHESES.md`.
-- **Details:** [references/framing-dialog.md](references/framing-dialog.md).
+- **Details:** [references/framing-dialog.md](references/framing-dialog.md); backlog template in [references/hypothesis-backlog.md](references/hypothesis-backlog.md).
 
 Note: interaction style borrows from brainstorming-type skills (one question at a time) but the goal differs — mapping knowledge boundaries, not converging on a design.
 
@@ -34,7 +34,7 @@ Note: interaction style borrows from brainstorming-type skills (one question at 
 
 ### ⛩ Gate 1 — backlog triage
 
-STOP. Human ranks/prunes the backlog. Do not proceed on your own.
+STOP. Human ranks/prunes the backlog. Do not proceed on your own. If the human prunes everything, return to Frame or close the charter.
 
 ### Stage: Falsify
 
@@ -55,18 +55,20 @@ Anything irreversible or destructive is human-driven per the repository's destru
 ### Stage: Synthesize
 
 - **Entry condition:** hypothesis is `confirmed` or `violated`.
-- **What the AI does:** every finding takes all three routes (report / artifact change / feedback to axes; details in [references/synthesis-rules.md](references/synthesis-rules.md)).
+- **What the AI does:** drafts proposed contents for all three routes (report / artifact change / feedback to axes; details in [references/synthesis-rules.md](references/synthesis-rules.md)), then stops at Gate 3 for human selection. Only after the human selects depth/publication does the AI execute the selected routes.
 - **Exit condition:** status becomes `synthesized`.
 
 ### ⛩ Gate 3 — findings triage
 
-STOP. Human decides which findings deserve depth or publication. Violated hypotheses and new failure classes flow back into the backlog and `axes.md`.
+STOP. Present findings with their proposed route contents; human decides which findings deserve depth or publication before any route is executed. Violated hypotheses and new failure classes flow back into the backlog and `axes.md`.
 
 ## Backlog State Machine
 
 ```
 proposed → predicted → confirmed | violated → synthesized
 ```
+
+The template, entry format, `H-NNN` numbering, and lifecycle rules live in [references/hypothesis-backlog.md](references/hypothesis-backlog.md).
 
 | State | Set by stage | Required fields before entering |
 |---|---|---|

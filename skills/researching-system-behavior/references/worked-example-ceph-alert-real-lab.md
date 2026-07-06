@@ -43,7 +43,11 @@ each one starting life as `Status: proposed`, and only then does the
 experiment either confirm or violate it. The entries below show the
 terminal state each one actually reached (`synthesized`, since all three
 findings were published), with a `State trace` line spelling out the full
-progression from `proposed` through to that terminal state.
+progression from `proposed` through to that terminal state (`State trace` is
+a narrative device of this worked example, not a `HYPOTHESES.md` field). All
+three entries below show only T3 evidence because the retrospective record
+predates this framework; a fresh run's `Evidence:` field would accumulate
+T1/T2 anchors during Falsify before the prediction was even written.
 
 ### H-101: `CephClientBlocked` fires within its window on real SLOW_OPS
 
@@ -199,9 +203,9 @@ lying"** — exists in `enumerating-adversarial-boundaries/SKILL.md` as the
 skill's own headline example, independent of this lab: *"a monitoring
 exporter that keeps reporting healthy metrics after real quorum loss lives
 in the cell 'mon × real fault × observer lying'."* That cell is reachable by
-crossing three fixed axes (component: `mon`; failure-mode: the fixed
-vocabulary includes `lying`; observation-path: does the signal report wrong
-values) — it does not require having already seen this specific failure.
+crossing three fixed axes (component: `mon`; failure-mode: `crash` — the
+mons really died; observation-path: reports wrong values — the observer
+lying) — it does not require having already seen this specific failure.
 
 This is the value test for the whole framework: **the two confirmed
 hypotheses (H-101, H-102) are useful, but the violated one (H-103) is the
