@@ -264,10 +264,20 @@ if grep -Eq 'ssh-live-noise|bench-live-noise|kubectl-noise-for-' "$live_stdout_f
 fi
 
 for stream_n in 1 2 3; do
-  stream_round_count="$(grep -Ec "^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n} --no-cleanup\$" "$live_trace_file" || true)"
-  [[ "$stream_round_count" -eq 3 ]] || fail "expected exactly 3 rounds for stream$stream_n at -t 64 concurrency with a distinct --run-name, got $stream_round_count"
+  stream_round_count="$(grep -Ec "^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n}-r[0-9]+ --no-cleanup\$" "$live_trace_file" || true)"
+  [[ "$stream_round_count" -eq 3 ]] || fail "expected exactly 3 rounds for stream$stream_n at -t 64 concurrency with a distinct per-round --run-name, got $stream_round_count"
+  # Each round of the SAME stream must get its OWN unique --run-name (stream
+  # index AND round counter): rados bench derives its object names
+  # deterministically from --run-name, so a regression to a fixed
+  # `stream$i` (no round suffix) makes round 2+ overwrite round 1's objects
+  # instead of writing new ones -- exactly the real-lab plateau bug (used
+  # bytes flat at ~0.10 MB/s after an initial climb) this test pins against.
+  for round_n in 1 2 3; do
+    grep -Fq "ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n}-r${round_n} --no-cleanup" "$live_trace_file" ||
+      fail "missing distinct --run-name stream${stream_n}-r${round_n} (fixed run-name regression would overwrite objects across rounds)"
+  done
 done
-total_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123] --no-cleanup$' "$live_trace_file" || true)"
+total_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123]-r[0-9]+ --no-cleanup$' "$live_trace_file" || true)"
 [[ "$total_round_count" -eq 9 ]] || fail "expected 3 streams * 3 rounds = 9 total bench invocations, got $total_round_count"
 
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 32$' "$live_trace_file" || fail "missing 32-PG pool create"
@@ -288,7 +298,7 @@ done
 [[ -f "$result_dir/sink-absent-check.log" ]] || fail "missing negative-assertion evidence file for sink pager absence"
 
 pool_create_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 32$' "$live_trace_file" | head -1 | cut -d: -f1)"
-last_bench_line="$(grep -nE '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123] --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
+last_bench_line="$(grep -nE '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123]-r[0-9]+ --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
 bluestore_clear_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" | head -1 | cut -d: -f1)"
 pool_delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- sh -c '"'"'ceph config set mon mon_allow_pool_delete true' "$live_trace_file" | head -1 | cut -d: -f1)"
 [[ -n "$pool_create_line" && -n "$last_bench_line" && -n "$bluestore_clear_line" && -n "$pool_delete_line" ]] || fail "missing trace lines for ordering checks"

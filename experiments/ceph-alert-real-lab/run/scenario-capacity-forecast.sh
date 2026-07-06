@@ -108,16 +108,28 @@ run_live_step() {
 # rounds instead of a single long-lived bench.
 #
 # This function is invoked once per PARALLEL stream (1, 2, 3) below. Each
-# stream's loop-of-rounds runs fully independently of the other two, using a
-# distinct `--run-name` (stream1/stream2/stream3) so concurrent rounds
-# across streams never collide on the same rados bench object names.
+# stream's loop-of-rounds runs fully independently of the other two. The
+# --run-name is `stream<N>-r<round>` -- BOTH the stream index AND the round
+# counter -- for two reasons: (1) it keeps concurrent rounds across streams
+# from colliding on the same rados bench object names, and (2) critically,
+# it keeps CONSECUTIVE rounds of the SAME stream from colliding too. `rados
+# bench` derives its object names deterministically from --run-name, so
+# round 2 reusing round 1's run-name (e.g. a fixed `stream$i` with no round
+# suffix) OVERWRITES round 1's objects instead of writing new ones -- used
+# bytes stop growing after the first round of each stream fills, which is
+# exactly the plateau real-lab evidence caught (12 rados bench processes
+# running, but ceph_cluster_total_used_bytes flat at ~0.10 MB/s after an
+# initial climb to ~2.3GB). Appending the round counter makes every round
+# write brand-new objects so used bytes keep accumulating round over round,
+# matching the 10-minute probe's ONE continuous (non-looping, non-reused)
+# `rados bench 600` per stream that measured ~6.9 MB/s sustained RAW growth.
 start_forecast_bench_loop() {
   local stream=$1 output_file=$2 pid_file=$3 child_pid_file=$4 pid
-  local run_name="stream${stream}"
   (
-    local round=1 rc=0 child=""
+    local round=1 rc=0 child="" run_name=""
     : >"$output_file"
     while [[ "$round" -le "$FORECAST_MAX_ROUNDS" ]]; do
+      run_name="stream${stream}-r${round}"
       printf '# round %s started: %s\n' "$round" "$(date -u +%FT%TZ)" >>"$output_file"
       set +e
       ssh_lab "$LAB_MON_01_HOST" \
