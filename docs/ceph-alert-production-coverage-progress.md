@@ -3,14 +3,14 @@
 > 目標環境：工廠關鍵生產系統，要求 0 downtime，每台 VM 掉 2 個 ping 都會被追問。
 > **驗收鐵律：每一條 alert 都必須在真 ceph-lab 上用真實故障注入讓它 firing，不接受模擬或假 metric。**
 >
-> 即時進度，隨場景陸續通過持續更新。最後更新：20/22 通過，S10 low-priority 執行中、剩 S3 mon-quorum-lost（2026-07-06）。
+> **22/22 場景全數真機驗證通過**，叢集完整復原至 HEALTH_OK（2026-07-06）。接下來是文件收尾與最終 whole-branch review。
 
 | 指標 | 數字 |
 |---|---|
 | 設計/修訂的 alert rule | **28** |
 | 真機故障注入場景 | **22** |
-| 已真機驗證 firing | **20** |
-| 真機才抓到的 bug/發現 | **15** |
+| 已真機驗證 firing | **22 ✅ 全數** |
+| 真機才抓到的 bug/發現 | **16** |
 
 ---
 
@@ -110,7 +110,7 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 
 ## 04 — 真機驗證進度看板（即時）
 
-**20 / 22 通過 · 1 執行中 · 1 待跑**（S10 執行中，剩 S3）
+**22 / 22 全數通過 ✅** · 叢集已復原 HEALTH_OK（ratios/flags/config 全還原、無殘留 crash/pool）
 
 | # | 場景 | 驗證的 alert | 真實注入手法 | 狀態 |
 |---|---|---|---|---|
@@ -134,8 +134,8 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 | S18 | capacity-forecast | CephCapacityForecast → 🔵 | 3 條連續 rados bench 平行流持續寫入，72h 趨勢預測越過 85% | ✅ |
 | S19 | data-damage | CephDataDamage → 🔴 | objectstore-tool `set-bytes` 損毀單一 object 內容 → deep-scrub | ✅ |
 | S20 | object-unfound | CephObjectUnfound → 🔴 | size=2/min_size=1 誘發 unfound 標準手法 | ✅ |
-| S10 | low-priority-notice | CephLowPriorityNotice → 🔵（pager 靜默） | noout flag → OSDMAP_FLAGS，等 for:30m | ⏳ 執行中 |
-| S3 | mon-quorum-lost | CephMonQuorumLost → 🔴 + inhibit 斷言 | 停 2 台 mon（保留 active mgr 那台） | ⏳ 待跑 |
+| S10 | low-priority-notice | CephLowPriorityNotice → 🔵（pager 靜默） | noout flag → OSDMAP_FLAGS，等 for:30m | ✅ |
+| S3 | mon-quorum-lost | CephMonQuorumLost → 🔴 + inhibit（確定性驗證） | 停 2 台 mon（保留 active mgr 那台） | ✅ |
 
 ---
 
@@ -179,6 +179,12 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 - **真根因**：一次 10 分鐘的受控 probe（單一連續 `rados bench 600`）實測到 **6.9 MB/s**，但場景的 round-loop 卻只有 0.1 MB/s 甚至負成長。差別在 **`rados bench` 的 round-loop 每輪都用固定 `--run-name streamN`，第二輪起就覆寫掉前一輪的同名 objects，pool 填滿第一輪後就不再成長**。probe 用單一連續 bench 所以 objects 持續累積。
 - **修法**：讓場景完全照 probe——每條 stream 一個連續 `rados bench 4500`（不分 round）。第六輪成長率衝到 **9.15 MB/s**，projection 爬到 2046 GB（門檻 821），alert 真的 fire → slack。
 - **教訓**：這是整輪最硬的除錯。「每條 alert 都要真機驗證」的鐵律逼我把一個看似「lab 太弱」的失敗，一路挖到「rados bench 物件命名語意」這麼底層——而 rule 本身從頭到尾都是對的（它正確地拒絕在不夠陡的趨勢上 fire）。
+
+### 16 · 真 quorum loss 時 inhibit 觀察不到——exporter-freeze 讓兩條 alert 不重疊（S3）
+- **症狀**：CephMonQuorumLost fire→pager 通過，但 inhibit 斷言（CephMonQuorumLost 應抑制 CephMonDownScoped）逾時。
+- **根因**：這是 finding #11（exporter 遙測凍結）的延伸後果。真 quorum loss 時 mgr exporter 先凍結（回報 stale quorum=3）、再死掉；CephMonQuorumLost 只能靠 exporter 死後的 empty-series path 觸發。但那時 `ceph_mon_quorum_status` 已消失,CephMonDownScoped 的 expr 無資料可算 → 不 active → **兩條 alert 在真故障中永遠不時間重疊**,inhibit 無從觀察。
+- **修法**：inhibit 設定本身是對的——直接 POST 兩條 synthetic alert 到 Alertmanager,CephMonDownScoped 立刻變 `suppressed`、`inhibitedBy` 指向 CephMonQuorumLost。於是把「真故障中觀察 inhibit」改成「確定性的 AM 設定行為測試」(Tier-C 式,測 Alertmanager 設定而非造假 ceph 故障),主 alert CephMonQuorumLost 仍由真 quorum loss 驗證。
+- **教訓**：與 S19 的 CephHealthError 同型——「機制正確但真故障的動態讓它觀察不到」。誠實的做法是把不可觀察的斷言換成確定性驗證、並記錄為什麼,而不是硬湊或造假。
 
 ### 14 · data-damage 三層疊：health_detail 閃爍 + objectstore remove 被 recovery 治好 + HEALTH_ERR 也閃爍（S19）
 - **症狀**：CephDataDamage 連兩輪不 fire。
