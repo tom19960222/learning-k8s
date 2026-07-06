@@ -2,9 +2,24 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/run/scenario-capacity-forecast.sh"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok: %s\n' "$*"; }
+
+# --- Static checks: the fast test paths below override
+# FORECAST_ROUND_SECONDS / PROMETHEUS_WAIT_ATTEMPTS via env vars for speed,
+# so they can't observe the actual real-lab-informed production defaults --
+# pin those defaults directly against the script source instead. Real-lab
+# evidence (see the physics comment near the top of scenario-capacity-forecast.sh)
+# showed a 1-PG pool + low bench concurrency only sustained ~0.72 MB/s,
+# projecting 183.7GB against an ~821GB threshold -- these higher-throughput
+# defaults are the fix.
+grep -Eq 'FORECAST_BENCH_THREADS="\$\{FORECAST_BENCH_THREADS:-128\}"' "$SCRIPT" || fail "missing FORECAST_BENCH_THREADS default of 128"
+grep -Eq 'FORECAST_ROUND_SECONDS="\$\{FORECAST_ROUND_SECONDS:-90\}"' "$SCRIPT" || fail "missing FORECAST_ROUND_SECONDS default of 90"
+grep -Eq 'FORECAST_MAX_ROUNDS="\$\{FORECAST_MAX_ROUNDS:-60\}"' "$SCRIPT" || fail "missing FORECAST_MAX_ROUNDS default of 60"
+grep -Eq 'PROMETHEUS_WAIT_ATTEMPTS="\$\{PROMETHEUS_WAIT_ATTEMPTS:-900\}"' "$SCRIPT" || fail "missing PROMETHEUS_WAIT_ATTEMPTS default of 900"
+ok "capacity-forecast throughput defaults (16-PG-ready bench threads/round-seconds/max-rounds and 75m wait budget)"
 
 make_fake_jq() {
   local path=$1 real_jq=$2 trace_file=$3
@@ -105,7 +120,11 @@ case "\$command" in
     exit 0
     ;;
   *"ceph health detail"*)
-    printf 'HEALTH_OK\n'
+    if grep -q 'bluestore_slow_ops_warn_lifetime 1\$' "$trace_file"; then
+      printf 'HEALTH_OK\n'
+    else
+      printf 'HEALTH_WARN BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing slow operations\n'
+    fi
     exit 0
     ;;
   *"quorum_status --format json"*)
@@ -125,7 +144,7 @@ case "\$command" in
     printf 'bench-live-noise\n'
     exit 0
     ;;
-  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*)
+  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*|*"ceph config set osd bluestore_slow_ops_warn_"*|*"ceph config rm osd bluestore_slow_ops_warn_"*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -233,8 +252,12 @@ if grep -Eq 'ssh-live-noise|bench-live-noise|kubectl-noise-for-' "$live_stdout_f
   fail "live command stdout leaked into scenario stdout"
 fi
 
-bench_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write --no-cleanup$' "$live_trace_file" || true)"
-[[ "$bench_round_count" -eq 3 ]] || fail "expected exactly 3 forecast bench loop rounds, got $bench_round_count"
+bench_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 128 --no-cleanup$' "$live_trace_file" || true)"
+[[ "$bench_round_count" -eq 3 ]] || fail "expected exactly 3 forecast bench loop rounds at -t 128 concurrency, got $bench_round_count"
+
+grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 16$' "$live_trace_file" || fail "missing 16-PG pool create"
+grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast size 3$' "$live_trace_file" || fail "missing pool size set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast min_size 2$' "$live_trace_file" || fail "missing pool min_size set"
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'capacity-forecast-*' | sort | tail -1)"
 [[ -f "$result_dir/forecast-bench-loop.txt" ]] || fail "missing forecast bench loop evidence file"
@@ -247,14 +270,26 @@ grep -q '# round 3 exit_code: 0' "$result_dir/forecast-bench-loop.txt" || fail "
 # would also "pass" but leave no evidence file behind).
 [[ -f "$result_dir/sink-absent-check.log" ]] || fail "missing negative-assertion evidence file for sink pager absence"
 
-pool_create_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 1$' "$live_trace_file" | head -1 | cut -d: -f1)"
-last_bench_line="$(grep -n '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
+pool_create_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 16$' "$live_trace_file" | head -1 | cut -d: -f1)"
+last_bench_line="$(grep -n '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 128 --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
+bluestore_clear_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" | head -1 | cut -d: -f1)"
 pool_delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- sh -c '"'"'ceph config set mon mon_allow_pool_delete true' "$live_trace_file" | head -1 | cut -d: -f1)"
-[[ -n "$pool_create_line" && -n "$last_bench_line" && -n "$pool_delete_line" ]] || fail "missing trace lines for ordering checks"
+[[ -n "$pool_create_line" && -n "$last_bench_line" && -n "$bluestore_clear_line" && -n "$pool_delete_line" ]] || fail "missing trace lines for ordering checks"
 (( last_bench_line > pool_create_line )) || fail "bench rounds ran before pool creation"
-(( pool_delete_line > last_bench_line )) || fail "pool delete happened before the bench loop finished"
+(( bluestore_clear_line > last_bench_line )) || fail "BlueStore slow-ops clear did not run after the bench loop finished"
+(( pool_delete_line > bluestore_clear_line )) || fail "pool delete happened before clear_bluestore_slow_ops completed"
 
-ok "capacity-forecast destructive ack guard, 3-round loop injection, and rollback ordering"
+# clear_bluestore_slow_ops must have actually run its remediation (not just
+# been a no-op): the fake ssh's health-detail gating above latches
+# BLUESTORE_SLOW_OP_ALERT until the warn_lifetime/warn_threshold config set
+# pair runs, so rollback must age it out via that config set/rm pair before
+# pool cleanup.
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_lifetime 1$' "$live_trace_file" || fail "rollback did not call clear_bluestore_slow_ops (missing warn_lifetime set)"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_warn_threshold 1$' "$live_trace_file" || fail "rollback did not call clear_bluestore_slow_ops (missing warn_threshold set)"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$live_trace_file" || fail "rollback did not restore warn_lifetime default"
+grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" || fail "rollback did not restore warn_threshold default"
+
+ok "capacity-forecast destructive ack guard, 16-PG pool, 3-round t128 loop injection, and BlueStore-cleanup rollback ordering"
 
 # --- Async lifetime: the whole point of the loop-of-rounds design is that
 # each round's rados bench keeps running independent of the ssh round-trip
