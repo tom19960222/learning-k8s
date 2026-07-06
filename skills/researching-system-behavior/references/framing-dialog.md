@@ -29,6 +29,8 @@ Map the user's knowledge boundary one question at a time, across these three zon
 
 **"Any question the user cannot answer, or answers with 'not sure', is converted into a `proposed` hypothesis with `Origin: framing-dialog`."**
 
+Assign `Tier:` the cheapest tier from "Tiers available" (see Charter Fields below) that could falsify the claim — default `T1` when the claim is source-checkable in the pinned version.
+
 ## Charter Fields
 
 The dialog must fill these fields before it can close:

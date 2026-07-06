@@ -3,6 +3,8 @@
 Reusable template for the three enumeration axes. Read the `## Accumulated Failure Classes`
 section below before starting a new enumeration — every class listed there was earned by
 a real review or incident, and belongs in the matrix or prompt pass for the next one too.
+When downstream work confirms a genuinely new failure class, append it here with provenance
+(source and date) and a generalized "Check:" question, following the format of the existing entries.
 
 ## Axis Template
 
