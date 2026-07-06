@@ -6,6 +6,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok: %s\n' "$*"; }
 
+# --- Static source checks: pin the *shape* of the content-corruption fix so
+# a future edit can't silently reintroduce the remove-based injection (which
+# races with PG recovery -- see the SAFETY comment at the top of
+# run/scenario-data-damage.sh) or drop the active+clean gate / scrub
+# re-issue guard it depends on. These run before any fixture/process is set
+# up and fail RED against the old remove-based script.
+scenario_script="$ROOT/run/scenario-data-damage.sh"
+grep -Fq 'set-bytes' "$scenario_script" || fail "scenario no longer injects via ceph-objectstore-tool set-bytes"
+# shellcheck disable=SC2016
+# Intentional single-quoted literal grep pattern -- matching the scenario
+# script's own literal source text (including its unexpanded $OBJECT), not
+# expanding anything in this test script.
+if grep -Eq '(\$OBJECT|victim) remove\b' "$scenario_script"; then
+  fail "scenario must not inject via ceph-objectstore-tool remove (races with PG recovery, see task-19 fix-round-1 report)"
+fi
+grep -Fq 'pg_query_state_contains "active+clean"' "$scenario_script" || fail "scenario must wait for active+clean (not just active) before deep-scrub"
+grep -Fq 'deep_scrub_wait_with_reissue' "$scenario_script" || fail "scenario must re-issue deep-scrub if OSD_SCRUB_ERRORS is slow to appear"
+# shellcheck disable=SC2016
+# Same reasoning: matching the scenario script's literal unexpanded $PGID.
+grep -Fq 'ceph pg repair $PGID' "$scenario_script" || fail "rollback must still run ceph pg repair"
+ok "static source checks: set-bytes injection, active+clean gate, scrub reissue, pg repair rollback"
+
 make_fake_jq() {
   local path=$1 real_jq=$2 trace_file=$3
   cat >"$path" <<EOF
@@ -76,9 +98,15 @@ EOF
 # purely from counts in the trace file, so a single fixture can answer every
 # poll correctly across the whole scenario:
 #   - osd.5 is down whenever it has more systemctl stops than starts.
-#   - cluster health reports OSD_SCRUB_ERRORS/PG_DAMAGED whenever a
-#     deep-scrub has run more times than a repair (i.e. damage was
-#     introduced and not yet repaired).
+#   - cluster health reports OSD_SCRUB_ERRORS/PG_DAMAGED once at least 2
+#     deep-scrub requests have been issued (and no repair has run yet).
+#     Requiring 2 (not 1) models a deep-scrub whose first request gets
+#     deferred by ceph's scrub scheduler -- OSD_SCRUB_ERRORS only actually
+#     surfaces once the scenario's own re-issue-on-timeout path
+#     (deep_scrub_wait_with_reissue in run/scenario-data-damage.sh) has
+#     re-requested it, exercising that path rather than assuming the first
+#     request always lands. Any `pg repair` call unconditionally clears
+#     health back to HEALTH_OK (see the "ceph health detail" case below).
 # FAKE_OBJECTSTORE_TOOL_FAIL=1 makes the ceph-objectstore-tool invocation
 # itself fail, for the "scenario_inject fails partway" rollback test.
 make_fake_ssh() {
@@ -136,7 +164,7 @@ case "\$command" in
     printf '{"nodes":[{"id":5,"name":"osd.5","type":"osd","status":"%s"}]}\n' "\$status"
     exit 0
     ;;
-  *"ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3.0 victim remove"*)
+  *"head -c 65536 /dev/urandom >/tmp/data-damage-garbage && ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3.0 victim set-bytes /tmp/data-damage-garbage"*)
     if [[ "\${FAKE_OBJECTSTORE_TOOL_FAIL:-0}" == "1" ]]; then
       printf 'simulated ceph-objectstore-tool failure\n' >&2
       exit 1
@@ -157,7 +185,15 @@ case "\$command" in
   *"ceph health detail"*)
     deep_scrubs=\$(grep -c 'ceph pg deep-scrub 3\.0' "$trace_file" || true)
     repairs=\$(grep -c 'ceph pg repair 3\.0' "$trace_file" || true)
-    if [[ "\$deep_scrubs" -gt "\$repairs" ]]; then
+    # A repair always wins and clears health outright (real pg repair
+    # fixes the PG; nothing here re-scrubs afterward to reintroduce the
+    # error), regardless of how many deep-scrub requests preceded it --
+    # this must NOT be a simple deep_scrubs>repairs comparison, since that
+    # would keep reporting ERR forever once 2+ scrubs were re-issued (2 > 1
+    # repair) and the rollback poll below would never clear.
+    if [[ "\$repairs" -ge 1 ]]; then
+      printf 'HEALTH_OK\n'
+    elif [[ "\$deep_scrubs" -ge 2 ]]; then
       printf 'HEALTH_ERR\n'
       printf '[ERR] OSD_SCRUB_ERRORS: 1 scrub errors\n'
       printf '[ERR] PG_DAMAGED: Possible data damage: 1 pg inconsistent\n'
@@ -243,8 +279,10 @@ grep -Fq -- 'data-damage requires --yes-really-inject' "$stderr_file" || fail "m
 [[ ! -s "$no_ack_trace_file" ]] || fail "live-capable commands ran before destructive ack"
 cmp -s "$before_dirs_file" "$after_dirs_file" || fail "result dir was created before destructive ack"
 
-# --- Success path: stop osd.5, objectstore-tool remove, restart, poll PG
-# active, deep-scrub, verify, then repair + rollback.
+# --- Success path: stop osd.5, objectstore-tool set-bytes (content
+# corruption), restart, poll PG active+clean, deep-scrub (re-issued once
+# per the fixture's deep_scrubs>=2 gate -- see make_fake_ssh's comment
+# above), verify, then repair + rollback.
 rm -rf "$fake_bin_dir"
 fake_bin_dir="$(mktemp -d)"
 make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$live_trace_file"
@@ -257,6 +295,7 @@ PATH="$fake_bin_dir:$PATH" \
   DATA_DAMAGE_POLL_ATTEMPTS=5 DATA_DAMAGE_POLL_SLEEP=0 \
   DATA_DAMAGE_PG_POLL_ATTEMPTS=5 DATA_DAMAGE_PG_POLL_SLEEP=0 \
   CEPH_HEALTH_CHECK_ATTEMPTS=5 CEPH_HEALTH_CHECK_SLEEP=0 \
+  DATA_DAMAGE_SCRUB_SUBWINDOW_ATTEMPTS=2 DATA_DAMAGE_SCRUB_REISSUE_ROUNDS=4 \
   PROMETHEUS_WAIT_ATTEMPTS=5 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=5 SINK_WAIT_SLEEP=0 \
   DATA_DAMAGE_REPAIR_ATTEMPTS=5 DATA_DAMAGE_REPAIR_SLEEP=0 \
   bash "$ROOT/run/scenario-data-damage.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
@@ -274,31 +313,37 @@ fi
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd map alert-damage victim --format json$' "$live_trace_file" || fail "missing dynamic osd map"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd find 5 --format json$' "$live_trace_file" || fail "missing osd find for selected non-primary OSD"
 grep -q '^ssh:sudo systemctl stop ceph-.*@osd\.5\.service$' "$live_trace_file" || fail "missing stop for osd.5"
-grep -q '^ssh:sudo -n cephadm shell --name osd\.5 -- ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3\.0 victim remove$' "$live_trace_file" || fail "missing ceph-objectstore-tool invocation on the OSD's own host"
+expected_corrupt_cmd="sudo -n cephadm shell --name osd.5 -- sh -c 'head -c 65536 /dev/urandom >/tmp/data-damage-garbage && ceph-objectstore-tool --data-path /var/lib/ceph/osd/ceph-5 --pgid 3.0 victim set-bytes /tmp/data-damage-garbage'"
+grep -Fxq "ssh:$expected_corrupt_cmd" "$live_trace_file" || fail "missing ceph-objectstore-tool set-bytes invocation on the OSD's own host"
+if grep -q 'ceph-objectstore-tool.*victim remove' "$live_trace_file"; then
+  fail "injection used ceph-objectstore-tool remove instead of set-bytes (races with PG recovery)"
+fi
 start_count="$(grep -c '^ssh:sudo systemctl start ceph-.*@osd\.5\.service$' "$live_trace_file" || true)"
 [[ "$start_count" -ge 1 ]] || fail "missing restart for osd.5"
 grep -q '^ssh:sudo -n cephadm shell -- ceph pg 3\.0 query --format json$' "$live_trace_file" || fail "missing PG-active poll after restart"
-grep -q '^ssh:sudo -n cephadm shell -- ceph pg deep-scrub 3\.0$' "$live_trace_file" || fail "missing deep-scrub trigger"
+scrub_count="$(grep -c '^ssh:sudo -n cephadm shell -- ceph pg deep-scrub 3\.0$' "$live_trace_file" || true)"
+[[ "$scrub_count" -ge 2 ]] || fail "expected the deep-scrub to be re-issued at least once, got $scrub_count total"
 grep -q '^ssh:sudo -n cephadm shell -- ceph pg repair 3\.0$' "$live_trace_file" || fail "missing rollback pg repair"
 delete_count="$(grep -c '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-damage alert-damage --yes-i-really-really-mean-it' "$live_trace_file" || true)"
 [[ "$delete_count" -eq 1 ]] || fail "expected one delete invocation, got $delete_count"
 
 stop_line="$(grep -n '^ssh:sudo systemctl stop ceph-.*@osd\.5\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
-objtool_line="$(grep -n '^ssh:sudo -n cephadm shell --name osd\.5 -- ceph-objectstore-tool' "$live_trace_file" | head -1 | cut -d: -f1)"
+objtool_line="$(grep -Fn "ssh:$expected_corrupt_cmd" "$live_trace_file" | head -1 | cut -d: -f1)"
 start_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@osd\.5\.service$' "$live_trace_file" | head -1 | cut -d: -f1)"
 scrub_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph pg deep-scrub 3\.0$' "$live_trace_file" | head -1 | cut -d: -f1)"
+last_scrub_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph pg deep-scrub 3\.0$' "$live_trace_file" | tail -1 | cut -d: -f1)"
 repair_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph pg repair 3\.0$' "$live_trace_file" | head -1 | cut -d: -f1)"
 delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-damage alert-damage --yes-i-really-really-mean-it' "$live_trace_file" | head -1 | cut -d: -f1)"
 [[ -n "$stop_line" && -n "$objtool_line" && -n "$start_line" && -n "$scrub_line" && -n "$repair_line" && -n "$delete_line" ]] || fail "missing trace lines for ordering checks"
 (( objtool_line > stop_line )) || fail "objectstore-tool ran before the OSD was stopped"
 (( start_line > objtool_line )) || fail "OSD restart happened before objectstore-tool ran"
 (( scrub_line > start_line )) || fail "deep-scrub requested before the OSD restart"
-(( repair_line > scrub_line )) || fail "rollback repair happened before the injected deep-scrub"
+(( repair_line > last_scrub_line )) || fail "rollback repair happened before the last (re-issued) deep-scrub"
 (( delete_line > repair_line )) || fail "pool delete happened before rollback repair"
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'data-damage-*' | sort | tail -1)"
-[[ -f "$result_dir/objectstore-tool-remove.txt" ]] || fail "missing objectstore-tool evidence file"
-grep -q '# exit_code: 0' "$result_dir/objectstore-tool-remove.txt" || fail "objectstore-tool evidence missing successful exit code"
+[[ -f "$result_dir/objectstore-tool-corrupt.txt" ]] || fail "missing objectstore-tool evidence file"
+grep -q '# exit_code: 0' "$result_dir/objectstore-tool-corrupt.txt" || fail "objectstore-tool evidence missing successful exit code"
 
 ok "data-damage destructive ack guard, injection/setup sequence, and rollback ordering"
 
