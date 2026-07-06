@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake ssh: log args; reply from fixture whose filename (under FAKE_SSH_DIR)
+# is a grep -F pattern matched against the full arg string.
+set -u
+args="$*"
+printf '%s\n' "$args" >> "${FAKE_SSH_LOG:?}"
+if [ -n "${FAKE_SSH_DIR:-}" ] && [ -d "$FAKE_SSH_DIR" ]; then
+  for f in "$FAKE_SSH_DIR"/*; do
+    [ -e "$f" ] || continue
+    pat="$(basename "$f")"
+    if printf '%s' "$args" | grep -qF -- "$pat"; then cat "$f"; exit 0; fi
+  done
+fi
+exit 0
