@@ -30,8 +30,19 @@ if [[ "\$*" == *"get pod -l app=alertmanager -o jsonpath={.items[0].metadata.nam
   printf 'alertmanager-0\n'
   exit 0
 fi
+if [[ "\$*" == *"exec alertmanager-0 -- wget -qO- --header=Content-Type: application/json --post-data="*"http://127.0.0.1:9093/api/v2/alerts"* ]]; then
+  printf 'ok\n'
+  exit 0
+fi
 if [[ "\$*" == *"exec alertmanager-0 -- wget -qO- http://127.0.0.1:9093/api/v2/alerts"* ]]; then
-  printf '%s\n' '[{"labels":{"alertname":"CephMonDownScoped"},"status":{"inhibitedBy":["abc"]}}]'
+  # Gate on the synthetic POST having already happened in the trace -- this
+  # proves the scenario really posted before it can observe inhibitedBy,
+  # rather than the fake unconditionally claiming inhibition.
+  if grep -q -- '--post-data=' "$trace_file"; then
+    printf '%s\n' '[{"labels":{"alertname":"CephMonDownScoped"},"status":{"inhibitedBy":["synthetic-CephMonQuorumLost"]}}]'
+  else
+    printf '%s\n' '[{"labels":{"alertname":"CephMonDownScoped"},"status":{"inhibitedBy":[]}}]'
+  fi
   exit 0
 fi
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
@@ -216,19 +227,26 @@ start3_line="$(grep -n '^ssh:sudo systemctl start ceph-.*@mon\.ceph-lab-mon-03\.
 (( start3_line > stop3_line )) || fail "rollback start for mon-03 happened before stop"
 grep -q 'query=%28count%28ceph_mon_quorum_status%20%3D%3D%201%29%20or%20vector%280%29%29%20%3C%202' "$live_trace_file" || fail "missing Prometheus quorum-loss evidence query"
 
-# alertmanager_alert_is_inhibited writes alertmanager-alerts-<alertname>.json
-# keyed on the CALLER's requested alertname, not the fake endpoint's response
-# body -- its existence (with a non-empty inhibitedBy) proves the scenario
-# itself issued a wait_alertmanager_inhibited call for CephMonDownScoped,
-# placed after the CephMonQuorumLost waits.
+# The mon-quorum-lost real fault cannot temporally overlap CephMonQuorumLost
+# firing with CephMonDownScoped being active (mgr exporter telemetry freezes
+# during real quorum loss -- see scenario_verify's comment), so the inhibit
+# relationship is validated deterministically instead: POST a synthetic pair
+# of alerts straight to Alertmanager and confirm the config actually
+# suppresses the target. Assert the scenario really POSTed both alertnames
+# (not just that the fake unconditionally claims inhibition), and that the
+# resulting inhibited-by evidence is only produced once that POST happened.
+grep -q -- '--post-data=.*CephMonQuorumLost.*CephMonDownScoped.*http://127.0.0.1:9093/api/v2/alerts' "$live_trace_file" || fail "missing synthetic POST of both CephMonQuorumLost and CephMonDownScoped to Alertmanager"
+
 result_dir="$ROOT/results/$(basename "$(sed -n 's/^result: //p' "$live_stdout_file")")"
-[[ -f "$result_dir/alertmanager-alerts-CephMonDownScoped.json" ]] || fail "missing CephMonDownScoped alertmanager inhibited-wait evidence"
-grep -q '"inhibitedBy":\["abc"\]' "$result_dir/alertmanager-alerts-CephMonDownScoped.json" || fail "alertmanager evidence file missing inhibitedBy content"
-grep -q 'PASS: Alertmanager alert CephMonDownScoped inhibited' "$live_stderr_file" || fail "missing evidence that CephMonDownScoped was confirmed inhibited"
+post_evidence_file="$result_dir/synthetic-inhibit-post-CephMonQuorumLost-CephMonDownScoped.json"
+[[ -f "$post_evidence_file" ]] || fail "missing synthetic inhibit POST evidence file"
+[[ -f "$result_dir/alertmanager-alerts-CephMonDownScoped.json" ]] || fail "missing CephMonDownScoped alertmanager inhibited-poll evidence"
+grep -q '"inhibitedBy":\["synthetic-CephMonQuorumLost"\]' "$result_dir/alertmanager-alerts-CephMonDownScoped.json" || fail "alertmanager evidence file missing inhibitedBy content gated on the synthetic POST"
+grep -q 'PASS: Alertmanager alert CephMonDownScoped inhibited via synthetic CephMonQuorumLost POST' "$live_stderr_file" || fail "missing evidence that CephMonDownScoped was confirmed inhibited via synthetic POST"
 
 quorum_lost_line="$(grep -n 'PASS: Prometheus alert CephMonQuorumLost' "$live_stderr_file" | head -1 | cut -d: -f1)"
-inhibited_line="$(grep -n 'PASS: Alertmanager alert CephMonDownScoped inhibited' "$live_stderr_file" | head -1 | cut -d: -f1)"
+inhibited_line="$(grep -n 'PASS: Alertmanager alert CephMonDownScoped inhibited via synthetic CephMonQuorumLost POST' "$live_stderr_file" | head -1 | cut -d: -f1)"
 [[ -n "$quorum_lost_line" && -n "$inhibited_line" ]] || fail "missing stderr lines for ordering check"
-(( inhibited_line > quorum_lost_line )) || fail "CephMonDownScoped inhibited-wait should run after the CephMonQuorumLost waits"
+(( inhibited_line > quorum_lost_line )) || fail "synthetic inhibit-config check should run after the CephMonQuorumLost waits"
 
 ok "mon-quorum-lost destructive ack guard"

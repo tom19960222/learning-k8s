@@ -207,4 +207,46 @@ ALERTMANAGER_WAIT_ATTEMPTS=1 ALERTMANAGER_WAIT_SLEEP=0 \
 
 ok "wait_alertmanager_inhibited"
 
+# ---------------------------------------------------------------------------
+# Case 8: assert_inhibit_via_synthetic_post
+# ---------------------------------------------------------------------------
+
+synthetic_dir="$(mktemp -d)"
+SYNTHETIC_POST_SEEN=0
+# shellcheck disable=SC2329
+kubectl_lab() {
+  case "$*" in
+    *"exec alertmanager-0 -- wget -qO- --header=Content-Type: application/json --post-data="*"CephMonQuorumLost"*"CephMonDownScoped"*"http://127.0.0.1:9093/api/v2/alerts"*)
+      SYNTHETIC_POST_SEEN=1
+      printf 'ok\n'
+      ;;
+    *"get pod -l app=alertmanager"*)
+      printf 'alertmanager-0\n'
+      ;;
+    *"/api/v2/alerts"*)
+      if [[ "$SYNTHETIC_POST_SEEN" -eq 1 ]]; then
+        printf '%s\n' '[{"labels":{"alertname":"CephMonDownScoped"},"status":{"inhibitedBy":["CephMonQuorumLost"]}}]'
+      else
+        printf '%s\n' '[{"labels":{"alertname":"CephMonDownScoped"},"status":{"inhibitedBy":[]}}]'
+      fi
+      ;;
+    *)
+      printf 'unexpected kubectl_lab call: %s\n' "$*" >&2
+      return 1
+      ;;
+  esac
+}
+
+SYNTHETIC_INHIBIT_WAIT_ATTEMPTS=1 SYNTHETIC_INHIBIT_WAIT_SLEEP=0 \
+  assert_inhibit_via_synthetic_post CephMonQuorumLost CephMonDownScoped "$synthetic_dir" ||
+  fail "assert_inhibit_via_synthetic_post should pass once the target alert shows inhibitedBy after the POST"
+
+[[ "$SYNTHETIC_POST_SEEN" -eq 1 ]] || fail "assert_inhibit_via_synthetic_post did not POST the synthetic alert pair"
+[[ -f "$synthetic_dir/synthetic-inhibit-post-CephMonQuorumLost-CephMonDownScoped.json" ]] ||
+  fail "assert_inhibit_via_synthetic_post did not capture POST response evidence"
+[[ -f "$synthetic_dir/alertmanager-alerts-CephMonDownScoped.json" ]] ||
+  fail "assert_inhibit_via_synthetic_post did not capture inhibited-poll evidence"
+
+ok "assert_inhibit_via_synthetic_post"
+
 ok "scenario framework and negative assertion helpers"

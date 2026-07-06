@@ -431,6 +431,40 @@ wait_alertmanager_inhibited() {
     alertmanager_alert_is_inhibited "$alertname" "$result_dir"
 }
 
+# assert_inhibit_via_synthetic_post <source_alertname> <target_alertname> <result_dir>
+#
+# Validates an Alertmanager inhibit_rules relationship deterministically,
+# instead of waiting for a real fault to (maybe) produce the temporal
+# overlap required for it to be observed. Some inhibit relationships can
+# never be observed from their real fault -- e.g. CephMonQuorumLost's
+# relationship with CephMonDownScoped: when quorum is actually lost, the mgr
+# exporter's telemetry freezes, so CephMonQuorumLost only fires later via its
+# `or vector(0)` empty-series fallback, by which point ceph_mon_quorum_status
+# / ceph_mon_metadata have no data at all and CephMonDownScoped's expr can
+# never evaluate to active. POSTing a synthetic pair of alerts straight to
+# Alertmanager's /api/v2/alerts exercises the same inhibit_rules matchers
+# that route in production, without depending on a faked ceph metric -- this
+# validates Alertmanager's suppression config, not the ceph fault itself.
+assert_inhibit_via_synthetic_post() {
+  local source_alertname=$1 target_alertname=$2 result_dir=$3
+  local pod now payload post_out
+
+  pod="$(kubectl_lab -n "$LAB_NAMESPACE" get pod -l app=alertmanager -o jsonpath='{.items[0].metadata.name}')"
+  now="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  payload=$(printf '[{"labels":{"alertname":"%s","severity":"critical","source":"ceph_stability"},"annotations":{"summary":"synthetic-inhibit-probe"},"startsAt":"%s"},{"labels":{"alertname":"%s","severity":"critical","source":"ceph_scoped","ceph_daemon":"mon.synthetic","hostname":"synthetic"},"annotations":{"summary":"synthetic-inhibit-probe"},"startsAt":"%s"}]' \
+    "$source_alertname" "$now" "$target_alertname" "$now")
+
+  post_out="$result_dir/synthetic-inhibit-post-${source_alertname}-${target_alertname}.json"
+  kubectl_lab -n "$LAB_NAMESPACE" exec "$pod" -- wget -qO- \
+    --header="Content-Type: application/json" \
+    --post-data="$payload" \
+    http://127.0.0.1:9093/api/v2/alerts >"$post_out"
+
+  poll_until "Alertmanager alert $target_alertname inhibited via synthetic $source_alertname POST" \
+    "${SYNTHETIC_INHIBIT_WAIT_ATTEMPTS:-12}" "${SYNTHETIC_INHIBIT_WAIT_SLEEP:-5}" \
+    alertmanager_alert_is_inhibited "$target_alertname" "$result_dir"
+}
+
 assert_sink_absent() {
   local receiver=$1 alertname=$2 label_name=$3 label_value=$4 result_dir=$5 checkpoint_file="${6:-}"
   local start=0

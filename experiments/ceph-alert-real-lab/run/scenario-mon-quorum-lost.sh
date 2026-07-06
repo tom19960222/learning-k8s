@@ -16,17 +16,6 @@ source "$ROOT/lib/scenario-framework.sh"
 ACTIVE_MGR_HOST=""
 ACTIVE_MGR_SERVICE=""
 
-# Real-cluster timing caveat: during full quorum loss the mgr exporter
-# telemetry FREEZES (verified against the real lab -- quorum_status stayed
-# stale after stopping 2 mons), so CephMonDownScoped may only coexist with
-# CephMonQuorumLost inside Alertmanager's resolve window, after the empty
-# metrics-series path is what actually fires CephMonQuorumLost. Give the
-# inhibited-wait a generous attempts budget for that window. If this proves
-# flaky in the real lab, the documented decision is to downgrade this
-# check to amtool-level verification instead -- that downgrade is NOT
-# implemented here.
-ALERTMANAGER_WAIT_ATTEMPTS="${ALERTMANAGER_WAIT_ATTEMPTS:-90}"
-export ALERTMANAGER_WAIT_ATTEMPTS
 stop_step=1
 restart_step=1
 
@@ -96,7 +85,21 @@ EOF
 scenario_verify() {
   wait_prometheus_alert CephMonQuorumLost "" "" "$RESULT_DIR"
   wait_sink_alert pager CephMonQuorumLost "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
-  wait_alertmanager_inhibited CephMonDownScoped "$RESULT_DIR"
+
+  # Why synthetic, not real-fault: during a real quorum loss the mgr exporter
+  # telemetry FREEZES (verified against the real lab -- ceph_mon_quorum_status
+  # stayed stale after stopping 2 mons), so CephMonQuorumLost only fires later
+  # via its `or vector(0)` empty-series fallback path -- by which point
+  # ceph_mon_quorum_status/ceph_mon_metadata are ABSENT entirely, so
+  # CephMonDownScoped's expr `(1 - ceph_mon_quorum_status) * ceph_mon_metadata
+  # == 1` has no data to evaluate against and never goes active. The two
+  # alerts never temporally overlap in a real quorum loss, so the inhibit
+  # relationship cannot be observed from this fault. Instead, validate the
+  # inhibit CONFIG deterministically by POSTing both alerts straight to
+  # Alertmanager -- this exercises the same inhibit_rules matchers that route
+  # in production, testing Alertmanager's suppression config rather than a
+  # faked ceph fault.
+  assert_inhibit_via_synthetic_post CephMonQuorumLost CephMonDownScoped "$RESULT_DIR"
 }
 
 scenario_rollback() {
