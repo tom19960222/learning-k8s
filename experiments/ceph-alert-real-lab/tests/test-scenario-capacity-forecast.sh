@@ -8,25 +8,37 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf 'ok: %s\n' "$*"; }
 
 # --- Static checks: the fast test paths below override
-# FORECAST_ROUND_SECONDS / PROMETHEUS_WAIT_ATTEMPTS via env vars for speed,
-# so they can't observe the actual real-lab-informed production defaults --
-# pin those defaults directly against the script source instead. Real-lab
-# evidence (see the physics comment near the top of scenario-capacity-forecast.sh)
-# showed that even a 16-PG/size-3/single-stream/-t128 redesign only sustained
-# 0.33-0.72 MB/s (3x replication write-amplification collapsing throughput
-# under BlueStore backpressure) -- the fix that actually sustains growth is
-# THREE parallel streams at -t 64 each, still at DEFAULT replication
-# (size=3/min_size=2, 32 PGs): a later real-lab attempt discovered that
-# `pool set size 1` is EPERM-disabled on v19.2.3 (needs an extra mon config
-# toggle we don't want to make), so the 6.9 MB/s probe measurement was
-# actually taken at size=3 the whole time -- replication multiplies logical
-# writes into the RAW usage the rule tracks, so size=3 alone clears the
-# needed slope; size=1 was never necessary.
+# FORECAST_STREAM_SECONDS / PROMETHEUS_WAIT_ATTEMPTS via env vars for
+# speed, so they can't observe the actual real-lab-informed production
+# defaults -- pin those defaults directly against the script source
+# instead. FIX ROUND 4 (real-lab): a dedicated 10-minute throughput PROBE
+# proved ONE continuous `rados bench` per stream (no round loop) x 3
+# parallel streams sustains 6.9 MB/s RAW growth at the pool's DEFAULT
+# replication (size=3/min_size=2, 32 PGs). Five real-lab runs of the
+# PREVIOUS round-loop design (many short rounds per stream, each
+# restarting rados bench with a fresh --run-name) never sustained >2 MB/s --
+# the restart churn itself was the regression versus the proven probe.
+# FORECAST_MAX_ROUNDS / FORECAST_ROUND_SECONDS must not reappear: their
+# reintroduction would mean a regression back to the round-loop design.
 grep -Eq 'FORECAST_BENCH_THREADS="\$\{FORECAST_BENCH_THREADS:-64\}"' "$SCRIPT" || fail "missing FORECAST_BENCH_THREADS default of 64 (per-stream concurrency)"
-grep -Eq 'FORECAST_ROUND_SECONDS="\$\{FORECAST_ROUND_SECONDS:-90\}"' "$SCRIPT" || fail "missing FORECAST_ROUND_SECONDS default of 90"
-grep -Eq 'FORECAST_MAX_ROUNDS="\$\{FORECAST_MAX_ROUNDS:-60\}"' "$SCRIPT" || fail "missing FORECAST_MAX_ROUNDS default of 60"
+grep -Eq 'FORECAST_STREAM_SECONDS="\$\{FORECAST_STREAM_SECONDS:-4500\}"' "$SCRIPT" || fail "missing FORECAST_STREAM_SECONDS default of 4500 (single continuous invocation per stream)"
 grep -Eq 'PROMETHEUS_WAIT_ATTEMPTS="\$\{PROMETHEUS_WAIT_ATTEMPTS:-900\}"' "$SCRIPT" || fail "missing PROMETHEUS_WAIT_ATTEMPTS default of 900"
-ok "capacity-forecast throughput defaults (64-thread-per-stream bench/round-seconds/max-rounds and 75m wait budget)"
+
+default_stream_seconds="$(grep -Eo 'FORECAST_STREAM_SECONDS:-[0-9]+' "$SCRIPT" | grep -Eo '[0-9]+' || true)"
+[[ -n "$default_stream_seconds" ]] || fail "could not extract FORECAST_STREAM_SECONDS default from script"
+[[ "$default_stream_seconds" -ge 3600 ]] || fail "FORECAST_STREAM_SECONDS default ($default_stream_seconds) must be >= 3600s to comfortably span the alert's for:30m plus fill time"
+
+# Match actual shell assignments/expansions of the retired round-loop env
+# vars (not their historical mentions in the physics comment above, which
+# intentionally document the regression that was fixed).
+# shellcheck disable=SC2016 # single-quoted grep -E regex, not a shell expansion
+if grep -Eq '(FORECAST_MAX_ROUNDS|FORECAST_ROUND_SECONDS)="\$\{|\$FORECAST_(MAX_ROUNDS|ROUND_SECONDS)\b|\$\{FORECAST_(MAX_ROUNDS|ROUND_SECONDS)\}' "$SCRIPT"; then
+  fail "round-loop env vars (FORECAST_MAX_ROUNDS/FORECAST_ROUND_SECONDS) must not be assigned or expanded -- regression to round-based restarts"
+fi
+if grep -Eq 'round=\$\(\(round' "$SCRIPT"; then
+  fail "round counter increment must not reappear -- regression to round-based restarts"
+fi
+ok "capacity-forecast throughput defaults (64-thread-per-stream, single continuous FORECAST_STREAM_SECONDS>=3600 invocation, 75m wait budget, no round-loop vars)"
 
 make_fake_jq() {
   local path=$1 real_jq=$2 trace_file=$3
@@ -39,12 +51,12 @@ EOF
 }
 
 # make_fake_kubectl's CephCapacityForecast alert only starts firing once at
-# least $1 rounds (summed across all 3 parallel streams) of the forecast
-# bench loop have been observed in the trace file -- this is what proves
-# scenario_verify's poll genuinely waits on (and outlasts) the looping
-# parallel streams, not just a single round.
+# least $1 stream invocations (summed across all 3 parallel streams) have
+# been observed in the trace file -- this is what proves scenario_verify's
+# poll genuinely waits on (and outlasts) scenario_inject launching every
+# parallel stream, not just the first one.
 make_fake_kubectl() {
-  local path=$1 trace_file=$2 min_rounds=$3 pager_leak_json=${4:-}
+  local path=$1 trace_file=$2 min_starts=$3 pager_leak_json=${4:-}
   cat >"$path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -53,9 +65,9 @@ if [[ "\$*" == *"get pod -l app=prometheus -o jsonpath={.items[0].metadata.name}
   printf 'prometheus-0\n'
   exit 0
 fi
-rounds=\$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast ' "$trace_file" || true)
+starts=\$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast ' "$trace_file" || true)
 if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/alerts"* ]]; then
-  if [[ "\$rounds" -ge $min_rounds ]]; then
+  if [[ "\$starts" -ge $min_starts ]]; then
     printf '%s\n' '{"data":{"alerts":[{"labels":{"alertname":"CephCapacityForecast"},"state":"firing"}]}}'
   else
     printf '%s\n' '{"data":{"alerts":[]}}'
@@ -68,7 +80,7 @@ if [[ "\$*" == *"exec prometheus-0 -- wget -qO- http://127.0.0.1:9090/api/v1/que
 fi
 if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"watchdog","alertname":"Watchdog","labels":{}}'
-  if [[ "\$rounds" -ge $min_rounds ]]; then
+  if [[ "\$starts" -ge $min_starts ]]; then
     printf '%s\n' '{"receiver":"slack","alertname":"CephCapacityForecast","labels":{"fresh":"true"}}'
 EOF
   if [[ -n "$pager_leak_json" ]]; then
@@ -152,7 +164,7 @@ case "\$command" in
     printf 'bench-live-noise\n'
     exit 0
     ;;
-  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*|*"ceph config set osd bluestore_slow_ops_warn_"*|*"ceph config rm osd bluestore_slow_ops_warn_"*)
+  *"ceph osd pool create "*|*"ceph osd pool set "*|*"rados -p "*|*"ceph osd tree"*|*"ceph osd pool delete "*|*"ceph config set osd bluestore_slow_ops_warn_"*|*"ceph config rm osd bluestore_slow_ops_warn_"*|*"pkill -f "*)
     printf 'ssh-live-noise\n'
     exit 0
     ;;
@@ -234,21 +246,21 @@ grep -Fq -- 'capacity-forecast requires --yes-really-inject' "$stderr_file" || f
 [[ ! -s "$no_ack_trace_file" ]] || fail "live-capable commands ran before destructive ack"
 cmp -s "$before_dirs_file" "$after_dirs_file" || fail "result dir was created before destructive ack"
 
-# --- Success path: EACH of the 3 parallel streams must run its own
-# FORECAST_MAX_ROUNDS=3 consecutive rounds under a distinct --run-name
-# (proving the streams actually run independently in parallel, not just one
-# stream sequentially), and scenario_verify's poll must genuinely wait for
-# that combined looping growth before CephCapacityForecast is considered
-# firing.
+# --- Success path: EACH of the 3 parallel streams must run exactly ONE
+# continuous `rados bench` invocation under its own distinct --run-name
+# (stream1/stream2/stream3, no round suffix) -- proving the streams
+# actually run independently in parallel with no round-loop restarts -- and
+# scenario_verify's poll must genuinely wait for all 3 streams to have
+# started before CephCapacityForecast is considered firing.
 rm -rf "$fake_bin_dir"
 fake_bin_dir="$(mktemp -d)"
 make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$live_trace_file"
-make_fake_kubectl "$fake_bin_dir/kubectl" "$live_trace_file" 9
+make_fake_kubectl "$fake_bin_dir/kubectl" "$live_trace_file" 3
 make_fake_curl "$fake_bin_dir/curl" "$live_trace_file"
 make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file"
 
 set +e
-PATH="$fake_bin_dir:$PATH" FORECAST_MAX_ROUNDS=3 FORECAST_ROUND_SECONDS=0 \
+PATH="$fake_bin_dir:$PATH" FORECAST_STREAM_SECONDS=0 \
   PROMETHEUS_WAIT_ATTEMPTS=50 PROMETHEUS_WAIT_SLEEP=0.05 SINK_WAIT_ATTEMPTS=50 SINK_WAIT_SLEEP=0.05 \
   BLUESTORE_CLEAR_DRAIN_SECONDS=0 \
   bash "$ROOT/run/scenario-capacity-forecast.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
@@ -264,21 +276,16 @@ if grep -Eq 'ssh-live-noise|bench-live-noise|kubectl-noise-for-' "$live_stdout_f
 fi
 
 for stream_n in 1 2 3; do
-  stream_round_count="$(grep -Ec "^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n}-r[0-9]+ --no-cleanup\$" "$live_trace_file" || true)"
-  [[ "$stream_round_count" -eq 3 ]] || fail "expected exactly 3 rounds for stream$stream_n at -t 64 concurrency with a distinct per-round --run-name, got $stream_round_count"
-  # Each round of the SAME stream must get its OWN unique --run-name (stream
-  # index AND round counter): rados bench derives its object names
-  # deterministically from --run-name, so a regression to a fixed
-  # `stream$i` (no round suffix) makes round 2+ overwrite round 1's objects
-  # instead of writing new ones -- exactly the real-lab plateau bug (used
-  # bytes flat at ~0.10 MB/s after an initial climb) this test pins against.
-  for round_n in 1 2 3; do
-    grep -Fq "ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n}-r${round_n} --no-cleanup" "$live_trace_file" ||
-      fail "missing distinct --run-name stream${stream_n}-r${round_n} (fixed run-name regression would overwrite objects across rounds)"
-  done
+  stream_invocation_count="$(grep -Ec "^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream${stream_n} --no-cleanup\$" "$live_trace_file" || true)"
+  [[ "$stream_invocation_count" -eq 1 ]] || fail "expected exactly ONE continuous rados bench invocation for stream$stream_n at -t 64 concurrency, got $stream_invocation_count"
 done
-total_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123]-r[0-9]+ --no-cleanup$' "$live_trace_file" || true)"
-[[ "$total_round_count" -eq 9 ]] || fail "expected 3 streams * 3 rounds = 9 total bench invocations, got $total_round_count"
+total_invocation_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123] --no-cleanup$' "$live_trace_file" || true)"
+[[ "$total_invocation_count" -eq 3 ]] || fail "expected 3 total bench invocations (one per stream, no rounds), got $total_invocation_count"
+# Regression guard: a round loop would produce round-suffixed run-names
+# (stream1-r1, stream1-r2, ...) instead of one bare stream$i run-name.
+if grep -Eq -- '--run-name stream[123]-r[0-9]+' "$live_trace_file"; then
+  fail "found round-suffixed --run-name (regression to round-loop restarts)"
+fi
 
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 32$' "$live_trace_file" || fail "missing 32-PG pool create"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast size 3$' "$live_trace_file" || fail "missing pool size=3 set"
@@ -286,9 +293,9 @@ grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast min_size
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'capacity-forecast-*' | sort | tail -1)"
 for stream_n in 1 2 3; do
-  [[ -f "$result_dir/forecast-bench-loop-stream${stream_n}.txt" ]] || fail "missing forecast bench loop evidence file for stream$stream_n"
-  grep -q "# round 3 exit_code: 0" "$result_dir/forecast-bench-loop-stream${stream_n}.txt" || fail "stream$stream_n loop evidence file missing round 3 success marker"
-  [[ -f "$result_dir/forecast-loop-stream${stream_n}.pid" ]] || fail "missing forecast-loop-stream${stream_n}.pid evidence file"
+  [[ -f "$result_dir/forecast-bench-stream${stream_n}.txt" ]] || fail "missing forecast bench stream evidence file for stream$stream_n"
+  grep -q '# exit_code: 0' "$result_dir/forecast-bench-stream${stream_n}.txt" || fail "stream$stream_n evidence file missing success exit marker"
+  [[ -f "$result_dir/forecast-bench-stream${stream_n}.pid" ]] || fail "missing forecast-bench-stream${stream_n}.pid evidence file"
 done
 
 # assert_sink_absent always writes sink-absent-check.log before its pass/fail
@@ -298,12 +305,14 @@ done
 [[ -f "$result_dir/sink-absent-check.log" ]] || fail "missing negative-assertion evidence file for sink pager absence"
 
 pool_create_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 32$' "$live_trace_file" | head -1 | cut -d: -f1)"
-last_bench_line="$(grep -nE '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123]-r[0-9]+ --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
+last_bench_line="$(grep -nE '^ssh:sudo -n cephadm shell -- rados bench -p alert-forecast 0 write -b 4194304 -t 64 --run-name stream[123] --no-cleanup$' "$live_trace_file" | tail -1 | cut -d: -f1)"
+pkill_line="$(grep -n '^ssh:sudo -n cephadm shell -- sh -c '"'"'pkill -f "\[r\]ados bench -p alert-forecast" || true'"'"'$' "$live_trace_file" | head -1 | cut -d: -f1)"
 bluestore_clear_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" | head -1 | cut -d: -f1)"
 pool_delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- sh -c '"'"'ceph config set mon mon_allow_pool_delete true' "$live_trace_file" | head -1 | cut -d: -f1)"
-[[ -n "$pool_create_line" && -n "$last_bench_line" && -n "$bluestore_clear_line" && -n "$pool_delete_line" ]] || fail "missing trace lines for ordering checks"
-(( last_bench_line > pool_create_line )) || fail "bench rounds ran before pool creation"
-(( bluestore_clear_line > last_bench_line )) || fail "BlueStore slow-ops clear did not run after every stream's bench loop finished"
+[[ -n "$pool_create_line" && -n "$last_bench_line" && -n "$pkill_line" && -n "$bluestore_clear_line" && -n "$pool_delete_line" ]] || fail "missing trace lines for ordering checks"
+(( last_bench_line > pool_create_line )) || fail "bench streams ran before pool creation"
+(( pkill_line > last_bench_line )) || fail "remote pkill did not run after every stream's bench invocation"
+(( bluestore_clear_line > pkill_line )) || fail "BlueStore slow-ops clear did not run after remote pkill"
 (( pool_delete_line > bluestore_clear_line )) || fail "pool delete happened before clear_bluestore_slow_ops completed"
 
 # clear_bluestore_slow_ops must have actually run its remediation (not just
@@ -316,16 +325,18 @@ grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_wa
 grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$live_trace_file" || fail "rollback did not restore warn_lifetime default"
 grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" || fail "rollback did not restore warn_threshold default"
 
-ok "capacity-forecast destructive ack guard, 32-PG size=3 pool, 3-parallel-stream t64 loop injection with distinct run-names, and BlueStore-cleanup rollback ordering"
+ok "capacity-forecast destructive ack guard, 32-PG size=3 pool, 3-parallel-stream continuous injection with distinct run-names (no round loop), remote pkill, and BlueStore-cleanup rollback ordering"
 
-# --- Async lifetime: the whole point of the loop-of-rounds design is that
-# each round's rados bench keeps running independent of the ssh round-trip
-# that launched it, and rollback must explicitly terminate whichever round
-# is currently in flight for ALL THREE streams (never leaving an orphaned
-# background process on any of them). Block every stream's round 1 open
-# until explicitly released, confirm the scenario proceeds past the launch
-# (on to alert polling) while all 3 rounds are still running, then confirm
-# rollback kills all 3 (each captured as exit_code 143).
+# --- Async lifetime: the whole point of the continuous-per-stream design is
+# that each stream's single rados bench keeps running independent of the
+# ssh round-trip that launched it, for the FULL FORECAST_STREAM_SECONDS
+# duration, and rollback must explicitly terminate whichever stream is
+# still in flight for ALL THREE streams (never leaving an orphaned
+# background process on any of them). Block every stream's single
+# invocation open until explicitly released, confirm the scenario proceeds
+# past the launch (on to alert polling) while all 3 streams are still
+# running, then confirm rollback kills all 3 (each captured as exit_code
+# 143).
 rm -f "$bench_started_file" "$bench_block_file" "$bench_terminated_file"
 make_fake_jq "$async_bin_dir/jq" "$real_jq" "$async_trace_file"
 make_fake_kubectl "$async_bin_dir/kubectl" "$async_trace_file" 1
@@ -333,7 +344,7 @@ make_fake_curl "$async_bin_dir/curl" "$async_trace_file"
 make_fake_ssh "$async_bin_dir/ssh" "$async_trace_file"
 
 set +e
-PATH="$async_bin_dir:$PATH" FORECAST_MAX_ROUNDS=45 PROMETHEUS_WAIT_ATTEMPTS=20 PROMETHEUS_WAIT_SLEEP=0.05 SINK_WAIT_ATTEMPTS=20 SINK_WAIT_SLEEP=0.05 \
+PATH="$async_bin_dir:$PATH" PROMETHEUS_WAIT_ATTEMPTS=20 PROMETHEUS_WAIT_SLEEP=0.05 SINK_WAIT_ATTEMPTS=20 SINK_WAIT_SLEEP=0.05 \
   BLUESTORE_CLEAR_DRAIN_SECONDS=0 \
   FAKE_BENCH_STARTED_FILE="$bench_started_file" \
   FAKE_BENCH_BLOCK_FILE="$bench_block_file" \
@@ -347,17 +358,17 @@ while [[ "$started_wait" -lt 20 && ! -f "$bench_started_file" ]]; do
   sleep 0.2
   started_wait=$((started_wait + 1))
 done
-[[ -f "$bench_started_file" ]] || fail "fake bench round 1 did not start"
+[[ -f "$bench_started_file" ]] || fail "fake bench stream invocation did not start"
 
-# make_fake_kubectl's min_rounds=1 requires at least one round-1 ssh trace
-# line (from any stream) to exist before the alert fires. The fake ssh
-# script writes that trace line immediately (before it blocks on
-# FAKE_BENCH_BLOCK_FILE), so this becomes true almost as soon as the loops
-# launch round 1 -- well before any round itself finishes. That is exactly
-# the case this test targets: verify proceeds and succeeds concurrently with
-# all 3 streams' round 1 still in flight. Poll for the alerts query itself,
-# which only runs inside scenario_verify -- strictly after scenario_inject
-# (launching all 3 loops) has returned.
+# make_fake_kubectl's min_starts=1 requires at least one stream's ssh trace
+# line to exist before the alert fires. The fake ssh script writes that
+# trace line immediately (before it blocks on FAKE_BENCH_BLOCK_FILE), so
+# this becomes true almost as soon as the streams launch -- well before any
+# stream itself finishes. That is exactly the case this test targets:
+# verify proceeds and succeeds concurrently with all 3 streams still in
+# flight. Poll for the alerts query itself, which only runs inside
+# scenario_verify -- strictly after scenario_inject (launching all 3
+# streams) has returned.
 poll_wait=0
 while [[ "$poll_wait" -lt 20 ]] && ! grep -q 'wget -qO- http://127.0.0.1:9090/api/v1/alerts' "$async_trace_file"; do
   sleep 0.2
@@ -377,7 +388,7 @@ done
 if kill -0 "$async_pid" 2>/dev/null; then
   kill "$async_pid" 2>/dev/null || true
   wait "$async_pid" 2>/dev/null || true
-  fail "scenario left the async fake bench loops running"
+  fail "scenario left the async fake bench streams running"
 fi
 wait "$async_pid"
 rc=$?
@@ -385,24 +396,24 @@ rc=$?
 
 async_result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'capacity-forecast-*' | sort | tail -1)"
 for stream_n in 1 2 3; do
-  grep -Fq '# round 1 exit_code: 143' "$async_result_dir/forecast-bench-loop-stream${stream_n}.txt" ||
-    fail "rollback did not terminate and capture the still-running round-1 fake bench for stream$stream_n"
+  grep -Fq '# exit_code: 143' "$async_result_dir/forecast-bench-stream${stream_n}.txt" ||
+    fail "rollback did not terminate and capture the still-running continuous bench for stream$stream_n"
 done
 
-ok "capacity-forecast keeps all 3 parallel bench streams alive independent of the ssh round-trip, and rollback kills every in-flight stream explicitly"
+ok "capacity-forecast keeps all 3 parallel continuous bench streams alive independent of the ssh round-trip, and rollback kills every in-flight stream explicitly"
 
 # --- Failure path: alert-sink also delivers CephCapacityForecast via the
 # pager receiver. Proves assert_sink_absent's pass/fail branches are both
 # reachable (not vacuously true): a leaked pager alert must make
 # scenario_verify fail, which must still let scenario_main's EXIT trap run
-# scenario_rollback (kill all 3 stream loops, delete the pool).
+# scenario_rollback (kill all 3 stream invocations, delete the pool).
 make_fake_jq "$pager_leak_bin_dir/jq" "$real_jq" "$pager_leak_trace_file"
 make_fake_kubectl "$pager_leak_bin_dir/kubectl" "$pager_leak_trace_file" 1 '{"receiver":"pager","alertname":"CephCapacityForecast","labels":{"fresh":"true"}}'
 make_fake_curl "$pager_leak_bin_dir/curl" "$pager_leak_trace_file"
 make_fake_ssh "$pager_leak_bin_dir/ssh" "$pager_leak_trace_file"
 
 set +e
-PATH="$pager_leak_bin_dir:$PATH" FORECAST_MAX_ROUNDS=1 FORECAST_ROUND_SECONDS=0 \
+PATH="$pager_leak_bin_dir:$PATH" FORECAST_STREAM_SECONDS=0 \
   PROMETHEUS_WAIT_ATTEMPTS=20 PROMETHEUS_WAIT_SLEEP=0.05 SINK_WAIT_ATTEMPTS=20 SINK_WAIT_SLEEP=0.05 \
   BLUESTORE_CLEAR_DRAIN_SECONDS=0 \
   bash "$ROOT/run/scenario-capacity-forecast.sh" --yes-really-inject >"$pager_leak_stdout_file" 2>"$pager_leak_stderr_file"

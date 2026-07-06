@@ -12,9 +12,28 @@ source "$ROOT/lib/scenarios.sh"
 # shellcheck source=/Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-real-lab/lib/scenario-framework.sh
 source "$ROOT/lib/scenario-framework.sh"
 
-# REAL-LAB EVIDENCE (physics, not a rule bug) -- FIX ROUND 3. Three real-lab
-# attempts at this scenario have now measured actual sustained throughput on
-# the ~900GiB (966329892864-byte) cluster:
+# REAL-LAB EVIDENCE (physics, not a rule bug) -- FIX ROUND 4. A dedicated
+# 10-minute throughput PROBE (independent of this scenario's own script)
+# proved 6.9 MB/s sustained RAW growth is achievable on this lab using ONE
+# continuous `rados bench 600 write -b 4194304 -t 64 --no-cleanup` per
+# stream x 3 parallel streams (size=3 pool, 32 PGs, default replication).
+# Five real-lab runs of THIS scenario's previous design -- a per-stream
+# ROUND LOOP (many consecutive short `rados bench` invocations of
+# FORECAST_ROUND_SECONDS each, restarting with a fresh --run-name every
+# time) -- never sustained
+# >2 MB/s and in some runs showed near-zero/negative used-bytes growth
+# despite the identical pool shape and thread count as the probe. The
+# common factor across every round-loop run is the restart itself: each
+# round's `rados bench` process has to reopen `librados`, rebuild its
+# connection to every OSD in the pool's PG set, and ramp its 64 writer
+# threads back up to steady state before it contributes any throughput --
+# and at a 90-second-per-round setting that ramp-up/ramp-down churn recurs
+# every 90 seconds, forever eating into the round's own useful window. The
+# round loop was the regression versus the proven probe, not a rule bug or
+# a replication/PG-count problem (both of those were already fixed in
+# rounds 2/3 below). Fix: make the scenario do EXACTLY what the probe did
+# -- one long-lived, uninterrupted `rados bench` per stream for the whole
+# injection window, never restarted.
 #
 #   Run 1 (original design): a 1-PG pool fed by rados bench's low default
 #   concurrency serialized every write onto that PG's 3 OSDs and sustained
@@ -29,32 +48,35 @@ source "$ROOT/lib/scenario-framework.sh"
 #   nowhere to hide a per-stream stall (the whole pipe idles while it
 #   recovers).
 #
-#   Run 3 (this fix): the round-2 probe's setup step (`ceph osd pool set
-#   alert-forecast size 1 --yes-i-really-mean-it`) actually fails outright on
-#   v19.2.3 with `Error EPERM: configuring pool size as 1 is disabled by
-#   default` (needs an extra `mon_allow_pool_size_one=true` mon config we do
-#   NOT want to toggle just for this scenario) -- and that failure was
-#   silent, so the 10-minute probe that measured 6.9 MB/s sustained RAW
-#   growth actually ran the whole time at the pool's DEFAULT size=3 (still
-#   32 PGs, still 3 parallel held-open bench streams at -t 64 each). That is
-#   good news, not a new problem: CephCapacityForecast's rule tracks
+#   Run 3 (round-loop design, now superseded): the round-2 probe's setup
+#   step (`ceph osd pool set alert-forecast size 1 --yes-i-really-mean-it`)
+#   actually fails outright on v19.2.3 with `Error EPERM: configuring pool
+#   size as 1 is disabled by default` (needs an extra
+#   `mon_allow_pool_size_one=true` mon config we do NOT want to toggle just
+#   for this scenario) -- and that failure was silent, so the 10-minute
+#   probe that measured 6.9 MB/s sustained RAW growth actually ran the
+#   whole time at the pool's DEFAULT size=3 (still 32 PGs, still 3 parallel
+#   held-open bench streams at -t 64 each). That is good news, not a new
+#   problem: CephCapacityForecast's rule tracks
 #   ceph_cluster_total_used_bytes -- RAW used bytes -- and 3x replication
 #   multiplies logical writes into raw growth (~2.3 MB/s logical x 3
 #   replicas ~= 6.9 MB/s raw), so size=3 alone already clears the ~3.2 MB/s
-#   floor below with room to spare. size=1 is unnecessary (and disabled by
-#   default anyway): keep default replication (size 3 / min_size 2,
-#   matching every other scenario's pool hygiene) and rely on the 3 parallel
-#   streams for the concurrency that actually mattered.
+#   floor below with room to spare. Run 3 then replaced the probe's single
+#   continuous `rados bench 600` per stream with a per-stream LOOP of many
+#   90s rounds (to extend past the probe's 10-minute duration and cover the
+#   full wait budget) -- but across 5 real-lab attempts that round-based
+#   restart pattern is what collapsed throughput (see Run 4 above); it was
+#   never validated end-to-end against a real alert firing.
 #
 # CephCapacityForecast (max(predict_linear(ceph_cluster_total_used_bytes[1h],
 # 259200)) > 0.85 * max(ceph_cluster_total_bytes), for: 30m) needs a
 # sustained write slope of at least (821GB - current_used) / 72h ~= 3.2
 # MB/s for predict_linear's 72h (259200s) extrapolation to clear the
 # threshold. At the probed ~6.9 MB/s RAW (size=3, 32 PGs, 3 parallel
-# streams), the projection crosses the ~821GB threshold once the [1h]
-# least-squares window's average slope exceeds 3.2 MB/s (~25-35 minutes of
-# fill), then 30 more continuous minutes for `for: 30m` to latch -- a
-# realistic fire time of ~55-70 minutes wall-clock. Bump
+# continuous streams), the projection crosses the ~821GB threshold once the
+# [1h] least-squares window's average slope exceeds 3.2 MB/s (~25-35
+# minutes of fill), then 30 more continuous minutes for `for: 30m` to latch
+# -- a realistic fire time of ~55-70 minutes wall-clock. Bump
 # PROMETHEUS_WAIT_ATTEMPTS to 900 attempts * 5s = 4500s (75m) to cover the
 # worst case of that window. A real (--yes-really-inject) run of this
 # scenario therefore takes up to ~75 MINUTES of wall-clock time -- do not
@@ -63,26 +85,26 @@ PROMETHEUS_WAIT_ATTEMPTS="${PROMETHEUS_WAIT_ATTEMPTS:-900}"
 export PROMETHEUS_WAIT_ATTEMPTS
 
 POOL="${FORECAST_POOL:-alert-forecast}"
-# 60 rounds * 90s/round = 5400s (90m) of sustained writes PER STREAM --
-# comfortably exceeds the 75m PROMETHEUS_WAIT_ATTEMPTS budget above so the 3
-# parallel background loops keep feeding predict_linear's growth slope for
+# ONE continuous rados bench per stream for FORECAST_STREAM_SECONDS,
+# matching the throughput probe exactly (no round loop, no restarts). 4500s
+# (75 minutes) comfortably spans the PROMETHEUS_WAIT_ATTEMPTS budget above
+# so all 3 parallel streams keep feeding predict_linear's growth slope for
 # at least as long as scenario_verify is willing to wait for the alert to
-# fire. 90s rounds amortize each round's ~10s cephadm-shell container
-# startup dead-time over a larger useful-write window per round.
-FORECAST_MAX_ROUNDS="${FORECAST_MAX_ROUNDS:-60}"
-FORECAST_ROUND_SECONDS="${FORECAST_ROUND_SECONDS:-90}"
-# 64 concurrent writer threads PER STREAM: the real-lab probe (see the
-# physics comment above) measured exactly this shape -- a size=3 pool (32
-# PGs, default replication) fed by 3 parallel streams at -t 64 each --
-# sustaining 6.9 MB/s raw growth. A single stream at higher concurrency
-# (-t 128, run 2's design) collapsed to 0.33-0.72 MB/s under BlueStore
-# backpressure; parallelizing across 3 independent streams instead of
-# piling more threads onto one absorbs a single stream's transient stall
-# without stalling the aggregate.
+# fire.
+FORECAST_STREAM_SECONDS="${FORECAST_STREAM_SECONDS:-4500}"
+# 64 concurrent writer threads PER STREAM: the real-lab throughput probe
+# (see the physics comment above) measured exactly this shape -- a size=3
+# pool (32 PGs, default replication) fed by 3 parallel streams at -t 64
+# each, each stream running ONE continuous `rados bench` -- sustaining 6.9
+# MB/s raw growth. A single stream at higher concurrency (-t 128, run 2's
+# design) collapsed to 0.33-0.72 MB/s under BlueStore backpressure;
+# parallelizing across 3 independent streams instead of piling more threads
+# onto one absorbs a single stream's transient stall without stalling the
+# aggregate.
 FORECAST_BENCH_THREADS="${FORECAST_BENCH_THREADS:-64}"
-LOOP_PID_1=""
-LOOP_PID_2=""
-LOOP_PID_3=""
+BENCH_PID_1=""
+BENCH_PID_2=""
+BENCH_PID_3=""
 cleanup_step=1
 
 run_live_step() {
@@ -91,7 +113,7 @@ run_live_step() {
 }
 
 # CONTROLLER CORRECTION (binding, supersedes the original task brief): do
-# NOT launch the bench loop with `nohup ... &` *inside* the cephadm shell
+# NOT launch rados bench with `nohup ... &` *inside* the cephadm shell
 # container -- the container is a foreground `podman run --rm` without
 # --pid=host (see scenario-latency-outlier.sh's start_background_capture
 # comment for the full analysis), so a nohup'd background job inside it
@@ -99,86 +121,85 @@ run_live_step() {
 # exact bug was found and fixed in S11 (scenario-slow-ops.sh's ancestor) and
 # again in S18's predecessor design here.
 #
-# Instead, each round's `rados bench` runs as the FOREGROUND command of its
-# own ssh + cephadm-shell invocation (keeping that round's container alive
-# for the round's full duration), and only the outer *loop* of rounds is
-# backgrounded locally, in this script's own process -- imitating
+# Instead, rados bench runs as the FOREGROUND command of its own ssh +
+# cephadm-shell invocation for the ENTIRE FORECAST_STREAM_SECONDS duration
+# (keeping that stream's container alive the whole time), and only the
+# thin holder subshell wrapping it is backgrounded locally, in this
+# script's own process -- exactly mirroring
 # scenario-latency-outlier.sh's start_background_capture/stop_bench_workload
-# mechanics, but repeated across up to FORECAST_MAX_ROUNDS consecutive
-# rounds instead of a single long-lived bench.
-#
-# This function is invoked once per PARALLEL stream (1, 2, 3) below. Each
-# stream's loop-of-rounds runs fully independently of the other two. The
-# --run-name is `stream<N>-r<round>` -- BOTH the stream index AND the round
-# counter -- for two reasons: (1) it keeps concurrent rounds across streams
-# from colliding on the same rados bench object names, and (2) critically,
-# it keeps CONSECUTIVE rounds of the SAME stream from colliding too. `rados
-# bench` derives its object names deterministically from --run-name, so
-# round 2 reusing round 1's run-name (e.g. a fixed `stream$i` with no round
-# suffix) OVERWRITES round 1's objects instead of writing new ones -- used
-# bytes stop growing after the first round of each stream fills, which is
-# exactly the plateau real-lab evidence caught (12 rados bench processes
-# running, but ceph_cluster_total_used_bytes flat at ~0.10 MB/s after an
-# initial climb to ~2.3GB). Appending the round counter makes every round
-# write brand-new objects so used bytes keep accumulating round over round,
-# matching the 10-minute probe's ONE continuous (non-looping, non-reused)
-# `rados bench 600` per stream that measured ~6.9 MB/s sustained RAW growth.
-start_forecast_bench_loop() {
-  local stream=$1 output_file=$2 pid_file=$3 child_pid_file=$4 pid
+# mechanics. This function is invoked once per PARALLEL stream (1, 2, 3)
+# below; each stream's single continuous bench runs fully independently of
+# the other two, under its own distinct --run-name (stream1/stream2/
+# stream3) so the 3 streams never collide on the same rados bench object
+# names. FIX ROUND 4 replaces the previous per-stream round-loop (many
+# consecutive short rounds, each restarting rados bench with a fresh
+# --run-name) with this single long-lived invocation: real-lab evidence
+# showed the round restarts themselves collapsing throughput (see the
+# physics comment above) -- this is now byte-for-byte the same shape as the
+# throughput probe that measured 6.9 MB/s sustained.
+start_forecast_bench_stream() {
+  local stream=$1 output_file=$2 pid_file=$3 child_pid_file=$4
+  local run_name="stream${stream}" pid
   (
-    local round=1 rc=0 child="" run_name=""
-    : >"$output_file"
-    while [[ "$round" -le "$FORECAST_MAX_ROUNDS" ]]; do
-      run_name="stream${stream}-r${round}"
-      printf '# round %s started: %s\n' "$round" "$(date -u +%FT%TZ)" >>"$output_file"
-      set +e
-      ssh_lab "$LAB_MON_01_HOST" \
-        "sudo -n cephadm shell -- rados bench -p $POOL $FORECAST_ROUND_SECONDS write -b 4194304 -t $FORECAST_BENCH_THREADS --run-name $run_name --no-cleanup" \
-        >>"$output_file" 2>&1 &
-      child=$!
-      printf '%s\n' "$child" >"$child_pid_file"
-      trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
-      wait "$child"
-      rc=$?
-      trap - TERM INT
-      set -e
-      printf '# round %s exit_code: %s\n' "$round" "$rc" >>"$output_file"
-      if [[ "$rc" -ne 0 ]]; then
-        break
-      fi
-      round=$((round + 1))
-    done
+    local started ended rc child
+    started="$(date -u +%FT%TZ)"
+    {
+      printf '# started: %s\n' "$started"
+      printf '# stream: %s\n' "$stream"
+    } >"$output_file"
+
+    set +e
+    ssh_lab "$LAB_MON_01_HOST" \
+      "sudo -n cephadm shell -- rados bench -p $POOL $FORECAST_STREAM_SECONDS write -b 4194304 -t $FORECAST_BENCH_THREADS --run-name $run_name --no-cleanup" \
+      >>"$output_file" 2>&1 &
+    child=$!
+    printf '%s\n' "$child" >"$child_pid_file"
+    trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 143' TERM INT
+    wait "$child"
+    rc=$?
+    trap - TERM INT
+    set -e
+
+    ended="$(date -u +%FT%TZ)"
+    {
+      printf '\n# ended: %s\n' "$ended"
+      printf '# exit_code: %s\n' "$rc"
+    } >>"$output_file"
     exit "$rc"
   ) &
   pid=$!
   case "$stream" in
-    1) LOOP_PID_1=$pid ;;
-    2) LOOP_PID_2=$pid ;;
-    3) LOOP_PID_3=$pid ;;
+    1) BENCH_PID_1=$pid ;;
+    2) BENCH_PID_2=$pid ;;
+    3) BENCH_PID_3=$pid ;;
   esac
   printf '%s\n' "$pid" >"$pid_file"
 }
 
-# stop_forecast_loop <stream> <reason> mirrors scenario-latency-outlier.sh's
-# stop_bench_workload exactly, parametrized by stream index: kill the
-# in-flight round's ssh child directly first (poll briefly, escalate to
-# SIGKILL if it won't die), then kill the outer loop subshell, then wait on
-# it -- defense in depth on top of the loop's own internal TERM trap above,
-# not a replacement for it. scenario_rollback calls this once per stream (1,
-# 2, 3) so all three parallel loops are torn down, not just the first one.
-stop_forecast_loop() {
+# stop_forecast_bench_stream <stream> <reason> mirrors
+# scenario-latency-outlier.sh's stop_bench_workload exactly, parametrized
+# by stream index: kill the in-flight ssh child directly first (poll
+# briefly, escalate to SIGKILL if it won't die), then kill the holder
+# subshell, then wait on it -- defense in depth on top of the holder's own
+# internal TERM trap above, not a replacement for it. scenario_rollback
+# calls this once per stream (1, 2, 3) so all three parallel continuous
+# streams are torn down, not just the first one. A remote `pkill -f` on the
+# mon host (see scenario_rollback below) is the additional belt-and-braces
+# step for the rare case where killing the local ssh client does not tear
+# down the remote rados bench process (e.g. a already-dropped connection).
+stop_forecast_bench_stream() {
   local stream=$1 reason=$2 child_pid="" i loop_pid=""
-  local child_pid_file="$RESULT_DIR/forecast-loop-stream${stream}.child.pid"
+  local child_pid_file="$RESULT_DIR/forecast-bench-stream${stream}.child.pid"
   case "$stream" in
-    1) loop_pid="$LOOP_PID_1" ;;
-    2) loop_pid="$LOOP_PID_2" ;;
-    3) loop_pid="$LOOP_PID_3" ;;
+    1) loop_pid="$BENCH_PID_1" ;;
+    2) loop_pid="$BENCH_PID_2" ;;
+    3) loop_pid="$BENCH_PID_3" ;;
   esac
   if [[ -z "$loop_pid" ]]; then
     return 0
   fi
 
-  log "stop capacity-forecast bench loop stream$stream ($reason)"
+  log "stop capacity-forecast bench stream$stream ($reason)"
   if [[ -f "$child_pid_file" ]]; then
     child_pid="$(cat "$child_pid_file")"
     if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
@@ -198,9 +219,9 @@ stop_forecast_loop() {
   fi
   wait "$loop_pid" 2>/dev/null || true
   case "$stream" in
-    1) LOOP_PID_1="" ;;
-    2) LOOP_PID_2="" ;;
-    3) LOOP_PID_3="" ;;
+    1) BENCH_PID_1="" ;;
+    2) BENCH_PID_2="" ;;
+    3) BENCH_PID_3="" ;;
   esac
   return 0
 }
@@ -221,9 +242,9 @@ scenario_setup() {
 }
 
 scenario_inject() {
-  start_forecast_bench_loop 1 "$RESULT_DIR/forecast-bench-loop-stream1.txt" "$RESULT_DIR/forecast-loop-stream1.pid" "$RESULT_DIR/forecast-loop-stream1.child.pid"
-  start_forecast_bench_loop 2 "$RESULT_DIR/forecast-bench-loop-stream2.txt" "$RESULT_DIR/forecast-loop-stream2.pid" "$RESULT_DIR/forecast-loop-stream2.child.pid"
-  start_forecast_bench_loop 3 "$RESULT_DIR/forecast-bench-loop-stream3.txt" "$RESULT_DIR/forecast-loop-stream3.pid" "$RESULT_DIR/forecast-loop-stream3.child.pid"
+  start_forecast_bench_stream 1 "$RESULT_DIR/forecast-bench-stream1.txt" "$RESULT_DIR/forecast-bench-stream1.pid" "$RESULT_DIR/forecast-bench-stream1.child.pid"
+  start_forecast_bench_stream 2 "$RESULT_DIR/forecast-bench-stream2.txt" "$RESULT_DIR/forecast-bench-stream2.pid" "$RESULT_DIR/forecast-bench-stream2.child.pid"
+  start_forecast_bench_stream 3 "$RESULT_DIR/forecast-bench-stream3.txt" "$RESULT_DIR/forecast-bench-stream3.pid" "$RESULT_DIR/forecast-bench-stream3.child.pid"
 }
 
 scenario_verify() {
@@ -234,12 +255,24 @@ scenario_verify() {
   assert_sink_absent pager CephCapacityForecast "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
 }
 
+# ROLLBACK NOTE: each stream runs a SINGLE continuous `rados bench
+# $FORECAST_STREAM_SECONDS` (up to 75 minutes) -- there is no round
+# boundary to wait for, so rollback must actively kill it rather than let
+# it finish. stop_forecast_bench_stream kills the tracked local ssh PID
+# first (which tears down the ssh connection and, with it, the remote
+# cephadm-shell container's foreground process); the remote `pkill -f
+# "[r]ados bench -p $POOL"` below is the belt-and-braces second layer for
+# the rare case where the remote process outlives the dropped connection.
+# `--no-cleanup` means every object written by all 3 streams persists on
+# disk until the `pool_cleanup_commands` pool delete below removes them.
 scenario_rollback() {
   local rc=0 stream
 
   for stream in 1 2 3; do
-    stop_forecast_loop "$stream" "before pool cleanup"
+    stop_forecast_bench_stream "$stream" "before pool cleanup"
   done
+  run_live_step "rollback-kill-rados-bench" "$LAB_MON_01_HOST" \
+    "sudo -n cephadm shell -- sh -c 'pkill -f \"[r]ados bench -p $POOL\" || true'" || rc=1
   # The sustained heavy writes above can also latch BLUESTORE_SLOW_OP_ALERT
   # on the OSDs backing this pool's PGs; clear it before pool cleanup so
   # assert_lab_recovered's HEALTH_OK gate doesn't time out (same latch
