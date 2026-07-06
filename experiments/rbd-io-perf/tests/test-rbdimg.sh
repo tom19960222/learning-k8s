@@ -25,6 +25,10 @@ grep -q -- '-o queue_depth=128' "$FAKE_SSH_LOG" || { echo "map options missing";
 img_unmap /dev/rbd7
 grep -q 'rbd unmap /dev/rbd7' "$FAKE_SSH_LOG" || exit 1
 
+# img_unmap: reject non-/dev/rbd* paths
+if ( img_unmap ioperf-data ) 2>/dev/null; then echo "unmap path guard missing"; exit 1; fi
+if ( img_unmap /tmp/evil ) 2>/dev/null; then echo "unmap /tmp evil path guard missing"; exit 1; fi
+
 img_meta_set ioperf-data conf_rbd_cache false
 grep -q 'rbd image-meta set ioperf/ioperf-data conf_rbd_cache false' "$FAKE_SSH_LOG" || exit 1
 echo OK
