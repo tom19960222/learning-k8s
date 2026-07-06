@@ -17,6 +17,10 @@ recovered_dir=""
 recovery_fail_dir=""
 LAB_RECOVERY_ATTEMPTS=1
 LAB_RECOVERY_SLEEP=0
+# Every clear_bluestore_slow_ops test below simulates the alert with fake
+# ceph_seed_cmd responses that flip instantly -- no real drain is needed, and
+# a 30s real sleep per test case would make this suite unbearably slow.
+BLUESTORE_CLEAR_DRAIN_SECONDS=0
 
 cleanup() {
   [[ -n "$success_dir" ]] && rm -rf "$success_dir"
@@ -140,8 +144,52 @@ grep -Fq -- 'config rm osd bluestore_slow_ops_warn_lifetime' "$clear_success_dir
 grep -Fq -- 'config rm osd bluestore_slow_ops_warn_threshold' "$clear_success_dir/bluestore-warn-threshold-rm.txt" || fail "missing threshold restore"
 health_polls="$(cat "$clear_health_calls_file")"
 [[ "$health_polls" -ge 3 ]] || fail "expected clear_bluestore_slow_ops to poll health detail repeatedly before it cleared, saw $health_polls"
+[[ ! -f "$clear_success_dir/bluestore-warn-lifetime-set-retry.txt" ]] || fail "first cycle sufficed -- no retry cycle should have run"
 rm -rf "$clear_success_dir"
 rm -f "$clear_health_calls_file"
+
+# --- Re-latch case: the post-restore recheck finds BLUESTORE_SLOW_OP_ALERT
+# present again (simulating in-flight ops that finished draining and
+# re-latched right after the first cycle restored the longer default
+# lifetime) -- clear_bluestore_slow_ops must run the whole
+# shrink/poll/restore cycle exactly once more and still succeed.
+relatch_dir="$(mktemp -d)"
+relatch_health_calls_file="$(mktemp)"
+BLUESTORE_CLEAR_ATTEMPTS=5
+BLUESTORE_CLEAR_SLEEP=0
+
+# shellcheck disable=SC2329
+ceph_seed_cmd() {
+  if [[ "$1 $2" == "health detail" ]]; then
+    calls=0
+    [[ -f "$relatch_health_calls_file" ]] && calls="$(cat "$relatch_health_calls_file")"
+    calls=$((calls + 1))
+    printf '%s' "$calls" >"$relatch_health_calls_file"
+    case "$calls" in
+      1) printf 'HEALTH_WARN BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)\n' ;;
+      2) printf 'HEALTH_OK\n' ;;
+      3) printf 'HEALTH_WARN BLUESTORE_SLOW_OP_ALERT 1 OSD(s) experiencing BlueStore slow operation(s)\n' ;;
+      *) printf 'HEALTH_OK\n' ;;
+    esac
+    return 0
+  fi
+  printf '%s\n' "$*"
+}
+
+if ! clear_bluestore_slow_ops "$relatch_dir"; then
+  fail "clear_bluestore_slow_ops should still succeed once the retry cycle clears a re-latched alert"
+fi
+grep -Fq -- 'config set osd bluestore_slow_ops_warn_lifetime 1' "$relatch_dir/bluestore-warn-lifetime-set.txt" || fail "missing first-cycle lifetime=1 config set"
+grep -Fq -- 'config rm osd bluestore_slow_ops_warn_lifetime' "$relatch_dir/bluestore-warn-lifetime-rm.txt" || fail "missing first-cycle lifetime restore"
+[[ -f "$relatch_dir/bluestore-warn-lifetime-set-retry.txt" ]] || fail "BLUESTORE_SLOW_OP_ALERT re-latching after the first cycle should trigger a retry cycle"
+grep -Fq -- 'config set osd bluestore_slow_ops_warn_lifetime 1' "$relatch_dir/bluestore-warn-lifetime-set-retry.txt" || fail "retry cycle did not re-shrink lifetime"
+grep -Fq -- 'config set osd bluestore_slow_ops_warn_threshold 1' "$relatch_dir/bluestore-warn-threshold-set-retry.txt" || fail "retry cycle did not re-shrink threshold"
+grep -Fq -- 'config rm osd bluestore_slow_ops_warn_lifetime' "$relatch_dir/bluestore-warn-lifetime-rm-retry.txt" || fail "retry cycle did not restore lifetime again"
+grep -Fq -- 'config rm osd bluestore_slow_ops_warn_threshold' "$relatch_dir/bluestore-warn-threshold-rm-retry.txt" || fail "retry cycle did not restore threshold again"
+relatch_calls="$(cat "$relatch_health_calls_file")"
+[[ "$relatch_calls" -eq 4 ]] || fail "expected exactly 4 health-detail calls (initial + cycle1 poll + post-restore recheck + cycle2 poll), saw $relatch_calls"
+rm -rf "$relatch_dir"
+rm -f "$relatch_health_calls_file"
 
 clear_timeout_dir="$(mktemp -d)"
 BLUESTORE_CLEAR_ATTEMPTS=2

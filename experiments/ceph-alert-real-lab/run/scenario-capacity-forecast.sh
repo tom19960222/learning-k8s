@@ -12,52 +12,69 @@ source "$ROOT/lib/scenarios.sh"
 # shellcheck source=/Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-real-lab/lib/scenario-framework.sh
 source "$ROOT/lib/scenario-framework.sh"
 
-# REAL-LAB EVIDENCE (physics, not a rule bug): a prior --yes-really-inject
-# run against this ~900GiB (966329892864-byte) cluster used a 1-PG pool
-# (pool_create_commands' default) fed by rados bench's low default
-# concurrency. That serializes every write onto the pool's single PG's 3
-# OSDs and measured only ~0.72 MB/s average throughput (used bytes climbed
-# 390MB -> 2.33GB over the whole run). predict_linear(...[1h], 259200)
-# projected a 72h-out total of just 183.7GB against the ~821GB threshold
-# (0.85 * 900GiB) -- 4.5x short. CephCapacityForecast correctly never
-# fired: the rule did its job, the injected trend was simply too weak to
-# extrapolate past the threshold. The fix below is THROUGHPUT (more PGs for
-# parallelism + higher bench concurrency + longer rounds to amortize
-# cephadm-shell container startup dead-time), not the rule or the wait
-# budget's shape.
+# REAL-LAB EVIDENCE (physics, not a rule bug) -- FIX ROUND 2. Two real-lab
+# attempts at this scenario have now measured actual sustained throughput on
+# the ~900GiB (966329892864-byte) cluster:
+#
+#   Run 1 (original design): a 1-PG pool fed by rados bench's low default
+#   concurrency serialized every write onto that PG's 3 OSDs and sustained
+#   only ~0.72 MB/s (used bytes climbed 390MB -> 2.33GB over the whole run).
+#   predict_linear(...[1h], 259200) projected a 72h-out total of just
+#   183.7GB against the ~821GB threshold (0.85 * 900GiB) -- 4.5x short.
+#
+#   Run 2 (16-PG pool, size 3, single stream, -t 128): still only sustained
+#   0.33-0.72 MB/s despite bursting as high as 12.8 MB/s -- throughput
+#   repeatedly collapsed back down under BlueStore backpressure once 3x
+#   replication write-amplification caught up with the burst. More PGs and
+#   more threads inside ONE stream did not fix it: 3x replication was eating
+#   the throughput budget, and a single stream has nowhere to hide a
+#   per-stream stall (the whole pipe idles while it recovers).
+#
+#   PROBE RESULT (10-minute sustained measurement, the fix below): a size=1
+#   pool (32 PGs) fed by THREE PARALLEL held-open bench streams (-t 64 each)
+#   sustains 6.9 MB/s raw cluster-usage growth, stable across the full 10
+#   minutes -- 2.2x the ~3.2 MB/s floor CephCapacityForecast's rule needs.
+#   Dropping replication to size=1 removes the write-amplification tax
+#   entirely (the growth under test is raw-used, not replicated-used, so
+#   replication factor is not part of the growth semantics being tested);
+#   running 3 streams in parallel means one stream's transient BlueStore
+#   stall no longer stalls the aggregate slope -- the other two keep it alive.
 #
 # CephCapacityForecast (max(predict_linear(ceph_cluster_total_used_bytes[1h],
 # 259200)) > 0.85 * max(ceph_cluster_total_bytes), for: 30m) needs a
 # sustained write slope of at least (821GB - current_used) / 72h ~= 3.2
 # MB/s for predict_linear's 72h (259200s) extrapolation to clear the
-# threshold, held long enough for the [1h] least-squares window to mostly
-# reflect it (~25-40 minutes of fill at good throughput before the window
-# is largely growth-signal), THEN 30 more continuous minutes for `for: 30m`
-# to latch -- a realistic fire time of ~55-75 minutes wall-clock. The 16-PG
-# pool + -t $FORECAST_BENCH_THREADS (128) below is expected to sustain
-# >=8 MB/s, comfortably above the ~3.2 MB/s floor. Bump PROMETHEUS_WAIT_ATTEMPTS
-# to 900 attempts * 5s = 4500s (75m) to cover the worst case of that window.
-# A real (--yes-really-inject) run of this scenario therefore takes up to
-# ~75 MINUTES of wall-clock time -- do not run it interactively without
-# expecting a long wait.
+# threshold. At the probed ~6.9 MB/s, the projection crosses the ~821GB
+# threshold once the [1h] least-squares window's average slope exceeds
+# 3.2 MB/s (~25-35 minutes of fill), then 30 more continuous minutes for
+# `for: 30m` to latch -- a realistic fire time of ~55-70 minutes wall-clock.
+# Bump PROMETHEUS_WAIT_ATTEMPTS to 900 attempts * 5s = 4500s (75m) to cover
+# the worst case of that window. A real (--yes-really-inject) run of this
+# scenario therefore takes up to ~75 MINUTES of wall-clock time -- do not
+# run it interactively without expecting a long wait.
 PROMETHEUS_WAIT_ATTEMPTS="${PROMETHEUS_WAIT_ATTEMPTS:-900}"
 export PROMETHEUS_WAIT_ATTEMPTS
 
 POOL="${FORECAST_POOL:-alert-forecast}"
-# 60 rounds * 90s/round = 5400s (90m) of sustained writes -- comfortably
-# exceeds the 75m PROMETHEUS_WAIT_ATTEMPTS budget above so the background
-# loop keeps feeding predict_linear's growth slope for at least as long as
-# scenario_verify is willing to wait for the alert to fire. 90s rounds (vs
-# the old 60s) amortize each round's ~10s cephadm-shell container startup
-# dead-time over a larger useful-write window per round.
+# 60 rounds * 90s/round = 5400s (90m) of sustained writes PER STREAM --
+# comfortably exceeds the 75m PROMETHEUS_WAIT_ATTEMPTS budget above so the 3
+# parallel background loops keep feeding predict_linear's growth slope for
+# at least as long as scenario_verify is willing to wait for the alert to
+# fire. 90s rounds amortize each round's ~10s cephadm-shell container
+# startup dead-time over a larger useful-write window per round.
 FORECAST_MAX_ROUNDS="${FORECAST_MAX_ROUNDS:-60}"
 FORECAST_ROUND_SECONDS="${FORECAST_ROUND_SECONDS:-90}"
-# 128 concurrent writer threads: the real-lab root cause of the ~0.72 MB/s
-# throughput was a 1-PG pool serializing writes onto one PG's 3 OSDs, not
-# insufficient bandwidth -- pairing this with the 16-PG pool below (see
-# scenario_setup) lets bench's concurrency actually parallelize.
-FORECAST_BENCH_THREADS="${FORECAST_BENCH_THREADS:-128}"
-LOOP_PID=""
+# 64 concurrent writer threads PER STREAM: the real-lab probe (see the
+# physics comment above) measured exactly this shape -- a size=1 pool (32
+# PGs) fed by 3 parallel streams at -t 64 each -- sustaining 6.9 MB/s raw
+# growth. A single stream at higher concurrency (-t 128, run 2's design)
+# collapsed to 0.33-0.72 MB/s under BlueStore backpressure; parallelizing
+# across 3 independent streams instead of piling more threads onto one
+# absorbs a single stream's transient stall without stalling the aggregate.
+FORECAST_BENCH_THREADS="${FORECAST_BENCH_THREADS:-64}"
+LOOP_PID_1=""
+LOOP_PID_2=""
+LOOP_PID_3=""
 cleanup_step=1
 
 run_live_step() {
@@ -81,8 +98,14 @@ run_live_step() {
 # scenario-latency-outlier.sh's start_background_capture/stop_bench_workload
 # mechanics, but repeated across up to FORECAST_MAX_ROUNDS consecutive
 # rounds instead of a single long-lived bench.
+#
+# This function is invoked once per PARALLEL stream (1, 2, 3) below. Each
+# stream's loop-of-rounds runs fully independently of the other two, using a
+# distinct `--run-name` (stream1/stream2/stream3) so concurrent rounds
+# across streams never collide on the same rados bench object names.
 start_forecast_bench_loop() {
-  local output_file=$1 pid_file=$2 child_pid_file=$3
+  local stream=$1 output_file=$2 pid_file=$3 child_pid_file=$4 pid
+  local run_name="stream${stream}"
   (
     local round=1 rc=0 child=""
     : >"$output_file"
@@ -90,7 +113,7 @@ start_forecast_bench_loop() {
       printf '# round %s started: %s\n' "$round" "$(date -u +%FT%TZ)" >>"$output_file"
       set +e
       ssh_lab "$LAB_MON_01_HOST" \
-        "sudo -n cephadm shell -- rados bench -p $POOL $FORECAST_ROUND_SECONDS write -b 4194304 -t $FORECAST_BENCH_THREADS --no-cleanup" \
+        "sudo -n cephadm shell -- rados bench -p $POOL $FORECAST_ROUND_SECONDS write -b 4194304 -t $FORECAST_BENCH_THREADS --run-name $run_name --no-cleanup" \
         >>"$output_file" 2>&1 &
       child=$!
       printf '%s\n' "$child" >"$child_pid_file"
@@ -107,22 +130,35 @@ start_forecast_bench_loop() {
     done
     exit "$rc"
   ) &
-  LOOP_PID=$!
-  printf '%s\n' "$LOOP_PID" >"$pid_file"
+  pid=$!
+  case "$stream" in
+    1) LOOP_PID_1=$pid ;;
+    2) LOOP_PID_2=$pid ;;
+    3) LOOP_PID_3=$pid ;;
+  esac
+  printf '%s\n' "$pid" >"$pid_file"
 }
 
-# stop_forecast_loop mirrors scenario-latency-outlier.sh's stop_bench_workload
-# exactly: kill the in-flight round's ssh child directly first (poll briefly,
-# escalate to SIGKILL if it won't die), then kill the outer loop subshell,
-# then wait on it -- defense in depth on top of the loop's own internal TERM
-# trap above, not a replacement for it.
+# stop_forecast_loop <stream> <reason> mirrors scenario-latency-outlier.sh's
+# stop_bench_workload exactly, parametrized by stream index: kill the
+# in-flight round's ssh child directly first (poll briefly, escalate to
+# SIGKILL if it won't die), then kill the outer loop subshell, then wait on
+# it -- defense in depth on top of the loop's own internal TERM trap above,
+# not a replacement for it. scenario_rollback calls this once per stream (1,
+# 2, 3) so all three parallel loops are torn down, not just the first one.
 stop_forecast_loop() {
-  local reason=$1 child_pid_file="$RESULT_DIR/forecast-loop.child.pid" child_pid="" i
-  if [[ -z "$LOOP_PID" ]]; then
+  local stream=$1 reason=$2 child_pid="" i loop_pid=""
+  local child_pid_file="$RESULT_DIR/forecast-loop-stream${stream}.child.pid"
+  case "$stream" in
+    1) loop_pid="$LOOP_PID_1" ;;
+    2) loop_pid="$LOOP_PID_2" ;;
+    3) loop_pid="$LOOP_PID_3" ;;
+  esac
+  if [[ -z "$loop_pid" ]]; then
     return 0
   fi
 
-  log "stop capacity-forecast bench loop ($reason)"
+  log "stop capacity-forecast bench loop stream$stream ($reason)"
   if [[ -f "$child_pid_file" ]]; then
     child_pid="$(cat "$child_pid_file")"
     if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
@@ -137,28 +173,35 @@ stop_forecast_loop() {
       fi
     fi
   fi
-  if kill -0 "$LOOP_PID" 2>/dev/null; then
-    kill "$LOOP_PID" 2>/dev/null || true
+  if kill -0 "$loop_pid" 2>/dev/null; then
+    kill "$loop_pid" 2>/dev/null || true
   fi
-  wait "$LOOP_PID" 2>/dev/null || true
-  LOOP_PID=""
+  wait "$loop_pid" 2>/dev/null || true
+  case "$stream" in
+    1) LOOP_PID_1="" ;;
+    2) LOOP_PID_2="" ;;
+    3) LOOP_PID_3="" ;;
+  esac
   return 0
 }
 
 scenario_setup() {
-  # 16 PGs (vs pool_create_commands' 1-PG default) so bench's high
-  # concurrency (-t $FORECAST_BENCH_THREADS) can actually parallelize writes
-  # across multiple PGs/OSDs instead of serializing onto a single PG -- the
-  # real-lab root cause of the original design's ~0.72 MB/s throughput (see
-  # the physics comment near the top of this file). Mirrors how
-  # scenario-capacity-ladder.sh builds its 8-PG pool inline.
-  run_live_step "pool-create" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool create $POOL 16"
-  run_live_step "pool-set-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL size 3"
-  run_live_step "pool-set-min-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL min_size 2"
+  # 32 PGs + size=1 (down from the previous design's size 3): the real-lab
+  # probe (see the physics comment above) measured that 3x replication --
+  # not PG count or bench concurrency -- was the actual throughput ceiling
+  # on these disks. size=1 still genuinely grows cluster raw usage (the
+  # metric CephCapacityForecast's rule tracks); replication factor is not
+  # part of the growth semantics being tested here, and keeping it at 3x
+  # starved the needed slope (see run 2's real-lab measurement above).
+  run_live_step "pool-create" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool create $POOL 32"
+  run_live_step "pool-set-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL size 1 --yes-i-really-mean-it"
+  run_live_step "pool-set-min-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL min_size 1"
 }
 
 scenario_inject() {
-  start_forecast_bench_loop "$RESULT_DIR/forecast-bench-loop.txt" "$RESULT_DIR/forecast-loop.pid" "$RESULT_DIR/forecast-loop.child.pid"
+  start_forecast_bench_loop 1 "$RESULT_DIR/forecast-bench-loop-stream1.txt" "$RESULT_DIR/forecast-loop-stream1.pid" "$RESULT_DIR/forecast-loop-stream1.child.pid"
+  start_forecast_bench_loop 2 "$RESULT_DIR/forecast-bench-loop-stream2.txt" "$RESULT_DIR/forecast-loop-stream2.pid" "$RESULT_DIR/forecast-loop-stream2.child.pid"
+  start_forecast_bench_loop 3 "$RESULT_DIR/forecast-bench-loop-stream3.txt" "$RESULT_DIR/forecast-loop-stream3.pid" "$RESULT_DIR/forecast-loop-stream3.child.pid"
 }
 
 scenario_verify() {
@@ -170,9 +213,11 @@ scenario_verify() {
 }
 
 scenario_rollback() {
-  local rc=0
+  local rc=0 stream
 
-  stop_forecast_loop "before pool cleanup"
+  for stream in 1 2 3; do
+    stop_forecast_loop "$stream" "before pool cleanup"
+  done
   # The sustained heavy writes above can also latch BLUESTORE_SLOW_OP_ALERT
   # on the OSDs backing this pool's PGs; clear it before pool cleanup so
   # assert_lab_recovered's HEALTH_OK gate doesn't time out (same latch

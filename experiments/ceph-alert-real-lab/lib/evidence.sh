@@ -92,6 +92,35 @@ _bluestore_slow_op_alert_absent() {
   ! grep -Fq 'BLUESTORE_SLOW_OP_ALERT' "$output_file"
 }
 
+# _bluestore_slow_op_cycle <result_dir> <file_suffix> runs one
+# shrink-lifetime -> poll -> restore-defaults cycle and returns its
+# accumulated rc. <file_suffix> (e.g. "" or "-retry") keeps a retried
+# cycle's evidence files from clobbering the first cycle's, so both are
+# preserved for post-mortem inspection.
+_bluestore_slow_op_cycle() {
+  local result_dir=$1 suffix=$2 rc=0
+
+  log "age out latched BLUESTORE_SLOW_OP_ALERT via bluestore_slow_ops_warn_lifetime=1"
+  run_capture "$result_dir/bluestore-warn-lifetime-set${suffix}.txt" \
+    ceph_seed_cmd config set osd bluestore_slow_ops_warn_lifetime 1 || rc=1
+  run_capture "$result_dir/bluestore-warn-threshold-set${suffix}.txt" \
+    ceph_seed_cmd config set osd bluestore_slow_ops_warn_threshold 1 || rc=1
+
+  poll_until "BLUESTORE_SLOW_OP_ALERT cleared" \
+    "${BLUESTORE_CLEAR_ATTEMPTS:-18}" "${BLUESTORE_CLEAR_SLEEP:-5}" \
+    _bluestore_slow_op_alert_absent "$result_dir" || rc=1
+
+  # Always restore defaults, even on poll timeout above: a lingering
+  # bluestore_slow_ops_warn_lifetime=1 would silently suppress this warning
+  # for real incidents later.
+  run_capture "$result_dir/bluestore-warn-lifetime-rm${suffix}.txt" \
+    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_lifetime || rc=1
+  run_capture "$result_dir/bluestore-warn-threshold-rm${suffix}.txt" \
+    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_threshold || rc=1
+
+  return "$rc"
+}
+
 # clear_bluestore_slow_ops <result_dir> clears the 24h-latched
 # BLUESTORE_SLOW_OP_ALERT warning. Any scenario that throttles OSD I/O hard
 # enough to also trip BLUESTORE_SLOW_OP_ALERT (a per-OSD latch, distinct from
@@ -103,30 +132,34 @@ _bluestore_slow_op_alert_absent() {
 # -> recovery gate timeout). Verified cleaner method: temporarily shrink the
 # warning's lifetime/threshold so the latch ages out cluster-wide in ~20s (no
 # daemon restart involved), then restore the defaults.
+#
+# Real-lab evidence (fix round 2): a run of this helper PASSed (the alert
+# cleared and defaults were restored), but NEW slow-op warnings latched right
+# after -- in-flight ops from before the clear were still draining when the
+# shortened warn-lifetime window was restored, so they aged into a fresh
+# latch under the (now much longer) default lifetime, and the caller's
+# HEALTH_OK recovery gate then timed out. Hardened two ways: (1) drain for
+# BLUESTORE_CLEAR_DRAIN_SECONDS before even starting the shrink, so in-flight
+# ops finish and latch BEFORE the clear window opens rather than after it
+# closes; (2) after restoring defaults, check once more -- if the alert is
+# present again, run the whole shrink/poll/restore cycle exactly ONE more
+# time (a single retry, not an unbounded loop).
 clear_bluestore_slow_ops() {
-  local result_dir=$1 health_file rc=0
+  local result_dir=$1 health_file rc=0 drain_seconds="${BLUESTORE_CLEAR_DRAIN_SECONDS:-30}"
 
   health_file="$result_dir/bluestore-slow-ops-health.txt"
   run_capture "$health_file" ceph_seed_cmd health detail || return 0
   grep -Fq 'BLUESTORE_SLOW_OP_ALERT' "$health_file" || return 0
 
-  log "age out latched BLUESTORE_SLOW_OP_ALERT via bluestore_slow_ops_warn_lifetime=1"
-  run_capture "$result_dir/bluestore-warn-lifetime-set.txt" \
-    ceph_seed_cmd config set osd bluestore_slow_ops_warn_lifetime 1 || rc=1
-  run_capture "$result_dir/bluestore-warn-threshold-set.txt" \
-    ceph_seed_cmd config set osd bluestore_slow_ops_warn_threshold 1 || rc=1
+  log "draining in-flight BlueStore slow ops for ${drain_seconds}s before shrinking warn lifetime/threshold"
+  sleep "$drain_seconds"
 
-  poll_until "BLUESTORE_SLOW_OP_ALERT cleared" \
-    "${BLUESTORE_CLEAR_ATTEMPTS:-18}" "${BLUESTORE_CLEAR_SLEEP:-5}" \
-    _bluestore_slow_op_alert_absent "$result_dir" || rc=1
+  _bluestore_slow_op_cycle "$result_dir" "" || rc=1
 
-  # Always restore defaults, even on poll timeout above: a lingering
-  # bluestore_slow_ops_warn_lifetime=1 would silently suppress this warning
-  # for real incidents later.
-  run_capture "$result_dir/bluestore-warn-lifetime-rm.txt" \
-    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_lifetime || rc=1
-  run_capture "$result_dir/bluestore-warn-threshold-rm.txt" \
-    ceph_seed_cmd config rm osd bluestore_slow_ops_warn_threshold || rc=1
+  if ! _bluestore_slow_op_alert_absent "$result_dir"; then
+    log "BLUESTORE_SLOW_OP_ALERT re-latched after the first clear cycle; retrying once"
+    _bluestore_slow_op_cycle "$result_dir" "-retry" || rc=1
+  fi
 
   return "$rc"
 }
