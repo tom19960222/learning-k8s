@@ -26,6 +26,17 @@ ip="$(vm_guest_ip)"
 default_sched="$(guest_ssh "$ip" 'cat /sys/block/vdb/queue/scheduler')"
 printf '%s\n' "$default_sched" > "$b/default-scheduler.txt"
 
+# Trap-restore the original scheduler (active entry is the [bracketed] one),
+# matching the trap-cleanup discipline of the image-based wrappers — a die
+# mid-sweep must not leave the guest stuck on a non-default scheduler.
+restore_sched="$(printf '%s\n' "$default_sched" | grep -oE '\[[a-z_-]+\]' | tr -d '[]' || true)"
+cleanup() {
+  if [ -n "$restore_sched" ]; then
+    guest_ssh "$ip" "echo $restore_sched | sudo tee /sys/block/vdb/queue/scheduler >/dev/null" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
 run_matrix_rounds "$b" default "$ip" /dev/vdb "$ROUNDS"
 
 guest_ssh "$ip" 'echo none | sudo tee /sys/block/vdb/queue/scheduler >/dev/null'
@@ -33,10 +44,5 @@ guest_ssh "$ip" 'cat /sys/block/vdb/queue/scheduler' | grep -qE '\[none\]' ||
   die "生效驗證失敗: guest scheduler 未切到 none"
 
 run_matrix_rounds "$b" none "$ip" /dev/vdb "$ROUNDS"
-
-restore="$(printf '%s\n' "$default_sched" | grep -oE '\[[a-z_-]+\]' | tr -d '[]')"
-if [ -n "$restore" ]; then
-  guest_ssh "$ip" "echo $restore | sudo tee /sys/block/vdb/queue/scheduler >/dev/null" || true
-fi
 
 printf '%s\n' "$b"

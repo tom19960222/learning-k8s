@@ -31,10 +31,24 @@ b="$(new_bundle exp8-queues)"
 write_prediction "$b" "E-08: 強制 num-queues=1 於高 qd/高 numjobs 下吞吐下降（單佇列序列化競爭）；qd1 單工影響小（H-026 機制推論）"
 
 _exp8_run_side() {
-  local side="$1" rnd="$2" ip entry
+  local side="$1" rnd="$2" ip entry mq_count
   ip="$(vm_guest_ip)"
-  guest_ssh "$ip" 'ls /sys/block/vdb/mq/ | wc -l' > "$b/$side-r$rnd-mq-count.txt" ||
+  mq_count="$(guest_ssh "$ip" 'ls /sys/block/vdb/mq/ | wc -l' | tr -d '[:space:]')" ||
     die "讀取 guest mq 數失敗"
+  printf '%s\n' "$mq_count" > "$b/$side-r$rnd-mq-count.txt"
+  # Per-side effectiveness assertion — the guest-visible verify this scenario
+  # uses instead of the engine's cmdline check. A = default/auto must be
+  # multi-queue (H-026: AUTO resolves to vCPU count); B = forced single queue.
+  # 2>/dev/null on the numeric test: a non-numeric read (empty/garbled sysfs
+  # output) makes [ error out, which the || die path reports with the raw
+  # value included.
+  if [ "$side" = "A" ]; then
+    [ "$mq_count" -gt 1 ] 2>/dev/null ||
+      die "生效驗證失敗: A 側（預設 auto）guest mq 數應 >1，實得 ${mq_count}（round ${rnd}）"
+  else
+    [ "$mq_count" -eq 1 ] 2>/dev/null ||
+      die "生效驗證失敗: B 側（num-queues=1）guest mq 數應 =1，實得 ${mq_count}（round ${rnd}）"
+  fi
   for entry in $FIO_PATTERNS; do
     if ! run_pattern_once "$b" "$side-r$rnd" "$ip" /dev/vdb "$entry"; then
       run_pattern_once "$b" "$side-r$rnd-retry" "$ip" /dev/vdb "$entry" ||

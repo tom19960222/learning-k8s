@@ -22,8 +22,18 @@ b="$(new_bundle exp13-readahead)"
 write_prediction "$b" "E-13: read_ahead_kb 越大 sr-1m 吞吐越高，隨機 pattern 落噪音帶（機制推論，焦點 sr-1m，H-022）"
 
 ip="$(vm_guest_ip)"
-default_ra="$(guest_ssh "$ip" 'cat /sys/block/vdb/queue/read_ahead_kb')"
+default_ra="$(guest_ssh "$ip" 'cat /sys/block/vdb/queue/read_ahead_kb' | tr -d '[:space:]')"
 printf '%s\n' "$default_ra" > "$b/default-read_ahead_kb.txt"
+
+# Trap-restore the original read_ahead_kb, matching the trap-cleanup
+# discipline of the image-based wrappers — a die mid-sweep must not leave
+# the guest on a swept value.
+cleanup() {
+  if [ -n "$default_ra" ]; then
+    guest_ssh "$ip" "echo $default_ra | sudo tee /sys/block/vdb/queue/read_ahead_kb >/dev/null" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 for ra in 0 128 4096; do
   guest_ssh "$ip" "echo $ra | sudo tee /sys/block/vdb/queue/read_ahead_kb >/dev/null"
@@ -31,7 +41,5 @@ for ra in 0 128 4096; do
     die "生效驗證失敗: read_ahead_kb 未切到 $ra"
   run_matrix_rounds "$b" "ra$ra" "$ip" /dev/vdb "$ROUNDS"
 done
-
-guest_ssh "$ip" "echo $default_ra | sudo tee /sys/block/vdb/queue/read_ahead_kb >/dev/null" || true
 
 printf '%s\n' "$b"
