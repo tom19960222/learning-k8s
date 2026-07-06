@@ -1,27 +1,55 @@
-# Tier A — CephObjectUnfound：OBJECT_UNFOUND 1m critical。
+# Tier A — CephObjectUnfound：max_over_time(ceph_health_detail{name="OBJECT_UNFOUND"}[5m]) > 0，1m critical。
+#
+# 這條鏡射 CephDataDamage 的視窗化修正（fix round 1），理由相同：OBJECT_UNFOUND 跟
+# PG_DAMAGED / OSD_SCRUB_ERRORS 同屬 mgr health_detail 匯出的資料完整性類 check，S20
+# （object-unfound 情境）幾乎必定重現同樣的 flicker——CLI health check 持續存在，但匯出的
+# ceph_health_detail 在 1 與 0 之間跳動。舊版 `== 1` + `for: 1m` 在這種 flicker 下永遠無法
+# 連續 1 分鐘為 1；改成 max_over_time(...[5m]) > 0 撐住視窗，for:1m 只當單次 scrape 抖動的
+# debounce。
 rule_files:
   - ../../rules/ceph-production-coverage.yml
 evaluation_interval: 1m
 tests:
+  # (a) firing + resolve：OBJECT_UNFOUND 在 t=2m、t=5m 各出現一次零星 spike
+  # （同 CephDataDamage 的 flicker 模式），其餘全 0。
+  # max_over_time([5m]) 撐住這段期間的視窗，讓 for:1m 在第一次 spike 後 1 分鐘就能 fire，
+  # 且持續到最後一次 spike（t=5m）之後 5 分鐘（t=10m）才 resolve。
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="OBJECT_UNFOUND", severity="HEALTH_WARN"}'
-        values: '1x5'
+        values: '0 0 1 0 0 1 0 0 0 0 0'
     alert_rule_test:
+      # 故障前：全 0，未 firing
       - eval_time: 0m
         alertname: CephObjectUnfound
         exp_alerts: []
-      - eval_time: 1m
+      # t=2m：第一個 spike 剛出現，[5m] 視窗內已 >0，但 for:1m 尚未跨滿 1 分鐘 → pending
+      - eval_time: 2m
+        alertname: CephObjectUnfound
+        exp_alerts: []
+      # t=3m：pending 已滿 1 分鐘 → firing（驗證過的確切 firing eval_time）
+      - eval_time: 3m
         alertname: CephObjectUnfound
         exp_alerts:
           - exp_labels: {name: OBJECT_UNFOUND, severity: critical, source: ceph_coverage}
             exp_annotations: {summary: "Ceph objects unfound: latest replica unavailable"}
+      # t=9m：雖然當下讀數是 0，但 t=5m 的 spike 仍在 [5m] 視窗內 → 持續 firing
+      - eval_time: 9m
+        alertname: CephObjectUnfound
+        exp_alerts:
+          - exp_labels: {name: OBJECT_UNFOUND, severity: critical, source: ceph_coverage}
+            exp_annotations: {summary: "Ceph objects unfound: latest replica unavailable"}
+      # t=10m：最後一次 spike（t=5m）已經超出 [5m] 視窗（5+5=10）→ resolve
+      - eval_time: 10m
+        alertname: CephObjectUnfound
+        exp_alerts: []
 
+  # (b) non-firing：全程無 unfound object（值恆為 0）→ max_over_time 恆為 0 → 永不 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="OBJECT_UNFOUND", severity="HEALTH_WARN"}'
-        values: '0x5'
+        values: '0x8'
     alert_rule_test:
-      - eval_time: 3m
+      - eval_time: 6m
         alertname: CephObjectUnfound
         exp_alerts: []

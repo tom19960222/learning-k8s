@@ -307,7 +307,7 @@ groups:
           summary: "Ceph raw capacity projected to exceed 85% within 3 days"
 
       - alert: CephDataDamage
-        expr: ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1
+        expr: max_over_time(ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"}[5m]) > 0
         for: 1m
         labels:
           severity: critical
@@ -316,7 +316,7 @@ groups:
           summary: "Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair"
 
       - alert: CephObjectUnfound
-        expr: ceph_health_detail{name="OBJECT_UNFOUND"} == 1
+        expr: max_over_time(ceph_health_detail{name="OBJECT_UNFOUND"}[5m]) > 0
         for: 1m
         labels:
           severity: critical

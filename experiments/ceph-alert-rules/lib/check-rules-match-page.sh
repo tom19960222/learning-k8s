@@ -35,8 +35,8 @@ invariants=(
   '(count(ceph_mgr_status) or vector(0)) < 2'
   'ceph_pool_bytes_used > 0.8 * ceph_pool_quota_bytes'
   'predict_linear(ceph_cluster_total_used_bytes[1h], 259200)'
-  'ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1'
-  'ceph_health_detail{name="OBJECT_UNFOUND"} == 1'
+  'max_over_time(ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"}[5m]) > 0'
+  'max_over_time(ceph_health_detail{name="OBJECT_UNFOUND"}[5m]) > 0'
   'ceph_pg_down + ceph_pg_incomplete + ceph_pg_unknown + ceph_pg_stale + ceph_pg_peered'
 )
 

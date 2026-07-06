@@ -150,8 +150,17 @@ groups:
         annotations:
           summary: "Ceph raw capacity projected to exceed 85% within 3 days"
 
+      # fix round 1（real-lab, S19 資料損壞情境）：mgr 的 health_detail 匯出對 scrub/damage
+      # 類 check 是 transient 的——objectstore-tool 破壞副本、deep-scrub 偵測到後，CLI
+      # `ceph health detail` 持續顯示 OSD_SCRUB_ERRORS 約 6 分鐘，但同一段時間 Prometheus
+      # 裡 ceph_health_detail{name="OSD_SCRUB_ERRORS"} 採了 97 個樣本、avg=0.031——值 1 只
+      # 出現在約 3 次零星 scrape，其餘全是 0。舊版 `== 1` + `for: 1m` 永遠無法連續 1 分鐘為
+      # 1，真故障期間規則永遠停在 pending、不會 fire（跟已修正的 CephDaemonSlowOps 同一種
+      # spiky snapshot gauge 問題）。改成 max_over_time(...[5m]) > 0 撐住這段 flicker，
+      # for:1m 只當單次 scrape 抖動的 debounce；一旦偵測到損壞，alert 會撐住約 5 分鐘（即使
+      # repair 已經讓 health check 清除），方便 oncall 觀察，這對 pager alert 是好事。
       - alert: CephDataDamage
-        expr: ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"} == 1
+        expr: max_over_time(ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"}[5m]) > 0
         for: 1m
         labels:
           severity: critical
@@ -159,8 +168,12 @@ groups:
         annotations:
           summary: "Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair"
 
+      # fix round 1（preemptive）：OBJECT_UNFOUND 跟上面的 PG_DAMAGED / OSD_SCRUB_ERRORS
+      # 同屬 mgr health_detail 匯出的資料完整性類 check，S20（object-unfound 情境）幾乎必定
+      # 重現同樣的 transient-export flicker，所以先套用同一套視窗化修正，理由與
+      # CephDataDamage 相同。
       - alert: CephObjectUnfound
-        expr: ceph_health_detail{name="OBJECT_UNFOUND"} == 1
+        expr: max_over_time(ceph_health_detail{name="OBJECT_UNFOUND"}[5m]) > 0
         for: 1m
         labels:
           severity: critical
