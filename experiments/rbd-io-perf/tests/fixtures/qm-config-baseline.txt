@@ -3,6 +3,6 @@ cores: 4
 ide2: ioperf:vm-1031-cloudinit,media=cdrom
 memory: 4096
 net0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr1
-scsi0: ioperf:vm-1031-disk-0,size=10G
+virtio0: ioperf:vm-1031-disk-0,size=10G
 scsihw: virtio-scsi-single
 virtio1: ioperf:vm-1031-disk-1,size=16G

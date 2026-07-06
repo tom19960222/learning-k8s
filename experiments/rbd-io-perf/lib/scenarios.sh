@@ -13,6 +13,8 @@ run_pattern_once() {
   local name="${entry%%:*}" rd="$bundle/$round"
   mkdir -p "$rd"
   collect_ceph_status "$rd/ceph-pre.txt"
+  [ -e "$bundle/ceph-baseline.txt" ] || cp "$rd/ceph-pre.txt" "$bundle/ceph-baseline.txt"
+  guard_check "$rd/ceph-pre.txt" "$bundle/ceph-baseline.txt"
   local iostat_pid=""
   if [ -n "$host_dev" ]; then
     sample_iostat_host "$host_dev" 75 "$rd/iostat-host-$name.txt" &
@@ -29,6 +31,7 @@ run_pattern_once() {
   }
   [ -n "$iostat_pid" ] && wait "$iostat_pid" 2>/dev/null
   collect_ceph_status "$rd/ceph-post.txt"
+  guard_check "$rd/ceph-post.txt" "$bundle/ceph-baseline.txt"
   if ! taint_check "$rd/ceph-post.txt"; then
     mv "$rd/$name.json" "$rd/$name.json.tainted"
     return 1

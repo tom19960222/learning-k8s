@@ -14,10 +14,10 @@ vm_create() {
   _vmid_guard
   pve_ssh "sudo -n qm create $VMID --name ioperf-test --cores 4 --memory 4096 \
 --net0 virtio,bridge=vmbr1 --scsihw virtio-scsi-single --agent 1 --ostype l26"
-  pve_ssh "sudo -n qm set $VMID --scsi0 $POOL:0,import-from=$img"
-  pve_ssh "sudo -n qm disk resize $VMID scsi0 10G"
+  pve_ssh "sudo -n qm set $VMID --virtio0 $POOL:0,import-from=$img"
+  pve_ssh "sudo -n qm disk resize $VMID virtio0 10G"
   pve_ssh "sudo -n qm set $VMID --ide2 $POOL:cloudinit --ciuser $GUEST_USER \
---sshkeys $pubkey --ipconfig0 ip=dhcp --boot order=scsi0"
+--sshkeys $pubkey --ipconfig0 ip=dhcp --boot order=virtio0"
 }
 
 vm_attach_data() {

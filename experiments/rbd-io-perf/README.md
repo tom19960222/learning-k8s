@@ -179,7 +179,7 @@ make validate
 
 ## 結果去向
 
-- 每次執行任何 `run/*.sh` 都會在 `results/<experiment>/<timestamp>/` 下產生一個 evidence bundle（prediction 檔、每輪 fio JSON、`ceph -s` 前後快照、noise/verdict 摘要等）。整個 `results/` 目錄被 `.gitignore` 擋掉，不進版控——bundle 本身可能包含環境細節，且會不斷累積。
+- 每次執行任何 `run/*.sh` 都會在 `results/<experiment>/<timestamp>/` 下產生一個 evidence bundle（prediction 檔、每輪 fio JSON、`ceph -s` 前後快照、noise 摘要等）；verdict 不是 scenario 自動產生的——由 Gate 3 的 `verdict.py compare` 步驟產生（bundle 內含原始資料與 prediction，供該步驟比對）。整個 `results/` 目錄被 `.gitignore` 擋掉，不進版控——bundle 本身可能包含環境細節，且會不斷累積。
 - 需要留存的是**索引**，不是原始 bundle：把當次執行的結論、關鍵數字、對應 bundle 路徑整理成 `EVIDENCE-SUMMARY-<date>.md`，這份**要進 git**。
 - 頁面（`rbd-io-experiment-plan.mdx`、`rbd-io-tuning-catalog.mdx`）上出現的每一個數字，都必須能對應到某份 bundle 或 `EVIDENCE-SUMMARY`——沒有 bundle 佐證的數字不寫進頁面。
 - 回填格式與規則（表格欄位、噪音帶判準、`indistinguishable` 何時合法）見 `next-site/content/vm-storage-perf/features/rbd-io-experiment-plan.mdx` 的「結果回填規範」一節；每個實驗的完整協定、預期與回填表在同頁「各實驗協定」。

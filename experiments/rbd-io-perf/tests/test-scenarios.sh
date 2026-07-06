@@ -27,6 +27,18 @@ run_pattern_once "$b" r1 192.168.18.77 /dev/vdb "rr-4k-qd1:randread:4k:1" || { e
 [ -s "$b/r1/rr-4k-qd1.json" ] || { echo "fio json missing"; ls -R "$b"; exit 1; }
 [ -s "$b/r1/ceph-pre.txt" ] || { echo "ceph pre missing"; exit 1; }
 
+# --- guard_check 已接線：pre 快照 HEALTH_ERR 立即中止，fio 完全不會跑 ---
+# 用全新 bundle：這個 bundle 還沒有 ceph-baseline.txt，第一次 pre 快照即
+# HEALTH_ERR，會被 lazy-copy 成 baseline。HEALTH_ERR 判斷是絕對值（非差異
+# 比對 baseline），所以即使 baseline == pre 仍應中止——這正是要驗證的行為。
+cp "$here/fixtures/ceph-s-health-err.txt" "$FAKE_SSH_DIR/ceph -s"
+bguard="$(new_bundle guard-err)"
+if ( run_pattern_once "$bguard" r1 192.168.18.77 /dev/vdb "rr-4k-qd1:randread:4k:1" ) 2>/dev/null; then
+  echo "guard_check 未在 HEALTH_ERR 時中止"; exit 1
+fi
+[ -e "$bguard/r1/rr-4k-qd1.json" ] && { echo "guard_check 中止前 fio 卻跑了"; exit 1; }
+cp "$here/fixtures/ceph-s-clean.txt" "$FAKE_SSH_DIR/ceph -s"
+
 # tainted 路徑：recovery 版 ceph -s → 檔案標記 .tainted 且 return 1
 cp "$here/fixtures/ceph-s-recovery.txt" "$FAKE_SSH_DIR/ceph -s"
 if run_pattern_once "$b" r2 192.168.18.77 /dev/vdb "rr-4k-qd1:randread:4k:1" 2>/dev/null; then
