@@ -1,5 +1,7 @@
 # VM Disk IO 調教實驗（rbd-io-perf）— 設計（spec）
 
+> **已被取代（superseded）**：前提於 2026-07-07 變更——T3 環境改為生產 Proxmox VE + Ceph cluster、只動 VM 參數不動 ceph。現行設計見 `2026-07-07-rbd-io-perf-pve-experiments-design.md`。本檔保留為 KubeVirt 版設計的歷史紀錄；其中 H-001 / H-002 的頁面修正結論仍然有效。
+>
 > 日期：2026-07-06
 > 被測對象來源：`next-site/content/vm-storage-perf/features/rbd-io-tuning-catalog.mdx`、`rbd-io-experiment-plan.mdx`
 > 研究 backlog：`experiments/rbd-io-perf/HYPOTHESES.md`（25 條 hypotheses，Gate 1 已裁示全收）
