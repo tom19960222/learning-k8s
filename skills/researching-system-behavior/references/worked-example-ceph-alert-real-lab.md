@@ -37,15 +37,20 @@ files named above. Nothing here is invented.
 
 ## Three hypotheses, walked through the state machine
 
-The point of writing these "before" is to show they were reachable *before*
-any fault was injected — the matrix produces the cell, the cell produces the
-hypothesis, and only then does the experiment either confirm or violate it.
+The point is to show these hypotheses were reachable *before* any fault was
+injected — the matrix produces the cell, the cell produces the hypothesis,
+each one starting life as `Status: proposed`, and only then does the
+experiment either confirm or violate it. The entries below show the
+terminal state each one actually reached (`synthesized`, since all three
+findings were published), with a `State trace` line spelling out the full
+progression from `proposed` through to that terminal state.
 
 ### H-101: `CephClientBlocked` fires within its window on real SLOW_OPS
 
 ```markdown
 ### H-101: Under a real disk-path slowdown on an acting OSD, CephClientBlocked{name="SLOW_OPS"} fires within its 1m window
-- Status: proposed
+- Status: synthesized
+- State trace: proposed → predicted → confirmed → synthesized
 - Tier: T3
 - Origin: matrix "osd × slow × signal arrives"
 - Prediction: injecting a realistic disk-path slowdown (not a synthetic
@@ -62,22 +67,24 @@ hypothesis, and only then does the experiment either confirm or violate it.
   `state="firing"`, `name="SLOW_OPS"`,
   `activeAt="2026-07-04T10:12:42.762155964Z"`; sink log confirms the
   alert reached the pager receiver.
-- Artifacts: none required — the rule as designed was correct; the finding
-  is confirmatory.
-- Notes: Status: confirmed.
+- Artifacts: none — documented decision: rule fired as designed, no change
+  needed (per synthesis-rules.md).
 ```
 
 The prediction was written before the injection ran: exact signal
 (`ceph_health_detail{name="SLOW_OPS"}`), expected value (`==1`, crossing
 the window), and an independently checkable window (`for: 1m`). The
 experiment (`inject → observe → collect → rollback → assert`) matched the
-prediction exactly. `Status: confirmed`.
+prediction exactly (`confirmed`), and the finding was written up on the
+findings page with no rule change needed, closing the loop at
+`synthesized`.
 
 ### H-102: `CephClientBlocked{name="PG_AVAILABILITY"}` fires when acting OSDs stop
 
 ```markdown
 ### H-102: Under acting-OSD stop dropping a PG below min_size, CephClientBlocked{name="PG_AVAILABILITY"} fires within its 1m window
-- Status: proposed
+- Status: synthesized
+- State trace: proposed → predicted → confirmed → synthesized
 - Tier: T3
 - Origin: matrix "osd × crash × signal arrives"
 - Prediction: stopping enough acting OSDs for a test-pool PG to fall below
@@ -91,18 +98,20 @@ prediction exactly. `Status: confirmed`.
   shows `state="firing"`, `name="PG_AVAILABILITY"`,
   `activeAt="2026-07-04T10:28:57.762155964Z"`; sink log confirms delivery
   to the pager receiver.
-- Artifacts: none required — confirmatory finding.
-- Notes: Status: confirmed.
+- Artifacts: none — documented decision: rule fired as designed, no change
+  needed (per synthesis-rules.md).
 ```
 
 Same shape as H-101: a clean crash-type fault (`osd × crash`), a signal that
-arrives on time, prediction matches evidence. `Status: confirmed`.
+arrives on time, prediction matches evidence (`confirmed`), written up with
+no rule change needed (`synthesized`).
 
 ### H-103: `CephMonQuorumLost` fires when quorum is really lost
 
 ```markdown
 ### H-103: Under real mon quorum loss, CephMonQuorumLost fires within its 1m window
-- Status: proposed
+- Status: synthesized
+- State trace: proposed → predicted → violated → synthesized
 - Tier: T3
 - Origin: matrix "mon × real fault × observer lying"
 - Prediction: stopping enough mons to break the 3-mon majority causes
@@ -124,12 +133,12 @@ arrives on time, prediction matches evidence. `Status: confirmed`.
   to the pager receiver.
 - Artifacts: rule doc updated with the empty-series-path caveat; a new
   exporter-blind scenario recorded; see Synthesis below.
-- Notes: Status: violated. The prediction said the rule would fire on real
-  quorum loss "independent of which mon processes are down" — false. It
-  fired only via a different mechanism (empty-series fallback, after the
-  observer itself died), not the intended detection path (falling
-  `ceph_mon_quorum_status == 1` count). Outcome recorded in the evidence
-  index as "Passed only on empty-series path; stale telemetry found."
+- Notes: The prediction said the rule would fire on real quorum loss
+  "independent of which mon processes are down" — false. It fired only via
+  a different mechanism (empty-series fallback, after the observer itself
+  died), not the intended detection path (falling `ceph_mon_quorum_status
+  == 1` count). Outcome recorded in the evidence index as "Passed only on
+  empty-series path; stale telemetry found."
 ```
 
 This is the interesting one. The prediction was falsifiable and specific
@@ -137,7 +146,8 @@ enough to be wrong in an informative way: the rule *did* eventually fire, so
 a coarse "did it page" check would have called this a pass. The prediction
 was more precise than that — it named the mechanism (`ceph_mon_quorum_status`
 count crossing below 2) — and that mechanism did not fire during the actual
-quorum loss window. `Status: violated`.
+quorum loss window: `violated`. It only reaches `synthesized` once all
+three synthesis routes below are taken.
 
 ## The violated hypothesis's three synthesis routes
 
