@@ -71,34 +71,12 @@ run_live_step() {
   run_capture "$RESULT_DIR/${label}.txt" ssh_lab "$host" "$command"
 }
 
-# with_sink_wait_attempts <attempts> <cmd...> mirrors lib/monitoring.sh's
-# with_prometheus_wait_attempts, but overrides SINK_WAIT_ATTEMPTS instead.
-# Needed because CephHealthError's own for:5m window is not otherwise
-# already spanned by a preceding wait_prometheus_alert call in this scenario
-# (unlike e.g. scenario-capacity-ladder.sh, which pairs a
-# with_prometheus_wait_attempts 150 wait_prometheus_alert CephHealthError
-# call with a default-attempts sink wait right after -- by the time that
-# sink wait runs, the for:5m window is already known to have elapsed here).
-# This scenario only waits on the sink delivery directly, so that wait alone
-# must span the window: the default 60 attempts * 5s = 300s sits exactly at
-# the 5m boundary, so push it out with margin.
-with_sink_wait_attempts() {
-  local attempts=$1
-  shift
-  local saved="${SINK_WAIT_ATTEMPTS:-60}" rc=0
-  SINK_WAIT_ATTEMPTS="$attempts"
-  export SINK_WAIT_ATTEMPTS
-  "$@" || rc=$?
-  SINK_WAIT_ATTEMPTS="$saved"
-  export SINK_WAIT_ATTEMPTS
-  return "$rc"
-}
-
 # with_ceph_health_check_attempts <attempts> <cmd...> mirrors
-# with_sink_wait_attempts above, but overrides CEPH_HEALTH_CHECK_ATTEMPTS
-# instead -- used by deep_scrub_wait_with_reissue below to bound each
-# sub-window poll of wait_ceph_health_check without needing a shared-lib
-# change (evidence.sh's wait_ceph_health_check already reads this var).
+# lib/monitoring.sh's with_prometheus_wait_attempts, but overrides
+# CEPH_HEALTH_CHECK_ATTEMPTS instead -- used by deep_scrub_wait_with_reissue
+# below to bound each sub-window poll of wait_ceph_health_check without
+# needing a shared-lib change (evidence.sh's wait_ceph_health_check already
+# reads this var).
 with_ceph_health_check_attempts() {
   local attempts=$1
   shift
@@ -242,11 +220,15 @@ scenario_verify() {
   deep_scrub_wait_with_reissue
   wait_prometheus_alert CephDataDamage "" "" "$RESULT_DIR"
   wait_sink_alert pager CephDataDamage "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
-  # PG_DAMAGED/OSD_SCRUB_ERRORS also drives cluster health to HEALTH_ERR,
-  # which trips the default mixin's CephHealthError (for:5m) -- see the
-  # with_sink_wait_attempts comment above for why this call carries its own
-  # extended attempts budget.
-  with_sink_wait_attempts 150 wait_sink_alert pager CephHealthError "" "" "$RESULT_DIR" "$SINK_CHECKPOINT"
+  # CephHealthError (ceph_health_status==2, for:5m) is deliberately NOT
+  # asserted here. PG_DAMAGED/OSD_SCRUB_ERRORS does drive cluster health to
+  # HEALTH_ERR, but real-lab evidence showed the scrub-error health check's
+  # mgr metric flickers 1->0->1, which flickers ceph_health_status
+  # 2(ERR)->1(WARN)->2 in turn -- never holding ERR for a stable 5m window,
+  # so CephHealthError stays PENDING and never fires here. That's a property
+  # of this fault type (a flickering health_detail check), not a rule
+  # defect: CephHealthError -> pager is already real-lab validated by
+  # scenario-capacity-ladder.sh, whose OSD_FULL trips a STABLE HEALTH_ERR.
 }
 
 scenario_rollback() {

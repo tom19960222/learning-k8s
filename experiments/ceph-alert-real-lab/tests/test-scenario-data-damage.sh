@@ -38,12 +38,16 @@ EOF
   chmod +x "$path"
 }
 
-# make_fake_kubectl's CephDataDamage/CephHealthError alerts and sink
-# deliveries only start firing once the scenario's deep-scrub trace line
-# exists (which only happens after the objectstore-tool damage + OSD
-# restart + PG-active poll have all already succeeded) -- this proves
-# scenario_verify genuinely depends on that full sequence, not just on the
-# scenario having started.
+# make_fake_kubectl's CephDataDamage alert and sink delivery only start
+# firing once the scenario's deep-scrub trace line exists (which only
+# happens after the objectstore-tool damage + OSD restart + PG-active poll
+# have all already succeeded) -- this proves scenario_verify genuinely
+# depends on that full sequence, not just on the scenario having started.
+# CephHealthError is deliberately not modeled here: real-lab evidence showed
+# it flickers PENDING->ERR->WARN for this fault type and never fires within
+# for:5m, and scenario-data-damage.sh no longer asserts it (see that
+# script's scenario_verify comment; CephHealthError -> pager is validated by
+# scenario-capacity-ladder.sh instead).
 make_fake_kubectl() {
   local path=$1 trace_file=$2
   cat >"$path" <<EOF
@@ -71,7 +75,6 @@ if [[ "\$*" == *"logs deploy/alert-sink"* ]]; then
   printf '%s\n' '{"receiver":"watchdog","alertname":"Watchdog","labels":{}}'
   if [[ "\$scrubbed" -ge 1 ]]; then
     printf '%s\n' '{"receiver":"pager","alertname":"CephDataDamage","labels":{"fresh":"true"}}'
-    printf '%s\n' '{"receiver":"pager","alertname":"CephHealthError","labels":{"fresh":"true"}}'
   fi
   exit 0
 fi
