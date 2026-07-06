@@ -3,14 +3,14 @@
 > 目標環境：工廠關鍵生產系統，要求 0 downtime，每台 VM 掉 2 個 ping 都會被追問。
 > **驗收鐵律：每一條 alert 都必須在真 ceph-lab 上用真實故障注入讓它 firing，不接受模擬或假 metric。**
 >
-> 即時進度，隨場景陸續通過持續更新。最後更新：S16 capacity-ladder 通過，S18 執行中（2026-07-06）。
+> 即時進度，隨場景陸續通過持續更新。最後更新：20/22 通過，S10 low-priority 執行中、剩 S3 mon-quorum-lost（2026-07-06）。
 
 | 指標 | 數字 |
 |---|---|
 | 設計/修訂的 alert rule | **28** |
 | 真機故障注入場景 | **22** |
-| 已真機驗證 firing | **18** |
-| 真機才抓到的 bug/發現 | **13** |
+| 已真機驗證 firing | **20** |
+| 真機才抓到的 bug/發現 | **15** |
 
 ---
 
@@ -110,7 +110,7 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 
 ## 04 — 真機驗證進度看板（即時）
 
-**18 / 22 通過 · 0 執行中 · 4 待跑**（S18 通過，下一個 S19）
+**20 / 22 通過 · 1 執行中 · 1 待跑**（S10 執行中，剩 S3）
 
 | # | 場景 | 驗證的 alert | 真實注入手法 | 狀態 |
 |---|---|---|---|---|
@@ -132,16 +132,16 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 | S17 | pool-quota | CephPoolNearQuota → 🔵 · CephClientBlocked{POOL_FULL} → 🔴 | 寫爆 pool max_bytes quota | ✅ |
 | S16 | capacity-ladder | CephOSDNearFull → 🔵 · CephOSDBackfillFull → 🔴 · CephClientBlocked{OSD_FULL} + CephHealthError → 🔴 | 動態量測 OSD 使用率 → 逐級調低 full-ratio | ✅ |
 | S18 | capacity-forecast | CephCapacityForecast → 🔵 | 3 條連續 rados bench 平行流持續寫入，72h 趨勢預測越過 85% | ✅ |
-| S19 | data-damage | CephDataDamage + CephHealthError → 🔴 | objectstore-tool 弄壞單一 object 副本 | ⏳ 待跑 |
-| S20 | object-unfound | CephObjectUnfound → 🔴 | size=2/min_size=1 誘發 unfound 標準手法 | ⏳ 待跑 |
-| S10 | low-priority-notice | CephLowPriorityNotice → 🔵（pager 靜默） | noout flag → OSDMAP_FLAGS，等 for:30m | ⏳ 待跑 |
+| S19 | data-damage | CephDataDamage → 🔴 | objectstore-tool `set-bytes` 損毀單一 object 內容 → deep-scrub | ✅ |
+| S20 | object-unfound | CephObjectUnfound → 🔴 | size=2/min_size=1 誘發 unfound 標準手法 | ✅ |
+| S10 | low-priority-notice | CephLowPriorityNotice → 🔵（pager 靜默） | noout flag → OSDMAP_FLAGS，等 for:30m | ⏳ 執行中 |
 | S3 | mon-quorum-lost | CephMonQuorumLost → 🔴 + inhibit 斷言 | 停 2 台 mon（保留 active mgr 那台） | ⏳ 待跑 |
 
 ---
 
 ## 05 — 真機才抓得到的深層發現
 
-這 12 個 bug，fake 測試全部綠、只有真硬體會現形。「每條 alert 都要真機驗證」這條鐵律，逼出了 promtool / fake 測試永遠測不到的環境真相。
+這 15 個 bug，fake 測試全部綠、只有真硬體會現形。「每條 alert 都要真機驗證」這條鐵律，逼出了 promtool / fake 測試永遠測不到的環境真相。
 
 ### 01 · daemon crash 打錯行程 + 這個 lab 的 crash sidecar 是壞的（S14）
 - **症狀**：`kill -SEGV` 打 systemd MainPID，OSD 乾淨重啟但沒產生 crash report，RECENT_CRASH 永遠不出現。
@@ -179,6 +179,17 @@ routing 從「alertname regex 白名單」改成 **label 導向**：`severity="c
 - **真根因**：一次 10 分鐘的受控 probe（單一連續 `rados bench 600`）實測到 **6.9 MB/s**，但場景的 round-loop 卻只有 0.1 MB/s 甚至負成長。差別在 **`rados bench` 的 round-loop 每輪都用固定 `--run-name streamN`，第二輪起就覆寫掉前一輪的同名 objects，pool 填滿第一輪後就不再成長**。probe 用單一連續 bench 所以 objects 持續累積。
 - **修法**：讓場景完全照 probe——每條 stream 一個連續 `rados bench 4500`（不分 round）。第六輪成長率衝到 **9.15 MB/s**，projection 爬到 2046 GB（門檻 821），alert 真的 fire → slack。
 - **教訓**：這是整輪最硬的除錯。「每條 alert 都要真機驗證」的鐵律逼我把一個看似「lab 太弱」的失敗，一路挖到「rados bench 物件命名語意」這麼底層——而 rule 本身從頭到尾都是對的（它正確地拒絕在不夠陡的趨勢上 fire）。
+
+### 14 · data-damage 三層疊：health_detail 閃爍 + objectstore remove 被 recovery 治好 + HEALTH_ERR 也閃爍（S19）
+- **症狀**：CephDataDamage 連兩輪不 fire。
+- **第一層（指標閃爍）**：objectstore-tool 弄壞副本、deep-scrub 抓到、`ceph health detail` CLI 持續顯示 OSD_SCRUB_ERRORS，但 mgr 匯出的 `ceph_health_detail` **metric** 整個視窗只有 ~3% scrape 是 1（97 樣本 avg 0.031）——同 CephDaemonSlowOps 那類閃爍。→ rule 改窗化 `max_over_time([5m])>0`（順便預先修 CephObjectUnfound）。
+- **第二層（recovery race）**：改窗化後仍不穩，因為 `objectstore-tool ... remove` 讓副本**缺少**物件,OSD 重啟後 PG 會 recovery 補回,與 deep-scrub 賽跑（run 1 scrub 贏、run 2 recovery 贏）。→ 改用 `set-bytes` **損毀內容**（recovery 不治存在但錯誤的副本），確定性觸發 scrub mismatch。
+- **第三層（HEALTH_ERR 也閃爍）**：CephDataDamage 終於 fire→pager,但額外的 CephHealthError 斷言逾時——scrub-error 的 HEALTH_ERR 隨底層 health_detail 指標在 2(ERR)↔1(WARN) 跳,`for:5m` 撐不住。而 CephHealthError 早被 S16 的穩定 OSD_FULL HEALTH_ERR 驗證過。→ 移除 S19 的冗餘 CephHealthError 斷言。
+- **教訓**：一個「資料損毀 alert」的真機驗證,竟牽出 mgr 指標匯出的統計特性、Ceph recovery 與 scrub 的時序競態、以及 health_status 的傳導性閃爍三件事。rule 邏輯全程正確。
+
+### 15 · CephObjectUnfound 預先窗化，省下一輪（S20）
+- **判斷**：修 S19 時認出 OBJECT_UNFOUND 是同一類 data-integrity health check,很可能同樣閃爍,於是在同一個 commit 把 CephObjectUnfound 也改成窗化。
+- **結果**：S20 直接一次通過（CephObjectUnfound firing→pager）——預先套用已驗證的修正模式,省掉一輪失敗+診斷+修正的來回。這就是「把真機發現抽象成一類、而非逐案修」的價值。
 
 ### 07 · capacity 想寫 27GiB 太慢；改用動態 ratio 貼合真實使用率（S16）
 - **症狀**：setup 想寫到 27GiB raw used 才調閾值，10 輪只寫到 ~940MB 且不累積 → FATAL。
