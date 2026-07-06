@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Scenario building blocks: single-point run with taint detection,
 # matrix rounds, A/B interleaving, machine verdict emission.
-# Requires common.sh, fio.sh, collect.sh.
+# Requires common.sh, fio.sh, collect.sh. run_qm_variant_scenario also
+# requires pve.sh (vm_set/vm_cold_restart/vm_assert_cmdline/vm_guest_ip).
 
 write_prediction() {
   printf '%s\n' "$2" > "$1/prediction.txt"
@@ -68,6 +69,51 @@ ab_rounds() {
     log "=== A/B round $r/$n: B ==="
     "$setup_b"; "$run_b" "$r"
   done
+}
+
+run_qm_variant_scenario() {
+  # Shared A/B engine for the "qm set <disk-spec>" style variants (E-04..
+  # E-08). A = baseline_spec, B = variant_spec (verified via QEMU cmdline
+  # after cold restart). Rounds are interleaved (A/B/A/B...) via ab_rounds so
+  # cluster background-load drift doesn't get misread as a knob effect
+  # (H-029). Ends by restoring the disk to baseline_spec (no restart — the
+  # caller's next scenario restarts as part of its own A setup, or does a
+  # final restart itself if it needs a running guest without restarting).
+  local scen="$1" pred="$2" base_spec="$3" var_spec="$4" verify="$5" rounds="$6"
+  local b
+  b="$(new_bundle "$scen")"
+  write_prediction "$b" "$pred"
+
+  # shellcheck disable=SC2329  # invoked indirectly by ab_rounds via "$setup_a"
+  _rqvs_setup_a() {
+    vm_set --virtio1 "$base_spec"
+    vm_cold_restart
+  }
+  # shellcheck disable=SC2329  # invoked indirectly by ab_rounds via "$setup_b"
+  _rqvs_setup_b() {
+    vm_set --virtio1 "$var_spec"
+    vm_cold_restart
+    vm_assert_cmdline "$verify"
+  }
+  # shellcheck disable=SC2329  # invoked indirectly via _rqvs_run_a/_rqvs_run_b
+  _rqvs_run_side() {
+    local side="$1" rnd="$2" ip entry
+    ip="$(vm_guest_ip)"
+    for entry in $FIO_PATTERNS; do
+      if ! run_pattern_once "$b" "$side-r$rnd" "$ip" /dev/vdb "$entry"; then
+        run_pattern_once "$b" "$side-r$rnd-retry" "$ip" /dev/vdb "$entry" ||
+          die "連續 tainted（${entry}）"
+      fi
+    done
+  }
+  # shellcheck disable=SC2329  # invoked indirectly by ab_rounds via "$run_a"
+  _rqvs_run_a() { _rqvs_run_side A "$1"; }
+  # shellcheck disable=SC2329  # invoked indirectly by ab_rounds via "$run_b"
+  _rqvs_run_b() { _rqvs_run_side B "$1"; }
+
+  ab_rounds "$b" "$rounds" _rqvs_setup_a _rqvs_setup_b _rqvs_run_a _rqvs_run_b
+  vm_set --virtio1 "$base_spec"
+  printf '%s\n' "$b"
 }
 
 emit_verdict() {
