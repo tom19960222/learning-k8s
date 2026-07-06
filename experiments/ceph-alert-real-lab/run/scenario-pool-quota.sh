@@ -18,9 +18,26 @@ QUOTA_TMPFILE="${QUOTA_TMPFILE:-/tmp/alert-quota-4mib.bin}"
 # 26MiB = 81% of the 32MiB quota: high enough to clear CephPoolNearQuota's
 # >80% threshold, comfortably below 100% so the near-quota `for:` window
 # never risks crossing into POOL_FULL territory.
+#
+# Real-lab accounting-overshoot caveat: `ceph df`'s bytes_used does not
+# advance by a clean 4MiB per 4MiB put -- on the size=3 replicated pool this
+# scenario creates, a single put has been observed to jump bytes_used by
+# 8-21MiB (replication fan-out + bluestore allocation rounding), not a fixed
+# 4MiB. That is why write_near_quota (below) checks bytes_used after EVERY
+# single put and stops at the FIRST one that clears this target, instead of
+# precomputing "N puts * 4MiB" up front -- it cannot control how big any one
+# jump is, so the only guarantee it can offer is "never issue another
+# near-quota put once the target is already cleared."
 NEARQUOTA_TARGET_BYTES="${NEARQUOTA_TARGET_BYTES:-27262976}"
 NEARQUOTA_MAX_PUTS="${NEARQUOTA_MAX_PUTS:-20}"
-OVERQUOTA_MAX_PUTS="${OVERQUOTA_MAX_PUTS:-20}"
+# OVERQUOTA_MAX_PUTS bounds the number of past-quota put ATTEMPTS (see
+# write_past_quota), not the global object index. Each attempt is a bounded
+# (`timeout 30`) put, and real-lab evidence shows POOL_FULL surfaces within
+# seconds of sustained write pressure once the pool is actually full, so 40
+# attempts (at most 160MiB of put traffic, since a full pool stops accepting
+# new bytes once it is actually full) is a generous cap against a
+# persistently silent mon rather than an expected steady-state count.
+OVERQUOTA_MAX_PUTS="${OVERQUOTA_MAX_PUTS:-40}"
 pool_step=1
 obj_index=1
 
@@ -58,7 +75,9 @@ scenario_setup() {
 # write_near_quota puts 4MiB objects one at a time, checking the pool's
 # bytes_used between puts, until it clears NEARQUOTA_TARGET_BYTES (a
 # CONTROLLED counted loop -- not `rados bench`, whose uncontrolled overshoot
-# could blow straight past the quota and skip the near-quota phase).
+# could blow straight past the quota and skip the near-quota phase). See the
+# accounting-overshoot caveat above NEARQUOTA_TARGET_BYTES for why this loop
+# cannot precompute how many puts are needed.
 write_near_quota() {
   local used=""
   while [[ "$obj_index" -le "$NEARQUOTA_MAX_PUTS" ]]; do
@@ -74,30 +93,50 @@ write_near_quota() {
   die "pool-quota: did not reach near-quota target (${NEARQUOTA_TARGET_BYTES} bytes) after ${NEARQUOTA_MAX_PUTS} puts"
 }
 
-# write_past_quota continues puts past the near-quota checkpoint until
-# either `ceph df` reports bytes_used at/above the quota, or a put itself
-# fails -- a quota rejection IS the expected signal here, so its failure is
-# tolerated (`|| put_rc=$?`) and confirmed via the POOL_FULL health check in
-# scenario_verify rather than treated as a scenario error.
+# write_past_quota keeps REAL client write pressure on the pool once it is
+# at or past its quota, instead of stopping after a single over-quota put.
+#
+# Real-lab evidence: a single put that lands over quota, followed by no
+# further write activity, does NOT reliably surface the POOL_FULL health
+# check within a normal poll window (observed: wait_ceph_health_check
+# POOL_FULL timed out after ~6.5min with zero ongoing writes once the prior
+# version of this function stopped after one over-quota put). Ceph's mon
+# only raises POOL_FULL while a client is actively hitting the quota wall --
+# write, get blocked/rejected, write again -- so this loop keeps putting
+# objects and polling `ceph health detail` after every attempt, stopping the
+# instant POOL_FULL appears (confirmed again, via the poll in
+# scenario_verify, once this returns).
+#
+# Each put is wrapped in a remote `timeout 30` so a put that BLOCKS on the
+# quota (rather than failing outright with EDQUOT) cannot hang the scenario:
+# exit 124 is the EXPECTED signal here -- it IS the pool-full pressure
+# signal, on equal footing with any other nonzero exit from a rejected put --
+# and is tolerated (`|| put_rc=$?`), not treated as a scenario failure.
 write_past_quota() {
-  local used="" put_rc=0
-  while [[ "$obj_index" -le "$OVERQUOTA_MAX_PUTS" ]]; do
+  local used="" put_rc=0 attempt=0
+  while [[ "$attempt" -lt "$OVERQUOTA_MAX_PUTS" ]]; do
+    attempt=$((attempt + 1))
     put_rc=0
     run_live_step "put-past-quota-$((obj_index))" "$LAB_MON_01_HOST" \
-      "$(quota_shell_cmd "rados -p $POOL put obj-$obj_index $QUOTA_TMPFILE")" || put_rc=$?
-    if [[ "$put_rc" -ne 0 ]]; then
-      log "pool-quota: put rejected (rc=$put_rc) -- treating this as the expected quota-full signal"
-      obj_index=$((obj_index + 1))
-      return 0
-    fi
-    used="$(pool_bytes_used)"
-    log "pool-quota: past-quota put $obj_index, bytes_used=${used} (quota ${QUOTA_MAX_BYTES})"
+      "$(quota_shell_cmd "timeout 30 rados -p $POOL put obj-$obj_index $QUOTA_TMPFILE")" || put_rc=$?
+    case "$put_rc" in
+      0)
+        used="$(pool_bytes_used)"
+        log "pool-quota: past-quota put $obj_index succeeded, bytes_used=${used} (quota ${QUOTA_MAX_BYTES})"
+        ;;
+      124)
+        log "pool-quota: past-quota put $obj_index timed out after 30s -- pool is enforcing the quota (expected write-pressure signal)"
+        ;;
+      *)
+        log "pool-quota: past-quota put $obj_index rejected (rc=$put_rc) -- expected quota-full signal"
+        ;;
+    esac
     obj_index=$((obj_index + 1))
-    if [[ "$used" =~ ^[0-9]+$ ]] && [[ "$used" -ge "$QUOTA_MAX_BYTES" ]]; then
+    if assert_ceph_health_check POOL_FULL "$RESULT_DIR"; then
       return 0
     fi
   done
-  die "pool-quota: pool did not fill past the quota (${QUOTA_MAX_BYTES} bytes) after ${OVERQUOTA_MAX_PUTS} puts"
+  die "pool-quota: POOL_FULL health check did not appear after ${OVERQUOTA_MAX_PUTS} past-quota put attempts"
 }
 
 scenario_inject() {
@@ -117,7 +156,9 @@ scenario_verify() {
 scenario_rollback() {
   local rc=0
   # The quota dies with the pool -- no separate `ceph osd pool set-quota ... 0`
-  # rollback step is needed.
+  # rollback step is needed. Any past-quota put still in flight is bounded by
+  # its own remote `timeout 30` (see write_past_quota), and this pool delete
+  # starves anything left once that timeout has (or is about to have) fired.
   run_live_step "rollback-pool-delete" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- $(pool_delete_command "$POOL")" || rc=1
   run_capture "$RESULT_DIR/rollback-remove-tmpfile.txt" ssh_lab "$LAB_MON_01_HOST" "rm -f $QUOTA_TMPFILE" || rc=1
   return "$rc"

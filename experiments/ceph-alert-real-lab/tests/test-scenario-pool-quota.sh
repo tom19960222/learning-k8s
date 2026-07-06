@@ -69,17 +69,30 @@ EOF
   chmod +x "$path"
 }
 
-# make_fake_ssh <path> <trace_file> <state_file> [reject_at_or_above]
+# make_fake_ssh <path> <trace_file> <state_file> [reject_at_or_above] [failure_mode] [pool_full_after_puts]
+#
 # state_file tracks alert-quota's simulated bytes_used across `rados put`
-# calls (each successful put adds exactly 4194304 bytes = 4MiB). Once
-# bytes_used-before-this-put is >= reject_at_or_above, the put itself is
-# rejected (nonzero exit, no stdout) instead of succeeding -- this models a
-# real Ceph mon's quota enforcement point, which need not line up exactly
-# with `ceph df`'s bytes_used reading. Default reject_at_or_above is
-# unreachably high, so puts only ever stop via the `ceph df` >= quota
-# readback (the other valid termination signal).
+# calls. Near-quota puts (no `timeout` wrapper) always succeed and add
+# exactly 4194304 bytes = 4MiB. Past-quota puts (wrapped in `timeout 30`,
+# matching the scenario's bounded-put fix) succeed the same way UNTIL
+# bytes_used-before-this-put is >= reject_at_or_above, at which point the put
+# itself fails instead of succeeding, per failure_mode:
+#   - "timeout": exit 124, no stdout -- models a put that blocked on the
+#     quota and was killed by the remote `timeout` wrapper.
+#   - "reject":  exit 1 with an EDQUOT-style stderr message -- models the
+#     mon rejecting the put outright.
+# Both are real, expected pool-full signals that write_past_quota must
+# tolerate and keep looping past.
+#
+# `ceph health detail` reports POOL_FULL only once at least
+# pool_full_after_puts PAST-QUOTA put attempts (i.e. `timeout 30 rados ...`
+# commands specifically) have appeared in the trace file -- modeling the
+# real-lab finding that Ceph's mon only raises the POOL_FULL health check
+# once it has observed sustained write pressure against the full pool, not
+# merely once `ceph df` reports bytes_used at/over the quota.
 make_fake_ssh() {
-  local path=$1 trace_file=$2 state_file=$3 reject_at_or_above=${4:-999999999999}
+  local path=$1 trace_file=$2 state_file=$3 reject_at_or_above=${4:-33554432} \
+    failure_mode=${5:-timeout} pool_full_after_puts=${6:-3}
   printf '0\n' >"$state_file"
   cat >"$path" <<EOF
 #!/usr/bin/env bash
@@ -103,12 +116,21 @@ for arg in "\$@"; do
 done
 printf 'ssh:%s\n' "\$command" >>"$trace_file"
 case "\$command" in
-  *"cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-"*)
+  *"cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-"*)
     current=\$(cat "$state_file")
     if [[ "\$current" -ge "$reject_at_or_above" ]]; then
+      if [[ "$failure_mode" == "timeout" ]]; then
+        printf 'put timed out waiting on quota\n' >&2
+        exit 124
+      fi
       printf 'error putting alert-quota/obj: (1) Operation not permitted (quota exceeded)\n' >&2
       exit 1
     fi
+    printf '%s\n' "\$((current + 4194304))" >"$state_file"
+    exit 0
+    ;;
+  *"cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-"*)
+    current=\$(cat "$state_file")
     printf '%s\n' "\$((current + 4194304))" >"$state_file"
     exit 0
     ;;
@@ -126,8 +148,9 @@ case "\$command" in
     exit 0
     ;;
   *"ceph health detail"*)
-    current=\$(cat "$state_file")
-    if [[ "\$current" -ge "$reject_at_or_above" ]] || [[ "\$current" -ge 33554432 ]]; then
+    past_quota_puts=\$(grep -c 'timeout 30 rados -p alert-quota put obj-' "$trace_file" || true)
+    past_quota_puts=\${past_quota_puts:-0}
+    if [[ "\$past_quota_puts" -ge "$pool_full_after_puts" ]]; then
       printf 'HEALTH_ERR 1 pool(s) full (POOL_FULL)\n'
     else
       printf 'HEALTH_WARN 1 pool(s) nearfull (POOL_NEAR_FULL)\n'
@@ -173,14 +196,20 @@ exhaust_stderr_file="$(mktemp)"
 exhaust_trace_file="$(mktemp)"
 exhaust_state_file="$(mktemp)"
 exhaust_bin_dir="$(mktemp -d)"
+poolfull_stdout_file="$(mktemp)"
+poolfull_stderr_file="$(mktemp)"
+poolfull_trace_file="$(mktemp)"
+poolfull_state_file="$(mktemp)"
+poolfull_bin_dir="$(mktemp -d)"
 real_jq="$(command -v jq)"
 
 cleanup() {
   rm -f "$stdout_file" "$stderr_file" "$no_ack_trace_file" "$before_dirs_file" "$after_dirs_file" \
     "$live_stdout_file" "$live_stderr_file" "$live_trace_file" "$live_state_file" \
     "$reject_stdout_file" "$reject_stderr_file" "$reject_trace_file" "$reject_state_file" \
-    "$exhaust_stdout_file" "$exhaust_stderr_file" "$exhaust_trace_file" "$exhaust_state_file"
-  rm -rf "$fake_bin_dir" "$reject_bin_dir" "$exhaust_bin_dir"
+    "$exhaust_stdout_file" "$exhaust_stderr_file" "$exhaust_trace_file" "$exhaust_state_file" \
+    "$poolfull_stdout_file" "$poolfull_stderr_file" "$poolfull_trace_file" "$poolfull_state_file"
+  rm -rf "$fake_bin_dir" "$reject_bin_dir" "$exhaust_bin_dir" "$poolfull_bin_dir"
 }
 
 trap cleanup EXIT
@@ -223,17 +252,23 @@ grep -Fq -- 'pool-quota requires --yes-really-inject' "$stderr_file" || fail "mi
 [[ ! -s "$no_ack_trace_file" ]] || fail "live-capable commands ran before destructive ack"
 cmp -s "$before_dirs_file" "$after_dirs_file" || fail "result dir was created before destructive ack"
 
-# --- Happy path: quota reached purely via `ceph df` readback (no put ever
-# rejected). 8 puts of 4MiB each land exactly on the 32MiB quota.
+# --- Happy path: near-quota puts obj-1..7 (unbounded, always succeed), then
+# past-quota keeps sustained write pressure with BOUNDED (`timeout 30`)
+# puts: obj-8 succeeds and lands exactly on the 32MiB quota, obj-9 and obj-10
+# both hit the quota wall and TIME OUT (exit 124) -- tolerated, not a
+# failure -- and only once 3 past-quota attempts have appeared in the trace
+# does `ceph health detail` start reporting POOL_FULL, which the scenario
+# picks up on its next poll and stops looping.
 rm -rf "$fake_bin_dir"
 fake_bin_dir="$(mktemp -d)"
 make_fake_jq "$fake_bin_dir/jq" "$real_jq" "$live_trace_file"
 make_fake_kubectl "$fake_bin_dir/kubectl" "$live_trace_file" "$live_state_file"
 make_fake_curl "$fake_bin_dir/curl" "$live_trace_file"
-make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file" "$live_state_file"
+make_fake_ssh "$fake_bin_dir/ssh" "$live_trace_file" "$live_state_file" 33554432 timeout 3
 
 set +e
 PATH="$fake_bin_dir:$PATH" PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  CEPH_HEALTH_CHECK_ATTEMPTS=5 CEPH_HEALTH_CHECK_SLEEP=0 \
   bash "$ROOT/run/scenario-pool-quota.sh" --yes-really-inject >"$live_stdout_file" 2>"$live_stderr_file"
 rc=$?
 set -e
@@ -249,26 +284,36 @@ fi
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-quota 1$' "$live_trace_file" || fail "missing pool create"
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set-quota alert-quota max_bytes 33554432$' "$live_trace_file" || fail "missing set-quota"
 grep -q '^ssh:dd if=/dev/zero of=/tmp/alert-quota-4mib.bin bs=1M count=4$' "$live_trace_file" || fail "missing tmpfile creation (plain host dd, not wrapped in cephadm shell)"
-put_count="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-' "$live_trace_file" || true)"
-[[ "$put_count" -eq 8 ]] || fail "expected exactly 8 rados puts (7 near-quota + 1 crossing the quota), got $put_count"
+
+near_put_count="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-' "$live_trace_file" || true)"
+[[ "$near_put_count" -eq 7 ]] || fail "expected exactly 7 near-quota puts (unbounded, no timeout wrapper), got $near_put_count"
+past_put_count="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-' "$live_trace_file" || true)"
+[[ "$past_put_count" -eq 3 ]] || fail "expected exactly 3 bounded past-quota put attempts (stops once POOL_FULL appears after 3), got $past_put_count"
+
 grep -q '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-7 /tmp/alert-quota-4mib.bin$' "$live_trace_file" || fail "missing near-quota put obj-7 (crosses the 26MiB near-quota target)"
-grep -q '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-8 /tmp/alert-quota-4mib.bin$' "$live_trace_file" || fail "missing past-quota put obj-8 (reaches the 32MiB quota)"
+grep -q '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-8 /tmp/alert-quota-4mib.bin$' "$live_trace_file" || fail "missing bounded past-quota put obj-8 (reaches the 32MiB quota)"
+grep -q '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-9 /tmp/alert-quota-4mib.bin$' "$live_trace_file" || fail "missing bounded past-quota put obj-9 (the one that times out)"
+grep -q '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-10 /tmp/alert-quota-4mib.bin$' "$live_trace_file" || fail "missing bounded past-quota put obj-10 (POOL_FULL surfaces after this one)"
+
+grep -q 'timed out after 30s' "$live_stderr_file" || fail "missing tolerated-timeout (exit 124) log line"
 
 quota_line="$(grep -n '^ssh:sudo -n cephadm shell -- ceph osd pool set-quota alert-quota max_bytes 33554432$' "$live_trace_file" | head -1 | cut -d: -f1)"
 tmpfile_line="$(grep -n '^ssh:dd if=/dev/zero' "$live_trace_file" | head -1 | cut -d: -f1)"
 put1_line="$(grep -n '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-1 ' "$live_trace_file" | head -1 | cut -d: -f1)"
 put7_line="$(grep -n '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-7 ' "$live_trace_file" | head -1 | cut -d: -f1)"
-put8_line="$(grep -n '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-8 ' "$live_trace_file" | head -1 | cut -d: -f1)"
+put8_line="$(grep -n '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-8 ' "$live_trace_file" | head -1 | cut -d: -f1)"
+put10_line="$(grep -n '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-10 ' "$live_trace_file" | head -1 | cut -d: -f1)"
 delete_line="$(grep -n '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-quota alert-quota --yes-i-really-really-mean-it' "$live_trace_file" | head -1 | cut -d: -f1)"
 rm_tmpfile_line="$(grep -n '^ssh:rm -f /tmp/alert-quota-4mib.bin$' "$live_trace_file" | head -1 | cut -d: -f1)"
 
-[[ -n "$quota_line" && -n "$tmpfile_line" && -n "$put1_line" && -n "$put7_line" && -n "$put8_line" && -n "$delete_line" && -n "$rm_tmpfile_line" ]] \
+[[ -n "$quota_line" && -n "$tmpfile_line" && -n "$put1_line" && -n "$put7_line" && -n "$put8_line" && -n "$put10_line" && -n "$delete_line" && -n "$rm_tmpfile_line" ]] \
   || fail "missing trace lines for ordering checks"
 (( tmpfile_line > quota_line )) || fail "tmpfile created before quota was set"
 (( put1_line > tmpfile_line )) || fail "first put happened before tmpfile creation"
 (( put7_line > put1_line )) || fail "near-quota puts out of order"
-(( put8_line > put7_line )) || fail "past-quota put happened before near-quota puts finished"
-(( delete_line > put8_line )) || fail "pool delete happened before injection completed"
+(( put8_line > put7_line )) || fail "past-quota puts happened before near-quota puts finished"
+(( put10_line > put8_line )) || fail "past-quota puts out of order"
+(( delete_line > put10_line )) || fail "pool delete happened before injection completed"
 (( rm_tmpfile_line > delete_line )) || fail "tmpfile removal happened before pool delete"
 
 # Every near-quota checkpoint (puts 1..7) must stay strictly below the
@@ -282,37 +327,36 @@ for i in 1 2 3 4 5 6 7; do
   [[ "$used" -lt 33554432 ]] || fail "near-quota put $i already at/over the 32MiB quota (used=$used)"
 done
 final_used="$(jq -r '.pools[0].stats.bytes_used' "$result_dir/ceph-df-check-8.json")"
-[[ "$final_used" -eq 33554432 ]] || fail "expected the final checkpoint to land exactly on the 32MiB quota, got $final_used"
-if grep -q 'put rejected' "$live_stderr_file"; then
-  fail "happy path should reach quota via ceph df readback, not a rejected put"
-fi
+[[ "$final_used" -eq 33554432 ]] || fail "expected obj-8 (the only successful past-quota put) to land exactly on the 32MiB quota, got $final_used"
 
-ok "pool-quota destructive ack guard, controlled near-quota write, and quota-reached-via-readback rollback"
+ok "pool-quota destructive ack guard, controlled near-quota write staying below quota, and bounded-put timeout (124) tolerance surfacing POOL_FULL"
 
-# --- Quota-rejection path: the mon's enforcement point (reject_at_or_above)
-# sits below the exact 32MiB quota, so obj-8's put itself is rejected. This
-# proves write_past_quota treats a put failure as the expected signal (not
-# a scenario error) and still confirms POOL_FULL/CephClientBlocked.
+# --- Rejected-put path: the mon rejects past-quota puts outright (rc=1,
+# EDQUOT-style) instead of the bounded put timing out. Proves
+# write_past_quota tolerates BOTH failure modes -- a hard rejection and a
+# `timeout 30`-triggered exit 124 -- as the expected quota-pressure signal,
+# not a scenario error, while still confirming POOL_FULL/CephClientBlocked.
 rm -rf "$reject_bin_dir"
 reject_bin_dir="$(mktemp -d)"
 make_fake_jq "$reject_bin_dir/jq" "$real_jq" "$reject_trace_file"
-make_fake_kubectl "$reject_bin_dir/kubectl" "$reject_trace_file" "$reject_state_file" 29360128
+make_fake_kubectl "$reject_bin_dir/kubectl" "$reject_trace_file" "$reject_state_file"
 make_fake_curl "$reject_bin_dir/curl" "$reject_trace_file"
-make_fake_ssh "$reject_bin_dir/ssh" "$reject_trace_file" "$reject_state_file" 29360128
+make_fake_ssh "$reject_bin_dir/ssh" "$reject_trace_file" "$reject_state_file" 33554432 reject 3
 
 set +e
 PATH="$reject_bin_dir:$PATH" PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  CEPH_HEALTH_CHECK_ATTEMPTS=5 CEPH_HEALTH_CHECK_SLEEP=0 \
   bash "$ROOT/run/scenario-pool-quota.sh" --yes-really-inject >"$reject_stdout_file" 2>"$reject_stderr_file"
 rc=$?
 set -e
 
-[[ "$rc" -eq 0 ]] || fail "expected success even when the past-quota put itself is rejected, got $rc"
-grep -q 'put rejected (rc=' "$reject_stderr_file" || fail "missing tolerated-put-failure log line"
-put_count_reject="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- rados -p alert-quota put obj-' "$reject_trace_file" || true)"
-[[ "$put_count_reject" -eq 8 ]] || fail "expected exactly 8 rados put attempts (the 8th rejected), got $put_count_reject"
+[[ "$rc" -eq 0 ]] || fail "expected success even when past-quota puts are rejected outright, got $rc"
+grep -q 'rejected (rc=1)' "$reject_stderr_file" || fail "missing tolerated-rejection log line"
+past_put_count_reject="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-' "$reject_trace_file" || true)"
+[[ "$past_put_count_reject" -eq 3 ]] || fail "expected exactly 3 bounded past-quota put attempts (stops once POOL_FULL appears after 3), got $past_put_count_reject"
 grep -q '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-quota alert-quota --yes-i-really-really-mean-it' "$reject_trace_file" || fail "missing rollback pool delete after put-rejection path"
 
-ok "pool-quota tolerates a rejected put as the quota-full signal and still confirms POOL_FULL"
+ok "pool-quota tolerates an outright-rejected past-quota put as the quota-full signal and still confirms POOL_FULL"
 
 # --- Near-quota exhaustion path: NEARQUOTA_TARGET_BYTES is set unreachably
 # high with NEARQUOTA_MAX_PUTS=1, so write_near_quota's die() fires. Proves
@@ -338,3 +382,30 @@ grep -q '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-quota alert-
 grep -q '^ssh:rm -f /tmp/alert-quota-4mib.bin$' "$exhaust_trace_file" || fail "rollback tmpfile removal missing after near-quota exhaustion"
 
 ok "pool-quota still deletes the pool and removes the tmpfile when the near-quota put budget is exhausted"
+
+# --- Past-quota exhaustion path: pool_full_after_puts is set unreachably
+# high (so `ceph health detail` never reports POOL_FULL) and
+# OVERQUOTA_MAX_PUTS is capped at 2, so write_past_quota's die() fires after
+# exactly 2 bounded put attempts instead of looping forever. Proves the
+# max-attempts safety net actually bounds the loop, and rollback still runs.
+rm -rf "$poolfull_bin_dir"
+poolfull_bin_dir="$(mktemp -d)"
+make_fake_jq "$poolfull_bin_dir/jq" "$real_jq" "$poolfull_trace_file"
+make_fake_kubectl "$poolfull_bin_dir/kubectl" "$poolfull_trace_file" "$poolfull_state_file"
+make_fake_curl "$poolfull_bin_dir/curl" "$poolfull_trace_file"
+make_fake_ssh "$poolfull_bin_dir/ssh" "$poolfull_trace_file" "$poolfull_state_file" 33554432 timeout 999
+
+set +e
+PATH="$poolfull_bin_dir:$PATH" OVERQUOTA_MAX_PUTS=2 PROMETHEUS_WAIT_SLEEP=0 SINK_WAIT_ATTEMPTS=2 SINK_WAIT_SLEEP=0 \
+  CEPH_HEALTH_CHECK_ATTEMPTS=5 CEPH_HEALTH_CHECK_SLEEP=0 \
+  bash "$ROOT/run/scenario-pool-quota.sh" --yes-really-inject >"$poolfull_stdout_file" 2>"$poolfull_stderr_file"
+rc=$?
+set -e
+
+[[ "$rc" -ne 0 ]] || fail "expected non-zero exit when POOL_FULL never appears within the attempt cap"
+grep -q 'FATAL: pool-quota: POOL_FULL health check did not appear after 2 past-quota put attempts' "$poolfull_stderr_file" || fail "missing die() message for exhausted past-quota attempt cap"
+past_put_count_poolfull="$(grep -c '^ssh:sudo -n cephadm shell --mount /tmp:/tmp -- timeout 30 rados -p alert-quota put obj-' "$poolfull_trace_file" || true)"
+[[ "$past_put_count_poolfull" -eq 2 ]] || fail "expected exactly 2 bounded past-quota put attempts before giving up, got $past_put_count_poolfull"
+grep -q '^ssh:sudo -n cephadm shell -- .*ceph osd pool delete alert-quota alert-quota --yes-i-really-really-mean-it' "$poolfull_trace_file" || fail "rollback pool delete missing after past-quota attempt-cap exhaustion"
+
+ok "pool-quota gives up after OVERQUOTA_MAX_PUTS bounded attempts when POOL_FULL never appears, and still rolls back"
