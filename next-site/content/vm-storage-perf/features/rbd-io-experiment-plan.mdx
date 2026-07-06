@@ -1,510 +1,306 @@
 ---
 layout: doc
-title: VM Disk IO 效能實驗計畫 — 從 impact 最高的幾個參數開始系統化驗證
-description: 接續參數目錄，把 🔴 / 🟡 旋鈕排成受控實驗：抽一份共用 baseline VMI + fio job 矩陣，Top 5 寫完整協定（假設 / VMI YAML diff / fio 跑法 / 收 metric / 生效驗證），6 之後精簡。所有「假設」標明是機制推論非實測，結果記錄模板留空、不寫任何 benchmark 數字。以 krbd 為主軸，版本對齊 kubevirt v1.5.0 / libvirt v10.10.0 / qemu v9.1.0 / host kernel 6.8.0-52 / ceph-csi v3.14.0 / ceph v19.2.3。
+title: VM Disk IO 效能實驗計畫 v2 — 在 Proxmox VE 上驗證 QEMU / krbd / librbd 旋鈕
+description: 計畫 v1（KubeVirt 軸）有三個前提被 pinned source 推翻（cache 留空自動 none+native、baseline VMI 開不起來、num-queues 預設就是多 queue），v2 整個重寫：改在生產 Proxmox VE + Ceph cluster 上做，只動自有測試 VM / image 的參數不動 ceph；krbd vs librbd 雙軸、16 個實驗項、每個實驗一個變因、prediction 先行、三態 verdict，結果邊做邊回填。研究 backlog 在 experiments/rbd-io-perf/HYPOTHESES.md。
 ---
 
-## 場景：拿到 datapath + 參數目錄後，怎麼系統化驗證
+## 場景：這一頁是 v2——v1 為什麼整個重寫
 
-[datapath 頁](./rbd-io-datapath)把一個 4K write 從 guest virtio-blk 一路追到 OSD，[參數目錄頁](./rbd-io-tuning-catalog)把這條路徑五層的旋鈕收成一份按 impact 排序的總表。現在問題只剩一個：**這些 impact 等級是機制推論，你環境真實的數字是多少？**
+這頁原本（v1）是一份 KubeVirt 軸的實驗計畫：拿 [參數目錄](./rbd-io-tuning-catalog)裡 🔴 / 🟡 的旋鈕，在 KubeVirt VMI 上一個一個量。動手前照規矩把每個「假設」拿回 pinned source 驗證，結果**計畫本身的三個前提被原始碼推翻**（詳見下一節）。加上一個環境判斷——KubeVirt 只是 control plane，不在 IO data path 上，它對效能的唯一影響是「幫你把 QEMU 旋鈕設成什麼預設值」——所以 v2 改成：**在實際使用中的 Proxmox VE + Ceph cluster 上做，只動自有測試 VM 與測試 image 的參數，完全不動 ceph**。QEMU / krbd 層的旋鈕結論兩邊通用，KubeVirt 特有的部分只剩「control plane 選了哪些預設」，那個用讀原始碼就能回答，不用實驗。
 
-這頁不是再列一次參數，而是把目錄裡 🔴 / 🟡 的旋鈕排成一組**受控實驗**：每個實驗只動一個旋鈕、跑同一組 fio、量同一組 metric、在 datapath 的兩個 iostat 邊界（guest `/dev/vda` 與 host `/dev/rbdX`）各看一次延遲落在哪。先抽一份共用 baseline，後面每個實驗都引用它，只描述「相對 baseline 改了哪一格」。
+這頁要回答你三個問題：**總共要做哪些實驗**（見「實驗總覽」一張表）、**每個實驗的變因是什麼、預期會有什麼結果**（每個實驗一節，變因唯一、預期標明是機制推論）、然後**結果邊做邊回填**（每節帶一張空的回填表，跑完填 verdict）。完整的研究方法紀錄（hypothesis backlog、evidence 規則）在 repo 的 `experiments/rbd-io-perf/HYPOTHESES.md`。
 
-<Callout type="warning" title="這頁是計畫，不是結果">
-  以下所有「假設」都是**機制上的推論，非實測**——它們說的是「照 datapath 的程式碼路徑，這個旋鈕機制上預期會怎樣」，不是任何 benchmark 數字。本頁刻意不寫任何 IOPS / latency 數值；文末的結果記錄模板是空表，數字要你在自己的 Proxmox + 3-node k8s + ceph cluster 上跑出來填。書裡看不到「提升多少」這種句子是故意的。
+## v1 被原始碼推翻的三個前提
+
+這三條全部是先寫了計畫、再對 pinned source 查證時抓到的。留在這裡當教訓：**「baseline 幻覺」——你以為的最樸素起點，其實系統早就幫你調過了**。
+
+| # | v1 的前提 | 原始碼說的 | 後果 |
+|---|---|---|---|
+| 1 | 「VMI `cache` 留空 = 不開 O_DIRECT、不觸發 auto 推導」 | KubeVirt 對 block device 後端在 cache 留空時**自動設 `cache=none`**，接著再推 `io=native` | v1 實驗 1 的 baseline 與變體是同一組設定，量不出任何差異 |
+| 2 | baseline VMI 一顆 datadisk 就能跑 | 該 VMI 沒有 boot volume，**開不起來**；補上 boot 盤後資料盤是 `/dev/vdb` | v1 所有 fio 指令的 `--filename=/dev/vda` 都指錯裝置 |
+| 3 | 「不設 queues 的 baseline 是單 virtqueue」 | QEMU 的 virtio-blk `num-queues` 預設是 AUTO，realize 時**自動解析成 vCPU 數**；libvirt 在 queues 未設時不輸出該屬性，預設直通 | v1 實驗 3（blockMultiQueue）的 baseline 與變體很可能又是同一組設定 |
+
+前提 1 的證據——cache 留空時 converter 的真實行為：
+
+```go
+// File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go
+	// if user did not set a cache mode and fs supports direct I/O then set cache = 'none'
+	// else set cache = 'writethrough
+	if mode == "" && supportDirectIO {
+		mode = v1.CacheNone
+	} else if mode == "" && !supportDirectIO {
+		mode = v1.CacheWriteThrough
+	}
+```
+
+（`SetDriverCacheMode` 約 L371-429；`manager.go` 約 L838-842 對每顆 disk 無條件先跑它、再跑 `SetOptimalIOMode`——所以留空 ⇒ `cache=none` ⇒ `io=native` 一路自動。）
+
+前提 3 的證據——QEMU 端 num-queues 預設值與 AUTO 的解析：
+
+```c
+// File: qemu/hw/virtio/virtio-blk-pci.c
+    if (conf->num_queues == VIRTIO_BLK_AUTO_NUM_QUEUES) {
+        conf->num_queues = virtio_pci_optimal_num_queues(0);
+    }
+```
+
+（屬性預設值在 `qemu/hw/block/virtio-blk.c` 約 L1997-1998 的 `DEFINE_PROP_UINT16("num-queues", ..., VIRTIO_BLK_AUTO_NUM_QUEUES)`；`virtio_pci_optimal_num_queues` 回傳 vCPU 數。libvirt 端 `qemu_command.c` 約 L1692 `"p:num-queues", disk->queues` 的 `p:` 修飾詞在 queues 未設（=0）時不輸出屬性。）
+
+<Callout type="warning" title="教訓：先驗 baseline，再談變體">
+  三條錯誤同一個型：**變體實驗的 baseline 沒有先對原始碼驗證過**。v2 的每個實驗因此都把「生效驗證」放在量測之前——先證明 baseline 與變體真的是兩組不同設定、而且改動真的到達 QEMU / kernel，才開始跑 fio。
 </Callout>
 
-## 實驗方法論
+## 新環境與操作邊界
 
-四條規則，貫穿底下每一個實驗：
+- **環境**：一座實際在用的 Proxmox VE cluster（內建 Ceph）。版本（pve-qemu / kernel / ceph）、OSD 拓樸（是否 hyperconverged）、媒體、網路、pool 用量——全部由 E-00 pre-flight 盤點後回填到文末的 environment snapshot，**這頁所有數字都以那個 snapshot 為準**。
+- **只動自有資源**：自建測試 VM、自建測試 image（含建檔參數）、自有 image 的 `rbd image-meta conf_*` 覆寫、自己手動 `rbd map`、專屬測試用 storage id（`krbd=1`，測完刪）。
+- **三條底線**：不改任何 ceph cluster / daemon 設定、不重啟 ceph、不讓其他 VM down（實驗負載造成的「變慢」可接受）。因此 v1 裡的 `osd_op_num_shards` 與 mClock profile 變體實驗**全部剪除**——mClock 只在 pre-flight read-only 記錄，供解讀天花板用。
+- **courtesy guardrails**：每輪監控，出現**相對基線新增**的 `HEALTH_ERR` / 持續 slow ops、pool 用量逼近 nearfull、（krbd 時）節點可用記憶體低於門檻——立即中止並清理。生產叢集的 `HEALTH_WARN` 可能常態存在，所以判斷用差分不用絕對值。
 
-1. **先 baseline，再一次只動一個參數**。baseline 是「cache 不設、單 queue、無 dedicated IOThread」的最樸素 VMI。每個實驗只相對 baseline 改一格，其餘固定。要量 A 旋鈕就只改 A；同時改兩個就沒辦法把效果歸因到誰。這條對應參數目錄頁開頭那個「一次只動一個參數」的 Callout。
-2. **量同一組 metric**。固定一份 fio job 矩陣（randread / randwrite / seqwrite × iodepth × bs），每個實驗都跑它，這樣不同實驗的數字可比。
-3. **對照 datapath 的兩個 iostat 邊界**。每次都同時收 guest `/dev/vda` 與 host `/dev/rbdX` 的 `iostat`。兩者的差就是「虛擬化稅」（datapath §①～④）；host 端 `/dev/rbdX` 自己的延遲反映 ceph / 網路（datapath §⑤）。一個旋鈕到底改善了哪一段，看這兩條邊界誰動了就知道。
-4. **每個實驗都要先確認旋鈕真的生效**。改了 VMI 不代表 QEMU 真的換了 driver 屬性——每個實驗最後都有一個「生效驗證」步驟（`virsh dumpxml` 看 `<driver/>`、`ps` 看 QEMU cmdline、`rbd showmapped` 看 map options），確認你量的是你以為在量的東西。
+## 兩條 datapath 軸：krbd vs librbd
 
-實驗順序按 impact 排：🔴 的先做、寫完整協定（實驗 1～5、再加 🔴 的 queue_depth 做實驗 6），🟡 的後做、精簡協定（實驗 7～9）。
+[datapath 頁](./rbd-io-datapath)的主軸是 krbd（host kernel map 出 `/dev/rbdX`）。但 **PVE 掛 RBD 的預設是 librbd**——storage 設定 `krbd=0` 時，QEMU 用內建的 rbd driver（`qemu/block/rbd.c`）在 user space 直連 OSD，**沒有 `/dev/rbdX`、沒有 host iostat 邊界**。兩軸差異：
 
-## 共用 baseline
+| | krbd 軸（`krbd=1`） | librbd 軸（PVE 預設） |
+|---|---|---|
+| datapath | QEMU → `/dev/rbdX` → host kernel krbd → libceph → OSD | QEMU 內 librbd → OSD（不經 host block layer） |
+| host 端觀測 | `iostat -x /dev/rbdX`（datapath §⑤ 邊界） | 無 block device；用 QMP `query-blockstats` + `rbd perf image iostat` |
+| cache 旋鈕控制的東西 | host page cache（O_DIRECT 與否） | **librbd 的 `rbd_cache`** |
+| 專屬旋鈕 | map options（queue_depth / alloc_size / rxbounce …） | `rbd_cache` 等 librbd 選項（可用 per-image `conf_*` 覆寫） |
 
-這節抽一次，後面所有實驗都引用它。
+librbd 軸的 cache 機制有原始碼直接證據——QEMU 依 cache mode 直接設 `rbd_cache`：
 
-### baseline VMI
-
-最樸素的設定：`cache` 不寫（讓 KubeVirt 不做任何 cache 假設）、`blockMultiQueue` 不開、不設 `dedicatedIOThread`、不設 `ioThreadsPolicy`。disk 接的是 ceph-csi 的 `volumeMode: Block` RBD PVC。
-
-```yaml
-# File: baseline VirtualMachineInstance — 後面每個實驗只相對它改一格
-apiVersion: kubevirt.io/v1
-kind: VirtualMachineInstance
-metadata:
-  name: ioperf-baseline
-spec:
-  domain:
-    cpu:
-      cores: 4            # 多 vCPU，blockMultiQueue 實驗才有對照空間
-    devices:
-      # blockMultiQueue 預設不開（實驗 3 才打開）
-      disks:
-        - name: datadisk
-          disk:
-            bus: virtio
-          # cache / io 都不寫：實驗 1 才動 cache，並觀察 io 的 auto 推導
-          # dedicatedIOThread 不寫：實驗 2 才打開
-      blockSize: {}       # 用底層預設，不在本系列驗證
-    resources:
-      requests:
-        memory: 4Gi
-  # ioThreadsPolicy 不寫：實驗 2 才設 auto
-  volumes:
-    - name: datadisk
-      persistentVolumeClaim:
-        claimName: ioperf-rbd-block   # volumeMode: Block 的 RBD PVC
-  # 對應的 PVC StorageClass 用 ceph-csi rbd（krbd mounter）
+```c
+// File: qemu/block/rbd.c
+    if (flags & BDRV_O_NOCACHE) {
+        rados_conf_set(*cluster, "rbd_cache", "false");
+    } else {
+        rados_conf_set(*cluster, "rbd_cache", "true");
+    }
 ```
 
-對應的 PVC 要是 `volumeMode: Block`，StorageClass 走 ceph-csi 的 rbd provisioner（krbd mounter）。實驗 6（queue_depth）與實驗 5（object-size / striping）會動到 StorageClass / image 建立參數，屆時再說。
+（約 L955-963；呼叫端約 L1121 以 `!(flags & BDRV_O_NOCACHE)` 傳入。所以 `cache=none` 在 librbd 軸關掉的是 librbd cache，跟 krbd 軸繞過 host page cache 是**兩個不同機制**——實驗 E-05 的預期因此分軸寫。）
 
-<Callout type="info" title="為什麼 baseline 的 cache 留空，而不是寫死 writethrough">
-  留空時 KubeVirt converter 不會主動幫你開 `O_DIRECT`，也不會觸發 `cache=none ⇒ io=native` 的 auto 推導（見參數目錄 ② 層 `SetOptimalIOMode`）。這讓 baseline 真的是「沒有任何 IO 優化意圖」的起點，實驗 1 打開 `cache=none` 後的差異才量得乾淨。
+<Callout type="info" title="krbd 能不能用，本身是第一個要驗的事">
+  這座 PVE 沒調過 krbd。E-01 會用三關驗證：自建 throwaway image 手動 `rbd map` 讀寫、image features 相容性、`krbd=1` 專屬 storage id 掛盤到測試 VM。全過 → 雙軸都測（krbd vs librbd 對打是本計畫的頭牌實驗）；不過 → librbd 單軸，krbd 相關實驗（E-10 / E-12 / E-14）降級成 host 層對照或剪除，結果如實記錄在 snapshot。
 </Callout>
 
-### fio job 矩陣
+## 實驗方法論 v2
 
-固定這幾個 pattern，每個實驗都跑同一組。在 **guest 內**對 `/dev/vda`（或掛載點上的測試檔）跑。
+六條規則，貫穿每一個實驗：
 
-```bash
-# File: fio job 矩陣 — guest 內跑，每個實驗都用同一組
-# 注意：--filename=/dev/vda 會直接寫裸裝置，請確認該盤是專用測試盤、無資料
-# randread 4k，掃 iodepth：1 / 8 / 32
-for qd in 1 8 32; do
-  fio --name=randread-4k-qd$qd --filename=/dev/vda --direct=1 \
-      --rw=randread --bs=4k --iodepth=$qd --numjobs=1 \
-      --ioengine=libaio --runtime=60 --time_based --group_reporting
-done
+1. **一個實驗只動一個變因**，其餘全部固定；E-07 之後的實驗若疊在某變體上，會明寫比較基準是誰。
+2. **prediction 先行**：每個實驗的「預期」在跑之前寫死（就是本頁各節的預期欄），跑完由機器比對，verdict 三態——`confirmed`（差異方向與預期一致且超出噪音帶）、`violated`（方向相反或該有差異卻沒有）、`indistinguishable`（差異落在噪音帶內，這個環境量不出來）。**violated 是有價值的結果，不准事後改口說「其實這是預期的」**。
+3. **n≥3 + 噪音帶**：baseline 先連跑多輪算出變異係數（CoV），差異要超過噪音帶才能宣稱方向。生產叢集噪音大，必要時升到 n≥5。
+4. **A/B 交錯執行**：baseline 輪與變體輪交錯跑（A/B/A/B…），不做「先全 A 再全 B」——生產叢集的背景負載隨時間變，區塊式執行會把別人的尖峰時段誤判成旋鈕效果。每輪同時記下當時的叢集併發負載（`ceph -s` 的 client io）。
+5. **生效驗證是量測的前置條件**：改完參數先斷言 `qm config`、QEMU 命令列（`/proc/<pid>/cmdline`）、krbd 軸再加 `rbd showmapped` / sysfs 讀值，全對才開始跑 fio。
+6. **量測有效性守則**：測試盤建立後先全盤 pre-fill（thin image 沒寫過的 extent 讀起來是假數字）；fio 帶 `--ramp_time` 丟暖身段；guest / host 觀測窗與 fio 量測窗對齊；一輪中若 ceph 出現 recovery / backfill 該輪作廢延後重跑，scrub 與他人負載則記錄下來靠交錯與重複吸收。
 
-# randwrite 4k，掃 iodepth：1 / 8 / 32
-for qd in 1 8 32; do
-  fio --name=randwrite-4k-qd$qd --filename=/dev/vda --direct=1 \
-      --rw=randwrite --bs=4k --iodepth=$qd --numjobs=1 \
-      --ioengine=libaio --runtime=60 --time_based --group_reporting
-done
+## 共用 fio 矩陣與要收的 metric
 
-# seqwrite 1M，看 throughput（striping / object-size 實驗主要看這條）
-fio --name=seqwrite-1m --filename=/dev/vda --direct=1 \
-    --rw=write --bs=1M --iodepth=16 --numjobs=1 \
-    --ioengine=libaio --runtime=60 --time_based --group_reporting
-```
-
-矩陣維度：`{randread, randwrite}` × `{qd 1, 8, 32}` 共 6 點，加上一條 `seqwrite-1m`。低 QD（qd1）量的是單流延遲，高 QD（qd32）量的是並行天花板——很多旋鈕（queue_depth、blockMultiQueue、IOThreads）只在高 QD 才看得出差異，所以兩端都要有。
-
-<Callout type="warning" title="這些指令要在你環境跑後對照">
-  上面的 fio / 底下的 virsh / rbd 指令都是**通用工具用法**，語法是對的，但需要真實 Proxmox + 3-node k8s + ceph cluster 才跑得出有意義的數字（kind / minikube 上沒有真正的 RBD 後端）。所有數字請在你環境跑後填進文末模板，不要引用任何別處看到的 benchmark 值。`--filename=/dev/vda --direct=1` 會直接對裸裝置做 O_DIRECT IO，**務必確認那是專用測試盤、上面沒有要保留的 filesystem**。
-</Callout>
-
-### 要收的 metric
-
-每跑一輪 fio，收這幾項：
-
-- **IOPS**：fio 輸出的 `read/write IOPS`（randread / randwrite 看這個）。
-- **latency p50 / p99**：fio 的 `clat percentiles`（`50.00th`、`99.00th`）。p99 比平均更能反映尾延遲。
-- **throughput**：fio 的 `BW`（seqwrite 看這個）。
-- **QEMU thread CPU**：在 virt-launcher Pod 所在 node 上 `top -H -p $(pgrep -f qemu-system)`，看 QEMU 主 loop 與 IOThread 各吃多少 CPU（IOThreads 實驗的關鍵觀測）。
-- **host `/dev/rbdX` iostat**：`iostat -x 1 /dev/rbdN`，看 `await`、`aqu-sz`、`r/s w/s`——這是 datapath §⑤ 那段（krbd→OSD）的延遲與並行。
-- **guest `/dev/vda` iostat**：guest 內 `iostat -x 1 /dev/vda`，跟 host `/dev/rbdX` 對比，差值是虛擬化稅。
-
-### 怎麼確認參數生效
-
-改完 VMI、VM 重啟後，到 virt-launcher Pod 所在 node 上驗證 QEMU 真的吃到設定：
+矩陣 8 個 pattern，每個實驗都跑同一組（特例會在該實驗註明）：
 
 ```bash
-# 1. 找到這台 VM 的 libvirt domain（virt-launcher Pod 內）
-kubectl get vmi ioperf-baseline -o jsonpath='{.status.nodeName}'   # 找 node
-# 在該 node 上、virt-launcher Pod 的 compute container 內：
-virsh -c qemu:///system list                # 找 domain 名（通常 <ns>_<vmi-name>）
-virsh -c qemu:///system dumpxml <domain>     # 看 <disk> 的 <driver .../>
+# File: fio 矩陣 v2 — guest 內對測試資料盤（virtio-blk，/dev/vdb）跑
+# 前置：該盤已 pre-fill（fio --rw=write --bs=1M 寫滿一遍）
+# {randread, randwrite} × {qd 1, 8, 32}：
+fio --name=rr-4k-qd$QD --filename=/dev/vdb --direct=1 --rw=randread \
+    --bs=4k --iodepth=$QD --numjobs=1 --ioengine=libaio \
+    --ramp_time=15 --runtime=60 --time_based --randseed=8675309 \
+    --group_reporting --output-format=json
+# （randwrite 同參數，--rw=randwrite）
 
-# 2. 直接看 QEMU 命令列（-blockdev 的 aio / cache.direct）
-ps -ef | grep qemu-system | tr ',' '\n' | grep -E 'aio=|cache'
-
-# 3. 看 RBD 怎麼 map（queue_depth / alloc_size 等 map options）
-rbd showmapped
-cat /sys/bus/rbd/devices/<id>/config_info 2>/dev/null   # 視 kernel 版本
+# seqread / seqwrite 1M（readahead / striping 的主場）：
+fio --name=seq{read,write}-1m --filename=/dev/vdb --direct=1 \
+    --rw={read,write} --bs=1M --iodepth=16 --numjobs=1 --ioengine=libaio \
+    --ramp_time=15 --runtime=60 --time_based --group_reporting --output-format=json
 ```
 
-`virsh dumpxml` 出來的 `<driver name='qemu' type='raw' cache='...' io='...'/>` 就是 KubeVirt 把 VMI 欄位翻成 libvirt domain XML 的結果（參數目錄 ② 層）。每個實驗的「生效驗證」會指明該看哪個 attribute。
+v1 的矩陣沒有 seqread——整條 readahead 讀路徑等於沒測過，v2 補上（E-13 的主場）。
+
+每輪收的 metric：
+
+- **fio JSON**：IOPS、`clat` p50 / p99、BW。
+- **guest `/dev/vdb` iostat**：`await` / `aqu-sz`——guest 端邊界。
+- **host 端邊界**：krbd 軸收 `iostat -x /dev/rbdX`；librbd 軸沒有 host block device，改收 QMP `query-blockstats`（QEMU 自己量的 per-disk 延遲）與 `rbd perf image iostat`（ceph mgr 端 read-only）。
+- **QEMU thread CPU**：`/proc/<pid>/task/<tid>/schedstat` 前後差分（不用 top 瞬時值），另記 host loadavg。
+- **dmesg 增量**（krbd 軸）：盯 `bad crc` / socket closed——rxbounce 問題的訊號（E-14）。
+- **`ceph -s` 前後**：recovery / scrub / client io，判 tainted 與記錄併發負載。
+
+## 實驗總覽——總共要做這些
+
+狀態欄圖例：⬜ 未跑 ／ ✅ confirmed ／ ❌ violated ／ ➖ indistinguishable ／ 🚫 剪除（附原因）。
+
+| # | 實驗 | 變因（唯一） | 軸 | 預期（機制推論，一句話） | 狀態 |
+|---|---|---|---|---|---|
+| E-00 | pre-flight 盤點 | —（read-only） | — | 產出 environment snapshot，無預測 | ⬜ |
+| E-01 | krbd 可行性 | —（三關檢查） | krbd | 現代 kernel 對 PVE 預設 image features 應可 map | ⬜ |
+| E-02 | host 層天花板 | fio ioengine：libaio vs io_uring（host 直打 `/dev/rbdX`） | krbd | 高 QD 下兩者差異小、低 QD io_uring 略優；此數字是後續所有 VM 實驗的天花板 | ⬜ |
+| E-03 | VM baseline | —（PVE 預設全收） | 預設軸 | 得出噪音帶；虛擬化稅（guest − host 邊界延遲）占比未知（backlog H-003，無預測） | ⬜ |
+| E-04 | krbd vs librbd | storage 的 `krbd` 0/1（同規格 image、同 VM） | 雙 | 兩軸延遲/CPU 分布可測出差異；方向不預設（機制太不同，誠實留空） | ⬜ |
+| E-05 | cache 模式 | `qm set` disk `cache`：none / writethrough / writeback | 雙 | krbd 軸：writethrough 每寫帶 flush 最慢；librbd 軸：cache 控制 rbd_cache，writeback 小寫吸收明顯 | ⬜ |
+| E-06 | aio 模式 | `qm set` disk `aio`：io_uring / native / threads | 預設軸 | 高 QD 下 threads 落後於 native / io_uring；qd1 三者接近 | ⬜ |
+| E-07 | IOThread | `qm set` disk `iothread` 0/1 | 預設軸 | 單盤單流差異有限；高 QD 下 dedicated thread 降 p99 | ⬜ |
+| E-08 | queues 反向對照 | `--args` 強制 `num-queues=1` vs 預設 auto（=vCPU 數） | 預設軸 | 多 job 高 QD 下強制單 queue 明顯變差——反向證明預設多 queue 的價值 | ⬜ |
+| E-09 | image layout | `rbd create`：object-size 4M / 16M / striping | 雙 | striping 幫 seq 1M 吞吐、對 4k random 幫助有限；object-size 影響方向不預設 | ⬜ |
+| E-10 | queue_depth | 手動 map options `queue_depth`：64 / 128 / 256 | krbd | 高 QD 下 aqu-sz 能否跟著上去；per-hctx tag 語意（nr_hw_queues=CPU 數）先 T1 重推再寫精確預測 | ⬜ |
+| E-11 | guest scheduler | guest `/sys/block/vdb/queue/scheduler`：none vs 預設 | 預設軸 | RBD 底層已排程，guest 端 none 降 CPU 與 p99，但屬情境性 | ⬜ |
+| E-12 | alloc_size | 手動 map options `alloc_size` | krbd | 只影響對齊 / discard 行為，一般 read/write 預期 indistinguishable | ⬜ |
+| E-13 | readahead | guest / host `read_ahead_kb` | 雙 | seqread 吞吐對 readahead 敏感；random 不受影響 | ⬜ |
+| E-14 | rxbounce | 手動 map options `rxbounce` on/off | krbd | 若監看見 bad crc：rxbounce 消除 p99 尖峰；沒見到則兩者 indistinguishable | ⬜ |
+| E-15 | librbd cache 覆寫 | 自有 image `rbd image-meta set conf_rbd_cache` | librbd | 與 QEMU cache 設定的優先序先 T1/T2 釐清再寫預測（backlog H-028 Notes） | ⬜ |
+
+## 各實驗協定
+
+完整協定（E-02～E-06）含：變因、怎麼設、預期、生效驗證、結果回填。其餘精簡為一組短列。**所有「預期」都是機制推論、非實測**；回填表空著等真機數字。
+
+### E-00：pre-flight 盤點（read-only）
+
+盤點並回填：pve-qemu / kernel / ceph 版本、node 清單與 OSD 拓樸（哪些 node 跑 OSD——決定測試 VM 落點，避開 hyperconverged krbd 風險）、OSD 媒體（`ceph osd metadata` 的 rotational）、網路（`ethtool` link speed）、pool 清單與用量（`ceph df`）、storage.cfg、PVE 建 VM 的預設參數（`qm config`）、CPU governor、mClock profile（僅記錄）、node 上 fio 是否帶 rbd engine。
+
+**回填（environment snapshot）**：
+
+| 項目 | 值 |
+|---|---|
+| PVE 版本 / pve-qemu / kernel | |
+| ceph 版本 | |
+| node 數 / OSD 拓樸（hyperconverged?） | |
+| OSD 媒體 / 網路 | |
+| 測試 pool / 用量 | |
+| PVE VM 預設（cache / aio / bus / iothread） | |
+| mClock profile（僅記錄） | |
+
+### E-01：krbd 可行性三關
+
+1. 自建 throwaway image → 手動 `rbd map` → 讀寫 → `rbd unmap`。
+2. `rbd info` 檢查 PVE 建檔的預設 features 與 kernel rbd 相容性（不相容時 map 會報錯或要求 disable feature——只對自有測試 image 處理，不碰別人的）。
+3. storage.cfg 加專屬測試 storage id（同 pool、`krbd=1`）→ 掛一顆盤到測試 VM → 確認 host 出現 `/dev/rbdX` 且 VM 可讀寫。
+
+**回填**：krbd 可用？＿＿；image features：＿＿；不可用時的降級決定：＿＿
+
+### E-02：host 層天花板（完整協定）
 
-## 實驗 1：cache mode（完整協定）
+- **變因**：host 直接對手動 map 的 `/dev/rbdX` 跑矩陣，fio `ioengine=libaio` vs `io_uring` 兩變體。VM 完全不參與。
+- **怎麼設**：PVE node 上 `rbd map` 自建測試 image（pre-fill 後）→ 對 `/dev/rbdN` 跑矩陣兩輪（兩種 engine）→ `rbd unmap`。librbd 天花板：若 node 的 fio 帶 rbd engine（`fio --enghelp`）則加跑 `ioengine=rbd`，沒有就略過並記錄。
+- **預期（機制推論）**：這組數字是「不含任何虛擬化層」的 ceph 側天花板——後續所有 VM 實驗的分母。libaio vs io_uring 在高 QD 差異小（都是非同步批次提交），qd1 io_uring 系統呼叫開銷較低、略優。若這裡的 4k randwrite qd1 延遲已經數 ms 級，虛擬化層旋鈕的效果空間就很小——先知道這件事再解讀後面所有實驗。
+- **生效驗證**：`rbd showmapped` 對到正確 image；fio JSON 的 `ioengine` 欄位。
+- **回填**：
 
-對應參數目錄 🔴 `cache`（VMI `disks[].cache`）。這是 impact 最高、最容易驗證的旋鈕，且它會連帶觸發 `io` 的 auto 推導，一個實驗看兩件事。
+| 變體 | rr 4k qd1 IOPS / p99 | rr 4k qd32 IOPS | rw 4k qd32 IOPS | seqwrite 1M BW | verdict |
+|---|---|---|---|---|---|
+| libaio | | | | | |
+| io_uring | | | | | |
+| rbd engine（若可用） | | | | | |
 
-### 假設
+### E-03：VM baseline（完整協定）
 
-**機制上預期**：baseline（`cache` 留空）對 `/dev/rbdX` 不走 O_DIRECT；改成 `cache=none` 後，QEMU 用 `O_DIRECT` 開 block device（datapath §④ `raw_co_prw` 的 O_DIRECT 分支），且 converter 的 `SetOptimalIOMode` 會把 `io` 自動推成 `native`（參數目錄 ② 層）。所以這一改同時切換了「走不走 host page cache」與「用不用 native AIO」兩件事，機制上預期對 host submit 路徑的並行與一致性語意都有影響。**（推論，非實測——真實方向與幅度要量。）**
+- **變因**：無——PVE 預設全收（依 PVE 文件預設 `aio=io_uring`、cache=none；**以 pre-flight 讀到的實際值為準**），唯一固定選擇：測試資料盤走 `virtio` bus（virtio-blk，guest 內 `/dev/vdb`），對齊 datapath 頁的軸；boot 盤與資料盤分開，fio 只打資料盤。
+- **怎麼設**：cloud image + PVE cloud-init 建測試 VM（4 vCPU / 4GiB，fio 定版）；資料盤 32G、pre-fill。連跑 n≥5 輪矩陣，算每個 pattern 的 CoV → **噪音帶**。
+- **預期（機制推論）**：這輪回答兩件事——(1) 噪音帶多寬（決定後面所有實驗的可分辨度與 n）；(2) 虛擬化稅：guest `/dev/vdb` await 與 host 邊界延遲的差值占比。backlog H-003 對後者**沒有預測**（使用者答「沒概念」，這正是要量的原因）。
+- **生效驗證**：`qm config` 逐欄記錄；QEMU cmdline 確認 aio / cache 實際值；guest `ls /sys/block/vdb/mq/` 記錄 hw queue 數（順帶 T3 驗證前提 3——預期**已是多 queue**）。
+- **回填**：
 
-### VMI YAML diff（只改 cache 欄位）
+| pattern | IOPS（mean±CoV） | p99 | guest await | host 邊界 | 虛擬化稅占比 |
+|---|---|---|---|---|---|
+| rr 4k qd1 | | | | | |
+| rr 4k qd32 | | | | | |
+| rw 4k qd1 | | | | | |
+| rw 4k qd32 | | | | | |
+| seqread 1M | | | | | |
+| seqwrite 1M | | | | | |
 
-```yaml
-# File: 實驗 1 — 相對 baseline 只加 disks[].cache: none
-spec:
-  domain:
-    devices:
-      disks:
-        - name: datadisk
-          disk:
-            bus: virtio
-          cache: none        # ← 唯一改動；io 留空，觀察 auto 推導成 native
-```
+噪音帶（CoV）：＿＿；guest `/sys/block/vdb/mq/` hw queue 數：＿＿（預期 = vCPU 數）
 
-### fio 跑法
+### E-04：krbd vs librbd（頭牌，完整協定）
 
-引用共用 baseline 的 fio 矩陣，整組跑一遍（randread/randwrite × qd 1/8/32 + seqwrite）。重點看 qd1 的延遲與 qd32 的 IOPS。
+- **變因**：同規格測試 image、同一台 VM，唯一差別是掛法——librbd（`krbd=0` storage）vs krbd（`krbd=1` 專屬 storage id）。
+- **怎麼設**：兩個 storage id 指同一個 pool；資料盤各建一顆（同大小、同 features、都 pre-fill）；A/B 交錯跑矩陣。
+- **預期（機制推論）**：兩軸 datapath 結構不同（librbd 全在 QEMU process 內 user-space 直連 OSD；krbd 多過一層 host block layer + kernel messenger），延遲與 CPU 分佈**應可測出差異，但方向誠實不預設**——librbd 少一層 block queue 但多 user-space messenger 開銷，krbd 反之；哪邊贏由環境決定。這是 KubeVirt + ceph-csi 做不到的同機對照，也是「PVE 該用哪個」的直接答案。
+- **生效驗證**：librbd 變體 QEMU cmdline 應見 rbd 協定的 blockdev、host 無 `/dev/rbdX`；krbd 變體 `rbd showmapped` 有對應 device。
+- **回填**：
 
-但要注意一個陷阱：baseline 矩陣全部是 `--direct=1`，那是 **guest 端** 的 O_DIRECT，跟 cache 控制的 **host 端** 開檔方式是不同層。所以那組矩陣量到的主要是 auto 推導出的 `io=native` 那一半，**不是 page cache vs O_DIRECT 那一半**。要看出 cache 真正的分歧，cache 實驗要**額外加一個 buffered + fsync 工作負載**——這才是 host page cache（`writeback` / 留空）與 O_DIRECT（`cache=none`）會明顯分岔的地方：
+| pattern | librbd IOPS / p99 | krbd IOPS / p99 | Δ vs 噪音帶 | QEMU CPU（兩軸） | verdict |
+|---|---|---|---|---|---|
+| rr 4k qd1 | | | | | |
+| rr 4k qd32 | | | | | |
+| rw 4k qd32 | | | | | |
+| seqwrite 1M | | | | | |
 
-```bash
-# cache 實驗專屬：buffered + 頻繁 fsync，逼出 host 端開檔方式的差異
-fio --name=cache-buffered --filename=/dev/vda --ioengine=libaio \
-    --rw=randwrite --bs=4k --direct=0 --fsync=1 --iodepth=1 \
-    --runtime=60 --time_based --group_reporting
-```
+### E-05：cache 模式（完整協定）
 
-`cache=none`（O_DIRECT）下每個 write 直接落到 `/dev/rbdX`；`writeback` 下 host page cache 會吸收與合併，這個 job 的 IOPS / p99 在兩種 cache 下才會拉開。O_DIRECT 矩陣留著量 `io=native` 那半，這個 buffered job 量 page cache 那半，兩半合起來才是 cache 的完整效果。
+- **變因**：`qm set <vmid> --virtio1 ...,cache=X`——none / writethrough / writeback 三方（v1 只測 none 對「留空」，而那兩個是同一組設定；directsync 列選配）。
+- **預期（機制推論，分軸）**：
+  - **krbd 軸**：cache 控制 QEMU 開 `/dev/rbdX` 的方式。`writethrough` 下 guest 看到 write cache off、每個 write 等同帶 flush——4k randwrite 預期三者中最慢；`writeback` 走 host page cache、小寫可被吸收合併，但 fsync 密集時優勢消失；`none`（O_DIRECT）繞過 page cache、行為最穩定。
+  - **librbd 軸**：cache 控制的是 `rbd_cache`（見上方 `block/rbd.c` 錨點），host page cache 根本不在路徑上。`writeback`（rbd_cache=true）對小寫的吸收效果、與 `none`（rbd_cache=false）的差距，機制上預期比 krbd 軸的 page cache 效果更直接。
+  - v1 那條「buffered + fsync=1 拉開差異」的 job 已撤——機制上可疑（fsync=1 逼每寫落盤，兩種 cache 反而趨同）；v2 改成兩條對照：`direct=0` 無 fsync（看吸收效果）與 `direct=0 --fsync=1`（看 durability 成本），預期前者才拉得開。
+- **生效驗證**：QEMU cmdline 的 cache 相關旗標；librbd 軸可另以 `rbd image-meta` 與 QMP 確認（優先序見 E-15）。
+- **回填**（每軸一份）：
 
-### 收集 metric
+| 軸 | 變體 | rw 4k qd1 p99 | rw 4k qd32 IOPS | buffered 無 fsync IOPS | buffered fsync=1 p99 | verdict |
+|---|---|---|---|---|---|---|
+| krbd | none | | | | | |
+| krbd | writethrough | | | | | |
+| krbd | writeback | | | | | |
+| librbd | none | | | | | |
+| librbd | writethrough | | | | | |
+| librbd | writeback | | | | | |
 
-照「要收的 metric」全收。特別對照 guest `/dev/vda` 與 host `/dev/rbdX` 的 `iostat`：cache 改動主要影響 host 端開檔方式，看 host `/dev/rbdX` 的 `await` 有沒有動。
+### E-06：aio 模式（完整協定）
 
-### 生效驗證
+- **變因**：`qm set <vmid> --virtio1 ...,aio=X`——io_uring（PVE 預設）/ native / threads。PVE 直接暴露這顆旋鈕，v1 需要 hook sidecar 的問題不存在了。
+- **預期（機制推論）**：三種 host 提交模型（datapath §④ `raw_co_prw` 的三個分支）。高 QD 下 `threads`（thread pool 同步 pread/pwrite）預期落後 `native` / `io_uring`（非同步批次）；qd1 三者接近（單流延遲由 ceph 側主導）。與 E-02 的 host 層對照可以互相印證——如果 host 層 libaio vs io_uring 沒差，VM 層也不該有差。
+- **生效驗證**：QEMU cmdline `aio=` 值；`native` 需要 O_DIRECT（cache=none），維持 baseline 的 cache 設定。
+- **回填**：
 
-```bash
-virsh -c qemu:///system dumpxml <domain> | grep '<driver'
-# 預期看到 cache='none' io='native'（io 由 auto 推導補上，不是你寫的）
-ps -ef | grep qemu-system | tr ',' '\n' | grep -E 'cache.direct|aio='
-# 預期 cache.direct=on（O_DIRECT）且 aio=native
-```
+| 變體 | rr 4k qd32 IOPS / p99 | rw 4k qd32 IOPS / p99 | qd1 p99 | QEMU CPU | verdict |
+|---|---|---|---|---|---|
+| io_uring（預設） | | | | | |
+| native | | | | | |
+| threads | | | | | |
 
-關鍵驗證點：你只寫了 `cache: none`，但 `<driver/>` 的 `io` 應該變成 `native`——這就證明 `SetOptimalIOMode` 的 auto 推導生效了。若 `io` 還是 default，回頭確認後端確實是 block device（`disk.Source.Dev != ""`）。
+### E-07～E-15：精簡協定
 
-<Callout type="warning" title="前提與回退（改 cache 要重啟 VM）">
-  cache 是建立 domain 時就定的 `<driver/>` 屬性，**改它需要重啟 VM**（停掉再起，IO 會中斷）。回退：把 `cache: none` 那行拿掉、重新 apply VMI、重啟，就回到 baseline。重啟前確認 guest 已 flush（`sync`），避免在切換 cache 語意時遺漏未落地的寫入。
-</Callout>
+每條格式：**變因 → 預期（機制推論）→ 生效驗證 → 回填欄**。
 
-## 實驗 2：IOThreads（完整協定）
+**E-07 IOThread**：`qm set` disk `iothread=1` vs 0。→ 把這顆盤的 IO 處理搬離 QEMU main loop；單盤單流預期差異有限、高 QD 降 p99（main loop 不再兼職）。→ QEMU cmdline 出現 iothread 物件、cmdline 中 disk 綁定該 iothread。→ 回填：qd32 rr/rw IOPS、p99、main loop vs IOThread CPU 分佈、verdict：＿＿
 
-對應參數目錄 🟡 `ioThreadsPolicy` + `dedicatedIOThread`。把這顆 disk 的 virtio-blk 處理從 QEMU 主 loop 搬到專屬 IOThread。這裡要在實驗 1 的 `cache=none`（native AIO 已開）基礎上做——IOThread 的效果只有在 native AIO 提交路徑上才看得清楚。
+**E-08 queues 反向對照**：`qm set --args` 強制 `num-queues=1` vs 預設 auto（=vCPU 數）。→ 前提 3 的實測面：多 job 高 QD 下強制單 queue 預期明顯變差（所有 vCPU 擠一條 vring）；單流 qd1 預期沒差。特例：矩陣外加 `--numjobs=4` 的 rr/rw。→ guest `ls /sys/block/vdb/mq/` 目錄數 1 vs vCPU 數。→ 回填：numjobs=4 rr IOPS（1q vs auto）、guest mq 數、verdict：＿＿
 
-### 假設
+**E-09 image layout**：`rbd create --object-size {4M,16M}`、`--stripe-unit 64K --stripe-count 16` 三顆 image 各掛各測（建檔期參數不能改既有 image，逐顆建、測完刪）。→ striping 預期幫 seqwrite/seqread 1M（一個大 IO 打散到多 OSD）、4k random 幫助有限；object-size 4M vs 16M 方向不預設。→ `rbd info` 的 order / stripe_unit / stripe_count。→ 回填：seq 1M BW 三變體、rr 4k qd32、verdict：＿＿
 
-**機制上預期**：baseline 下 QEMU 在主 event loop 上處理這顆 disk 的 virtio-blk request（datapath §② host notifier、§③④ submit 都在主 loop）；設 `ioThreadsPolicy: auto` + `dedicatedIOThread: true` 後，這顆 disk 改由一條專屬 IOThread 的 AioContext 處理，機制上預期能把 IO 提交與 QEMU 其他工作（含其他盤）解耦，在高 QD / 多盤時減少主 loop 排隊。對單盤單流低 QD，機制上預期差異有限。**（推論，非實測。）**
+**E-10 queue_depth**：手動 `rbd map -o queue_depth={64,128,256}` + 以 raw path 掛給 VM。→ krbd 的 blk-mq tag 深度；但 pinned kernel 顯示 `nr_hw_queues = num_present_cpus()`（`rbd.c` 約 L4962），queue_depth 是 per-hctx 深度——實際 in-flight 上限與 v1 敘述不同，**精確預測等 T1 重推完才寫**；觀測聚焦高 QD 下 host `aqu-sz` 上得去否。→ `/sys/block/rbdN/queue/nr_requests` 讀值 + 同時記 scheduler（讀值語意受 scheduler 影響）。→ 回填：qd32 rw IOPS / host aqu-sz（64/128/256）、verdict：＿＿
 
-### VMI YAML diff（只改 IOThread 相關欄位）
+**E-11 guest scheduler**：guest `echo none > /sys/block/vdb/queue/scheduler` vs 預設。→ RBD 底層已排程，guest 再排一次通常多餘；預期 none 降 guest CPU 與 p99，幅度情境性。→ `cat .../scheduler` 中括號在 `[none]`。→ 回填：rw 4k qd32 p99、guest CPU、verdict：＿＿
 
-```yaml
-# File: 實驗 2 — 相對實驗 1 再加 ioThreadsPolicy + dedicatedIOThread
-spec:
-  domain:
-    ioThreadsPolicy: auto        # ← 新增
-    devices:
-      disks:
-        - name: datadisk
-          disk:
-            bus: virtio
-          cache: none
-          dedicatedIOThread: true # ← 新增（註解明寫此項 implies useIOThreads）
-```
+**E-12 alloc_size**：手動 map options `alloc_size`（power of 2、≤ object size）。→ 只影響 io_min/io_opt 對齊與 discard 粒度；一般 read/write **預期 indistinguishable**（這是少數預測「沒差」的實驗——若量出顯著差異反而是 violated，值得追）；discard 場景（guest `fstrim`）才預期有感。→ `/sys/block/rbdN/queue/minimum_io_size`。→ 回填：rr/rw 4k qd32、fstrim 時長、verdict：＿＿
 
-### fio 跑法
+**E-13 readahead**：guest 與 host（krbd 軸）`read_ahead_kb` 各掃低/預設/高三檔。→ seqread 1M 吞吐預期對 readahead 敏感（預讀命中），random 不受影響；guest 與 host 兩層 readahead 的疊加行為是開放問題。→ sysfs 讀值。→ 回填：seqread BW × 檔位矩陣、verdict：＿＿
 
-引用 baseline 的 fio 矩陣整組跑。IOThread 的差異主要在高並行，重點對照 qd32 的 randread/randwrite IOPS 與 p99；qd1 預期變化小（驗證上面「單流影響有限」的推論方向）。
+**E-14 rxbounce**：手動 map options `rxbounce` on/off（kernel 6.8 支援已驗：`net/ceph/ceph_common.c` 約 L299）。→ guest 在 read 飛行中改寫 buffer 會讓 krbd 收包 CRC 驗證失敗、messenger 連線重建、p99 尖峰；**條件預測**——若全程 dmesg 見 `bad crc`：rxbounce=on 消除尖峰（confirmed）；若從未出現：兩者 indistinguishable 且「此 workload 不觸發」本身就是結論。→ dmesg 增量 + map options 回讀。→ 回填：bad crc 出現？＿＿；rr 4k qd32 p99（on/off）、verdict：＿＿
 
-### 收集 metric
+**E-15 librbd cache 覆寫**：自有 image `rbd image-meta set conf_rbd_cache false/true`。→ per-image 覆寫與 QEMU `rados_conf_set` 的優先序**先 T1/T2 釐清再寫預測**（backlog H-028 Notes）——這一條的價值是確立 librbd 軸上「per-image 調 cache 而不動 VM 設定」是否可行。→ QMP + 行為對照（小寫吸收有無）。→ 回填：優先序結論：＿＿；verdict：＿＿
 
-除了標準 metric，這個實驗特別要看 **QEMU thread CPU**：`top -H -p <qemu-pid>`，確認多了一條 IOThread、且它在跑 fio 時吃 CPU（代表 IO 真的搬到它上面）。對照主 loop thread 的 CPU 有沒有下降。
+## 結果回填規範
 
-### 生效驗證
+- 每個實驗跑完，回填該節的表格 + 把總覽表狀態欄從 ⬜ 改成 verdict 圖示。
+- 數字一律來自 evidence bundle（`experiments/rbd-io-perf/results/`，不進 git；`EVIDENCE-SUMMARY-<date>.md` 索引進 git）——**頁面上不出現沒有 bundle 對應的數字**。
+- `indistinguishable` 是正當結果：這個環境量不出這顆旋鈕，寫進表裡，比硬掰一個方向誠實。
+- 所有絕對數字都綁 E-00 的 environment snapshot，不可外推到其他環境。
 
-```bash
-virsh -c qemu:///system dumpxml <domain> | grep -E '<iothreads>|iothread='
-# 預期看到 <iothreads>N</iothreads> 且該 disk 的 <driver ... iothread='X'/>
-virsh -c qemu:///system qemu-monitor-command <domain> --hmp 'info iothreads'
-```
+## 邊界：什麼情況這些實驗白做
 
-關鍵驗證點：disk 的 `<driver/>` 要帶 `iothread='X'`，且 `<iothreads>` 數量大於 0。注意參數目錄提到 converter 只對 **virtio bus** 的 disk 設 IOThread——baseline 已經是 `bus: virtio`，符合。
+v1 的這節大部分仍然成立，v2 補三條：
 
-## 實驗 3：blockMultiQueue（完整協定）
-
-對應參數目錄 🟡 `blockMultiQueue`（VMI `devices.blockMultiQueue`）。讓 guest virtio-blk 協商出多條 virtqueue，多 vCPU 各走一條 vring 平行提交（datapath §①②）。
-
-### 假設
-
-**機制上預期**：baseline 是單 virtqueue，所有 vCPU 的 IO 都擠同一條 vring、共用 §② 那次 kick 的鎖；開 `blockMultiQueue: true` 後 converter 把 `driver.queues` 設成 vCPU 數（這裡 4），不同 vCPU 各走一條 vring，機制上預期能拉開 §①② 的並行度、減少 kick 路徑爭用。前提是 workload 真的多 vCPU 並行發 IO（`numjobs > 1` 或 guest 內多執行緒）；單流 fio 機制上預期沒差。**（推論，非實測。）**
-
-### VMI YAML diff（只改 blockMultiQueue）
-
-```yaml
-# File: 實驗 3 — 相對實驗 1 再加 devices.blockMultiQueue
-spec:
-  domain:
-    devices:
-      blockMultiQueue: true       # ← 新增；converter 會把 driver.queues 設成 vCPU 數
-      disks:
-        - name: datadisk
-          disk:
-            bus: virtio
-          cache: none
-```
-
-### fio 跑法
-
-這個實驗要改 fio 的並行維度才量得出效果：在 baseline 矩陣外，**額外**跑 `--numjobs=4`（對齊 4 vCPU）的版本，例如：
-
-```bash
-# 多 job 平行，逼出多 queue 的效果
-fio --name=randread-4k-mq --filename=/dev/vda --direct=1 \
-    --rw=randread --bs=4k --iodepth=8 --numjobs=4 \
-    --ioengine=libaio --runtime=60 --time_based --group_reporting
-```
-
-對照「baseline 單 queue 的 numjobs=4」與「本實驗多 queue 的 numjobs=4」，差值才是多 queue 的貢獻。
-
-### 收集 metric
-
-標準 metric 全收。多 queue 的效果在 guest 端並行提交，重點看 guest `/dev/vda` 的 `iostat` 在多 job 下 `aqu-sz` 有沒有上去、以及 QEMU 各 vCPU thread 的 CPU 分佈是否更均勻。
-
-### 生效驗證
-
-```bash
-virsh -c qemu:///system dumpxml <domain> | grep -E 'queues='
-# 預期 disk 的 <driver ... queues='4'/>（等於 vCPU 數）
-# guest 內：
-ls /sys/block/vda/mq/        # 預期看到多個 hw queue（mq/0 mq/1 ...）
-```
-
-關鍵驗證點：guest 內 `/sys/block/vda/mq/` 應出現多個 hw queue 目錄（不是只有 `mq/0`）。注意參數目錄提醒：converter 那個 `multiQueueMaxQueues = 256` 是**網路**介面的 cap，不是 block——block 直接用 vCPU 數，別預期 block queue 會被 256 限制。
-
-## 實驗 4：aio mode（完整協定）
-
-對應參數目錄 🔴 `aio mode`（QEMU `-blockdev` 的 `aio`：threads / native / io_uring）。這是 host 端 submit 模型的核心岔路（datapath §④ `raw_co_prw`）。
-
-### 假設
-
-**機制上預期**：`threads` 走 QEMU thread pool 的同步 `pread`/`pwrite`；`native` 走 Linux native AIO（`laio_co_submit`）；`io_uring` 走 `luring_co_submit`。三者是三種提交模型，機制上預期在高 QD 下對 batching 與並行能力影響最大——native / io_uring 的非同步批次提交通常比 thread pool 更能餵滿 host 到 OSD 這段。**（推論，非實測。）**
-
-### 怎麼設這三個值
-
-這裡有個誠實的限制要講清楚：**KubeVirt 的 VMI `io` 欄位只給到 `native` / `default` / `threads`，不直接暴露 `io_uring`**（參數目錄 ① 層 `io`、② 層 `aio mode`）。所以：
-
-- `threads` 與 `native` 可以直接用 VMI `io` 欄位切：
-  ```yaml
-  # File: 實驗 4 變體 A/B — 用 VMI io 欄位切 threads / native
-  spec:
-    domain:
-      devices:
-        disks:
-          - name: datadisk
-            disk: { bus: virtio }
-            cache: none
-            io: threads     # 變體 A：強制 thread pool（覆蓋 auto 推導）
-            # io: native    # 變體 B：強制 native AIO
-  ```
-  注意：手填 `io` 會**跳過** `SetOptimalIOMode` 的 auto 推導（參數目錄 ② 層明寫「一旦手填 io，auto 路徑被跳過」）——這正好讓你拿實驗 1 的 auto-native 跟這裡的手填 native 對照，確認兩條路徑等價。
-- `io_uring` 走的是 QEMU `-blockdev aio=io_uring`（datapath §④ `luring_co_submit`），VMI 這層的 `io` 欄位給不到。要量 io_uring，得在 libvirt domain XML / QEMU 命令列那層設（參數目錄 ② 層 `aio mode`），且 host kernel 與 QEMU 編譯時都要支援 io_uring。本實驗對 io_uring 只在「環境支援時」列為第三個變體，方法同其他兩個。
-
-### fio 跑法
-
-三個變體（threads / native / io_uring）各跑一次完整 baseline 矩陣。重點看 qd32 的 IOPS 與 p99——提交模型的差異在高並行最明顯。
-
-### 收集 metric
-
-標準 metric 全收。aio mode 改的是 host 端提交，重點對照 host `/dev/rbdX` 的 `iostat`（`aqu-sz` 反映 in-flight 並行）與 QEMU thread CPU（`threads` 模式會看到 thread pool worker 吃 CPU，`native`/`io_uring` 則是少數 IOThread 吃 CPU）。
-
-### 生效驗證
-
-```bash
-ps -ef | grep qemu-system | tr ',' '\n' | grep 'aio='
-# 變體 A 預期 aio=threads；變體 B 預期 aio=native；io_uring 變體預期 aio=io_uring
-virsh -c qemu:///system dumpxml <domain> | grep '<driver'
-# <driver ... io='threads'/> 或 io='native'（io_uring 在 XML 可能顯示為 io='io_uring'，視 libvirt 版本）
-```
-
-關鍵驗證點：`native` / `io_uring` 都要求 `cache.direct=on`（即 `cache: none`），缺了 QEMU 會直接報「it requires cache.direct=on」（參數目錄 ② 層 `cache.direct`）——所以這三個變體都建立在 `cache: none` 之上。
-
-## 實驗 5：RBD object-size / striping（完整協定）
-
-對應參數目錄 🟡 `RBD object-size` + `RBD striping`。這兩個決定一個 IO 在 RADOS 怎麼切成 object、打散到幾個 OSD（datapath §⑤ `rbd_img_fill_from_bio`）。
-
-### 假設
-
-**機制上預期**：預設 object-size 4MiB、無 striping 時，一個 4K write 通常落在單一 object（單一 obj_request、單一 primary OSD）。改 object-size 改變「一個 IO 落在同一 object 的機率」；加 striping（`stripe-unit` / `stripe-count`）把連續 IO 打散到多個 object 進而多個 OSD，機制上預期對**大順序 IO**（seqwrite 1M）的並行吞吐有結構性幫助，對小隨機 4K 幫助有限。**（推論，非實測。）**
-
-### 怎麼設（建檔期決策，必須重建 image）
-
-<Callout type="danger" title="破壞性：object-size / striping 不能改既有 image，必須重建">
-  object-size 與 striping 是**建檔期**參數，**建立後不能改既有 RBD image**（參數目錄 ⑤ 層明列「建檔期決策，不可改」）。要測不同值，必須**新建 image / 新 PVC**，不能原地改。
-  <br/>
-  **前提**：準備一個獨立測試 pool / image，不要動正式資料盤。
-  <br/>
-  **回退**：每個變體用獨立 PVC，測完 `kubectl delete pvc` + `rbd rm` 清掉即可；baseline 的 PVC 全程不動。
-</Callout>
-
-變體用 `rbd create` 直接建測試 image（或在 ceph-csi StorageClass 帶對應參數後動態建 PVC）：
-
-```bash
-# File: 實驗 5 — 建不同 layout 的測試 image（獨立測試 pool）
-# 變體 A：預設 4MiB object，無 striping（對照組）
-rbd create testpool/img-4m   --size 20G --object-size 4M
-
-# 變體 B：較大 object
-rbd create testpool/img-16m  --size 20G --object-size 16M
-
-# 變體 C：striping（連續 IO 打散到多 object）
-rbd create testpool/img-stripe --size 20G --object-size 4M \
-    --stripe-unit 64K --stripe-count 16
-```
-
-每個變體各自接成一個 `volumeMode: Block` PV / PVC，掛進一台跟 baseline 同規格的 VMI（cache=none、其餘 baseline）。
-
-### fio 跑法
-
-每個 image 變體各跑完整矩陣，**特別看 `seqwrite-1m`**（striping 的主場）。小隨機 4K 也跑，用來驗證「對小隨機幫助有限」這個推論方向。
-
-### 收集 metric
-
-標準 metric 全收。striping 的效果在「一個大 IO 同時打到多個 OSD」，重點看 host `/dev/rbdX` 的 `iostat` throughput（`wMB/s`）以及——若你有 ceph 端觀測——多個 OSD 是否同時受載（`ceph osd perf`）。
-
-### 生效驗證
-
-```bash
-rbd info testpool/img-stripe
-# 預期 order（object-size 的 log2）、stripe_unit、stripe_count 對得上你建立時的值
-# 例：order=22 即 4MiB；stripe_unit / stripe_count 顯示 striping 設定
-rbd showmapped     # 確認 host 上對到哪個 /dev/rbdN
-```
-
-關鍵驗證點：`rbd info` 的 `stripe_unit` / `stripe_count` 要等於你建立的值；`order` 換算回 object-size（order=22 → 4MiB、order=24 → 16MiB）。
-
-## 實驗 6：queue_depth（完整協定，🔴）
-
-對應參數目錄 🔴 `queue_depth`（`rbd map --options`，ceph-csi StorageClass `mapOptions`）。它是 host 端 `/dev/rbdX` 到 OSD 這一段的並行上限（datapath §⑤ `rbd_queue_workfn` 之前的排隊容量）。是 🔴，所以給它接近完整的協定。
-
-### 假設
-
-**機制上預期**：queue_depth 直接設 krbd 的 blk-mq `tag_set.queue_depth`，也就是 host 端允許的 in-flight request 數。baseline 用 krbd 預設（`RBD_QUEUE_DEPTH_DEFAULT = BLKDEV_DEFAULT_RQ`）；拉高它，機制上預期能在高 QD workload 下讓更多 request 同時在 host→OSD 路徑上飛，不被 host 端的 tag 數卡住。前提是 ceph 端吃得下這個並行——拉太高只是把壓力堆到 OSD，不會更快（參數目錄風險欄）。**（推論，非實測。）**
-
-### 怎麼設（透過 ceph-csi StorageClass mapOptions）
-
-queue_depth 是 `rbd map` 的 option，ceph-csi 透過 StorageClass 的 `mapOptions` 傳進來（參數目錄 ④ 層 `appendKRbdDeviceTypeAndOptions`：使用者的 `mapOptions` 接在預設 `noudev` 後面、可覆寫）。
-
-```yaml
-# File: 實驗 6 — StorageClass 帶 queue_depth；用它動態建新 PVC
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ceph-rbd-qd128
-provisioner: rbd.csi.ceph.com
-parameters:
-  # ... 其餘 ceph-csi 參數同你既有的 rbd StorageClass ...
-  mapOptions: "queue_depth=128"     # ← 變體：64（預設附近）/ 128 / 256 各建一個 SC
-mountOptions: []
-```
-
-<Callout type="warning" title="前提與回退：換 mapOptions 要重新 map（新 PVC / 重掛）">
-  `mapOptions` 在 `rbd map` 時生效，**改它要重新 map**——最乾淨的做法是用新 StorageClass 建新 PVC、掛到新 VMI。不要對線上盤熱改。回退：刪掉測試 SC / PVC 即可，baseline 不受影響。queue_depth 拉太高會增加 OSD 端壓力與 host memory 佔用（參數目錄風險欄），從 128 之類的值起步、對照 ceph 端負載再決定要不要更高。
-</Callout>
-
-### fio 跑法
-
-每個 queue_depth 變體（如 64 / 128 / 256）各跑完整矩陣，**重點在 qd32 的並行點**——queue_depth 是並行上限，低 QD（qd1）機制上預期看不出差異，把它當對照即可。
-
-### 收集 metric
-
-標準 metric 全收。queue_depth 改的是 host 端並行容量，**最關鍵的觀測是 host `/dev/rbdX` 的 `iostat` `aqu-sz`**：拉高 queue_depth 後，高 QD fio 下 `aqu-sz` 能不能跟著上去（上不去代表瓶頸不在這、在更下游的 ceph）。
-
-### 生效驗證
-
-```bash
-rbd showmapped       # 確認 image 對到哪個 /dev/rbdN
-cat /sys/block/rbdN/queue/nr_requests
-# 預期反映你設的 queue_depth（krbd 把 opts->queue_depth 套進 tag_set.queue_depth）
-dmesg | grep -i rbd  # map 時的 options 也會留痕，可交叉確認
-```
-
-關鍵驗證點：host `/sys/block/rbdN/queue/nr_requests` 應反映你設的 queue_depth。若沒變，確認 `mapOptions` 字串真的被帶進 `rbd map`（ceph-csi 把它接在 `--options noudev` 後）。
-
-## 實驗 7～9：osd_op_num_shards / guest scheduler / alloc_size（精簡協定）
-
-剩下三個是 🟡，採精簡協定：每個只給「假設（推論／非實測）→ 改哪個旋鈕 → 量哪個 metric → 生效驗證一行」。
-
-### 實驗 7：osd_op_num_shards
-
-- **假設**：增加每個 OSD 的 shard 數（各有獨立處理 queue，PG 平均分配），機制上預期提高 OSD 端處理並行度，讓 ceph 那一側吃得下更多並行——但這是 ceph 側旋鈕，改善的是 datapath §⑤ 之後 OSD 內部，不是虛擬化層；要搭 OSD CPU 與媒體型態一起看。**（推論，非實測。）**
-- **改哪個旋鈕**：`ceph config set osd osd_op_num_shards <N>`（預設 0 → 用 `_hdd`/`_ssd` 變體：HDD 1、SSD 8）。
-- **量哪個 metric**：高 QD 下 host `/dev/rbdX` 的 throughput / `await`，以及 ceph 端 `ceph osd perf`；對照改 shard 前後同一組 fio。
-- **生效驗證一行**：`ceph config get osd osd_op_num_shards` 回傳你設的值。
-- **破壞性 / 回退**：
-
-<Callout type="danger" title="破壞性：osd_op_num_shards 是 startup flag，要重啟 OSD">
-  `osd_op_num_shards` 是 `startup` flag，**改完要重啟 OSD 才生效**，且屬 **cluster 範圍**設定、影響所有 pool（參數目錄 ⑤ 層）。前提：在維護視窗、確認 cluster `HEALTH_OK`、一次重啟一個 OSD 並等 recovery 完成再動下一個，避免同時拉低多個 OSD。回退：`ceph config set osd osd_op_num_shards 0`（回預設）後同樣逐一重啟 OSD。深入見 [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore)。
-</Callout>
-
-### 實驗 8：guest IO scheduler
-
-- **假設**：底層是 RBD（ceph 端已排程），guest 端再排一次通常多餘；把 guest scheduler 從預設切成 `none`，機制上預期降低 guest 內 CPU 與排程延遲（datapath §① 進 `virtio_queue_rq` 之前）——但強依 workload，屬情境性。**（推論，非實測。）**
-- **改哪個旋鈕**：guest 內 `echo none > /sys/block/vda/queue/scheduler`（可選值 none / mq-deadline / bfq / kyber）。
-- **量哪個 metric**：guest 內 randwrite 的 p99 與 guest CPU（`mpstat`），對照切換前後同一組 fio。
-- **生效驗證一行**：`cat /sys/block/vda/queue/scheduler` 顯示 `[none]`（中括號標示生效中）。
-- **前提 / 回退**：純 guest 內 sysfs、非破壞性、即時生效；回退把值寫回原本的 scheduler 即可。必須在你環境實測，不能照抄（不同 workload 結論可能相反）。
-
-### 實驗 9：alloc_size
-
-- **假設**：`alloc_size` 被 krbd 設成 block queue 的 `io_min`/`io_opt` 並當 discard 對齊粒度（datapath §⑤ 切 object 與 discard punt），機制上預期影響的是 IO 對齊與 discard 行為，對一般 read/write throughput 是次要旋鈕，對 discard 密集 / 對齊敏感 workload 才明顯。**（推論，非實測。）**
-- **改哪個旋鈕**：`rbd map --options alloc_size=<2 的次方>`（透過 ceph-csi StorageClass `mapOptions`，預設 64KiB；必須是 power of 2 且不大於 object size，否則 krbd 報錯 / 調回 object size）。
-- **量哪個 metric**：對齊敏感的 mixed-size fio（如 `--bs=4k` vs `--bs=64k`）與 discard 場景（`fio --rw=trim` 或 guest `fstrim`）下的延遲；一般 throughput 預期變化小（驗證「次要旋鈕」推論）。
-- **生效驗證一行**：`cat /sys/block/rbdN/queue/minimum_io_size` 反映你設的 `alloc_size`。
-- **前提 / 回退**：同 queue_depth——是 map option，改它要重新 map（新 PVC / 重掛），不要熱改線上盤；回退刪測試 SC / PVC。
-
-## 結果記錄模板
-
-跑完每個實驗，把數字填進這張表。**這裡刻意留空——所有 cell 都是你環境跑出來的，本頁不預填任何數字。** 一個實驗的一個 fio pattern 填一列；同一實驗的不同變體（如 aio threads / native / io_uring）各填一列方便對照。
-
-| 實驗 | 變體 | fio pattern (rw/bs/qd) | guest IOPS | guest p50 (µs) | guest p99 (µs) | host /dev/rbdX await (ms) | host aqu-sz | QEMU/IOThread CPU% | 備註 |
-|------|------|------------------------|-----------|----------------|----------------|---------------------------|-------------|--------------------|------|
-| baseline | — | randread 4k qd1 |  |  |  |  |  |  |  |
-| baseline | — | randread 4k qd32 |  |  |  |  |  |  |  |
-| baseline | — | randwrite 4k qd32 |  |  |  |  |  |  |  |
-| baseline | — | seqwrite 1m |  |  |  |  |  |  |  |
-| 1 cache | cache=none |  |  |  |  |  |  |  |  |
-| 2 IOThreads | dedicated |  |  |  |  |  |  |  |  |
-| 3 blockMultiQueue | queues=vCPU |  |  |  |  |  |  |  |  |
-| 4 aio | threads |  |  |  |  |  |  |  |  |
-| 4 aio | native |  |  |  |  |  |  |  |  |
-| 4 aio | io_uring |  |  |  |  |  |  |  |  |
-| 5 layout | 4M / 16M / stripe |  |  |  |  |  |  |  |  |
-| 6 queue_depth | 64 / 128 / 256 |  |  |  |  |  |  |  |  |
-| 7 osd shards | N |  |  |  |  |  |  |  |  |
-| 8 scheduler | none |  |  |  |  |  |  |  |  |
-| 9 alloc_size | 變體 |  |  |  |  |  |  |  |  |
-
-填表時的紀律：先把 baseline 四列量滿，後面每個實驗的數字都跟對應 baseline 列比。差距落在 guest 端（guest p99 動、host await 沒動）= 虛擬化層的改善；落在 host 端（host await / aqu-sz 動）= ceph / 並行容量這段的改善。
-
-## 邊界：什麼情況這些參數無感 / 反效果
-
-把幾個容易白做工的情境先講清楚，省得量了半天發現旋鈕根本沒被觸發：
-
-- **低 QD 量並行旋鈕 = 看不出差異**：queue_depth、blockMultiQueue、IOThreads、aio mode 都是「拉高並行天花板」的旋鈕。只跑 qd1 / 單流，機制上它們本來就不該有差——別據此下「這旋鈕沒用」的結論。要在 qd32 / 多 job 下看。
-- **瓶頸不在你調的那一層**：如果 host `/dev/rbdX` 的 `await` 本來就很高（ceph / 網路是大頭），那 host 之上的旋鈕（cache、IOThreads、blockMultiQueue）再怎麼調，guest 端延遲也下不去——先用 host iostat 把「ceph 側 vs 虛擬化側」切開（datapath 頁的除錯原則），再決定調哪一層。
-- **queue_depth / osd shards 拉過頭 = 反效果**：兩者都是「把更多並行壓往 OSD」。ceph 端吃不下時，拉高它們只是堆積壓力、增加尾延遲與 memory 佔用，不會更快。要對照 ceph 端負載（`ceph osd perf` / OSD CPU）一起看。
-- **手填 io 跳過 auto 推導**：實驗 4 手填 `io` 後，`SetOptimalIOMode` 的 `cache=none ⇒ io=native` 推導被跳過（參數目錄 ② 層）。如果你手填了 `io: threads` 又期待它跑 native，會搞混自己——這是「改了卻沒生效」的常見來源，靠生效驗證步驟抓。
-- **guest scheduler / rq_affinity / alloc_size 強依環境**：這幾個的結論跨環境不可移植，不同 workload / 媒體型態可能得到相反答案。只信你自己環境的數字，別照抄任何外部 benchmark。
-- **object-size / striping 改不動既有盤**：實驗 5 必須重建 image。在既有盤上 `rbd info` 看到舊 layout 卻以為改了，是另一個白做工來源——一律新建 PVC 量。
+- **E-02 的天花板先看**：如果 host 層 4k randwrite qd1 延遲已經數 ms，虛擬化層旋鈕（E-05～E-08）大概全部 indistinguishable——這不是實驗失敗，是這個環境的真實答案（瓶頸在 ceph 側，調 VM 參數沒用）。
+- **生產叢集的別人負載**：交錯執行 + 併發負載記錄能吸收大部分，但若某輪 `ceph -s` 顯示 recovery/backfill，該輪一定作廢重跑——recovery 對延遲的干擾遠超過任何旋鈕效果。
+- **mClock 天花板**：ceph v19 預設 mclock_scheduler，QoS profile 可能封頂 client IOPS。我們不動它（read-only 記錄），但解讀高 QD 實驗時要拿它對照——天花板可能是 mClock 不是你調的旋鈕。
 
 ## 接下來 / 相關頁面
 
-<Callout type="info" title="計畫跑完，回頭對照 datapath 與目錄">
-  這頁把參數目錄的 🔴 / 🟡 旋鈕排成一組受控實驗：共用 baseline + fio 矩陣抽一次，Top 5（cache / IOThreads / blockMultiQueue / aio / object-size·striping）寫完整協定，queue_depth 近完整，osd_op_num_shards / guest scheduler / alloc_size 精簡。所有假設都標明是機制推論、非實測；數字要你在自己環境填進文末空表。
+<Callout type="info" title="計畫 v2 的執行狀態看總覽表">
+  16 個實驗項的 verdict 會隨執行回填到本頁。研究方法的完整紀錄（hypothesis backlog、Gate 裁示、evidence 規則）在 repo `experiments/rbd-io-perf/HYPOTHESES.md`；harness 實作在 `experiments/rbd-io-perf/`。
 
-  - [VM Disk IO datapath](./rbd-io-datapath) — 每個實驗的「假設」都連回它的某一跳；量延遲時對照它的兩個 iostat 邊界與除錯原則
-  - [VM Disk IO 調教參數目錄](./rbd-io-tuning-catalog) — 本頁挑的旋鈕、impact 等級與原始碼來源都在這份目錄的總表裡
-  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) — 實驗 7 `osd_op_num_shards` 之後 OSD 端怎麼落地，ceph 側那段的延伸
+  - [VM Disk IO datapath](./rbd-io-datapath) — 每個實驗的預期都連回這條路徑的某一跳；krbd / librbd 兩軸的差異也從這裡長出來
+  - [VM Disk IO 調教參數目錄](./rbd-io-tuning-catalog) — 旋鈕的五層目錄；本頁三條被推翻的前提也會回頭修正該頁對應條目
+  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) — E-02 天花板之後 ceph 側的延伸
 </Callout>
