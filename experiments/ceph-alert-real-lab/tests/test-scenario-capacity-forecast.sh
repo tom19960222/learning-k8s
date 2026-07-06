@@ -14,8 +14,14 @@ ok() { printf 'ok: %s\n' "$*"; }
 # evidence (see the physics comment near the top of scenario-capacity-forecast.sh)
 # showed that even a 16-PG/size-3/single-stream/-t128 redesign only sustained
 # 0.33-0.72 MB/s (3x replication write-amplification collapsing throughput
-# under BlueStore backpressure) -- the probed fix is size=1 (32 PGs) fed by
-# THREE parallel streams at -t 64 each, sustaining 6.9 MB/s.
+# under BlueStore backpressure) -- the fix that actually sustains growth is
+# THREE parallel streams at -t 64 each, still at DEFAULT replication
+# (size=3/min_size=2, 32 PGs): a later real-lab attempt discovered that
+# `pool set size 1` is EPERM-disabled on v19.2.3 (needs an extra mon config
+# toggle we don't want to make), so the 6.9 MB/s probe measurement was
+# actually taken at size=3 the whole time -- replication multiplies logical
+# writes into the RAW usage the rule tracks, so size=3 alone clears the
+# needed slope; size=1 was never necessary.
 grep -Eq 'FORECAST_BENCH_THREADS="\$\{FORECAST_BENCH_THREADS:-64\}"' "$SCRIPT" || fail "missing FORECAST_BENCH_THREADS default of 64 (per-stream concurrency)"
 grep -Eq 'FORECAST_ROUND_SECONDS="\$\{FORECAST_ROUND_SECONDS:-90\}"' "$SCRIPT" || fail "missing FORECAST_ROUND_SECONDS default of 90"
 grep -Eq 'FORECAST_MAX_ROUNDS="\$\{FORECAST_MAX_ROUNDS:-60\}"' "$SCRIPT" || fail "missing FORECAST_MAX_ROUNDS default of 60"
@@ -265,8 +271,8 @@ total_round_count="$(grep -Ec '^ssh:sudo -n cephadm shell -- rados bench -p aler
 [[ "$total_round_count" -eq 9 ]] || fail "expected 3 streams * 3 rounds = 9 total bench invocations, got $total_round_count"
 
 grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool create alert-forecast 32$' "$live_trace_file" || fail "missing 32-PG pool create"
-grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast size 1 --yes-i-really-mean-it$' "$live_trace_file" || fail "missing pool size=1 set (with --yes-i-really-mean-it)"
-grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast min_size 1$' "$live_trace_file" || fail "missing pool min_size=1 set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast size 3$' "$live_trace_file" || fail "missing pool size=3 set"
+grep -q '^ssh:sudo -n cephadm shell -- ceph osd pool set alert-forecast min_size 2$' "$live_trace_file" || fail "missing pool min_size=2 set"
 
 result_dir="$(find "$ROOT/results" -maxdepth 1 -type d -name 'capacity-forecast-*' | sort | tail -1)"
 for stream_n in 1 2 3; do
@@ -300,7 +306,7 @@ grep -q '^ssh:sudo -n cephadm shell -- ceph config set osd bluestore_slow_ops_wa
 grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_lifetime$' "$live_trace_file" || fail "rollback did not restore warn_lifetime default"
 grep -q '^ssh:sudo -n cephadm shell -- ceph config rm osd bluestore_slow_ops_warn_threshold$' "$live_trace_file" || fail "rollback did not restore warn_threshold default"
 
-ok "capacity-forecast destructive ack guard, 32-PG size=1 pool, 3-parallel-stream t64 loop injection with distinct run-names, and BlueStore-cleanup rollback ordering"
+ok "capacity-forecast destructive ack guard, 32-PG size=3 pool, 3-parallel-stream t64 loop injection with distinct run-names, and BlueStore-cleanup rollback ordering"
 
 # --- Async lifetime: the whole point of the loop-of-rounds design is that
 # each round's rados bench keeps running independent of the ssh round-trip

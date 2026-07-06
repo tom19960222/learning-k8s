@@ -12,7 +12,7 @@ source "$ROOT/lib/scenarios.sh"
 # shellcheck source=/Users/ikaros/Documents/code/learning-k8s/experiments/ceph-alert-real-lab/lib/scenario-framework.sh
 source "$ROOT/lib/scenario-framework.sh"
 
-# REAL-LAB EVIDENCE (physics, not a rule bug) -- FIX ROUND 2. Two real-lab
+# REAL-LAB EVIDENCE (physics, not a rule bug) -- FIX ROUND 3. Three real-lab
 # attempts at this scenario have now measured actual sustained throughput on
 # the ~900GiB (966329892864-byte) cluster:
 #
@@ -24,32 +24,39 @@ source "$ROOT/lib/scenario-framework.sh"
 #
 #   Run 2 (16-PG pool, size 3, single stream, -t 128): still only sustained
 #   0.33-0.72 MB/s despite bursting as high as 12.8 MB/s -- throughput
-#   repeatedly collapsed back down under BlueStore backpressure once 3x
-#   replication write-amplification caught up with the burst. More PGs and
-#   more threads inside ONE stream did not fix it: 3x replication was eating
-#   the throughput budget, and a single stream has nowhere to hide a
-#   per-stream stall (the whole pipe idles while it recovers).
+#   repeatedly collapsed back down under BlueStore backpressure. More PGs
+#   and more threads inside ONE stream did not fix it: a single stream has
+#   nowhere to hide a per-stream stall (the whole pipe idles while it
+#   recovers).
 #
-#   PROBE RESULT (10-minute sustained measurement, the fix below): a size=1
-#   pool (32 PGs) fed by THREE PARALLEL held-open bench streams (-t 64 each)
-#   sustains 6.9 MB/s raw cluster-usage growth, stable across the full 10
-#   minutes -- 2.2x the ~3.2 MB/s floor CephCapacityForecast's rule needs.
-#   Dropping replication to size=1 removes the write-amplification tax
-#   entirely (the growth under test is raw-used, not replicated-used, so
-#   replication factor is not part of the growth semantics being tested);
-#   running 3 streams in parallel means one stream's transient BlueStore
-#   stall no longer stalls the aggregate slope -- the other two keep it alive.
+#   Run 3 (this fix): the round-2 probe's setup step (`ceph osd pool set
+#   alert-forecast size 1 --yes-i-really-mean-it`) actually fails outright on
+#   v19.2.3 with `Error EPERM: configuring pool size as 1 is disabled by
+#   default` (needs an extra `mon_allow_pool_size_one=true` mon config we do
+#   NOT want to toggle just for this scenario) -- and that failure was
+#   silent, so the 10-minute probe that measured 6.9 MB/s sustained RAW
+#   growth actually ran the whole time at the pool's DEFAULT size=3 (still
+#   32 PGs, still 3 parallel held-open bench streams at -t 64 each). That is
+#   good news, not a new problem: CephCapacityForecast's rule tracks
+#   ceph_cluster_total_used_bytes -- RAW used bytes -- and 3x replication
+#   multiplies logical writes into raw growth (~2.3 MB/s logical x 3
+#   replicas ~= 6.9 MB/s raw), so size=3 alone already clears the ~3.2 MB/s
+#   floor below with room to spare. size=1 is unnecessary (and disabled by
+#   default anyway): keep default replication (size 3 / min_size 2,
+#   matching every other scenario's pool hygiene) and rely on the 3 parallel
+#   streams for the concurrency that actually mattered.
 #
 # CephCapacityForecast (max(predict_linear(ceph_cluster_total_used_bytes[1h],
 # 259200)) > 0.85 * max(ceph_cluster_total_bytes), for: 30m) needs a
 # sustained write slope of at least (821GB - current_used) / 72h ~= 3.2
 # MB/s for predict_linear's 72h (259200s) extrapolation to clear the
-# threshold. At the probed ~6.9 MB/s, the projection crosses the ~821GB
-# threshold once the [1h] least-squares window's average slope exceeds
-# 3.2 MB/s (~25-35 minutes of fill), then 30 more continuous minutes for
-# `for: 30m` to latch -- a realistic fire time of ~55-70 minutes wall-clock.
-# Bump PROMETHEUS_WAIT_ATTEMPTS to 900 attempts * 5s = 4500s (75m) to cover
-# the worst case of that window. A real (--yes-really-inject) run of this
+# threshold. At the probed ~6.9 MB/s RAW (size=3, 32 PGs, 3 parallel
+# streams), the projection crosses the ~821GB threshold once the [1h]
+# least-squares window's average slope exceeds 3.2 MB/s (~25-35 minutes of
+# fill), then 30 more continuous minutes for `for: 30m` to latch -- a
+# realistic fire time of ~55-70 minutes wall-clock. Bump
+# PROMETHEUS_WAIT_ATTEMPTS to 900 attempts * 5s = 4500s (75m) to cover the
+# worst case of that window. A real (--yes-really-inject) run of this
 # scenario therefore takes up to ~75 MINUTES of wall-clock time -- do not
 # run it interactively without expecting a long wait.
 PROMETHEUS_WAIT_ATTEMPTS="${PROMETHEUS_WAIT_ATTEMPTS:-900}"
@@ -65,12 +72,13 @@ POOL="${FORECAST_POOL:-alert-forecast}"
 FORECAST_MAX_ROUNDS="${FORECAST_MAX_ROUNDS:-60}"
 FORECAST_ROUND_SECONDS="${FORECAST_ROUND_SECONDS:-90}"
 # 64 concurrent writer threads PER STREAM: the real-lab probe (see the
-# physics comment above) measured exactly this shape -- a size=1 pool (32
-# PGs) fed by 3 parallel streams at -t 64 each -- sustaining 6.9 MB/s raw
-# growth. A single stream at higher concurrency (-t 128, run 2's design)
-# collapsed to 0.33-0.72 MB/s under BlueStore backpressure; parallelizing
-# across 3 independent streams instead of piling more threads onto one
-# absorbs a single stream's transient stall without stalling the aggregate.
+# physics comment above) measured exactly this shape -- a size=3 pool (32
+# PGs, default replication) fed by 3 parallel streams at -t 64 each --
+# sustaining 6.9 MB/s raw growth. A single stream at higher concurrency
+# (-t 128, run 2's design) collapsed to 0.33-0.72 MB/s under BlueStore
+# backpressure; parallelizing across 3 independent streams instead of
+# piling more threads onto one absorbs a single stream's transient stall
+# without stalling the aggregate.
 FORECAST_BENCH_THREADS="${FORECAST_BENCH_THREADS:-64}"
 LOOP_PID_1=""
 LOOP_PID_2=""
@@ -186,16 +194,18 @@ stop_forecast_loop() {
 }
 
 scenario_setup() {
-  # 32 PGs + size=1 (down from the previous design's size 3): the real-lab
-  # probe (see the physics comment above) measured that 3x replication --
-  # not PG count or bench concurrency -- was the actual throughput ceiling
-  # on these disks. size=1 still genuinely grows cluster raw usage (the
-  # metric CephCapacityForecast's rule tracks); replication factor is not
-  # part of the growth semantics being tested here, and keeping it at 3x
-  # starved the needed slope (see run 2's real-lab measurement above).
+  # 32 PGs at DEFAULT replication (size 3 / min_size 2, matching every
+  # other scenario's pool hygiene): the real-lab probe (see the physics
+  # comment above) turned out to have silently kept size=3 the whole time
+  # (`size 1 --yes-i-really-mean-it` is EPERM-disabled on v19.2.3 without an
+  # extra mon config toggle we do not want to make) and still sustained 6.9
+  # MB/s of RAW growth -- 3x replication multiplies logical writes into raw
+  # usage, which is exactly the metric CephCapacityForecast's rule tracks,
+  # so size=3 clears the needed slope on its own. No need to fight the
+  # cluster's size-1 guardrail at all.
   run_live_step "pool-create" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool create $POOL 32"
-  run_live_step "pool-set-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL size 1 --yes-i-really-mean-it"
-  run_live_step "pool-set-min-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL min_size 1"
+  run_live_step "pool-set-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL size 3"
+  run_live_step "pool-set-min-size" "$LAB_MON_01_HOST" "sudo -n cephadm shell -- ceph osd pool set $POOL min_size 2"
 }
 
 scenario_inject() {
