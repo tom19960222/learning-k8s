@@ -139,6 +139,9 @@ collect_prometheus() {
   done
   [[ -n "$outdir" && -n "$manifest" && -n "$url" ]] || { usage >&2; return 1; }
 
+  # tolerate operator-pasted trailing slashes; path segments below add their own /
+  while [[ "$url" == */ ]]; do url="${url%/}"; done
+
   local promdir="$outdir/cluster/prometheus"
   local masked_url window start_epoch end_epoch deadline missing
   masked_url="$(prom_mask_url "$url")"
@@ -203,7 +206,7 @@ collect_prometheus() {
   while IFS= read -r job; do
     [[ -n "$job" ]] || continue
     jobs_seen_str="${jobs_seen_str:+$jobs_seen_str }$job"
-    if printf '%s' "$job" | grep -qiE "$job_regex"; then
+    if printf '%s' "$job" | grep -qiE -- "$job_regex"; then
       # shellcheck disable=SC1003 # literal backslash-in-glob pattern below, not an escaped quote
       case "$job" in
         *'"'*|*'\'*)

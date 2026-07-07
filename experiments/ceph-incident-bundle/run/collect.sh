@@ -442,10 +442,10 @@ main() {
   fi
   [[ "$kube_mode" == "local" || "$kube_mode" == "remote" ]] || die "invalid --kube-mode (local|remote): $kube_mode"
   if [[ -n "$prom_url" ]]; then
-    local num_re='^[0-9]+$'
+    local num_re='^[0-9]+$' step_re='^[1-9][0-9]*$'
     prom_duration_seconds "$since" >/dev/null \
       || die "--since must be N/Ns/Nm/Nh/Nd/Nw when using --prom-url: $since"
-    [[ -z "$prom_step" || "$prom_step" =~ $num_re ]] || die "invalid --prom-step (seconds): $prom_step"
+    [[ -z "$prom_step" || "$prom_step" =~ $step_re ]] || die "invalid --prom-step (positive seconds): $prom_step"
     [[ "$prom_timeout" =~ $num_re ]] || die "invalid --prom-timeout (seconds): $prom_timeout"
   fi
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"

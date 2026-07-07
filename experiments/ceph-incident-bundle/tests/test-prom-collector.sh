@@ -133,6 +133,7 @@ test_missing_python3() {
   for c in mkdir date dirname; do
     ln -s "$(command -v "$c")" "$bin/$c"
   done
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
   ( PATH="$bin"
     collect_prometheus --out "$wd" --manifest "$wd/manifest.jsonl" \
       --url http://prom.example:9090 --since 24h ) || rc=$?
@@ -227,6 +228,27 @@ test_metric_listing_failure() {
   grep -qF 'metric listing failed for job ceph' "$wd/errors.log" || fail "errors.log should record listing failure"
 }
 
+test_trailing_slash_url() {
+  local wd="$tmpdir/wd-slash"
+  : >"$FAKE_CURL_LOG"
+  mkdir -p "$wd"
+  : >"$wd/manifest.jsonl"
+  : >"$wd/errors.log"
+  : >"$wd/environment.txt"
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
+  ( PATH="$fakebin:$PATH"
+    collect_prometheus --out "$wd" --manifest "$wd/manifest.jsonl" \
+      --url http://prom.example:9090/ --since 24h ) || fail "trailing-slash URL should still work"
+  grep -qF '9090//api' "$FAKE_CURL_LOG" && fail "double slash must not appear in request URLs" || true
+}
+
+test_dash_leading_job_regex() {
+  local wd="$tmpdir/wd-dashre" rc=0 err
+  err="$( run_prom "$wd" --since 24h --job-regex '-zzz' 2>&1 >/dev/null )" || rc=$?
+  [[ "$rc" == "2" ]] || fail "dash-leading regex with no match should return 2, got $rc"
+  case "$err" in *"grep:"*) fail "grep must not treat the regex as options: $err" ;; esac
+}
+
 test_duration_parser
 test_auto_step
 test_mask_url
@@ -243,5 +265,7 @@ test_redaction_excludes_metric_dumps
 test_targets_failure
 test_job_listing_failure
 test_metric_listing_failure
+test_trailing_slash_url
+test_dash_leading_job_regex
 
 printf 'ok: prom collector\n'

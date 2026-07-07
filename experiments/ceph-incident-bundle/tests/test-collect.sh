@@ -549,6 +549,10 @@ prom_bad_timeout="$(run_and_capture "$ROOT/run/collect.sh" --prom-url http://pro
 prom_bad_timeout_status="${prom_bad_timeout%%$'\n'*}"
 [[ "$prom_bad_timeout_status" == "1" ]] || fail "non-numeric --prom-timeout should exit 1, got $prom_bad_timeout_status"
 
+prom_zero_step="$(run_and_capture "$ROOT/run/collect.sh" --prom-url http://prom.example:9090 --prom-step 0 --inventory "$inventory" --ssh-key "$ssh_key")"
+prom_zero_step_status="${prom_zero_step%%$'\n'*}"
+[[ "$prom_zero_step_status" == "1" ]] || fail "--prom-step 0 should exit 1, got $prom_zero_step_status"
+
 # ---------------------------------------------------------------------------
 # --prom-url: metrics dump lands inside the bundle; only matching jobs dumped
 # ---------------------------------------------------------------------------
