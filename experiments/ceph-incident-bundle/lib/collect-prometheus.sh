@@ -179,6 +179,7 @@ collect_prometheus() {
   started="$(date -u +%FT%TZ)"
   detail="$(prom_curl "$url" /api/v1/targets "$promdir/targets.json" "$timeout" 2>&1)" && rc=0 || rc=$?
   if [[ $rc -ne 0 ]]; then
+    rm -f -- "$promdir/targets.json"
     prom_error "$outdir" "prometheus targets fetch failed (curl exit $rc): $detail"
     failed=1
   fi

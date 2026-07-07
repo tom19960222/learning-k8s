@@ -176,6 +176,36 @@ test_long_window_step() {
   grep -qF 'step=61' "$FAKE_CURL_LOG" || fail "7d window should query with step=61"
 }
 
+test_targets_failure() {
+  local wd="$tmpdir/wd-targets" rc=0 p
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
+  ( export FAKE_CURL_FAIL_PATHS='/api/v1/targets'; run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "targets failure should return 2, got $rc"
+  p="$wd/cluster/prometheus"
+  [[ ! -f "$p/targets.json" ]] || fail "failed targets fetch must not leave targets.json"
+  [[ -f "$p/buildinfo.json" ]] || fail "buildinfo should still be collected"
+  [[ -f "$p/ceph/ceph_health_status.json.gz" ]] || fail "metric dumps should still proceed"
+  grep -qF 'targets fetch failed' "$wd/errors.log" || fail "errors.log should record targets failure"
+}
+
+test_job_listing_failure() {
+  local wd="$tmpdir/wd-joblist" rc=0
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
+  ( export FAKE_CURL_FAIL_PATHS='/api/v1/label/job/values'; run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "job listing failure should return 2, got $rc"
+  grep -qF 'job listing failed' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED should say job listing failed"
+}
+
+test_metric_listing_failure() {
+  local wd="$tmpdir/wd-namelist" rc=0 p
+  # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
+  ( export FAKE_CURL_FAIL_PATHS='/api/v1/label/__name__/values'; run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "metric listing failure should return 2, got $rc"
+  p="$wd/cluster/prometheus"
+  grep -qF 'FAILED: metric listing for job ceph' "$p/ceph/index.txt" || fail "index should record listing failure"
+  grep -qF 'metric listing failed for job ceph' "$wd/errors.log" || fail "errors.log should record listing failure"
+}
+
 test_duration_parser
 test_auto_step
 test_mask_url
@@ -188,5 +218,8 @@ test_single_metric_failure
 test_budget_truncation
 test_unsafe_job_name
 test_long_window_step
+test_targets_failure
+test_job_listing_failure
+test_metric_listing_failure
 
 printf 'ok: prom collector\n'

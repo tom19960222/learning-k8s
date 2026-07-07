@@ -6,6 +6,7 @@ set -euo pipefail
 # Knobs (env):
 #   FAKE_CURL_LOG           append each invocation's argv here (required)
 #   FAKE_CURL_DOWN=1        every request fails as a connect error (exit 7)
+#   FAKE_CURL_FAIL_PATHS    space-separated URL substrings whose requests 500
 #   FAKE_CURL_FAIL_METRICS  space-separated metrics whose query_range 500s
 #   FAKE_CURL_JOBS_JSON     override the /label/job/values response body
 
@@ -31,6 +32,17 @@ if [[ "${FAKE_CURL_DOWN:-}" == "1" ]]; then
   printf 'curl: (7) Failed to connect to prometheus\n' >&2
   exit 7
 fi
+
+for fp in ${FAKE_CURL_FAIL_PATHS:-}; do
+  case "$url" in
+    *"$fp"*)
+      # mimic real curl creating/truncating the -o output before failing
+      [[ -n "$out" ]] && printf 'partial' >"$out"
+      printf 'curl: (22) The requested URL returned error: 500\n' >&2
+      exit 22
+      ;;
+  esac
+done
 
 param_for() {
   local key=$1 p
