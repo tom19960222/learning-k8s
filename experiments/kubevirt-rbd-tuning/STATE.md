@@ -7,7 +7,11 @@
 
 - 2026-07-07 Frame/Enumerate/Gate1 完成；P0（H-001/002/003/006/020）T1 查證完成並回填 HYPOTHESES.md。
 - 2026-07-07 Azure quota 實查：全 region cores=65、LSv3=65；主案 L32s_v3 需調 quota（見 AZURE-ENV-SPEC）。
-- 2026-07-08 RUNBOOK.md 完成。**下一步：等使用者交付環境 → 填 RUNBOOK §0 表格 → E-00。**
+- 2026-07-08 RUNBOOK.md 完成。
+- 2026-07-08 環境交付（cyshih-kubevirt-ceph-lab @japanwest）並體檢通過：3mon+9osd HEALTH_OK、
+  kubevirt v1.5.0 ✓、ceph-csi v3.14.0 ✓、kernel 6.8 ✓、RWX Block PVC 實測 Bound ✓、
+  cephadm systemd unit 形式 ✓（E-32/35/36 注入手法可用）。RUNBOOK §0 已填實際值。
+  **下一步：建 tools/ + manifests/（RUNBOOK §2.5/§3）→ E-00 正式盤點。**
 - （之後每行格式：`E-XX done <bundle path> — <一句話結論>`）
 
 ## 待辦（環境到手後依序）
@@ -21,3 +25,10 @@
 
 - E-13 預先修正：KubeVirt 無法強制 queues=1，實驗降級為 no-op 驗證（RUNBOOK §4 E-13，設計期已知）。
 - E-20 預設走 host 層對照（csi 靜態供應繁瑣），VM 層 optional。
+- 環境 vs 規格書（2026-07-08 體檢，全部可接受）：
+  - OSD = **L8s_v3 fallback**（1 實體 NVMe 切 3 OSD，非 L32s 主案）→ E-22 與 per-OSD 隔離類解讀力降，同碟鄰居效應寫結論時標註。
+  - ceph 19.2.4（pinned 19.2.3，patch 版差）；Ubuntu 22.04（kernel 6.8-azure，krbd 對齊不受影響）；k8s 1.32.13。
+  - CSI = 原生 ceph-csi（非 Rook external）；SC `ceph-rbd` 的 imageFeatures 只有 `layering`；
+    RUNBOOK §3 的 SC 模板 secret 名改用 `csi-rbd-secret@ceph-csi-rbd`、clusterID=FSID。
+  - guest key 用 `~/.ssh/azure-lab.pub`（非 repo key）；kubectl 可直接於 Mac 執行。
+  - 生命週期歸 azure-iac-lab repo 的 make（stop=清 NVMe+自動重建）；共享訂閱只准動 cyshih-*。

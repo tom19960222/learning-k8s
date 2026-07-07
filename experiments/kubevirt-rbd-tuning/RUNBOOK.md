@@ -6,46 +6,46 @@
 
 ---
 
-## 0. 環境與存取（開工前填好）
+## 0. 環境與存取（✅ 2026-07-08 已交付實填；體檢通過）
 
-使用者交付環境後，把實際值填進本節表格（直接編輯本檔或寫進 `STATE.md`）：
+環境 = `cyshih-kubevirt-ceph-lab`（japanwest；IaC 在 `~/Documents/code/azure-iac-lab`，
+連線細節與生命週期見該 repo `ACCESS.md`——public IP、`make stop/start/destroy`）。
+**NSG 只放行使用者固定 IP 的 22/6443 → 必須在使用者的 Mac（同對外 IP）上執行。**
 
-| 變數 | 說明 | 值（交付後填） |
-|---|---|---|
-| `MON1/MON2/MON3` | ceph mon VM IP | 10.60.1.__ |
-| `OSD1/OSD2/OSD3` | ceph OSD node IP | 10.60.1.__ |
-| `K8SCP` | k8s controller IP | 10.60.2.__ |
-| `K8SW1/K8SW2` | k8s worker IP | 10.60.2.__ |
-| `FSID` | ceph cluster fsid（`ceph fsid`） | |
-| `SSHKEY` | 一律 repo 內 `.ssh/id_ed25519` | 固定 |
+| 變數 | 值 |
+|---|---|
+| `MON1/2/3` | `20.89.248.174` / `40.74.64.220` / `20.89.232.116`（cyshih-mon-{0,1,2}） |
+| `OSD1/2/3` | `20.89.233.19` / `20.78.146.15` / `20.89.232.246`（cyshih-osd-{0,1,2}；私網 10.0.2.x、**ceph cluster 網 10.0.3.x**） |
+| `K8SCP` | `20.89.248.121`（cyshih-k8s-0；worker：`20.63.217.150` / `20.78.153.64`） |
+| `FSID` | `ab33c12c-7a5c-11f1-913a-894a658522d3` |
+| ssh | user=`azureuser`、key=`~/.ssh/azure-lab`（**不是** repo key） |
+| pool / SC | `kubevirt`（size3/min_size2/pg64）；SC=`ceph-rbd`（default，krbd，`imageFeatures: layering`，secret=`csi-rbd-secret@ceph-csi-rbd`） |
+| 版本 | ceph **19.2.4**（pinned 19.2.3，patch 差）、ceph-csi **v3.14.0** ✓、KubeVirt **v1.5.0** ✓、k8s v1.32.13、Ubuntu 22.04 + kernel **6.8**-azure ✓ |
+| OSD 硬體 | **L8s_v3 fallback 案**：每台 1 顆實體 NVMe 1.7T 切 3 OSD（各 ~100G，叢集 900G）——E-22/per-OSD 隔離解讀力降（同碟鄰居），寫結論時標註 |
 
 **本機（macOS bastion）注意**：bash 3.2（無 mapfile/nameref、空陣列 + `set -u` 會爆）、無 `timeout`、無 `gh`；中文字串內變數一律寫 `${var}`。詳見 repo `CLAUDE.md`。
 
-**標準 ssh 包裝**（所有遠端指令都走這個形式，選項逐個寫死、不要用變數串）：
+**標準入口**（zsh 下用函式，不要用含空白的變數展開）：
 
 ```bash
-SSH='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none -o ConnectTimeout=10'
-$SSH ikaros@$MON1  'sudo cephadm shell -- ceph -s'          # ceph 指令入口
-$SSH ikaros@$K8SCP 'sudo k0s kubectl get nodes'             # kubectl 入口
+s(){ ssh -i ~/.ssh/azure-lab -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no -o ConnectTimeout=15 "$@"; }
+ceph_c(){ s azureuser@20.89.248.174 "sudo ceph $*"; }        # mon 有 ceph-common，不用 cephadm shell
+kc(){ s azureuser@20.89.248.121 "kubectl $*"; }              # cp 的 azureuser 已有 kubeconfig
+# kubectl 也可直接在 Mac 跑（ACCESS.md §3 匯 kubeconfig）——大量操作時比 ssh 快
 ```
 
-以下縮寫（在你的工作 shell 定義成函式）：
+**guest 存取**：VMI 起來後 `kc get vmi -n vmtest baseline -o jsonpath='{.status.interfaces[0].ipAddress}'`，經 cp 跳板：
 
 ```bash
-ceph_c(){ $SSH ikaros@$MON1 "sudo cephadm shell -- ceph $*"; }
-kc()    { $SSH ikaros@$K8SCP "sudo k0s kubectl $*"; }
+guest(){ s -o ProxyJump=azureuser@20.89.248.121 ubuntu@$GUEST_IP "$*"; }
+# 不通則 fallback：s azureuser@20.89.248.121 "ssh -o StrictHostKeyChecking=no ubuntu@$GUEST_IP '$*'"
+#（cloud-init 注入的 key 用 ~/.ssh/azure-lab.pub，manifest §3 的 YOUR_PUBKEY 以它取代）
 ```
 
-**guest 存取**：VMI 起來後 `kc get vmi -n vmtest baseline -o jsonpath='{.status.interfaces[0].ipAddress}'` 取 pod IP，從 K8SCP **跳板** ssh 進 guest（cloud-init 已注入同一把 key）：
-
-```bash
-guest(){ $SSH -o ProxyJump=ikaros@$K8SCP ubuntu@$GUEST_IP "$*"; }
-# 若 ProxyJump 到 pod IP 不通（pod 網段路由問題），fallback：
-#   $SSH ikaros@$K8SCP "ssh -o StrictHostKeyChecking=no ubuntu@$GUEST_IP '$*'"
-#   （先把 repo key 放上 K8SCP 的 ~/.ssh/，記入 deviation log）
-```
-
-**成本紀律**：離場時提醒使用者關機；只 `az vm stop`（不 deallocate，NVMe 保留）。需要 az 的步驟（E-31/E-41）若你沒有 az 權限，把指令交給使用者執行並等結果。
+**環境特性（影響實驗的三件事）**：
+1. `make stop` = deallocate = **NVMe 清空**；`make start` 自動重建 ceph（IaC 內建）→ 每個 ceph 世代 E-01 sentinel 要重驗（§4 E-01）、跨世代數字不可直接比。
+2. RWX Block PVC 已實測 Bound ✓（migration 前提成立）；Kyverno policy `rbd-block-disk-group` 給 pod GID 6 開 RBD 裸裝置——E-00 snapshot 要收這條 policy。
+3. E-31/E-41 的 `az vm stop` 操作 **RG=cyshih-kubevirt-ceph-lab、只准動 cyshih-* 資源**（共享訂閱）；無 az 權限就把指令交給使用者。
 
 ---
 
