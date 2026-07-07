@@ -21,11 +21,13 @@ for path in \
   "$ROOT/lib/collect-cluster-cephadm.sh" \
   "$ROOT/lib/collect-cluster-rook.sh" \
   "$ROOT/lib/collect-node.sh" \
+  "$ROOT/lib/collect-prometheus.sh" \
   "$ROOT/lib/verify-bundle.sh" \
   "$ROOT/tests/test-collect.sh" \
   "$ROOT/tests/test-cephadm-collector.sh" \
   "$ROOT/tests/test-node-collector.sh" \
   "$ROOT/tests/test-rook-collector.sh" \
+  "$ROOT/tests/test-prom-collector.sh" \
   "$ROOT/tests/test-verify-bundle.sh"; do
   [[ -f "$path" ]] || fail "missing $path"
 done
@@ -82,6 +84,11 @@ rook_collector_args="$(run_and_capture "$ROOT/tests/test-rook-collector.sh")"
 rook_collector_status="${rook_collector_args%%$'\n'*}"
 rook_collector_output="${rook_collector_args#*$'\n'}"
 [[ "$rook_collector_status" == "0" ]] || fail "test-rook-collector.sh failed: $rook_collector_output"
+
+prom_collector_args="$(run_and_capture "$ROOT/tests/test-prom-collector.sh")"
+prom_collector_status="${prom_collector_args%%$'\n'*}"
+prom_collector_output="${prom_collector_args#*$'\n'}"
+[[ "$prom_collector_status" == "0" ]] || fail "test-prom-collector.sh failed: $prom_collector_output"
 
 collect_args="$(run_and_capture "$ROOT/tests/test-collect.sh")"
 collect_status="${collect_args%%$'\n'*}"
