@@ -40,10 +40,11 @@ printf 'up\n' > "$FAKE_SSH_DIR/qm agent 1031 ping"
 export VMID=1031 POOL="ioperf" GUEST_USER="root"
 
 # vm_create smoke test: check command structure
-vm_create /mnt/img.raw /home/ioperf/k.pub
+vm_create /mnt/img.raw
 grep -q 'qm create 1031' "$FAKE_SSH_LOG" || { echo "vm_create missing 'qm create 1031'"; cat "$FAKE_SSH_LOG"; exit 1; }
 grep -q 'import-from=/mnt/img.raw' "$FAKE_SSH_LOG" || { echo "vm_create missing 'import-from=/mnt/img.raw'"; cat "$FAKE_SSH_LOG"; exit 1; }
-grep -q -- '--ide2 ioperf:cloudinit' "$FAKE_SSH_LOG" || { echo "vm_create missing '--ide2 ioperf:cloudinit'"; cat "$FAKE_SSH_LOG"; exit 1; }
+grep -q -- '--ide2 ioperf:cloudinit' "$FAKE_SSH_LOG" || { echo "vm_create missing ide2"; exit 1; }
+grep -q -- '--cicustom user=ds216j:snippets/ioperf-user-data.yaml' "$FAKE_SSH_LOG" || { echo "vm_create missing cicustom"; exit 1; }
 
 # vm_attach_data smoke test
 : > "$FAKE_SSH_LOG"  # Clear log for cleaner assertions

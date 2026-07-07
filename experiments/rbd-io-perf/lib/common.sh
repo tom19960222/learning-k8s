@@ -11,6 +11,9 @@ RESULTS_DIR="${RESULTS_DIR:-$RBDPERF_ROOT/results}"
 POOL="${POOL:-ioperf}"
 VMID="${VMID:-1031}"
 GUEST_USER="${GUEST_USER:-ubuntu}"
+SNIPPET_STORAGE="${SNIPPET_STORAGE:-ds216j}"
+SNIPPET_PATH="${SNIPPET_PATH:-/mnt/pve/ds216j/snippets/ioperf-user-data.yaml}"
+SNIPPET_VOL="${SNIPPET_VOL:-ds216j:snippets/ioperf-user-data.yaml}"
 
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }

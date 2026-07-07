@@ -25,8 +25,8 @@ pve_ssh "ls $CLOUDIMG" >/dev/null 2>&1 || die "cloud image 不存在: ${CLOUDIMG
 b="$(new_bundle baseline)"
 write_prediction "$b" "E-03: 量噪音帶（CoV）與虛擬化稅占比（H-003 無先驗預測）。guest /sys/block/vdb/mq 預期 = vCPU 數（H-026）。"
 
-pve_ssh 'cat > /home/ioperf/ioperf.pub' < "$SSH_KEY.pub"
-vm_create "$CLOUDIMG" /home/ioperf/ioperf.pub
+vm_upload_snippet "$(cat "$SSH_KEY.pub")"
+vm_create "$CLOUDIMG"
 vm_attach_data "$POOL:16"
 vm_cold_restart
 ip="$(vm_guest_ip)"

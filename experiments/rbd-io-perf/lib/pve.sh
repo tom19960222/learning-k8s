@@ -9,15 +9,39 @@ _vmid_guard() {
   esac
 }
 
+# Upload a cloud-init user-data snippet that installs qemu-guest-agent
+# (NOT in Ubuntu cloud images by default — without it vm_guest_ip can never
+# work) plus fio/sysstat, and embeds the given public key.
+vm_upload_snippet() {
+  local pubkey_line="$1"
+  pve_ssh "sudo -n tee $SNIPPET_PATH >/dev/null" <<EOF
+#cloud-config
+hostname: ioperf-test
+users:
+  - name: $GUEST_USER
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - $pubkey_line
+package_update: true
+packages:
+  - qemu-guest-agent
+  - fio
+  - sysstat
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+EOF
+}
+
 vm_create() {
-  local img="$1" pubkey="$2"
+  local img="$1"
   _vmid_guard
   pve_ssh "sudo -n qm create $VMID --name ioperf-test --cores 4 --memory 4096 \
 --net0 virtio,bridge=vmbr1 --scsihw virtio-scsi-single --agent 1 --ostype l26"
   pve_ssh "sudo -n qm set $VMID --virtio0 $POOL:0,import-from=$img"
   pve_ssh "sudo -n qm disk resize $VMID virtio0 10G"
-  pve_ssh "sudo -n qm set $VMID --ide2 $POOL:cloudinit --ciuser $GUEST_USER \
---sshkeys $pubkey --ipconfig0 ip=dhcp --boot order=virtio0"
+  pve_ssh "sudo -n qm set $VMID --ide2 $POOL:cloudinit --cicustom user=$SNIPPET_VOL \
+--ipconfig0 ip=dhcp --boot order=virtio0"
 }
 
 vm_attach_data() {
@@ -40,8 +64,10 @@ vm_cold_restart() {
     sleep 5
   done
   pve_ssh "sudo -n qm start $VMID"
+  # timeout: qm agent ping blocks for minutes when no agent is listening;
+  # bound each attempt so 30 attempts stay ~5 minutes total.
   for i in $(seq 1 30); do
-    if pve_ssh "sudo -n qm agent $VMID ping >/dev/null 2>&1 && echo up" | grep -q up; then
+    if pve_ssh "sudo -n timeout 10 qm agent $VMID ping >/dev/null 2>&1 && echo up" | grep -q up; then
       return 0
     fi
     sleep 5
@@ -68,7 +94,7 @@ vm_assert_cmdline() {
 
 vm_guest_ip() {
   _vmid_guard
-  pve_ssh "sudo -n qm agent $VMID network-get-interfaces" | python3 -c '
+  pve_ssh "sudo -n timeout 10 qm agent $VMID network-get-interfaces" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 for itf in d.get("result", d if isinstance(d, list) else []):
