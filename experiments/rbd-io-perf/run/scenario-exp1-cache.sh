@@ -21,10 +21,19 @@ require_inject_flag "$@"
 ROUNDS="${SCEN_ROUNDS:-3}"
 BASE="${DATA_SPEC:-ioperf:vm-1031-disk-1}"
 
+# PVE9 -blockdev JSON 的生效特徵（F4 first-contact 實測）：
+#   writethrough → device token 帶 write-cache=off
+#   writeback    → virtio1 的 rbd drive token 帶 "direct":false 且 device write-cache=on
+verify_for() {
+  case "$1" in
+    writethrough) printf 'drive=drive-virtio1[^ ]*write-cache=off' ;;
+    writeback)    printf '"direct":false[^ ]*vm-1031-disk-1.*drive=drive-virtio1[^ ]*write-cache=on' ;;
+  esac
+}
 for cache in writethrough writeback; do
   run_qm_variant_scenario "exp1-cache-$cache" \
     "E-05: cache=$cache 相對 none 於 rr/rw 4k 差異落噪音帶內（無 host page cache 前提下機制推論；H-023）" \
-    "$BASE" "$BASE,cache=$cache" "cache=$cache" "$ROUNDS"
+    "$BASE" "$BASE,cache=$cache" "$(verify_for "$cache")" "$ROUNDS"
 done
 
 # 另兩條 buffered job（H-023）：--direct=0 與 --direct=0 --fsync=1，皆用

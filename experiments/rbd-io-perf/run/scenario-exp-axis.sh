@@ -43,7 +43,7 @@ _axis_setup_a() {
   vm_set --delete virtio1 2>/dev/null || true
   vm_set --virtio1 "$BASE"
   vm_cold_restart
-  vm_assert_cmdline 'rbd:'
+  vm_assert_cmdline '"driver":"rbd"'
 }
 _axis_setup_b() {
   vm_set --delete virtio1 2>/dev/null || true
