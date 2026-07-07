@@ -25,24 +25,31 @@ b="$(new_bundle exp9-layout)"
 write_prediction "$b" "E-09: object-size/striping 對 sr-1m/sw-1m 大順序區塊有感，4k 隨機落噪音帶（機制推論；焦點 sr-1m/sw-1m）"
 
 CUR_IMG=""
+CUR_DEV=""
 cleanup() {
   vm_set --virtio1 "$BASE" 2>/dev/null || true
+  [ -n "$CUR_DEV" ] && img_unmap "$CUR_DEV" 2>/dev/null || true
   [ -n "$CUR_IMG" ] && img_rm "$CUR_IMG" 2>/dev/null || true
 }
 trap cleanup EXIT
 
+# PVE storage 只認 vm-<id>-disk-N 命名，任意 image 名要走手動 map + raw path
+# （E-09 首跑 "unable to parse rbd volume name" 的修正；同 exp10/12/14 手法）
 run_layout() {
   local label="$1" img="$2"; shift 2
   CUR_IMG="$img"
   img_create "$img" 16G "$@"
+  CUR_DEV="$(img_map "$img")"
+  [ -n "$CUR_DEV" ] || die "map ${img} 失敗"
   vm_set --delete virtio1 2>/dev/null || true
-  vm_attach_data "$POOL:$img"
+  vm_attach_data "$CUR_DEV"
   vm_cold_restart
   local ip
   ip="$(vm_guest_ip)"
   guest_ssh "$ip" "sudo $(prefill_cmd /dev/vdb)" > "$b/$label-prefill.json"
   run_matrix_rounds "$b" "$label" "$ip" /dev/vdb "$ROUNDS"
   vm_set --delete virtio1
+  img_unmap "$CUR_DEV"; CUR_DEV=""
   img_rm "$img"
   CUR_IMG=""
 }
