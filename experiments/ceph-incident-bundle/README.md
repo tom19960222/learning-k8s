@@ -114,6 +114,34 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 - `--mode cephadm`（可配 `--seed USER@HOST`）：只收 ceph 層。
 - `--mode rook`：只收 rook 層（在第一台有 kubectl 的 node 上跑）。
 
+## Prometheus metrics dump（選用）
+
+給 `--prom-url` 時，會在收 cluster 證據後，從該 Prometheus 把「執行當下往回
+`--since`」窗內、job 名稱符合 `ceph|node`（`--prom-job-regex` 可覆寫）的每個
+metric 各打一次 `query_range`，原始 JSON 逐一 gzip 存進
+`cluster/prometheus/<job>/<metric>.json.gz`。不給 `--prom-url` 則完全不碰
+Prometheus。
+
+```bash
+bash experiments/ceph-incident-bundle/run/collect.sh \
+  --inventory experiments/ceph-incident-bundle/inventory/ceph-lab.example.env \
+  --ssh-key .ssh/id_ed25519 --mode cephadm --since 24h \
+  --prom-url http://192.168.18.166:9095
+```
+
+- 前置：工作機要有 `curl` 與 `python3`，且 URL 從工作機直接可達（不走 ssh
+  tunnel）。缺任一 → `cluster/prometheus/SKIPPED.txt` + exit 2。
+- step 預設 `max(15, ceil(window/10000))` 秒（避開 Prometheus 每 series 11,000
+  點上限；`--prom-step` 可覆寫）。整段 dump 的時間預算 `--prom-timeout`（預設
+  600s），超時會截斷並在 `dump-info.txt`／`index.txt` 標 `TRUNCATED`。
+- exit code 語意不變：dump 失敗／截斷 → exit 2（partial），bundle 照樣產出。
+- 安全界線：`<job>/<metric>.json.gz` 是數值 time series，**不做** redaction
+  （單行大 JSON 逐行 redact 極慢，且 regex 誤中會讓整檔變 `[REDACTED]`）；
+  `dump-info.txt`、`index.txt`、`buildinfo.json`、`targets.json` 照常 redact。
+  URL 內嵌的 `user:pass@` 寫進任何 artifact 前會遮蔽為 `user:***@`。
+- 尚未對真 Prometheus 驗證（lab 機器備妥後補跑）；目前行為以測試 + Prometheus
+  HTTP API 官方文件交叉驗證。
+
 ## auto 的限制（已知）
 
 - **來源挑「第一台」**：cluster-ceph 取第一台**ceph 連得上**的 node(會實際試 `ceph -s`,連不上就換下一個候選);cluster-rook(remote)取第一台**有 `kubectl` 指令**的 node(只看指令存在,不檢查 k8s 健康、不 fallback 到第二台)。若想釘住一台已知健康的 mon,用 `--seed USER@HOST`。
@@ -175,6 +203,7 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 - `errors.log`：非零 exit code、SSH 失敗、部分失敗。
 - `redactions.log`：每個檔遮蔽了幾行。
 - `cluster/`：cephadm(直接 `ceph` 或 `cephadm shell`)或 Rook cluster-level 狀態。
+- `cluster/prometheus/` — 選用的 metrics dump（有給 `--prom-url` 才存在）
 - `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、Ceph log 與 cephadm 狀態。
 
 ## exit code 怎麼看
