@@ -12,6 +12,8 @@ source "$COLLECT_ROOT/lib/collect-cluster-cephadm.sh"
 # shellcheck disable=SC1091
 source "$COLLECT_ROOT/lib/collect-cluster-rook.sh"
 # shellcheck disable=SC1091
+source "$COLLECT_ROOT/lib/collect-prometheus.sh"
+# shellcheck disable=SC1091
 source "$COLLECT_ROOT/lib/bundle.sh"
 
 usage() {
@@ -37,6 +39,11 @@ Options:
   --kube-mode MODE       where the rook layer runs kubectl: remote (on an
                          inventory node, default) or local (this jump host)
   --since DURATION       log/journal window (default: 24h)
+  --prom-url URL         optional Prometheus base URL; dump metrics of scrape
+                         jobs matching --prom-job-regex over the --since window
+  --prom-job-regex RE    scrape-job filter for the dump (default: ceph|node)
+  --prom-step SECONDS    query_range step (default: max(15, window/10000))
+  --prom-timeout SECONDS overall time budget for the metrics dump (default: 600)
   --timeout SECONDS      per-command / SSH-connect timeout (default: 20)
   --node-timeout SECONDS overall timeout for one node's full collection (default: 600)
   --skip-logs            collect state but skip larger Ceph log copies
@@ -320,6 +327,7 @@ main() {
   local inventory='' ssh_key='' seed_override='' out_dir="$COLLECT_ROOT/results"
   local mode=auto since=24h timeout=20 node_timeout=600 skip_logs=0 keep_workdir=0
   local trust_ssh_host_key=1 redact_enabled=1
+  local prom_url='' prom_job_regex='ceph|node' prom_step='' prom_timeout=600
   local seed='' ssh_user='' seed_host='' rook_namespace=rook-ceph rook_operator_namespace=rook-ceph kube_context='' kube_mode=remote
   local timestamp workdir manifest bundle rc=0 cluster_rc=0 node_ok=0 node_failed=0
 
@@ -360,6 +368,22 @@ main() {
         ;;
       --since)
         since=${2-}
+        shift 2
+        ;;
+      --prom-url)
+        prom_url=${2-}
+        shift 2
+        ;;
+      --prom-job-regex)
+        prom_job_regex=${2-}
+        shift 2
+        ;;
+      --prom-step)
+        prom_step=${2-}
+        shift 2
+        ;;
+      --prom-timeout)
+        prom_timeout=${2-}
         shift 2
         ;;
       --timeout)
@@ -417,6 +441,13 @@ main() {
     die "invalid --kube-context (allowed: A-Za-z0-9._@:/-): $kube_context"
   fi
   [[ "$kube_mode" == "local" || "$kube_mode" == "remote" ]] || die "invalid --kube-mode (local|remote): $kube_mode"
+  if [[ -n "$prom_url" ]]; then
+    local num_re='^[0-9]+$'
+    prom_duration_seconds "$since" >/dev/null \
+      || die "--since must be N/Ns/Nm/Nh/Nd/Nw when using --prom-url: $since"
+    [[ -z "$prom_step" || "$prom_step" =~ $num_re ]] || die "invalid --prom-step (seconds): $prom_step"
+    [[ "$prom_timeout" =~ $num_re ]] || die "invalid --prom-timeout (seconds): $prom_timeout"
+  fi
   [[ -n "$inventory" && -f "$inventory" ]] || die "missing inventory: ${inventory:-<unset>}"
   [[ -n "$ssh_key" && -f "$ssh_key" ]] || die "missing ssh key: ${ssh_key:-<unset>}"
   export CEPH_INCIDENT_TRUST_SSH_HOST_KEY=$trust_ssh_host_key
@@ -488,6 +519,21 @@ main() {
   if [[ $cluster_rc -ne 0 ]]; then
     append_error "$workdir" "cluster collection exited $cluster_rc"
     rc=2
+  fi
+
+  local prom_rc=0
+  if [[ -n "$prom_url" ]]; then
+    progress "collecting prometheus metrics from $(prom_mask_url "$prom_url")…"
+    set +e
+    collect_prometheus --out "$workdir" --manifest "$manifest" --url "$prom_url" \
+      --job-regex "$prom_job_regex" --step "$prom_step" --since "$since" \
+      --timeout "$timeout" --budget "$prom_timeout"
+    prom_rc=$?
+    set -e
+    if [[ $prom_rc -ne 0 ]]; then
+      append_error "$workdir" "prometheus collection exited $prom_rc"
+      rc=2
+    fi
   fi
 
   local i alias target node_rc ntotal

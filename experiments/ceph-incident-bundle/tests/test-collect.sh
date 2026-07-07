@@ -61,6 +61,7 @@ help_output="${help_result#*$'\n'}"
 [[ "$help_output" == *"--kube-context"* ]] || fail "help should document --kube-context"
 [[ "$help_output" == *"--no-trust-ssh-host-key"* ]] || fail "help should document --no-trust-ssh-host-key"
 [[ "$help_output" == *"--no-redact"* ]] || fail "help should document --no-redact"
+[[ "$help_output" == *"--prom-url"* ]] || fail "help should document --prom-url"
 
 missing_result="$(run_and_capture "$ROOT/run/collect.sh" --inventory "$tmpdir/missing.env")"
 missing_status="${missing_result%%$'\n'*}"
@@ -252,6 +253,8 @@ contents="$(tar -xOzf "$bundle_auto" ./CONTENTS.md 2>/dev/null)"
 [[ "$contents" == *"cluster/ceph/json/status.json"* ]] || fail "CONTENTS.md missing a cluster artifact row"
 [[ "$contents" == *"ceph status --format json-pretty"* ]] || fail "CONTENTS.md missing the producing command"
 [[ "$contents" == *"nodes/cephnode/system/hostname.txt"* ]] || fail "CONTENTS.md missing a per-node artifact row"
+# no --prom-url: the bundle must not contain any prometheus layer at all
+tar -tzf "$bundle_auto" | grep -q 'cluster/prometheus' && fail "prometheus dir must not exist without --prom-url" || true
 
 # safety toggles: defaults are on; each off-switch must be independent.
 out_no_trust="$tmpdir/out-no-trust"
@@ -534,6 +537,38 @@ km_bad_status="${km_bad%%$'\n'*}"
 km_bad_out="${km_bad#*$'\n'}"
 [[ "$km_bad_status" == "1" ]] || fail "invalid --kube-mode should exit 1, got $km_bad_status"
 [[ "$km_bad_out" == *"invalid --kube-mode"* ]] || fail "bad --kube-mode should explain failure"
+
+# --prom-url with an unparseable --since is rejected up front (exit 1)
+prom_bad_since="$(run_and_capture "$ROOT/run/collect.sh" --prom-url http://prom.example:9090 --since yesterday --inventory "$inventory" --ssh-key "$ssh_key")"
+prom_bad_since_status="${prom_bad_since%%$'\n'*}"
+prom_bad_since_out="${prom_bad_since#*$'\n'}"
+[[ "$prom_bad_since_status" == "1" ]] || fail "--prom-url with bad --since should exit 1, got $prom_bad_since_status"
+[[ "$prom_bad_since_out" == *"--since must be"* ]] || fail "bad since should explain the failure"
+
+prom_bad_timeout="$(run_and_capture "$ROOT/run/collect.sh" --prom-url http://prom.example:9090 --prom-timeout abc --inventory "$inventory" --ssh-key "$ssh_key")"
+prom_bad_timeout_status="${prom_bad_timeout%%$'\n'*}"
+[[ "$prom_bad_timeout_status" == "1" ]] || fail "non-numeric --prom-timeout should exit 1, got $prom_bad_timeout_status"
+
+# ---------------------------------------------------------------------------
+# --prom-url: metrics dump lands inside the bundle; only matching jobs dumped
+# ---------------------------------------------------------------------------
+cp "$ROOT/tests/fixtures/bin/curl" "$fakebin/curl"
+export FAKE_CURL_LOG="$tmpdir/curl.log"
+out_prom="$tmpdir/out-prom"
+: >"$FAKE_CURL_LOG"
+FAKE_CEPH_TARGETS="10.0.0.1" FAKE_KUBE_TARGETS="" \
+PATH="$fakebin:$PATH" "$ROOT/run/collect.sh" \
+  --inventory "$inventory" --ssh-key "$ssh_key" \
+  --seed tester@10.0.0.1 --mode cephadm --out "$out_prom" --since 24h --timeout 5 \
+  --prom-url http://prom.example:9090
+bundle_prom="$(find_bundle "$out_prom")"
+assert_archive_contains "$bundle_prom" "cluster/prometheus/dump-info.txt"
+assert_archive_contains "$bundle_prom" "cluster/prometheus/buildinfo.json"
+assert_archive_contains "$bundle_prom" "cluster/prometheus/ceph/ceph_health_status.json.gz"
+assert_archive_contains "$bundle_prom" "cluster/prometheus/node-exporter/node_load1.json.gz"
+tar -tzf "$bundle_prom" | grep -q 'cluster/prometheus/grafana/' && fail "non-matching job must not be dumped" || true
+assert_archive_file_contains "$bundle_prom" "environment.txt" "prom_url=http://prom.example:9090"
+grep -qF 'step=15' "$FAKE_CURL_LOG" || fail "24h window should query with step=15"
 
 # Progress: default-on goes to stderr; stdout stays just `bundle:`; --quiet silences it.
 prog_out="$tmpdir/prog.out"; prog_err="$tmpdir/prog.err"
