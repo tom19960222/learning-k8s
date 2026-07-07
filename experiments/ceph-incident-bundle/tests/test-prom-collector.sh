@@ -176,6 +176,20 @@ test_long_window_step() {
   grep -qF 'step=61' "$FAKE_CURL_LOG" || fail "7d window should query with step=61"
 }
 
+test_redaction_excludes_metric_dumps() {
+  local wd="$tmpdir/wd-redact"
+  local pdir="$wd/cluster/prometheus/ceph"
+  mkdir -p "$pdir" "$wd/nodes"
+  # this line WOULD be redacted (key = base64-ish) if the redactor visited it
+  printf 'key = AQBSOMETHINGLONGENOUGHTOTRIGGERBASE64REDACTIONXX==\n' | gzip -c >"$pdir/ceph_fake.json.gz"
+  printf 'password = hunter2\n' >"$wd/cluster/prometheus/dump-info.txt"
+  redact_bundle_text "$wd"
+  gzip -dc "$pdir/ceph_fake.json.gz" | grep -qF 'AQBSOMETHING' \
+    || fail "per-metric dump must NOT be redacted"
+  grep -qF '[REDACTED]' "$wd/cluster/prometheus/dump-info.txt" \
+    || fail "dump-info.txt must still be redacted"
+}
+
 test_targets_failure() {
   local wd="$tmpdir/wd-targets" rc=0 p
   # shellcheck disable=SC2030,SC2031 # export intentionally scoped to subshell
@@ -218,6 +232,7 @@ test_single_metric_failure
 test_budget_truncation
 test_unsafe_job_name
 test_long_window_step
+test_redaction_excludes_metric_dumps
 test_targets_failure
 test_job_listing_failure
 test_metric_listing_failure
