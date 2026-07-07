@@ -18,6 +18,27 @@ source "$ROOT/lib/bundle.sh"
 # shellcheck disable=SC1091
 source "$ROOT/lib/collect-prometheus.sh"
 
+fakebin="$tmpdir/fakebin"
+mkdir -p "$fakebin"
+cp "$ROOT/tests/fixtures/bin/curl" "$fakebin/curl"
+export FAKE_CURL_LOG="$tmpdir/curl.log"
+
+# Invoke collect_prometheus against a fresh fake workdir. Runs in a subshell
+# so the PATH override and knob exports never leak between test cases.
+run_prom() {
+  local wd=$1
+  shift
+  mkdir -p "$wd"
+  : >"$wd/manifest.jsonl"
+  : >"$wd/errors.log"
+  : >"$wd/environment.txt"
+  (
+    PATH="$fakebin:$PATH"
+    collect_prometheus --out "$wd" --manifest "$wd/manifest.jsonl" \
+      --url http://prom.example:9090 "$@"
+  )
+}
+
 test_duration_parser() {
   [[ "$(prom_duration_seconds 90)" == "90" ]] || fail "90 -> 90"
   [[ "$(prom_duration_seconds 45s)" == "45" ]] || fail "45s -> 45"
@@ -55,9 +76,117 @@ test_require_cmds() {
   [[ "$out" == *python3* ]] || fail "reason should name python3, got '$out'"
 }
 
+test_happy_path() {
+  local wd="$tmpdir/wd-happy" p s e rows
+  : >"$FAKE_CURL_LOG"
+  run_prom "$wd" --since 24h --timeout 5 || fail "happy path should return 0"
+  p="$wd/cluster/prometheus"
+  [[ -f "$p/buildinfo.json" ]] || fail "missing buildinfo.json"
+  [[ -f "$p/targets.json" ]] || fail "missing targets.json"
+  [[ -f "$p/dump-info.txt" ]] || fail "missing dump-info.txt"
+  [[ -f "$p/ceph/index.txt" ]] || fail "missing ceph index.txt"
+  [[ -f "$p/ceph/ceph_health_status.json.gz" ]] || fail "missing ceph_health_status dump"
+  [[ -f "$p/ceph/ceph_osd_up.json.gz" ]] || fail "missing ceph_osd_up dump"
+  [[ -f "$p/node-exporter/node_load1.json.gz" ]] || fail "missing node_load1 dump"
+  [[ ! -d "$p/grafana" ]] || fail "grafana job must not be collected"
+  gzip -dc "$p/ceph/ceph_health_status.json.gz" | grep -qF '"status":"success"' \
+    || fail "metric dump is not a success response"
+  grep -qF 'step=15' "$FAKE_CURL_LOG" || fail "24h window should query with step=15"
+  grep -qF 'ok ceph_health_status ceph_health_status.json.gz' "$p/ceph/index.txt" \
+    || fail "index missing ok row"
+  s="$(sed -n 's/^window_start_epoch=//p' "$p/dump-info.txt")"
+  e="$(sed -n 's/^window_end_epoch=//p' "$p/dump-info.txt")"
+  [[ "$((e - s))" == "86400" ]] || fail "window should span 86400s, got $((e - s))"
+  rows="$(grep -c '"collector":"collect-prometheus"' "$wd/manifest.jsonl")"
+  [[ "$rows" == "4" ]] || fail "expected 4 manifest rows (buildinfo/targets/2 jobs), got $rows"
+  grep -qF 'prom_url=http://prom.example:9090' "$wd/environment.txt" \
+    || fail "environment.txt missing prom_url"
+  grep -qF 'prom_jobs=ceph node-exporter' "$wd/environment.txt" \
+    || fail "environment.txt missing prom_jobs"
+}
+
+test_unreachable() {
+  local wd="$tmpdir/wd-down" rc=0
+  ( export FAKE_CURL_DOWN=1; run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "unreachable prometheus should return 2, got $rc"
+  grep -qF 'not reachable' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED should say not reachable"
+  grep -qF 'prometheus' "$wd/errors.log" || fail "errors.log should record the skip"
+}
+
+test_no_matching_jobs() {
+  local wd="$tmpdir/wd-nojobs" rc=0
+  run_prom "$wd" --since 24h --job-regex 'zzz' || rc=$?
+  [[ "$rc" == "2" ]] || fail "no matching jobs should return 2, got $rc"
+  grep -qF 'no scrape job matched' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED reason wrong"
+  grep -qF 'grafana' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED should list the jobs seen"
+}
+
+test_missing_python3() {
+  # Restricted PATH that still provides what the pre-check code path needs
+  # (mkdir/date/dirname for prom_skip + errors.log), but no python3.
+  local wd="$tmpdir/wd-nopy" bin="$tmpdir/nopybin" rc=0 c
+  mkdir -p "$bin" "$wd"
+  : >"$wd/manifest.jsonl"
+  : >"$wd/errors.log"
+  printf '#!/bin/sh\nexit 0\n' >"$bin/curl"
+  chmod +x "$bin/curl"
+  for c in mkdir date dirname; do
+    ln -s "$(command -v "$c")" "$bin/$c"
+  done
+  ( PATH="$bin"
+    collect_prometheus --out "$wd" --manifest "$wd/manifest.jsonl" \
+      --url http://prom.example:9090 --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "missing python3 should return 2, got $rc"
+  grep -qF 'python3 not found' "$wd/cluster/prometheus/SKIPPED.txt" || fail "SKIPPED should name python3"
+}
+
+test_single_metric_failure() {
+  local wd="$tmpdir/wd-onefail" rc=0 p
+  ( export FAKE_CURL_FAIL_METRICS='ceph_osd_up'; run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "metric failure should return 2, got $rc"
+  p="$wd/cluster/prometheus"
+  [[ -f "$p/ceph/ceph_health_status.json.gz" ]] || fail "other metrics should still be dumped"
+  [[ ! -f "$p/ceph/ceph_osd_up.json.gz" ]] || fail "failed metric must not leave a dump"
+  grep -qF 'failed ceph_osd_up' "$p/ceph/index.txt" || fail "index should mark the failure"
+  grep -qF 'ceph_osd_up' "$wd/errors.log" || fail "errors.log should record the metric failure"
+}
+
+test_budget_truncation() {
+  local wd="$tmpdir/wd-budget" rc=0
+  run_prom "$wd" --since 24h --budget 0 || rc=$?
+  [[ "$rc" == "2" ]] || fail "budget truncation should return 2, got $rc"
+  grep -qF 'TRUNCATED' "$wd/cluster/prometheus/ceph/index.txt" || fail "index should mark TRUNCATED"
+  grep -qF 'truncated=1' "$wd/cluster/prometheus/dump-info.txt" || fail "dump-info should mark truncated"
+  grep -qF 'truncated' "$wd/errors.log" || fail "errors.log should record the truncation"
+}
+
+test_unsafe_job_name() {
+  local wd="$tmpdir/wd-badjob" rc=0
+  ( export FAKE_CURL_JOBS_JSON='{"status":"success","data":["ceph","node\"x"]}'
+    run_prom "$wd" --since 24h ) || rc=$?
+  [[ "$rc" == "2" ]] || fail "unsafe job name should be partial (2), got $rc"
+  grep -qF 'unsafe name' "$wd/errors.log" || fail "errors.log should record the unsafe job"
+  [[ -f "$wd/cluster/prometheus/ceph/index.txt" ]] || fail "safe job should still be collected"
+}
+
+test_long_window_step() {
+  local wd="$tmpdir/wd-7d"
+  : >"$FAKE_CURL_LOG"
+  run_prom "$wd" --since 7d || fail "7d dump should succeed"
+  grep -qF 'step=61' "$FAKE_CURL_LOG" || fail "7d window should query with step=61"
+}
+
 test_duration_parser
 test_auto_step
 test_mask_url
 test_require_cmds
+test_happy_path
+test_unreachable
+test_no_matching_jobs
+test_missing_python3
+test_single_metric_failure
+test_budget_truncation
+test_unsafe_job_name
+test_long_window_step
 
 printf 'ok: prom collector\n'
