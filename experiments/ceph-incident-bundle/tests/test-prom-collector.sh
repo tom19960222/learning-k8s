@@ -188,6 +188,13 @@ test_redaction_excludes_metric_dumps() {
     || fail "per-metric dump must NOT be redacted"
   grep -qF '[REDACTED]' "$wd/cluster/prometheus/dump-info.txt" \
     || fail "dump-info.txt must still be redacted"
+  # anchoring: a look-alike path under nodes/ must NOT be excluded
+  local ndir="$wd/nodes/hostA/deep/cluster/prometheus/jobx"
+  mkdir -p "$ndir"
+  printf 'key = AQBSOMETHINGLONGENOUGHTOTRIGGERBASE64REDACTIONXX==\n' | gzip -c >"$ndir/evil.json.gz"
+  redact_bundle_text "$wd"
+  gzip -dc "$ndir/evil.json.gz" | grep -qF '[REDACTED]' \
+    || fail "look-alike path under nodes/ must still be redacted"
 }
 
 test_targets_failure() {

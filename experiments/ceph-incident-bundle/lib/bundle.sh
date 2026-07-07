@@ -166,7 +166,7 @@ redact_bundle_text() {
   local redaction_log="$workdir/redactions.log"
   local path
 
-  # Per-metric Prometheus dumps (cluster/prometheus/<job>/*.json.gz) are
+  # Per-metric Prometheus dumps (workdir/cluster/prometheus/<job>/*.json.gz) are
   # numeric time series in single multi-MB JSON lines: line-based redaction is
   # pathologically slow there and one regex false-positive would blank the
   # whole file. They are excluded; dump-info/index/buildinfo/targets in
@@ -177,6 +177,6 @@ redact_bundle_text() {
       *) redact_file "$path" "$redaction_log" ;;
     esac
   done < <(find "$workdir/cluster" "$workdir/nodes" -type f \
-    -not -path '*/cluster/prometheus/*/*.json.gz' \
+    -not -path "$workdir/cluster/prometheus/*/*.json.gz" \
     \( -name '*.txt' -o -name '*.log' -o -name '*.log.*' -o -name '*.yaml' -o -name '*.json' -o -name '*.jsonl' -o -name '*.conf' -o -name 'config' -o -name '*.gz' \) -print 2>/dev/null || true)
 }
