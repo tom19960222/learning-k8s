@@ -25,6 +25,8 @@ prom_duration_seconds() {
   [[ $value =~ $re ]] || return 1
   n="${BASH_REMATCH[1]}"
   unit="${BASH_REMATCH[2]}"
+  # Normalize to base-10 immediately to avoid octal interpretation
+  n=$((10#$n))
   [[ "$n" -gt 0 ]] || return 1
   case "$unit" in
     ''|s) : ;;

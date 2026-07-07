@@ -29,6 +29,9 @@ test_duration_parser() {
   prom_duration_seconds 5x >/dev/null 2>&1 && fail "'5x' should be rejected" || true
   prom_duration_seconds '' >/dev/null 2>&1 && fail "empty should be rejected" || true
   prom_duration_seconds 0 >/dev/null 2>&1 && fail "'0' should be rejected" || true
+  [[ "$(prom_duration_seconds 010h)" == "36000" ]] || fail "leading zero must be base-10 (010h -> 36000)"
+  [[ "$(prom_duration_seconds 008)" == "8" ]] || fail "008 -> 8 (no octal crash)"
+  prom_duration_seconds 000 >/dev/null 2>&1 && fail "'000' should be rejected" || true
 }
 
 test_auto_step() {
