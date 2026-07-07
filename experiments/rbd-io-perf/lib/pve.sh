@@ -97,7 +97,9 @@ vm_guest_ip() {
   pve_ssh "sudo -n timeout 10 qm agent $VMID network-get-interfaces" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-for itf in d.get("result", d if isinstance(d, list) else []):
+# PVE 9 qm prints the bare list; older wrappers use {"result": [...]}
+itfs = d.get("result", []) if isinstance(d, dict) else d
+for itf in itfs:
     for a in itf.get("ip-addresses", []):
         ip = a.get("ip-address", "")
         if a.get("ip-address-type") == "ipv4" and ip.startswith("192.168.18."):
