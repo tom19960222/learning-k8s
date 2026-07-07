@@ -131,6 +131,7 @@ GIT_SSH_COMMAND='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=n
 - **bsdtar 會塞 `com.apple.provenance` xattr**：送檔給遠端 GNU tar 會噴 `Ignoring unknown extended header`；打包／傳輸時對 bsdtar 加 `--no-xattrs`。
 - **這個 harness 擋 `set -m`／job-control，背景程序收不到可靠的 SIGINT**：訊號／Ctrl+C 相關行為別靠真訊號測，改測 handler 的單元邏輯（直接呼叫 handler、驗退出碼與副作用）。
 - **ssh/scp 的選項別用「一整串變數」**：`X="-i k -o ..."` 展開常爆；flag 一律逐個寫死。
+- **bash 3.2 + 中文標點**：未加大括號的 `$var` 緊接全形標點（（）、，）會被誤讀進識別字 → `set -u` 下 unbound variable；中文字串內的變數一律寫 `${var}`。shellcheck 抓不到這類錯。
 
 ## Ceph 驗證叢集（子專案需要真機驗證時）
 
