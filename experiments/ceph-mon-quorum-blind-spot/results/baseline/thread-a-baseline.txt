@@ -1,0 +1,9 @@
+# Thread A baseline (healthy) — 2026-07-08T15:34:31Z
+## count(ceph_mon_quorum_status==1):
+[{'metric': {}, 'value': [1783524871.575, '3']}]
+## count(probe_success{job=mon-tcp}==1):
+[{'metric': {}, 'value': [1783524871.976, '3']}]
+## up{job=ceph}:
+[('ceph-mgr', '1')]
+## active alerts:
+[]

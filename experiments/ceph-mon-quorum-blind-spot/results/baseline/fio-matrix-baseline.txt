@@ -1,0 +1,10 @@
+# fio matrix — BASELINE (healthy 3-mon quorum), pre-connected pod, direct=1 iodepth=1
+pattern    threads  iops    bw         lat_us    rc
+randread   1t       2847    11.1MB/s   348       0
+randread   4t       36134   141.1MB/s  108       0
+randwrite  1t       10      0.0MB/s    95794     0
+randwrite  4t       13      0.1MB/s    295824    0
+read(seq)  1t       172     171.7MB/s  5779      0
+read(seq)  4t       1380    1380.3MB/s 2850      0
+write(seq) 1t       1       1.4MB/s    733469    0
+write(seq) 4t       3       2.6MB/s    1480908   0

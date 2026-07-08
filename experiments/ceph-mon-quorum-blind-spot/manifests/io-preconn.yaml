@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qio-preconn
+  namespace: default
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-rbd
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fio-preconn
+  namespace: default
+  labels: { app: fio-preconn }
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 3
+  containers:
+  - name: fio
+    image: xridge/fio:latest
+    command: ["sh","-c","while true; do sleep 3600; done"]
+    volumeMounts:
+    - { name: vol, mountPath: /vol }
+  volumes:
+  - name: vol
+    persistentVolumeClaim: { claimName: qio-preconn }

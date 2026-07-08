@@ -69,15 +69,33 @@
 
 - [x] **Step 0**：Lab 復原（IP 漂移 → secondary IP 修，quorum 回 HEALTH_OK）；metric 拓樸盤點（唯一源 = mgr :9283）；k8s RBD 路徑 smoke test 通過。
 - [x] **Step 1**：實驗設計（HYPOTHESES.md + 本報告）落地、push。
-- [ ] **Step 2**：部署 monitoring（Prometheus + blackbox_exporter + node_exporter），baseline。
-- [ ] **Step 3**：注入長窗、窗內量兩 thread、還原、assert。
+- [x] **Step 2**：部署 monitoring（k8s ns `qmon`：Prometheus NodePort 30090 + blackbox_exporter 探 mon:3300；scrape mgr :9283）+ 兩 thread baseline。node_exporter(A5) 因 mon host 不在 k8s、需 per-host agent 而 blackbox 已足，改以設計論證處理（見 §5）。
+- [ ] **Step 3**：注入長窗（停 mon-02+mon-03）、窗內量兩 thread、還原、assert。
 - [ ] **Step 4**：Synthesize — 推薦 + 規則草案 + promtool test。
 
 ---
 
 ## 4. 結果（回填中）
 
-_待 Step 2+ 回填。_
+### 4.0 Baseline（healthy 3-mon quorum）
+Thread A 全部偵測源一致（health 時本來就該一致）：`count(ceph_mon_quorum_status==1)=3`、`count(probe_success{mon-tcp}==1)=3`、`up{ceph}=1`、無 alert。
+
+Thread B pre-connected fio 矩陣（direct=1, iodepth=1；小 lab、size=3、慢碟 → 寫很慢是常態，重點在 baseline vs window 比較）：
+
+| pattern | 1 thread | 4 thread |
+|---|---|---|
+| randread 4k | 2847 iops / 348µs | 36134 iops / 108µs |
+| randwrite 4k | 10 iops / 95.8ms | 13 iops / 295.8ms |
+| read seq 1M | 172 iops (172 MB/s) | 1380 iops (1380 MB/s) |
+| write seq 1M | 1 iops (1.4 MB/s) | 3 iops (2.6 MB/s) |
+
+原始 JSON、Thread A snapshot 見 `results/baseline/`。
+
+### 4.1 Thread A — 偵測結果
+_待 Step 3 回填。_
+
+### 4.2 Thread B — IO 衝擊結果
+_待 Step 3 回填。_
 
 ---
 
