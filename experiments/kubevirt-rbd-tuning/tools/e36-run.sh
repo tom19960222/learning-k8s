@@ -18,7 +18,7 @@ vmx 'cat > /home/ubuntu/probe.sh << "EOF"
 DEV=$1; OUT=$2; BLK=$3
 i=0
 while true; do
-  off=$(( (i * 65537) % BLK ))
+  off=$(( ((i * 65537) % (BLK / 4096)) * 4096 ))
   t0=$(date +%s.%N)
   if sudo dd if=/dev/zero of=$DEV bs=4k count=1 seek=$off oflag=direct,seek_bytes conv=notrunc status=none 2>>${OUT}.err; then
     echo "$t0 $(date +%s.%N) ok $off" >> $OUT

@@ -75,3 +75,7 @@
 - 2026-07-08 **E-36 已點火**（`tools/e36-run.sh <bundle> 10.244.1.195 8 0`：t30 盤（SC ceph-rbd-t30，osd_request_timeout=30 已驗 config_info）vs baseline 盤；停 PG 2.5 acting 的 osd.8+osd.0 → min_size 不滿 300s → 回復。VM 現有第 4 顆盤 datat30/PVC data-t30——實驗後保留或清理見 E-36 收尾）。
 - 2026-07-08 E-36 首跑踩雷：`$OB（` 全形括號吃進變數名 → unbound（CLAUDE.md 已載明的 bash+CJK 標點雷，
   自家 runbook 腳本也要過 `${var}` 檢查）。已修（tools/e36-run.sh），重新點火。
+- 2026-07-08 E-36 二跑無效：probe 的 dd 偏移沒 4k 對齊 → O_DIRECT 全 EINVAL（教訓：O_DIRECT probe 偏移必須 block 對齊）。
+  已修（stride 改成 4k 的倍數）三跑中。**殘留線索**：二跑中 t30 盤一筆對齊寫入 blocked 311s
+  ——若三跑重現，H-032（osd_request_timeout=30 應 30s abort）部分 violated，機制要回 T1 重查
+  （懷疑：inactive PG 的 request 可能卡在 epoch barrier/paused 層，不在 handle_timeout 掃描的 o_requests 內）。
