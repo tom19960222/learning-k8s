@@ -16,6 +16,16 @@
 - 2026-07-08 `E-00 done results/E-00/<ts>/ — 版本全對齊；修正 autotune osd_memory_target 15.7G→4G（記入 SUMMARY）；mClock 天花板 ~6k IOPS/OSD`。
   **執行約束（使用者 2026-07-08 指示）：az CLI 對共享帳號零 write——E-31/E-41 的 VM stop/start 由使用者執行。**
   **下一步：kubectl 建 vmtest ns + PVC + VM → pre-fill → E-01。**
+- 2026-07-08 baseline VM 建立：ns vmtest、PVC data-baseline(RWX Block 16Gi ceph-rbd) Bound、
+  VMI Running @cyshih-k8s-2、IP 10.244.1.92、LIVE-MIGRATABLE=True、guest fio 3.36/vdb 16G。
+  guest 連線 = ProxyCommand 經 cp（ProxyJump 跳板段吃不到 key，deviation 已知；函式見下）。
+- 2026-07-08 **E-01 已點火**：guest 上 `nohup bash e01.sh`（pid 1930）＝prefill + 5 輪矩陣，
+  預計 ~60min；進度看 guest `/home/ubuntu/e01/status`（ALL-DONE 為完成）。
+  接手方式：`vmssh 'cat e01/status'` → 完成後把 `/home/ubuntu/e01/` scp 回
+  `results/E-01/<ts>/` → `python3 tools/fio_stats.py cov results/E-01/<ts>` 產 band.json（放本目錄，git 追蹤）。
+  vmssh 函式（zsh 注意 `g` 是 alias 不可用）：
+  `vmssh(){ ssh -i ~/.ssh/azure-lab -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no -o ProxyCommand='ssh -i ~/.ssh/azure-lab -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no -W %h:%p azureuser@20.89.248.121' ubuntu@10.244.1.92 "$@"; }`
+  Deviation：E-01 五輪連跑未跨 2h 時段（rate limit 考量）；後續任一實驗前跑 sentinel 輪可補驗時段漂移。
 - （之後每行格式：`E-XX done <bundle path> — <一句話結論>`）
 
 ## 待辦（環境到手後依序）
