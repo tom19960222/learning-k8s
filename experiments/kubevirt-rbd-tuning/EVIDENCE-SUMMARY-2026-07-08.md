@@ -44,3 +44,12 @@
 - **虛擬化稅（host 相對 guest 的優勢）**：rr-qd32 **+36.7%**（26771→36602）、rr-qd8 +17.4%、rw-qd1 +11.9%、rw-qd8 +11.6%、rr-qd1 +9.0%；**rw-qd32 +4.7%、seq read/write +2.7%/+1.2% = indistinguishable**。
 - 解讀：虛擬層（virtio+QEMU）的代價集中在高並行小塊隨機讀；寫側與大塊頻寬瓶頸在 ceph 端，虛擬層幾乎免費。rr-qd32 的 36.7% 缺口是 E-13（多 queue）/E-14（IOThread）最該追的 headroom。
 - verdict 檔：`results/E-02/<ts>/verdict-vs-guest.txt`；throwaway image/key 已清理，HEALTH_OK。
+
+## E-10 cache mode — done（H-004 **confirmed**；附帶抓到 cache-regime 量測陷阱）
+
+- Bundle：`results/E-10/20260708-015243/`（A/wt/wb 交錯 n=3；生效斷言全過：A=direct:true,wc:on／wt=false,off／wb=false,on）
+- **writeback（vs baseline none）**：rw-qd1 IOPS **+1997%**（592→12424）、p99 −95.6%——host RAM ack 的假象；但 rw-qd8 **p999 +2064%**（3.3ms→71ms）、rw-qd32 p99 +1354%（4ms→57.6ms）、sw-1m **max +1089%（1.52s，另輪 3.47s，STALL-FLAG）**。均值好看、尾延遲爆炸+整秒 stall。
+- **writethrough（vs none）**：寫側嚴格劣化——rw-qd8/32 IOPS −35%/−37%、p99 +40%/+22%、rw-qd8 max +1666%（209ms）；讀側 qd1/qd8 帶內。
+- **量測陷阱（一等發現）**：wt/wb 都關 O_DIRECT → 讀經 host page cache，16G 測試盤 < 32G worker RAM → **讀側數字是 RAM 不是 ceph**（sr-1m 2709→14630 IOPS ≈ 14.3GiB/s、rr-qd32 +161~176%）。生產 working set >> host RAM 時讀側增益消失；本實驗讀側結論僅在 cache-hit regime 成立。
+- **latency-first 生產結論（機制級）**：維持預設 `cache=none`——wt 嚴格劣於 none；wb 的寫側均值增益以 p99.9 崩壞 + 秒級 stall 為代價（另有 E-40 crash consistency 未驗）。
+- verdict 檔：`verdict-wt.txt`、`verdict-wb.txt`。

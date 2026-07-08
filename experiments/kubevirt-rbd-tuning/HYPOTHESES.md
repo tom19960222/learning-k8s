@@ -52,7 +52,7 @@
 - Notes: 注意 mClock 下 `osd_max_backfills`/`osd_recovery_max_active` 被 mClock 接管，需 `osd_mclock_override_recovery_settings=true` 才可手調——E-39 設計要計入。
 
 ### H-004: `cache=writeback` 相對 `cache=none` 拉高平均 throughput，但 p99.9 顯著惡化（flush 聚積 + 突發回寫），且 host 記憶體壓力下有整段 stall 風險——以本 charter 的 latency-first 判準，writeback 在生產是負分
-- Status: proposed
+- Status: confirmed（E-10 2026-07-08：rw-qd8 p999 +2064%、sw-1m max 1.5~3.5s stall；bundle results/E-10/20260708-015243）
 - Tier: T3
 - Origin: framing-dialog（穩定定義：p99/p99.9 可控）
 - Prediction:
