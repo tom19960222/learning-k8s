@@ -25,7 +25,7 @@
 ## Hypotheses
 
 ### H-001: 在 KubeVirt v1.5.0，改 VM 物件 template 的 disk driver 欄位（cache / io / blockMultiQueue / dedicatedIOThread）不會被 live migration 套用——running VMI 的 spec 不會跟著變，VM 只會被標 RestartRequired，唯一套用路徑是 stop/start（有 downtime）
-- Status: confirmed（T1；T3 真機確認留 E-50）
+- Status: confirmed（T1+T3：E-50 2026-07-08 實錘——patch 後 RestartRequired 出現、migration ×2 cmdline 不變；revert 不清條件。bundle results/E-42/20260708-063540）
 - Tier: T1
 - Origin: framing-dialog（使用者答「不確定——這正是要研究的重點」）
 - Prediction: 改 template disk 欄位後 VM 出現 `RestartRequired` condition；後續 migration 不改 QEMU cmdline。

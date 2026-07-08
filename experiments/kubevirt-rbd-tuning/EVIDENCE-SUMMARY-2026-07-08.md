@@ -91,3 +91,15 @@
 - **與 E-30 對照的機制發現（一等）**：同樣是 backfill，E-30 是 rr ×24、這裡只有 +38%。差異＝E-30 先經歷 600s「down 未 out」的持續寫入 → 累積 degraded 物件債 → out 後**熱物件 recovery 擋 client op**；E-39 立即 out 無債。**傷害來源是 hot-object recovery debt，不是 backfill 資料搬移**（→ 新假設 H-033）。
 - 生產含義：mClock profile 在 OSD 有 headroom 時不用調（runtime 可調留作飽和時的工具）；真正該管理的是 down-未-out 期間的寫入債——監控 degraded objects 數比切 profile 更重要。
 - Deviation：high_client_ops 輪的 pre 窗被前一輪殘餘 recovery 汙染（pre rw 3.16ms），backfill 窗本體可比。
+
+## E-42 live migration IO 代價 — done（H-019 confirmed，優於預期）
+
+- Bundle：`results/E-42/<ts>/`（rw-qd8 負載中 migration ×3，lat log 1s 粒度跨 migration 連續）
+- **IO 零中斷**：無任何 >2.5s log 斷點；migration 期間最差 1s 窗 = 3.8 / 8.0 / 7.2ms（baseline 1.53ms）；三次 phase 全 Succeeded。
+- 生產結論（機制級）：live migration 對 disk IO 的擾動在 1s 粒度下僅為個位數 ms 的短暫抬升——節點維運可放心用（記憶體密集 workload 的 dirty-page 收斂是另一題，不在本實驗範圍）。
+
+## E-50 可調性真機確認 — done（H-001 T1+T3 全 confirmed）
+
+- Bundle：同 E-42 bundle（合併執行）
+- patch `cache=writethrough`（不重啟）→ **`RestartRequired` condition 出現** ✓；migration ×2 有效樣本後 cmdline 仍 `"direct":true`（=none）✓——**live migration 不套用 disk 旋鈕，T3 實錘**（mig-3 樣本無效：migration 中新舊 pod 並存抓錯 pod，空檔案誤報 violated——deviation 記錄）。
+- **額外發現**：revert patch（spec 改回原樣）後 `RestartRequired` **不會自動清除**——碰過非 live-updatable 欄位，條件就掛著直到重啟。生產含義：改錯 VM template 沒有「改回去就當沒發生」。
