@@ -44,11 +44,11 @@ log "probes-started"
 HC=$!; trap 'kill $HC 2>/dev/null' EXIT
 
 sleep 60
-log "T0-inject: stop osd.$OA osd.$OB（同 PG acting，min_size 不滿）"
-monx "sudo ceph orch daemon stop osd.$OA; sudo ceph orch daemon stop osd.$OB"
+log "T0-inject: stop osd.${OA} osd.${OB} (PG acting overlap, min_size violated)"
+monx "sudo ceph orch daemon stop osd.${OA}; sudo ceph orch daemon stop osd.${OB}"
 sleep 300
-log "T1-recover: start osd.$OA osd.$OB"
-monx "sudo ceph orch daemon start osd.$OA; sudo ceph orch daemon start osd.$OB"
+log "T1-recover: start osd.${OA} osd.${OB}"
+monx "sudo ceph orch daemon start osd.${OA}; sudo ceph orch daemon start osd.${OB}"
 for i in $(seq 1 90); do [ "$(monx 'sudo ceph health' 2>/dev/null | head -1)" = "HEALTH_OK" ] && break; sleep 10; done
 log "health-ok"
 sleep 120
