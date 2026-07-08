@@ -100,3 +100,13 @@
   若要補：跑完後單開一台 L32s_v3 數小時做 E-22 對照即可，不用整組重建。
 - 2026-07-08 **改派 Sonnet subagent 執行**（使用者授權，省主線 rate limit）：第一棒 = E-13 + E-21
   （序列執行，subagent 自行記錄/回填/commit；主線只派工與抽查）。同時段主線不碰叢集。
+- 2026-07-08 **使用者裁示：全自動接力，一棒完成直接派下一棒不等人**。派工 queue（固定順序，
+  每棒 = 一個 Sonnet subagent，序列執行、自行記錄回填 commit push、FATAL 才停）：
+  1. （進行中）E-13 收尾 + E-21
+  2. E-11（bus=scsi；⚠scsi 變體 guest 裝置名變 /dev/sda*，run_matrix filename 要跟著換；t30 盤仍是 virtio 不動）+ E-40（crash consistency：fio --verify=crc32c 寫入中 kill -9 qemu-kvm ×3 次 × {none,writeback}，verify_only 回讀+變體收尾回 baseline）
+  3. E-37（deep-scrub 齊發 × osd_scrub_sleep 0 vs 0.1，degraded 模板）+ E-34（osd.3 週期 stop/start ×5 ± noout，degraded 模板）
+  4. E-32（gray：systemctl set-property IOReadIOPSMax/IOWriteIOPSMax 限單 OSD，斷言 ceph health 全程 OK）+ E-33（worker 出口 tc netem loss 0.1%/0.5% 對 10.0.2.0/24，收尾 qdisc del）
+  5. E-38（set-nearfull/full-ratio 到當前用量+ε 注入 full，觀察寫入 hang vs EIO，回復 0.85/0.95）+ E-51（改 SC 驗無效 + kubectl patch pv volumeAttributes 驗 escape hatch，被 API 拒也是結論）
+  6. E-19（queue_depth 64/256 SC+PVC 變體，D 類，記 placement）+ E-15（CPU limit throttle：Guaranteed vs limits<vCPU，收 cgroup throttled_usec）
+  7. E-35（mon 階梯：down 1 觀察→down 2 quorum 失→疊 osd kill→systemctl 恢復；⚠quorum 失時 ceph CLI 會 hang，恢復動作全走 systemctl）+ E-22（shards 16 rolling restart，rolling 全程收 client p99 時序）
+  排除：E-31/E-41（需使用者 az）、E-16（要改 kubelet 設定，等使用者在線）、E-20 host 層（P3）、E-23/E-43（P3）。
