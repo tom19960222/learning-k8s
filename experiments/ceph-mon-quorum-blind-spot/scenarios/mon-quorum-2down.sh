@@ -48,7 +48,7 @@ rollback() {
   echo ">>> ROLLBACK: start mon-02, mon-03  $(date -u +%FT%TZ)"
   hssh "$MON2_IP" "sudo systemctl reset-failed $UNIT2 2>/dev/null; sudo systemctl start $UNIT2" || true
   hssh "$MON3_IP" "sudo systemctl reset-failed $UNIT3 2>/dev/null; sudo systemctl start $UNIT3" || true
-  for i in $(seq 1 40); do
+  for _ in $(seq 1 40); do
     c="$(pqs 'count(probe_success{job="mon-tcp"}==1)')"
     echo "   waiting quorum: blackbox_probe_count=$c"
     [ "$c" = "3" ] && break; sleep 3

@@ -29,8 +29,12 @@ PY
 }
 
 echo "== fio matrix phase=$PHASE tmo=$TMO =="
-run randread 1 4k;  run randread 4 4k
-run randwrite 1 4k; run randwrite 4 4k
-run read 1 1m;      run read 4 1m
-run write 1 1m;     run write 4 1m
+# pattern names come from $spec (variable) so the fio rw words never appear as
+# barewords — avoids SC2162 misreading "read"/"write" as the read builtin.
+for spec in "randread 4k" "randwrite 4k" "read 1m" "write 1m"; do
+  # shellcheck disable=SC2086  # intentional word split of "pattern bs"
+  set -- $spec
+  run "$1" 1 "$2"
+  run "$1" 4 "$2"
+done
 echo "== end phase=$PHASE =="

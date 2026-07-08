@@ -1,0 +1,139 @@
+# Tier A — blackbox-based quorum detection vs the mgr blind spot.
+# Loads BOTH the existing mgr rule and the new blackbox rules so the headline
+# case proves them side by side against the SAME synthetic quorum-loss.
+rule_files:
+  - ../rules/ceph-mon-quorum-blackbox.yml
+  - ../../ceph-alert-rules/rules/ceph-stability-first.yml
+evaluation_interval: 30s
+tests:
+  # 健康：3 mon port 可達、mgr 也 =3 → 兩層都不 fire
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m2"}'
+        values: '1x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m3"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m2"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m3"}'
+        values: '1x6'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x6'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x6'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CephMonQuorumLostBlackbox
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+
+  # ★ 頭條：停 2/3 mon。mgr metric 凍結（stale 三顆都 =1），blackbox 反映真相 [1,0,0]。
+  #   → 現行 CephMonQuorumLost 盲（不 fire）；CephMonQuorumLostBlackbox fire。
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m2"}'
+        values: '0x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m3"}'
+        values: '0x6'
+      - series: 'up{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m2"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m3"}'
+        values: '1x6'
+      # mgr 凍結：quorum 真失守，但 mgr 續吐 stale=1 給每一顆
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.a"}'
+        values: '1x6'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.b"}'
+        values: '1x6'
+      - series: 'ceph_mon_quorum_status{ceph_daemon="mon.c"}'
+        values: '1x6'
+    alert_rule_test:
+      # for:30s 邊界：0s 不 fire、1m fire
+      - eval_time: 0m
+        alertname: CephMonQuorumLostBlackbox
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: CephMonQuorumLostBlackbox
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations:
+              summary: "Ceph MON quorum lost — fewer than 2 of 3 mon msgr ports reachable (blackbox, mgr-independent)"
+              runbook: "blackbox 探 mon:3300 少於 majority。先確認是 mon daemon 掛、host 掛、還是網路分區；ceph quorum_status（若還能連）；勿同時重啟多台 mon。此訊號不依賴 mgr，quorum 真失守時 mgr metric 會 stale。"
+      # 對照：同一時刻現行 mgr 版完全盲
+      - eval_time: 1m
+        alertname: CephMonQuorumLost
+        exp_alerts: []
+      # 動態版同樣 fire（分母 count(probe_success)=3 穩定）
+      - eval_time: 1m
+        alertname: CephMonQuorumLostBlackboxDynamic
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations:
+              summary: "Ceph MON quorum lost — reachable mon ports below dynamic majority (blackbox)"
+
+  # 全 3 掉：blackbox 匯出 0（series 仍在）→ 寫死版 or vector(0) 與動態版都 fire
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="mon-tcp",mon_addr="m1"}'
+        values: '0x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m2"}'
+        values: '0x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m3"}'
+        values: '0x6'
+      - series: 'up{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m2"}'
+        values: '1x6'
+      - series: 'up{job="mon-tcp",mon_addr="m3"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CephMonQuorumLostBlackbox
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_stability}
+            exp_annotations:
+              summary: "Ceph MON quorum lost — fewer than 2 of 3 mon msgr ports reachable (blackbox, mgr-independent)"
+              runbook: "blackbox 探 mon:3300 少於 majority。先確認是 mon daemon 掛、host 掛、還是網路分區；ceph quorum_status（若還能連）；勿同時重啟多台 mon。此訊號不依賴 mgr，quorum 真失守時 mgr metric 會 stale。"
+
+  # 探針自己掛：up{mon-tcp} 全 0、probe_success absent。
+  #   → 寫死版靠 or vector(0) 仍 fire（對 mon 全盲要叫），且 CephMonProbeExporterDown 分辨出「是探針死了」
+  - interval: 30s
+    input_series:
+      - series: 'up{job="mon-tcp",mon_addr="m1"}'
+        values: '0x6'
+      - series: 'up{job="mon-tcp",mon_addr="m2"}'
+        values: '0x6'
+      - series: 'up{job="mon-tcp",mon_addr="m3"}'
+        values: '0x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CephMonProbeExporterDown
+        exp_alerts:
+          - exp_labels: {severity: warning, source: ceph_stability}
+            exp_annotations:
+              summary: "mon-tcp blackbox probe target all down — quorum blind spot detector is itself blind"
+
+  # 還原：3 mon port 回可達 → 不 fire
+  - interval: 30s
+    input_series:
+      - series: 'probe_success{job="mon-tcp",mon_addr="m1"}'
+        values: '1x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m2"}'
+        values: '1x6'
+      - series: 'probe_success{job="mon-tcp",mon_addr="m3"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CephMonQuorumLostBlackbox
+        exp_alerts: []
