@@ -1,0 +1,50 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: baseline
+  namespace: vmtest
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: baseline
+    spec:
+      domain:
+        cpu:
+          cores: 4
+        memory:
+          guest: 8Gi
+        devices:
+          disks:
+          - name: boot
+            disk: {bus: virtio}
+          - name: data          # 被測盤：driver 欄位全留空 = baseline（自動 cache=none + io=native）
+            disk: {bus: virtio}
+          - name: cloudinit
+            disk: {bus: virtio}
+          interfaces:
+          - name: default
+            masquerade: {}
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - name: boot
+        containerDisk:
+          image: "quay.io/containerdisks/ubuntu:24.04"
+      - name: data
+        persistentVolumeClaim:
+          claimName: data-baseline
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            users:
+            - name: ubuntu
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              ssh_authorized_keys:
+              - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdCR0YA4pA0pkGI26XmFZpR/DD0jahDP+TiDnl6mxDs azure-kubevirt-lab"
+            package_update: true
+            packages: [fio, sysstat]

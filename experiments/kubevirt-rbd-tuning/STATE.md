@@ -12,6 +12,10 @@
   kubevirt v1.5.0 ✓、ceph-csi v3.14.0 ✓、kernel 6.8 ✓、RWX Block PVC 實測 Bound ✓、
   cephadm systemd unit 形式 ✓（E-32/35/36 注入手法可用）。RUNBOOK §0 已填實際值。
   **下一步：建 tools/ + manifests/（RUNBOOK §2.5/§3）→ E-00 正式盤點。**
+- 2026-07-08 tools/fio_stats.py + manifests/{01-pvc,02-vm} 建立（pubkey=azure-lab）。
+- 2026-07-08 `E-00 done results/E-00/<ts>/ — 版本全對齊；修正 autotune osd_memory_target 15.7G→4G（記入 SUMMARY）；mClock 天花板 ~6k IOPS/OSD`。
+  **執行約束（使用者 2026-07-08 指示）：az CLI 對共享帳號零 write——E-31/E-41 的 VM stop/start 由使用者執行。**
+  **下一步：kubectl 建 vmtest ns + PVC + VM → pre-fill → E-01。**
 - （之後每行格式：`E-XX done <bundle path> — <一句話結論>`）
 
 ## 待辦（環境到手後依序）
