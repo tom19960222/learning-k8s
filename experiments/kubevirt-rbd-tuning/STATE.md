@@ -67,3 +67,7 @@
 - 2026-07-08 **E-14 已點火**（`tools/e14-orchestrator.sh`，dedicatedIOThread on/off 交錯×3；斷言 ua-data device 的 iothread 欄位）。單盤輪先跑；雙盤輪（獨佔主場）視結果加測。
 - 2026-07-08 `E-14 done results/E-14/<ts> — 單盤 dedicatedIOThread 無感（confirmed）；收不回 rr-qd32 36.7% 稅；雙盤輪列 P3`
 - 2026-07-08 **E-30 已點火**（`tools/e30-run.sh <bundle> <guest-ip> 3`，degraded 第一格：stop osd.3 →750s（含 600s out+backfill 開始）→ 回復；guest dg 負載 rw-qd8+rr-qd1 各 1s 粒度 lat log；health.jsonl 5s 粒度）。分析時對齊 timeline.txt 的 epoch 戳記。
+- 2026-07-08 `E-30 done results/E-30/<ts> — down 未 out 完全無感（=baseline）；auto-out 後 backfill 是傷害視窗（rr-qd1 mean ×24、max 1.01s；rw max 76ms）；re-in recovery rw max 309ms；全自癒無 guest 症狀。健康碼 OSD_DOWN/PG_AVAILABILITY/PG_DEGRADED`
+- 2026-07-08 **E-39 已點火**（`tools/e39-run.sh`：60G scratch image 加大 backfill 量→兩次獨立注入
+  balanced vs high_client_ops，手動 `osd out` 立即觸發 backfill，各量 240s；status.jsonl 含 recovery 速率；
+  結束自動還原 profile 預設並刪 config）。scratch image `kubevirt/ioperf-fill` 60G 保留供 E-31/E-34 重用，最後清理時 `rbd rm`。

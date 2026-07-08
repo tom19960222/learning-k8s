@@ -68,3 +68,18 @@
 - 26 metric 中 17 個 indistinguishable；邊緣超帶：rr-qd1 +5.4%、rw-qd8 +8.4%（正向）、rr-qd32 p99 **+8%（反向劣化）**；max 類雙向亂跳（n=3 單發 outlier）。
 - **關鍵否定結論：單盤 dedicatedIOThread 收不回 E-02 的 rr-qd32 +36.7% 虛擬化稅**（IOPS 帶內）——qd32 瓶頸不在「缺一條獨立 iothread」。與 E-12（threads +12.4%）合看：提交路徑寬度有影響但不是主稅源。
 - 雙盤並行輪（dedicated 的設計主場）延後列 P3。生產結論（機制級）：單盤 VM 不用開。
+
+## E-30 單 OSD 乾淨 down — done（degraded 矩陣第 1 列；H-005 單 OSD 部分 confirmed+細化）
+
+- Bundle：`results/E-30/<ts>/`（timeline.txt epoch 對齊；dg lat log 1s 粒度；health.jsonl 5s）
+- 分相位結果（1s 窗 clat，baseline rw-qd8=1.48ms / rr-qd1=0.96ms）：
+  | 相位 | rw-qd8 mean/max | rr-qd1 mean/max |
+  |---|---|---|
+  | peering（down 瞬間 20s） | 1.59 / 3.70ms | 1.09 / 3.80ms |
+  | down 未 out（580s） | **1.44 / 1.51ms（=baseline）** | **0.95 / 1.00ms（=baseline）** |
+  | **auto-out → backfill** | 3.95 / **76.4ms** | **22.73 / 1010.9ms（×24，整秒窗）** |
+  | re-in recovery | 4.46 / **309.3ms** | 1.87 / 71.9ms |
+  | post | 1.49ms（全自癒） | 0.96ms |
+- **頭條結論（機制級）**：單 OSD 故障本身近乎無感；**真正的傷害視窗是 `mon_osd_down_out_interval`（600s）到期後的 backfill 與回歸後的 recovery**——隨機讀在 backfill 期整整劣化 24 倍。維運含義：短暫維護先 `ceph osd set noout`；預期外故障要嘛 10 分鐘內救回、要嘛接受 backfill 視窗（E-39 測 mClock 能壓多少）。
+- guest 症狀：無 hung task、無 remount、恢復後 direct read OK（`guest-symptoms.txt`）。健康碼：OSD_DOWN、PG_AVAILABILITY、PG_DEGRADED。
+- Deviation：script 的 health-ok-again 戳記誤判（grep 過鬆），實際恢復以 health.jsonl 為準；後窗數據證實 T1+150s 已回 baseline。
