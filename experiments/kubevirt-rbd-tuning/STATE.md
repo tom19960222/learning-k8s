@@ -100,6 +100,7 @@
   若要補：跑完後單開一台 L32s_v3 數小時做 E-22 對照即可，不用整組重建。
 - 2026-07-08 **改派 Sonnet subagent 執行**（使用者授權，省主線 rate limit）：第一棒 = E-13 + E-21
   （序列執行，subagent 自行記錄/回填/commit；主線只派工與抽查）。同時段主線不碰叢集。
+- 2026-07-08 `E-13 done results/E-13/20260708-095032 — confirmed：blockMultiQueue 是 no-op（兩變體 guest mq 都=4、cmdline 唯一差=mq 顯式寫 num-queues:4，QEMU AUTO 本就給 4）；fio 23/29 帶內，超帶項全歸因 drift/spiky-max（verdict.md 照實列）；頁面已回填。下一步 E-21。`
 - 2026-07-08 **使用者裁示：全自動接力，一棒完成直接派下一棒不等人**。派工 queue（固定順序，
   每棒 = 一個 Sonnet subagent，序列執行、自行記錄回填 commit push、FATAL 才停）：
   1. （進行中）E-13 收尾 + E-21

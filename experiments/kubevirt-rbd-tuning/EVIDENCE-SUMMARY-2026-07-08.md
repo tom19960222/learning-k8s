@@ -62,6 +62,14 @@
 - 生產結論（機制級）：**維持預設（留空=native）即可**——threads 的 qd32 增益不大、且未量 QEMU CPU 代價（本輪未收 schedstat，deviation）；沒有改的理由，但「native 一定比較快」的說法在本 stack 不成立。
 - verdict 檔：`verdict-threads.txt`。
 
+## E-13 blockMultiQueue no-op 驗證 — done（confirmed：錨點成立，開了=沒開）
+
+- Bundle：`results/E-13/20260708-095032/`（A=不設 vs mq=`blockMultiQueue: true` 交錯 n=3）
+- **錨點實錘**：7/7 次生效驗證 guest `/sys/block/vdb/mq` 目錄數**兩變體都=4**；cmdline diff 顯示唯一實質差異=mq 變體對所有 virtio-blk 裝置顯式寫入 `"num-queues":4`，A 變體省略、QEMU AUTO 預設自動解析為 vCPU 數=4——**blockMultiQueue 只是把 QEMU 已在做的預設值顯式化**（繼承錨點 v2 H-026：virtio-blk.c:1997 的 AUTO 行為，T3 confirmed）。
+- fio：23/29 metric indistinguishable；超帶項（rr-qd1 iops −6.5%、sr-1m p99 +9.6%）經 per-round 檢視為時間漂移（兩變體各自單調下滑、A 側自身 −5.2%；sr-1m 是 E-17 實錄漂移最大 pattern），max 類三項雙向亂跳（spiky、band.json 無 max 校準）——佇列拓樸完全相同下無機制可產生真差異。verdict.md 內全數照實列出。
+- 生產結論（機制級）：**新 QEMU（AUTO num-queues）上 blockMultiQueue 不用開**——它不會給你更多 queue，也不會更快；唯一用途是老 QEMU（無 AUTO）或需要顯式固定 queue 數的場景。真 queues=1 反向對照需 hook sidecar，維持 optional-skip（設計期已記 deviation）。
+- verdict 檔：`verdict.md`（機器輸出 verdict-raw.txt 照抄）。
+
 ## E-14 dedicatedIOThread — done（單盤輪：confirmed「無感」）
 
 - Bundle：`results/E-14/<ts>/`（A/io 交錯 n=3；device iothread 欄位斷言全過）
