@@ -61,3 +61,5 @@
   cache A/wt/wb 交錯 ×3、每次切換 stop/start + cmdline 生效斷言（A:direct=true,wc=on／wt:false,off／wb:false,on）、
   containerDisk 重啟重置已處理（cloud-init --wait + 重推 run_matrix.sh）。冪等：中斷後同指令重跑會跳過已完成 round。
   完成後：fio_stats.py cmp <A輪> <wt輪|wb輪> band.json → verdict.md → 回填 SUMMARY/頁面 → 收尾已自動回 baseline。
+- 2026-07-08 `E-10 done results/E-10/20260708-015243 — H-004 confirmed（wb p999 +2064%、1.5~3.5s stall；wt 寫側嚴格劣化）；⚠cache-regime 陷阱：非 direct 讀側=host RAM（16G 盤<32G RAM），讀增益不可移植`
+- 2026-07-08 **E-12 已點火**（背景 `tools/e12-orchestrator.sh`，io native vs threads 交錯×3，~75min；斷言 aio 欄位）。
