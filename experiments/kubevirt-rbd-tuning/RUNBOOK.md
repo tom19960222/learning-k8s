@@ -141,7 +141,7 @@ guest 'sudo fio --name=prefill --filename=/dev/vdb --rw=write --bs=1M --iodepth=
 ```bash
 # (a) QEMU cmdline（cache/aio/num-queues/iothread 全在這）：
 POD=$(kc get pod -n vmtest -l kubevirt.io/domain=baseline -o jsonpath='{.items[0].metadata.name}')
-kc exec -n vmtest $POD -c compute -- sh -c 'tr "\0" "\n" < /proc/$(pgrep -f qemu-system | head -1)/cmdline' \
+kc exec -n vmtest $POD -c compute -- sh -c 'tr "\0" "\n" < /proc/$(pgrep -x qemu-kvm | head -1)/cmdline' \
   | grep -E 'blockdev|device|iothread|cache|aio' > effect-verify-X.txt
 # (b) domain XML（佐證）：
 kc exec -n vmtest $POD -c compute -- virsh dumpxml 1 >> effect-verify-X.txt
@@ -528,7 +528,7 @@ ceph_c config set osd osd_mclock_profile high_client_ops   # B；A=balanced
 # 變體 A=cache none、B=writeback（E-10 的 patch）各重複 3 次：
 guest 'sudo fio --name=vw --filename=/dev/vdb --rw=randwrite --bs=4k --iodepth=8 --verify=crc32c --verify_backlog=1024 --runtime=300 --time_based' &
 sleep 60
-$SSH ikaros@$NODE 'sudo kill -9 $(pgrep -f "qemu-system.*baseline")'   # 注入
+$SSH ikaros@$NODE 'sudo kill -9 $(pgrep -f "qemu-kvm.*baseline" || pgrep -x qemu-kvm)'   # 注入
 kc wait -n vmtest vmi/baseline --for=condition=Ready --timeout=600s    # virt-launcher 重建
 guest 'sudo fio --name=vr --filename=/dev/vdb --rw=randread --bs=4k --verify=crc32c --verify_only --verify_backlog=1024'  # 回讀驗證
 # 記錄：verify 錯誤數、dmesg、每變體 3 次的結果矩陣
