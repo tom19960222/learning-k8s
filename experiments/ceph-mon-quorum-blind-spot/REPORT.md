@@ -161,7 +161,13 @@ blackbox 相對 mgr metric 的關鍵優勢：down target 它匯出 `probe_succes
 - **真正會爆的是「任何要新建 mon 連線」的動作**：k8s 上就是 node 的 kernel `rbd map`（新 pod 卡 `ContainerCreating`）。這涵蓋**新部署、pod 重啟、node 重開機、drain 後重排、HPA 擴容**——全部卡住直到 quorum 回。控制面 PVC provisioning 反而可能成功（CSI provisioner 是既有連線）。
 - **對 alert 的意涵**：不能指望存量 workload 自己察覺 quorum 失守（它們無感）；quorum pager（A3）是必要的主動訊號。且 quorum 失守期間**別重排 pod / drain node**，會把無感變成全卡。
 
-### 5.4 誠實的邊界 / 未竟
+### 5.4 現場狀態與善後（給醒來的你）
+- **叢集**：3-mon quorum 回復、9 OSD up、mgr active+standby。`HEALTH_WARN` 只剩兩個既存良性項：BlueStore slow-op alert（實驗寫入觸發，~24h latch，非現時 slow）＋「3 hosts fail cephadm check」（IP 漂移導致 orch SSH 失敗，data plane 無礙）。
+- **⚠️ mon secondary IP 不要拆**：`.166/.167/.164` 是現在維持 quorum 的綁定位址（見 §1.3）。重開機不會保留；下次開機要照 memory 重補。
+- **推薦偵測 stack 仍在線**：k8s ns `qmon`（Prometheus + blackbox）。Prometheus UI＝ `http://192.168.18.155:30090`（Mac 可直接開），已在即時監測 quorum。要收掉：`sudo kubectl delete ns qmon`（在 .155）。
+- **Gate 3（發佈決策）**：報告 + 規則 + promtool 測試都在 `experiments/`；**尚未**動任何網站 MDX（依你選的「延後」）。要不要把 blackbox 這層併進 `prometheus-alert-design.mdx` / `prometheus-alert-real-lab-findings.mdx`，等你定奪。
+
+### 5.5 誠實的邊界 / 未竟
 - blackbox 探的是**可達性**（TCP port 開）。「mon 進程活、port 開、但因分區/選舉卡在 probing 沒進 quorum」這種 corner case blackbox 會誤判為健康——需 A6 才抓得到。實務上 quorum 失守最常見成因（mon daemon 掛、host 掛、網路斷）都會讓 port 不可達，A3 抓得到。
 - H-B5（新 mount 在 quorum 回來後恢復）未直接觀察（cleanup 提早刪 pod）；屬 Ceph 既有行為。
 - A5/A6 以設計 + 拓樸論證處理，未真機部署（mon host 不在 k8s、需 per-host agent，且 A3 已解題）。
