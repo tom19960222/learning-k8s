@@ -91,3 +91,5 @@
   E-41(需使用者 az stop)/E-43(P3)/E-51/52(部分證據已有)。orchestrator 模板齊全（e10/e12/e14 為 B 類模板、
   e17 為 A 類模板、e30/e36/e39 為注入模板），接手 agent 照模板換 patch/斷言即可。
 - 2026-07-08 `E-17 done results/E-17/<ts> — none 優於 mq-deadline（seq +30~40%、rr-qd32 p99 −7.7%）；預設已是 none=檢查清單項。⚠實測到跨實驗漂移（sr-1m 對 E-01 -19%）——後續 E-1x 前建議跑 sentinel 輪`
+- 2026-07-08 **E-18 已點火**（`tools/e18-run.sh`，readahead 128/512/4096 ×3 輪精簡矩陣 sr-1m/sr4k/rr-qd1，~40min；
+  分析注意：mini matrix 只有 3 pattern，cmp 時 band.json 缺 sr4k-qd1 條目會用預設 10% band）。
