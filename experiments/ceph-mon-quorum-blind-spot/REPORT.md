@@ -165,7 +165,7 @@ blackbox 相對 mgr metric 的關鍵優勢：down target 它匯出 `probe_succes
 - **叢集**：3-mon quorum 回復、9 OSD up、mgr active+standby。`HEALTH_WARN` 只剩兩個既存良性項：BlueStore slow-op alert（實驗寫入觸發，~24h latch，非現時 slow）＋「3 hosts fail cephadm check」（IP 漂移導致 orch SSH 失敗，data plane 無礙）。
 - **⚠️ mon secondary IP 不要拆**：`.166/.167/.164` 是現在維持 quorum 的綁定位址（見 §1.3）。重開機不會保留；下次開機要照 memory 重補。
 - **推薦偵測 stack 仍在線**：k8s ns `qmon`（Prometheus + blackbox）。Prometheus UI＝ `http://192.168.18.155:30090`（Mac 可直接開），已在即時監測 quorum。要收掉：`sudo kubectl delete ns qmon`（在 .155）。
-- **Gate 3（發佈決策）**：報告 + 規則 + promtool 測試都在 `experiments/`；**尚未**動任何網站 MDX（依你選的「延後」）。要不要把 blackbox 這層併進 `prometheus-alert-design.mdx` / `prometheus-alert-real-lab-findings.mdx`，等你定奪。
+- **Gate 3（發佈決策，已定案）**：使用者選「獨立一頁」。已新增 `next-site/content/ceph/features/mon-quorum-detection-blind-spot.mdx`（偵測盲區為主軸 + blackbox 解 + IO 衝擊以既有 `mon-quorum-loss-impact` 頁為深追、本頁只放真機確認），並註冊進 `projects.ts`（監控與告警群組）、`feature-map.json`、`quiz.json`（Q17/Q18）。`make validate` 全過。
 
 ### 5.5 誠實的邊界 / 未竟
 - blackbox 探的是**可達性**（TCP port 開）。「mon 進程活、port 開、但因分區/選舉卡在 probing 沒進 quorum」這種 corner case blackbox 會誤判為健康——需 A6 才抓得到。實務上 quorum 失守最常見成因（mon daemon 掛、host 掛、網路斷）都會讓 port 不可達，A3 抓得到。

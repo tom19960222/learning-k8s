@@ -190,5 +190,29 @@
     ],
     "answer": 0,
     "explanation": "collect.sh 的 exit code 0 是完整成功，2 是部分失敗但 bundle 已產生，1 才是使用方式、必要輸入或驗證失敗。事故現場常有某台 node 半失聯，所以工具刻意保留可收集到的資料；遇到 2 時應先保留 .tar.gz，從 summary.txt、errors.log、manifest.jsonl 判斷哪些 artifact 或 node 需要補跑。"
+  },
+  {
+    "id": 17,
+    "question": "3-mon cluster 停掉 2 台 mon（quorum 失守）時，為什麼 `CephMonQuorumLost`（expr: `(count(ceph_mon_quorum_status==1) or vector(0)) < 2`）不會 fire？",
+    "options": [
+      "唯一的 metric 來源是 active mgr 的 prometheus module，它從自身快取的 mon_status 算 quorum_status；quorum 一失守 mgr 拿不到新 map、快取凍結在三顆都在 quorum 的狀態，count(==1) 仍是 3",
+      "規則的 `or vector(0)` 寫錯了，應該用 `or vector(2)` 才能在 2 台掛掉時 fire",
+      "Prometheus 對 mgr 的 scrape 會失敗，導致 ceph_mon_quorum_status series 全部消失、count 算不出來",
+      "mon daemon 其實沒有真的停止，systemd 仍把它們標為 active"
+    ],
+    "answer": 0,
+    "explanation": "get_quorum_status()（ceph/src/pybind/mgr/prometheus/module.py:1018）每次 scrape 從 self.get('mon_status') 讀 mgr 快取的 cluster state 算 in_quorum。這份快取靠 active mgr 與 mon quorum 的 session 更新；quorum 失守後 session 斷、快取停在最後一次好值（三顆 mon 都還列在 quorum），三條 series 全凍在 1，count(==1)=3、3<2 永遠 false。這不是規則 bug 而是輸入資料 stale——sensor 與被測物同生共死。真機實測 mgr metric 全窗停在 3 且 up{ceph}=1（mgr 進程沒停、續吐 stale）。"
+  },
+  {
+    "id": 18,
+    "question": "在 mon quorum 失守（2/3 down）的窗內，client 的 RBD I/O 會怎樣？",
+    "options": [
+      "已 map/mount 的既有 volume：single/multi thread、random/seq 讀寫都照跑（cached osdmap 直打 OSD）；真正卡住的是要新建 mon 連線的動作，例如 node 端 kernel rbd map（新 pod 卡 ContainerCreating）",
+      "所有讀寫立刻全部中斷，因為每個 I/O 都要先問 mon 拿位置",
+      "只有寫入會卡（要 mon 確認 map），讀取一律正常",
+      "隨機 I/O 會卡、循序 I/O 正常，因為兩者走不同的 mon 路徑"
+    ],
+    "answer": 0,
+    "explanation": "mon 負責 map 分發與建立新 session，不在 dataplane 的 critical path。已持有 cached osdmap 的 client 直接對 OSD 讀寫，OSD 全 up、PG 不 re-peer，所以既有連線的 IO pattern（rand/seq）與併發度都不受影響——真機 fio 矩陣窗內吞吐約等於 baseline。會卡的是任何需要向 mon 取新 map 的新連線：node kernel rbd map、新 rados client，對應 k8s 的新部署 / pod 重啟 / node 重開 / drain 重排 / HPA 擴容。因此存量 workload 對 quorum 失守幾乎無感，這也是為什麼一定要有獨立的 quorum pager。"
   }
 ]
