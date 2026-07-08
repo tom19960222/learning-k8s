@@ -1,0 +1,1 @@
+[{"op":"replace","path":"/spec/template/spec/domain/devices/disks/1/disk/bus","value":"virtio"}]
