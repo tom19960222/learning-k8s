@@ -86,7 +86,7 @@ KubeVirt 的 disk driver 欄位定義在 `schema.go` 的 `DiskDevice` / disk dri
 - **作用機制**：開啟後 converter 把 disk 的 `driver.queues` 設成 vCPU 數，讓 guest virtio-blk 協商出多條 virtqueue（datapath §① guest 把 request 放進 vring、§② 每條 queue 各自 kick）。converter 只對 `Bus == virtio` 的 disk 設 `Driver.Queues`。**但注意：不開它也不是單 queue**——QEMU ≥5.2 的 virtio-blk `num-queues` 預設是 AUTO、realize 時解析成 vCPU 數（`File: qemu/hw/block/virtio-blk.c` 約 L1997-1998、`qemu/hw/virtio/virtio-blk-pci.c` 約 L56-58），且 libvirt 在 queues 未設時不輸出該屬性（`File: libvirt/src/qemu/qemu_command.c` 約 L1692 的 `p:` 修飾詞）、預設直通。所以此旋鈕在新 QEMU 上是「把 queues 明確設成與 auto 相同的值」，機制上傾向 no-op——實際差異待實驗反向對照（強制 queues=1 vs auto）驗證。
 - **impact**：🟡 中 —— 對多 vCPU、多並行 IO 的 workload 有感（拉開 §①② 的並行度）；單 vCPU 或低並行時幾乎沒差。
 - **來源**：`File: kubevirt/pkg/virt-launcher/virtwrap/converter/converter.go`（`disk.Driver.Queues = numQueues` 僅在 virtio bus，約 L205-206；`blockMultiQueue` 推導出 `numBlkQueues = &vcpus` 約 L1580-1588）；欄位定義 `File: kubevirt/staging/src/kubevirt.io/api/core/v1/schema.go`（`BlockMultiQueue` 約 L493）。
-- **風險 / 前提**：注意 converter 裡那個 `multiQueueMaxQueues = uint32(256)`（約 L74）是**網路介面** multi-queue 的上限（用在 `network.go` 的 `NetworkQueuesCapacity`），不是 block 路徑的 cap；block 路徑直接用 vCPU 數，別把 256 當成 block queue 上限。
+- **風險 / 前提**：注意 converter 裡那個 `multiQueueMaxQueues = uint32(256)`（約 L74）是**網路介面** multi-queue 的上限（用在 `network.go` 的 `NetworkQueuesCapacity`），不是 block 路徑的 cap；block 路徑直接用 vCPU 數，別把 256 當成 block queue 上限。**實測註腳**：在 ceph 側延遲主導的環境，多 queue 沒有可觀測效益、強制單 queue 甚至略快（PVE 實測見[實驗計畫頁](./rbd-io-experiment-plan) E-08）——這顆旋鈕的主場是本機 NVMe 等低延遲後端 + 多 vCPU 高並行。
 
 ### blockSize（對應 datapath 第 ① 跳 / ① 層）
 - **在哪設**：VMI spec `spec.domain.devices.disks[].blockSize`，二選一：`custom.{logical,physical}` 或 `matchVolume`。
@@ -227,7 +227,7 @@ static const struct fs_parameter_spec rbd_parameters[] = {
 - **作用機制**：直接設 krbd 的 blk-mq `tag_set.queue_depth`，也就是 host 端 `/dev/rbdX` 允許的 in-flight request 數（datapath §⑤ `rbd_queue_workfn` 之前的排隊容量）。深度不足會在 host 端就把並行壓下來，不管 ceph 端多快。
 - **impact**：🔴 高 —— 它是 host 到 OSD 這一段的並行上限；對高 QD workload 直接決定能不能打滿 ceph。
 - **來源**：`File: linux/drivers/block/rbd.c`（token `queue_depth` 約 L817、`opt->queue_depth = result.uint_32` 約 L6282、套用 `tag_set.queue_depth = rbd_dev->opts->queue_depth` 約 L4959；預設 `RBD_QUEUE_DEPTH_DEFAULT = BLKDEV_DEFAULT_RQ` 約 L837）。
-- **風險 / 前提**：拉太高會增加 OSD 端壓力與 memory 佔用；要搭配 ceph 端容量一起看，不是越大越好。
+- **風險 / 前提**：拉太高會增加 OSD 端壓力與 memory 佔用；要搭配 ceph 端容量一起看，不是越大越好。**精確語意注意**：krbd 的 tag 是 per-hctx 的——`tag_set.flags` 只有 `BLK_MQ_F_SHOULD_MERGE`（沒有 shared-tag flag），且 `nr_hw_queues = num_present_cpus()`（rbd.c 約 L4958-4963），所以 host 端理論 in-flight 容量是 **queue_depth × CPU 數**，不是單一 queue_depth 值；單一 IO 流很難打滿最小預設值，此旋鈕只在極高並行 workload 才可能成為約束（實測全帶內，見[實驗計畫頁](./rbd-io-experiment-plan) E-10）。
 
 ### alloc_size（對應 datapath 第 ⑤ 跳 / ④ 層）
 - **在哪設**：`rbd map --options alloc_size=...`（預設 64KiB）。
@@ -250,6 +250,13 @@ static const struct fs_parameter_spec rbd_parameters[] = {
 - **來源**：`File: linux/net/ceph/ceph_common.c`（`fsparam_string("crush_location", Opt_crush_location)` 約 L288）；語意參考官方 `rbd` man page `https://docs.ceph.com/en/latest/man/8/rbd/`。
 - **風險 / 前提**：拓樸字串要對得上實際 CRUSHMap 的 bucket 名稱，否則無效。ceph-csi 也有 read-affinity 機制可自動帶這個（見 `getMapOptions` 的 `GetReadAffinityMapOptions`）。
 
+### rxbounce（對應 datapath 第 ⑤ 跳 / ④ 層）
+- **在哪設**：`rbd map --options rxbounce`（ceph-csi StorageClass `mapOptions` 同理）。
+- **作用機制**：VM 類 workload 可能在 read 還在飛行時改寫自己的 buffer（Windows guest 常見）；krbd 預設把收到的資料直接寫進該 buffer，資料中途變動會讓 messenger 的 CRC 驗證失敗、整條連線重建、IO 重試。`rxbounce` 讓 libceph 先收進 bounce buffer 再複製給上層——用一次 memcpy 換掉重試風暴。
+- **impact**：🟢 低或情境性 —— 只在「guest 會改寫飛行中 buffer」的 workload 有感；Linux guest + O_DIRECT fio 實測**不觸發**（dmesg 零筆 bad crc，見[實驗計畫頁](./rbd-io-experiment-plan) E-14）。跑 Windows guest on krbd 時建議開。
+- **來源**：`File: linux/net/ceph/ceph_common.c`（`fsparam_flag("rxbounce", Opt_rxbounce)` 約 L299）。
+- **風險 / 前提**：需要 kernel ≥5.17；開啟後每個 read 多一次記憶體複製，對不觸發問題的 workload 是純開銷。
+
 ### host sysfs /sys/block/rbdX/queue/*（對應 datapath 第 ⑤ 跳 / ④ 層）
 - **在哪設**：host 端 `/sys/block/rbdX/queue/nr_requests`、`/scheduler` 等。
 - **作用機制**：host 端對 `/dev/rbdX` 這顆 block device 的 blk-mq 行為（排程、queue 深度）。krbd 預設把 scheduler 走 blk-mq、`QUEUE_FLAG_NONROT` 設好（rbd.c 建 disk 時設定），多數情況不需動。
@@ -263,6 +270,8 @@ static const struct fs_parameter_spec rbd_parameters[] = {
 
 <Callout type="info" title="librbd-only 的旋鈕，krbd 路徑不走">
   Ceph 有一批常被提到的 RBD 效能旋鈕——`rbd_cache`、`rbd_readahead_max_bytes` 等——是 **librbd**（user-space）的選項，service 標的就是 `rbd`。本頁主軸 krbd 走的是 host kernel 的 rbd module，**完全不經過 librbd**，所以這些 `rbd_cache` / `rbd_readahead` 對 krbd 路徑無效。要用它們得改走 librbd（QEMU 內建 rbd driver 或 rbd-nbd mounter），那是另一條 datapath。來源：`File: ceph/src/common/options/rbd.yaml.in`（`rbd_cache` 約 L100、`services: [rbd]`；`rbd_readahead_max_bytes` 約 L257）。
+  <br/>
+  補一條重要互動（librbd 路徑上）：**QEMU 的 cache 模式直接控制 `rbd_cache`**——`cache=none` 時 QEMU 對 librbd 設 `rbd_cache=false`、其餘設 true（`File: qemu/block/rbd.c` 約 L955-963、L1121）。所以走 librbd 時「VM 的 cache 旋鈕」實質上就是 rbd_cache 開關：writeback 讓小寫由 librbd cache 吸收（PVE 實測 qd1 隨機寫 **+69 倍**、附一致性代價與警語）、writethrough 每寫附帶 flush（實測高並行寫 **−69%**）——見[實驗計畫頁](./rbd-io-experiment-plan) E-05。
 </Callout>
 
 ### RBD object-size（對應 datapath 第 ⑤ 跳 / ⑤ 層）
@@ -314,6 +323,7 @@ static const struct fs_parameter_spec rbd_parameters[] = {
 | rq_affinity | ③ | guest `/sys/.../rq_affinity` | 🟢 completion CPU 親和，多核才有感 | 依環境實測 |
 | read_from_replica | ④ | `rbd map --options` | 🟢 read-heavy + 拓樸差異才有感 | 需搭 crush_location |
 | crush_location | ④ | `rbd map --options` | 🟢 搭 localize 跨 zone 才有意義 | 字串要對上 CRUSHMap |
+| rxbounce | ④ | `rbd map --options` | 🟢 防 guest 改寫飛行中 buffer 的 CRC 重試風暴；Linux+direct 實測不觸發 | kernel ≥5.17；多一次 memcpy |
 | host sysfs rbdX/queue/* | ④ | host `/sys/block/rbdX/queue/*` | 🟢 queue_depth 已涵蓋主要旋鈕 | 與 map option 重疊 |
 
 ## 接下來 / 相關頁面

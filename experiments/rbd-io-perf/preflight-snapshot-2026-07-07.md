@@ -50,3 +50,11 @@
 - pve3 硬體：8 cores、32G RAM（avail ~15G）、governor=performance、/dev/kvm 存在。
 - **fio 未安裝於 node**（E-02 需要；`fio --enghelp` 的 rbd engine 支援待安裝後確認）——待使用者同意 `apt install fio`。
 - VMID 1031–1039 全空 ✅；帳號 ioperf + NOPASSWD sudo 運作正常 ✅。
+
+## SSD 調查（2026-07-08，Gate 3 授權）
+
+`ceph device ls` + `ceph device get-health-metrics`（read-only）：
+
+- **osd.0 = Crucial_CT275MX300SSD1（MX300 275GB，2016 消費級 TLC，無 PLP）**：WEAR **90%**、Ave_Block-Erase_Count 1360（額定 ~1500 P/E）、Power_On_Hours 29,154、Total_LBAs_Written ≈23.7TB（相對額定 80TBW 不高——Ceph 小寫的 write amplification 把 P/E 吃掉了）、Reallocated 7。
+- **osd.8 = OCZ-ARC100（2014 入門消費級，無 PLP）**：mgr 未回報 wear。
+- 結論：E-02 的 33 IOPS 寫入天花板與 osd.0 長期 BLUESTORE_SLOW_OP_ALERT 的根因即此二盤——無 PLP 消費 SSD 上 BlueStore 每寫真 flush，磨損 90% 的 MX300 更是雪上加霜。建議更換為有 PLP 的資料中心級 SSD。
