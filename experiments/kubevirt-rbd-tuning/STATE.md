@@ -71,3 +71,5 @@
 - 2026-07-08 **E-39 已點火**（`tools/e39-run.sh`：60G scratch image 加大 backfill 量→兩次獨立注入
   balanced vs high_client_ops，手動 `osd out` 立即觸發 backfill，各量 240s；status.jsonl 含 recovery 速率；
   結束自動還原 profile 預設並刪 config）。scratch image `kubevirt/ioperf-fill` 60G 保留供 E-31/E-34 重用，最後清理時 `rbd rm`。
+- 2026-07-08 `E-42+E-50 done results/E-42/<ts> — migration IO 零中斷（1s 窗最差 8ms）；H-001 T3 實錘（RestartRequired 出現/migration 不套用/revert 不清條件）；mig-3 cmdline 樣本無效（pod race）`
+- 2026-07-08 **E-36 已點火**（`tools/e36-run.sh <bundle> 10.244.1.195 8 0`：t30 盤（SC ceph-rbd-t30，osd_request_timeout=30 已驗 config_info）vs baseline 盤；停 PG 2.5 acting 的 osd.8+osd.0 → min_size 不滿 300s → 回復。VM 現有第 4 顆盤 datat30/PVC data-t30——實驗後保留或清理見 E-36 收尾）。
