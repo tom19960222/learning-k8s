@@ -50,3 +50,4 @@
 - 2026-07-08 MDX 專題頁上線：`next-site/content/vm-storage-perf/features/rbd-io-production-tuning.mdx`
   （P0 四分類+三 violated 直覺+已完成 T3；實驗回填表留空——每完成一個實驗要同步回填此頁）。
   slug 已入 projects.ts features+featureGroups(效能調教)。quiz 未加（等實驗數字齊再出題）。
+- 2026-07-08 `E-01 done results/E-01/<ts>/ — H-008 violated：IOPS CoV 0.4–2.0%（判準多為 5%），band.json 已產出（git 追蹤）；baseline 錨點 rr 968/8458/26771、rw 597/5322/14751 IOPS、seq 2838/1233 MiB/s；頁面表已回填。下一步 E-02（host 天花板，worker k8s-1）。`

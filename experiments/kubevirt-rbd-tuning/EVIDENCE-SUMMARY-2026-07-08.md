@@ -27,3 +27,13 @@
 - 同一 60s 窗（E-01 round-1 的 rr 負載中）：guest vdb **27005 r/s** vs host rbd0 **26998 r/s**（差 0.03% ≪ 10% 判準）；`virsh domblkstat` 差分可用（rd_req 增量/60 與 iostat 同量級）。
 - 虛擬化稅初值：guest await 1.12ms − host await 1.03ms ≈ **0.09ms/op**（qd32 高載時）。
 - 三邊界收集管線全部自動化可用 → 後續實驗照此收。
+
+## E-01 噪音帶 — done（H-008 **violated**：Azure 專屬叢集比 PVE 生產穩一個數量級）
+
+- Bundle：`results/E-01/<ts>/e01/round-{1..5}-A/`（n=5 連跑；deviation：未跨 2h 時段）
+- **IOPS CoV 0.4–2.0%**（v2 PVE 4k qd1 讀是 23.4%）；p99 CoV 0.5–7.9%；p999 除 sw-1m（35.2%）外 ≤9%。
+- band.json（git 追蹤，`band = max(2×CoV, 5%)`）：多數 metric 判準落在 5%；sw-1m p999 判準 70%（seq write 尾端本質性抖，該 metric 幾乎只能出 indistinguishable——誠實限制）。
+- **gen-1 baseline 錨點數字**：rr qd1/8/32 = **968 / 8458 / 26771** IOPS；rw = **597 / 5322 / 14751**；
+  seq read/write = **2838 / 1233 MiB/s**。rr-qd1 p50=0.97ms、rw-qd1 p50=1.63ms。
+- p999 樣本數規則生效：qd1 pattern（58k/36k 樣本 < 1e5）不報 p999。
+- 對照 mClock 天花板 9×6000=54k：rr-qd32 已用到 27k（50%）；單 VM 單盤打不滿叢集。
