@@ -63,3 +63,5 @@
   完成後：fio_stats.py cmp <A輪> <wt輪|wb輪> band.json → verdict.md → 回填 SUMMARY/頁面 → 收尾已自動回 baseline。
 - 2026-07-08 `E-10 done results/E-10/20260708-015243 — H-004 confirmed（wb p999 +2064%、1.5~3.5s stall；wt 寫側嚴格劣化）；⚠cache-regime 陷阱：非 direct 讀側=host RAM（16G 盤<32G RAM），讀增益不可移植`
 - 2026-07-08 **E-12 已點火**（背景 `tools/e12-orchestrator.sh`，io native vs threads 交錯×3，~75min；斷言 aio 欄位）。
+- 2026-07-08 `E-12 done results/E-12/<ts> — prediction violated：threads 不輸 native（rr-qd32 +12.4%/p99 −7.2%），其餘全帶內；維持預設。未收 QEMU schedstat（deviation）`
+- 2026-07-08 **E-14 已點火**（`tools/e14-orchestrator.sh`，dedicatedIOThread on/off 交錯×3；斷言 ua-data device 的 iothread 欄位）。單盤輪先跑；雙盤輪（獨佔主場）視結果加測。

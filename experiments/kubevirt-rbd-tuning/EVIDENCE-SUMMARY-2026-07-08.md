@@ -53,3 +53,11 @@
 - **量測陷阱（一等發現）**：wt/wb 都關 O_DIRECT → 讀經 host page cache，16G 測試盤 < 32G worker RAM → **讀側數字是 RAM 不是 ceph**（sr-1m 2709→14630 IOPS ≈ 14.3GiB/s、rr-qd32 +161~176%）。生產 working set >> host RAM 時讀側增益消失；本實驗讀側結論僅在 cache-hit regime 成立。
 - **latency-first 生產結論（機制級）**：維持預設 `cache=none`——wt 嚴格劣於 none；wb 的寫側均值增益以 p99.9 崩壞 + 秒級 stall 為代價（另有 E-40 crash consistency 未驗）。
 - verdict 檔：`verdict-wt.txt`、`verdict-wb.txt`。
+
+## E-12 io mode — done（prediction **violated**：threads 不輸 native，高 QD 讀還略勝）
+
+- Bundle：`results/E-12/<ts>/`（A=native, th=threads 交錯 n=3；aio 欄位斷言全過）
+- **rr-qd32：threads +12.4% IOPS（27563→30993）、p99 −7.2%**——超出噪音帶，方向與「native 優於 threads」的常識相反；其餘 22/26 個 metric 全部 indistinguishable（max 類除外，n=3 下單發 outlier 不穩）。
+- 機制假說（待 E-14 交叉驗證）：O_DIRECT + krbd 下，native AIO 的提交集中在單一 event loop；thread pool 把阻塞 IO 攤到多工作緒，在高並行時提交面更寬。
+- 生產結論（機制級）：**維持預設（留空=native）即可**——threads 的 qd32 增益不大、且未量 QEMU CPU 代價（本輪未收 schedstat，deviation）；沒有改的理由，但「native 一定比較快」的說法在本 stack 不成立。
+- verdict 檔：`verdict-threads.txt`。
