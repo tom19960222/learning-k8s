@@ -83,3 +83,10 @@
   （blocked 302.8s 無 abort 無 dmesg）；baseline 盤 blocked 293s 後自癒。機制矛盾開 H-034 追查
   （建議變體：連線層故障 vs PG inactive 對照）。頁面 osd_request_timeout 敘述已加 violated Callout。
   收尾狀態：VM 仍掛 4 顆盤（datat30 保留供 H-034 續用）；SC ceph-rbd-t30 保留。`
+- 2026-07-08 **E-17 已點火**（`tools/e17-run.sh`，guest scheduler mq-deadline vs none 同 VM 交錯×3 免重啟，~65min；
+  完成後 cmp grp 分組照舊：A=mq-deadline B=none）。
+- **進度總覽（gen-1，截至此刻）**：done = E-00/01/02/03/10/12/14/30/36/39/42/50 + baseline-verify；
+  running = E-17；**剩餘** = E-11(bus)/E-13(mq no-op)/E-15/16(CPU)/E-18(readahead)/E-19(qdepth,D類)/
+  E-20(layout)/E-21(memory_target)/E-22(shards)/E-23(P3)/E-31~35+37~38(degraded 其餘)/E-40(crash)/
+  E-41(需使用者 az stop)/E-43(P3)/E-51/52(部分證據已有)。orchestrator 模板齊全（e10/e12/e14 為 B 類模板、
+  e17 為 A 類模板、e30/e36/e39 為注入模板），接手 agent 照模板換 patch/斷言即可。
