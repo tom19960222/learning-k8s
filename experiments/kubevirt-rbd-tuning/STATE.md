@@ -111,3 +111,5 @@
   6. E-19（queue_depth 64/256 SC+PVC 變體，D 類，記 placement）+ E-15（CPU limit throttle：Guaranteed vs limits<vCPU，收 cgroup throttled_usec）
   7. E-35（mon 階梯：down 1 觀察→down 2 quorum 失→疊 osd kill→systemctl 恢復；⚠quorum 失時 ceph CLI 會 hang，恢復動作全走 systemctl）+ E-22（shards 16 rolling restart，rolling 全程收 client p99 時序）
   排除：E-31/E-41（需使用者 az）、E-16（要改 kubelet 設定，等使用者在線）、E-20 host 層（P3）、E-23/E-43（P3）。
+- 2026-07-09 `E-13 done`（subagent 已 commit dcfd58a）+ `E-21 done results/E-21/20260708-153326 — indistinguishable（16G 盤 vs 12G cache 已足）；RSS 8G→1.5G/4G→1.1G 證 runtime 生效；印證 E-00 釘 4G 的判斷`。
+  ⚠ subagent 監聽器在 E-21 ALL-DONE 後死亡未收尾，主線補記錄。**教訓：長時監聽 subagent 不穩 → 改「background bash 跑實驗 + 完成後主線派短命 subagent 只做收尾」**。

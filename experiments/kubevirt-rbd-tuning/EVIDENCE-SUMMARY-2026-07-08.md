@@ -134,3 +134,12 @@
 - **事後看是設計必然**：矩陣是 `--direct=1`，O_DIRECT 繞過 page cache → `read_ahead_kb` 完全不參與。
 - 機制結論（比數字有價值）：**readahead 只影響 buffered read**——對 direct IO workload（資料庫、本研究的 latency-first profile）它是「非旋鈕」。buffered 變體（會被 guest page cache 混淆）列 P3 不追。
 - 生產結論：direct IO 型服務不用碰 readahead；buffered 型（檔案服務等）另案。
+
+## E-21 osd_memory_target 4G vs 8G — done（indistinguishable；邊界條件是關鍵）
+
+- Bundle：`results/E-21/20260708-153326/`（4G=A / 8G=B 交錯 n=3，各 round 600s 暖機；RSS 佐證 rss-before/after.txt）
+- **IOPS/p99 全 pattern indistinguishable**：rr-qd1 4G 964 IOPS/p99 1401us vs 8G 935/1532us（帶內）；只有 max 類雙向抖動（rr max +10~11%、seq/rw max −11~35%，n=3 outlier）。
+- **RSS 佐證行為級生效**（=E-52 的證據）：osd.1 RSS 在 8G 輪爬到 ~1505MB、4G 輪 ~1135MB——`ceph config set` 確實改變了 OSD 記憶體用量（runtime 生效 confirmed），但**兩者都遠低於 target**（8G target 下才 1.5G）。
+- **為什麼 indistinguishable（邊界條件，比 verdict 重要）**：測試盤 16G，4G×3 OSD=12G 聚合 cache 已足以涵蓋單盤熱資料 → 8G 沒有多命中可拿。**這證實 E-00 當初釘回 4G 的判斷**：若不釘、任 autotune 給 15.7G，baseline 讀側數字會被 cache 全命中美化。生產含義：`osd_memory_target` 的收益只在 **working set > 當前 cache** 時才出現——本環境單 VM 打不到那個 regime；大 working set 或多 VM 聚合負載才需要加記憶體（本環境無法量化該增益，誠實標記）。
+- verdict 檔：`verdict-8g.txt`。
+- ⚠ 執行 deviation：subagent 監聽器在 ALL-DONE（17:36）後死亡、未完成收尾；數據完整，由主線 orchestrator 事後補記錄+commit。此為「subagent 長時監聽不穩」的實證 → 改用「background bash 跑實驗 + 短命 subagent 只做收尾」模式。
