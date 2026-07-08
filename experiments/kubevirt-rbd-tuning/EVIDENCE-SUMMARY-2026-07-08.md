@@ -83,3 +83,11 @@
 - **頭條結論（機制級）**：單 OSD 故障本身近乎無感；**真正的傷害視窗是 `mon_osd_down_out_interval`（600s）到期後的 backfill 與回歸後的 recovery**——隨機讀在 backfill 期整整劣化 24 倍。維運含義：短暫維護先 `ceph osd set noout`；預期外故障要嘛 10 分鐘內救回、要嘛接受 backfill 視窗（E-39 測 mClock 能壓多少）。
 - guest 症狀：無 hung task、無 remount、恢復後 direct read OK（`guest-symptoms.txt`）。健康碼：OSD_DOWN、PG_AVAILABILITY、PG_DEGRADED。
 - Deviation：script 的 health-ok-again 戳記誤判（grep 過鬆），實際恢復以 health.jsonl 為準；後窗數據證實 T1+150s 已回 baseline。
+
+## E-39 mClock backfill A/B — done（verdict: **indistinguishable**，但挖出關鍵機制）
+
+- Bundle：`results/E-39/<ts>/{balanced,high_client_ops}/`（60G scratch、立即 `osd out` 觸發、各 240s 窗）
+- backfill 窗 client latency：balanced rw 2.39ms/rr 1.31ms vs high_client_ops rw 2.36ms/rr 1.31ms——**帶內無差**；recovery 速率 467 vs 617 MB/s（NVMe headroom 大到兩個 profile 都沒讓 client 等）。
+- **與 E-30 對照的機制發現（一等）**：同樣是 backfill，E-30 是 rr ×24、這裡只有 +38%。差異＝E-30 先經歷 600s「down 未 out」的持續寫入 → 累積 degraded 物件債 → out 後**熱物件 recovery 擋 client op**；E-39 立即 out 無債。**傷害來源是 hot-object recovery debt，不是 backfill 資料搬移**（→ 新假設 H-033）。
+- 生產含義：mClock profile 在 OSD 有 headroom 時不用調（runtime 可調留作飽和時的工具）；真正該管理的是 down-未-out 期間的寫入債——監控 degraded objects 數比切 profile 更重要。
+- Deviation：high_client_ops 輪的 pre 窗被前一輪殘餘 recovery 汙染（pre rw 3.16ms），backfill 窗本體可比。

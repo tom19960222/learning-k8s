@@ -266,3 +266,12 @@
 - **librbd 軸 cache 控的是 `rbd_cache` 不是 host page cache**（v2 H-028，qemu block/rbd.c:961）——本輪 librbd out of scope，僅結論引用。
 - **krbd 比 librbd 顯著更穩**（v2 E-04：krbd CoV 5-6% vs librbd 20-22%，krbd seqwrite +17.9%）——支持本 charter 選 krbd 主軸的穩定性理由，寫進新頁的「為什麼 krbd」一節。
 - **thin image 未 pre-fill 的 randread 虛高**（v2 H-005 方法論規則）、**prediction 先行 / n≥3 噪音帶 / A/B 交錯 / 生效驗證前置**（v2 方法論六規則）——全數繼承為 v3 harness 規則。
+
+### H-033: degraded 期間 client 延遲惡化的主因是「熱物件 recovery 債」——OSD down-未-out 期間被寫過的物件，在該 OSD out/回歸時其 recovery 會阻擋 client op（object 級鎖），惡化幅度與 down 期間寫入量成正比；純 backfill（冷資料搬移）對 client 近乎無感
+- Status: proposed（E-30 vs E-39 差異強烈支持：同 backfill、rr ×24 vs +38%，唯一差異=600s 寫入債）
+- Tier: T3（可再驗：E-39 變體改為 down 600s 後才 out，預測重現 ×24）+ T1（osd recovery 的 object 鎖路徑）
+- Origin: E-30/E-39 對照（Falsify 階段意外發現）
+- Prediction:（下輪具體化）
+- Evidence: results/E-30（backfill 相 rr mean 22.73ms）vs results/E-39（backfill 相 rr mean 1.31ms）
+- Artifacts:（待 Gate 3）頁面 degraded 一節的核心敘事；生產監控建議（degraded objects 數）
+- Notes: 若 confirmed，「加快 out」與「縮短 down 視窗」比任何 QoS 旋鈕都有效；與 mon_osd_down_out_interval 的取捨要重寫。
