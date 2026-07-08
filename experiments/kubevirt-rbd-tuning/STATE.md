@@ -51,3 +51,8 @@
   （P0 四分類+三 violated 直覺+已完成 T3；實驗回填表留空——每完成一個實驗要同步回填此頁）。
   slug 已入 projects.ts features+featureGroups(效能調教)。quiz 未加（等實驗數字齊再出題）。
 - 2026-07-08 `E-01 done results/E-01/<ts>/ — H-008 violated：IOPS CoV 0.4–2.0%（判準多為 5%），band.json 已產出（git 追蹤）；baseline 錨點 rr 968/8458/26771、rw 597/5322/14751 IOPS、seq 2838/1233 MiB/s；頁面表已回填。下一步 E-02（host 天花板，worker k8s-1）。`
+- 2026-07-08 **E-02 已點火**：worker k8s-1（20.63.217.150）nohup e02.sh（pid 8618）＝
+  /dev/rbd0（kubevirt/ioperf-host，client.hosttest）prefill+3 輪矩陣，~35min；
+  進度 `tail -1 /home/azureuser/e02/status`。完成後：scp e02/ → results/E-02/<ts>/ →
+  fio_stats.py cmp <E-01輪> <E-02輪> band.json 算虛擬化稅 → 清理：worker `sudo rbd unmap /dev/rbd0`、
+  mon `sudo rbd rm kubevirt/ioperf-host && sudo ceph auth rm client.hosttest`。
