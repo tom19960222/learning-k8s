@@ -244,7 +244,7 @@
 - Notes: 與 H-018 分工：H-018 驗 cgroup throttle（QoS 錯誤設定的傷害），本條驗正面投資的收益。注入：同 node 跑 CPU 噪音 pod。
 
 ### H-032: krbd map option `osd_request_timeout=N`（libceph 層，預設 0=永不）是唯一能把「Ceph 無法回應 → guest 無限 hang」轉成「N 秒後 IO 以 -ETIMEDOUT 失敗」的 client 側旋鈕，且對 homeless request（min_size 不滿、PG 卡 peering 的情境）同樣生效；但 N 設太小會在正常 recovery 的暫態誤殺 IO，guest fs 因此 remount read-only——比 hang 更難自癒
-- Status: proposed
+- Status: **violated（T3，E-36 2026-07-08）**——min_size 不滿情境下 timeout=30 實測不觸發（blocked 302.8s 至恢復、無 -ETIMEDOUT、dmesg 無訊息）；機制矛盾轉 H-034 追查
 - Tier: T1（機制已驗）→ T3（trade-off 量化）
 - Origin: H-006 violated 後的機制重推（Falsify 階段發現）
 - Prediction:（E-36 具體化：不同 N 值下 hang→error 轉換時間與 fs 後果）
@@ -275,3 +275,12 @@
 - Evidence: results/E-30（backfill 相 rr mean 22.73ms）vs results/E-39（backfill 相 rr mean 1.31ms）
 - Artifacts:（待 Gate 3）頁面 degraded 一節的核心敘事；生產監控建議（degraded objects 數）
 - Notes: 若 confirmed，「加快 out」與「縮短 down 視窗」比任何 QoS 旋鈕都有效；與 mon_osd_down_out_interval 的取捨要重寫。
+
+### H-034: osd_request_timeout 在「PG inactive（min_size 不滿）」情境下不觸發 abort 的機制——handle_timeout 的掃描路徑與該情境下 request 的實際狀態（paused？homeless？重建？）之間存在未知環節
+- Status: proposed（E-36 T3 實測 302.8s 無 abort、dmesg 無 timeout 訊息；與 osd_client.c:3479/3504 的源碼閱讀矛盾）
+- Tier: T1（深讀 calc_target/resend/rbd obj_request 重試）→ T3（變體：手動 rbd map + 單 OSD 連線層故障 vs PG inactive 對照——分辨「連線死」與「PG 死」兩種等待的 timeout 行為差異）
+- Origin: E-36 violated 後的機制重推
+- Prediction:（Falsify 時具體化）
+- Evidence: results/E-36/<ts>（t30 blocked 302.8s）；對照 H-032 的 T1 證據
+- Artifacts:（待 Gate 3）頁面 osd_request_timeout 一節的重寫
+- Notes: 若「連線死會 abort、PG inactive 不會」成立，這個旋鈕的適用範圍要重新定義成「防 OSD 連線黑洞」而非「防 PG 不可用」。

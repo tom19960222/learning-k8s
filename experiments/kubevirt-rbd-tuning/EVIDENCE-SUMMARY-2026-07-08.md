@@ -103,3 +103,11 @@
 - Bundle：同 E-42 bundle（合併執行）
 - patch `cache=writethrough`（不重啟）→ **`RestartRequired` condition 出現** ✓；migration ×2 有效樣本後 cmdline 仍 `"direct":true`（=none）✓——**live migration 不套用 disk 旋鈕，T3 實錘**（mig-3 樣本無效：migration 中新舊 pod 並存抓錯 pod，空檔案誤報 violated——deviation 記錄）。
 - **額外發現**：revert patch（spec 改回原樣）後 `RestartRequired` **不會自動清除**——碰過非 live-updatable 欄位，條件就掛著直到重啟。生產含義：改錯 VM template 沒有「改回去就當沒發生」。
+
+## E-36 卡死邊界 × osd_request_timeout — done（H-032 **T3 violated**，附未解機制矛盾）
+
+- Bundle：`results/E-36/<ts>/`（第三跑有效；前兩跑無效：CJK 標點變數雷、O_DIRECT 未對齊 EINVAL——教訓入 STATE）
+- 注入：停 PG 2.5 acting 的 osd.8+osd.0（min_size 不滿）300s。兩顆盤 probe（0.2s 一發 4k direct write）各在 T0+12~21s 撞進 inactive PG 後整條凍結。
+- **結果**：baseline 盤 blocked 293s（預期）；**t30 盤（config_info 實證帶 osd_request_timeout=30）blocked 302.8s——沒有 30s abort、無 -ETIMEDOUT、dmesg 零 timeout 訊息**。恢復後兩盤 op 成功完成、direct read OK、無 hung task（probe 週期短，未持續 120s 同一 op 等待——hung task 條目由後續長 hold 情境補）。
+- **機制矛盾（open question → H-034）**：pinned source 讀起來必觸發（osd_client.c:3479 掃 o_requests、:3504 掃 homeless；r_start_stamp 僅 account_request 設一次不重置；handle_timeout 每 5s 跑）——T3 卻無 abort。待查方向：inactive PG 的 calc_target 路徑、resend 時 req 重建？、rbd obj_request 層的重試包裝。
+- **生產含義（立即生效）**：**不要把 osd_request_timeout 當救命索**——在它最該出場的 min_size 情境下實測不觸發。「卡死轉有界失敗」目前沒有已驗證的 client 側旋鈕；防線只能靠 (1) 不讓 PG inactive（容量規劃、min_size/size 設計、快速換件）(2) application 層 timeout。

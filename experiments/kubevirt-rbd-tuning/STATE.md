@@ -79,3 +79,7 @@
   已修（stride 改成 4k 的倍數）三跑中。**殘留線索**：二跑中 t30 盤一筆對齊寫入 blocked 311s
   ——若三跑重現，H-032（osd_request_timeout=30 應 30s abort）部分 violated，機制要回 T1 重查
   （懷疑：inactive PG 的 request 可能卡在 epoch barrier/paused 層，不在 handle_timeout 掃描的 o_requests 內）。
+- 2026-07-08 `E-36 done results/E-36/<ts>（三跑）— H-032 **T3 violated**：osd_request_timeout=30 在 min_size 不滿情境不觸發
+  （blocked 302.8s 無 abort 無 dmesg）；baseline 盤 blocked 293s 後自癒。機制矛盾開 H-034 追查
+  （建議變體：連線層故障 vs PG inactive 對照）。頁面 osd_request_timeout 敘述已加 violated Callout。
+  收尾狀態：VM 仍掛 4 顆盤（datat30 保留供 H-034 續用）；SC ceph-rbd-t30 保留。`
