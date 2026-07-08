@@ -61,3 +61,10 @@
 - 機制假說（待 E-14 交叉驗證）：O_DIRECT + krbd 下，native AIO 的提交集中在單一 event loop；thread pool 把阻塞 IO 攤到多工作緒，在高並行時提交面更寬。
 - 生產結論（機制級）：**維持預設（留空=native）即可**——threads 的 qd32 增益不大、且未量 QEMU CPU 代價（本輪未收 schedstat，deviation）；沒有改的理由，但「native 一定比較快」的說法在本 stack 不成立。
 - verdict 檔：`verdict-threads.txt`。
+
+## E-14 dedicatedIOThread — done（單盤輪：confirmed「無感」）
+
+- Bundle：`results/E-14/<ts>/`（A/io 交錯 n=3；device iothread 欄位斷言全過）
+- 26 metric 中 17 個 indistinguishable；邊緣超帶：rr-qd1 +5.4%、rw-qd8 +8.4%（正向）、rr-qd32 p99 **+8%（反向劣化）**；max 類雙向亂跳（n=3 單發 outlier）。
+- **關鍵否定結論：單盤 dedicatedIOThread 收不回 E-02 的 rr-qd32 +36.7% 虛擬化稅**（IOPS 帶內）——qd32 瓶頸不在「缺一條獨立 iothread」。與 E-12（threads +12.4%）合看：提交路徑寬度有影響但不是主稅源。
+- 雙盤並行輪（dedicated 的設計主場）延後列 P3。生產結論（機制級）：單盤 VM 不用開。
