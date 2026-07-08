@@ -56,3 +56,8 @@
   進度 `tail -1 /home/azureuser/e02/status`。完成後：scp e02/ → results/E-02/<ts>/ →
   fio_stats.py cmp <E-01輪> <E-02輪> band.json 算虛擬化稅 → 清理：worker `sudo rbd unmap /dev/rbd0`、
   mon `sudo rbd rm kubevirt/ioperf-host && sudo ceph auth rm client.hosttest`。
+- 2026-07-08 `E-02 done results/E-02/<ts>/ — 虛擬化稅：rr-qd32 +36.7%、qd1/qd8 +9~17%、seq/rw-qd32 帶內；throwaway image/key 已清；頁面已回填`
+- 2026-07-08 **E-10 已點火**（背景 orchestrator：`tools/e10-orchestrator.sh <bundle>`，~2h）：
+  cache A/wt/wb 交錯 ×3、每次切換 stop/start + cmdline 生效斷言（A:direct=true,wc=on／wt:false,off／wb:false,on）、
+  containerDisk 重啟重置已處理（cloud-init --wait + 重推 run_matrix.sh）。冪等：中斷後同指令重跑會跳過已完成 round。
+  完成後：fio_stats.py cmp <A輪> <wt輪|wb輪> band.json → verdict.md → 回填 SUMMARY/頁面 → 收尾已自動回 baseline。
