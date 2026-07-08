@@ -93,3 +93,8 @@
 - 2026-07-08 `E-17 done results/E-17/<ts> — none 優於 mq-deadline（seq +30~40%、rr-qd32 p99 −7.7%）；預設已是 none=檢查清單項。⚠實測到跨實驗漂移（sr-1m 對 E-01 -19%）——後續 E-1x 前建議跑 sentinel 輪`
 - 2026-07-08 **E-18 已點火**（`tools/e18-run.sh`，readahead 128/512/4096 ×3 輪精簡矩陣 sr-1m/sr4k/rr-qd1，~40min；
   分析注意：mini matrix 只有 3 pattern，cmp 時 band.json 缺 sr4k-qd1 條目會用預設 10% band）。
+- 2026-07-08 `E-18 done results/E-18/<ts> — 全檔位 indistinguishable（機制必然：O_DIRECT 不經 page cache，readahead 非旋鈕）；buffered 變體 P3 不追`
+- **共享 NVMe 適足性裁定（使用者問答，2026-07-08）**：1 NVMe 切 3 OSD 對本 charter 夠用
+  （噪音 0.4-2%、daemon 層注入不受影響）；例外=E-22 與媒體隔離類（解讀力打折）、
+  E-30 的 ×24 倍率可能被同碟效應放大（機制成立、倍率環境綁定——頁面要標註）。
+  若要補：跑完後單開一台 L32s_v3 數小時做 E-22 對照即可，不用整組重建。

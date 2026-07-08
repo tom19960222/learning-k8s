@@ -119,3 +119,10 @@
 - 機制：底層 RBD 已有自己的排序與並行，guest 再排一層 mq-deadline 對高吞吐 pattern 是純開銷。
 - 生產結論（機制級）：**維持 none**（Ubuntu 24.04 virtio-blk 預設即是）——這是「檢查清單」項不是「調教」項：發現誰把它改成 mq-deadline/bfq 要改回來。
 - ⚠ 跨實驗漂移：本輪 mq-deadline 側 sr-1m 遠低於 E-01 baseline（-42%），none 側亦 -19%——pool 狀態隨實驗演進（+60G scratch、多輪寫入）。A/B 交錯內部可比；**跨實驗絕對值比較需 sentinel 重跑**（方法論規則的實證）。
+
+## E-18 guest readahead — done（indistinguishable，且是機制必然）
+
+- Bundle：`results/E-18/<ts>/`（128/512/4096 ×3 輪，全 pattern 全檔位帶內）
+- **事後看是設計必然**：矩陣是 `--direct=1`，O_DIRECT 繞過 page cache → `read_ahead_kb` 完全不參與。
+- 機制結論（比數字有價值）：**readahead 只影響 buffered read**——對 direct IO workload（資料庫、本研究的 latency-first profile）它是「非旋鈕」。buffered 變體（會被 guest page cache 混淆）列 P3 不追。
+- 生產結論：direct IO 型服務不用碰 readahead；buffered 型（檔案服務等）另案。
