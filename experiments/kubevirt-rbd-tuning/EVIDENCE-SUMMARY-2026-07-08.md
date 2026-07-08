@@ -111,3 +111,11 @@
 - **結果**：baseline 盤 blocked 293s（預期）；**t30 盤（config_info 實證帶 osd_request_timeout=30）blocked 302.8s——沒有 30s abort、無 -ETIMEDOUT、dmesg 零 timeout 訊息**。恢復後兩盤 op 成功完成、direct read OK、無 hung task（probe 週期短，未持續 120s 同一 op 等待——hung task 條目由後續長 hold 情境補）。
 - **機制矛盾（open question → H-034）**：pinned source 讀起來必觸發（osd_client.c:3479 掃 o_requests、:3504 掃 homeless；r_start_stamp 僅 account_request 設一次不重置；handle_timeout 每 5s 跑）——T3 卻無 abort。待查方向：inactive PG 的 calc_target 路徑、resend 時 req 重建？、rbd obj_request 層的重試包裝。
 - **生產含義（立即生效）**：**不要把 osd_request_timeout 當救命索**——在它最該出場的 min_size 情境下實測不觸發。「卡死轉有界失敗」目前沒有已驗證的 client 側旋鈕；防線只能靠 (1) 不讓 PG inactive（容量規劃、min_size/size 設計、快速換件）(2) application 層 timeout。
+
+## E-17 guest IO scheduler — done（confirmed：none 優，且幅度超預期）
+
+- Bundle：`results/E-17/<ts>/`（同 VM runtime 切換交錯 n=3；guest vdb 預設=**none**）
+- **none vs mq-deadline**：seq read **+39.7%**（1640→2291 MiB/s）、seq write **+30.1%**、rr-qd32 +6.0%（p99 −7.7%、max −45%）；qd1/qd8 隨機小 IO 帶內。
+- 機制：底層 RBD 已有自己的排序與並行，guest 再排一層 mq-deadline 對高吞吐 pattern 是純開銷。
+- 生產結論（機制級）：**維持 none**（Ubuntu 24.04 virtio-blk 預設即是）——這是「檢查清單」項不是「調教」項：發現誰把它改成 mq-deadline/bfq 要改回來。
+- ⚠ 跨實驗漂移：本輪 mq-deadline 側 sr-1m 遠低於 E-01 baseline（-42%），none 側亦 -19%——pool 狀態隨實驗演進（+60G scratch、多輪寫入）。A/B 交錯內部可比；**跨實驗絕對值比較需 sentinel 重跑**（方法論規則的實證）。

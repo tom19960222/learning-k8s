@@ -90,3 +90,4 @@
   E-20(layout)/E-21(memory_target)/E-22(shards)/E-23(P3)/E-31~35+37~38(degraded 其餘)/E-40(crash)/
   E-41(需使用者 az stop)/E-43(P3)/E-51/52(部分證據已有)。orchestrator 模板齊全（e10/e12/e14 為 B 類模板、
   e17 為 A 類模板、e30/e36/e39 為注入模板），接手 agent 照模板換 patch/斷言即可。
+- 2026-07-08 `E-17 done results/E-17/<ts> — none 優於 mq-deadline（seq +30~40%、rr-qd32 p99 −7.7%）；預設已是 none=檢查清單項。⚠實測到跨實驗漂移（sr-1m 對 E-01 -19%）——後續 E-1x 前建議跑 sentinel 輪`
