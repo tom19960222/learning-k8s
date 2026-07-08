@@ -113,3 +113,7 @@
   排除：E-31/E-41（需使用者 az）、E-16（要改 kubelet 設定，等使用者在線）、E-20 host 層（P3）、E-23/E-43（P3）。
 - 2026-07-09 `E-13 done`（subagent 已 commit dcfd58a）+ `E-21 done results/E-21/20260708-153326 — indistinguishable（16G 盤 vs 12G cache 已足）；RSS 8G→1.5G/4G→1.1G 證 runtime 生效；印證 E-00 釘 4G 的判斷`。
   ⚠ subagent 監聽器在 E-21 ALL-DONE 後死亡未收尾，主線補記錄。**教訓：長時監聽 subagent 不穩 → 改「background bash 跑實驗 + 完成後主線派短命 subagent 只做收尾」**。
+- 2026-07-09 **改回穩健模式**（subagent 監聽不可靠）：實驗用主線 nohup background bash 跑 +
+  背景 poller 等 ALL-DONE/FATAL（=E-01~E-18 用過的可靠通知路徑），主線每次完成才醒來收尾。
+  E-11 已點火（bus virtio vs scsi）。踩雷：orchestrator 內巢狀 awk 偵測裝置的跳脫被 mangle→
+  空 filename→fio 秒 FATAL；已改成 run_matrix.sh 自偵測 16GiB 盤（免外部傳裝置名）。

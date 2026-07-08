@@ -1,7 +1,10 @@
 #!/bin/bash
 # guest 內跑：bash run_matrix.sh <輸出目錄>
+# 資料盤自動偵測：16GiB(17179869184) 的那顆（不管 vdb 還是 sda）
 OUT=$1; mkdir -p $OUT
-run(){ sudo fio --name=$1 --filename=/dev/vdb --direct=1 --ioengine=libaio \
+DEV=/dev/$(lsblk -bdno NAME,SIZE | awk '$2==17179869184{print $1; exit}')
+[ "$DEV" = "/dev/" ] && { echo "FATAL: 16GiB data disk not found" >&2; exit 3; }
+run(){ sudo fio --name=$1 --filename=$DEV --direct=1 --ioengine=libaio \
   --rw=$2 --bs=$3 --iodepth=$4 --numjobs=1 --time_based --runtime=60 \
   --ramp_time=15 --randseed=8675309 --group_reporting \
   --output-format=json --output=$OUT/fio-$1.json \
