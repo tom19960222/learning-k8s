@@ -1,0 +1,7 @@
+# t+30s  2026-07-08T15:41:09Z
+A1 mgr count(ceph_mon_quorum_status==1) = 3  [expect stale=3 => BLIND]
+   sum(ceph_mon_quorum_status)         = 3
+A3 blackbox count(probe_success==1)     = 1  [expect 1 => DETECTS]
+A4 up{job=ceph} (mgr scrape)            = 1  [expect 1 => BLIND]
+   sum(up{job=mon-tcp}) blackbox scrape = 3
+alerts = [('CephMonQuorumLostBlackbox', 'A3_blackbox', 'firing'), ('CephMonQuorumLostBlackboxDynamic', 'A3_blackbox_dyn', 'firing')]

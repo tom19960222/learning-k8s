@@ -1,0 +1,14 @@
+== pvc ==
+NAME            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+qio-newclient   Bound    pvc-b4d2a61e-94a3-48e8-bc70-98e7eb0d3c48   1Gi        RWO            ceph-rbd       <unset>                 105s
+== pod ==
+NAME            READY   STATUS              RESTARTS   AGE    IP       NODE           NOMINATED NODE   READINESS GATES
+fio-newclient   0/1     ContainerCreating   0          105s   <none>   ceph-lab-k8s   <none>           <none>
+== events ==
+Events:
+  Type     Reason                  Age                  From                     Message
+  ----     ------                  ----                 ----                     -------
+  Warning  FailedScheduling        105s                 default-scheduler        0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims. not found
+  Warning  FailedScheduling        103s (x2 over 103s)  default-scheduler        0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims. not found
+  Normal   Scheduled               103s                 default-scheduler        Successfully assigned default/fio-newclient to ceph-lab-k8s
+  Normal   SuccessfulAttachVolume  103s                 attachdetach-controller  AttachVolume.Attach succeeded for volume "pvc-b4d2a61e-94a3-48e8-bc70-98e7eb0d3c48"

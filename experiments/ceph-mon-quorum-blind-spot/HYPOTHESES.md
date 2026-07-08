@@ -84,3 +84,23 @@
 3. 注入單次長窗（停 mon-02+mon-03）：窗內同時量 Thread A（各偵測源）與 Thread B（已連線 fio 矩陣 + 新 client 阻塞）
 4. 還原、assert HEALTH_OK、收 bundle
 5. Synthesize → 推薦 + 規則草案 + promtool test
+
+---
+
+## 結果狀態（run 20260708T154019Z）
+
+| H | 判定 | 證據 |
+|---|---|---|
+| H-A1 現行規則盲 | **confirmed** | 全窗 `count(ceph_mon_quorum_status==1)=3`，CephMonQuorumLost 未 pending/fire |
+| H-A2 mgr 凍結非缺席 | **confirmed** | up=1 全窗、值凍結=3 ~2.5min 未自癒 |
+| H-A3 blackbox 探 mon port | **confirmed** | 注入 ≤5s `count(probe_success==1)=1`，30s fire；還原回 3 |
+| H-A4 up-only 盲 | **confirmed** | up{ceph}=1 全窗，CephExporterAllDown 不 fire |
+| H-A5 node_exporter systemd | 設計論證（未部署） | mon host 不在 k8s、需 per-host agent；blackbox 已 dominates |
+| H-A6 per-host ceph-exporter | 設計論證（未部署） | 需 per-host agent + orch 壞；blackbox 較省 |
+| H-B1 已連線續跑 | **confirmed** | 窗內 fio 矩陣全 rc=0、吞吐≈baseline |
+| H-B2 新連線阻塞 | **confirmed（修正版）** | 新 pod 卡 ContainerCreating（krbd map）；但 PVC provision 經既有 provisioner 連線仍成功 |
+| H-B3 rand/seq×thread 無質性差異 | **confirmed** | 8 cell 皆續、無階梯崩落 |
+| H-B4 讀寫皆續 | **confirmed** | randwrite/write 窗內維持 baseline 級（慢是碟慢，非 quorum） |
+| H-B5 還原後恢復 | 未直接觀察 | cleanup 提早刪 new pod；屬預期 |
+
+**一句話**：偵測盲區的根因是「sensor（mgr metric）與被測物（quorum）同生共死」，唯一解是引入 mgr 以外、逐 mon 獨立的訊號（blackbox TCP 探 mon port 最省）；IO 衝擊則是「已連線者無感、新建 mon 連線者阻塞」。

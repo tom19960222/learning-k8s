@@ -70,7 +70,7 @@
 - [x] **Step 0**：Lab 復原（IP 漂移 → secondary IP 修，quorum 回 HEALTH_OK）；metric 拓樸盤點（唯一源 = mgr :9283）；k8s RBD 路徑 smoke test 通過。
 - [x] **Step 1**：實驗設計（HYPOTHESES.md + 本報告）落地、push。
 - [x] **Step 2**：部署 monitoring（k8s ns `qmon`：Prometheus NodePort 30090 + blackbox_exporter 探 mon:3300；scrape mgr :9283）+ 兩 thread baseline。node_exporter(A5) 因 mon host 不在 k8s、需 per-host agent 而 blackbox 已足，改以設計論證處理（見 §5）。
-- [ ] **Step 3**：注入長窗（停 mon-02+mon-03）、窗內量兩 thread、還原、assert。
+- [x] **Step 3**：注入長窗（停 mon-02+mon-03，~2.5min quorum loss）、窗內量兩 thread、trap 還原、assert 3-mon quorum 回。結果見 §4.1/§4.2。
 - [ ] **Step 4**：Synthesize — 推薦 + 規則草案 + promtool test。
 
 ---
@@ -91,11 +91,45 @@ Thread B pre-connected fio 矩陣（direct=1, iodepth=1；小 lab、size=3、慢
 
 原始 JSON、Thread A snapshot 見 `results/baseline/`。
 
-### 4.1 Thread A — 偵測結果
-_待 Step 3 回填。_
+### 4.1 Thread A — 偵測結果（confirmed）
+注入 = 停 mon-02+mon-03（留 mon-01+active mgr）。bundle：`results/mon-quorum-2down-20260708T154019Z/`。
 
-### 4.2 Thread B — IO 衝擊結果
-_待 Step 3 回填。_
+| 時間 | A1 mgr `count(quorum_status==1)` | A3 blackbox `count(probe==1)` | A4 mgr `up` | firing |
+|---|---|---|---|---|
+| baseline | 3 | 3 | 1 | — |
+| t+3s | **3（stale, 盲）** | **1（偵測）** | 1（盲） | blackbox → pending |
+| t+10s | 3 | 1 | 1 | blackbox pending |
+| t+30s | **3** | **1** | 1 | **blackbox FIRING** |
+| window-final(~2.5m) | **3** | **1** | 1 | blackbox firing |
+
+**判定**：
+- **H-A1 confirmed（現行規則盲）**：整個窗 `ceph_mon_quorum_status` 三顆都停在 stale=1、`count(==1)=3`。`CephMonQuorumLost`（A1）**從頭到尾沒進 pending，更沒 fire**。重現前一輪 finding #5。
+- **H-A3 confirmed（blackbox 主推）**：注入後**一個 scrape（≤5s）**內 `count(probe_success==1)` 掉到 1；`for:30s` 後 fire。還原後 3-scrape 內回 3。偵測與 mgr 是否凍結完全無關。
+- **H-A4 confirmed（up-only 盲）**：`up{job=ceph}` 全窗 =1——mon daemon 停不代表 mgr 進程停，mgr host 續跑、續 serve stale ⇒ `CephExporterAllDown` 不 fire。
+- **H-A2 confirmed（凍結非缺席）**：mgr 續 serve（up=1），值凍結 =3 長達 ~2.5min 未自癒為可偵測狀態 ⇒ 靠「等 mgr 掛」不可靠。
+- **ground truth（真的失守）**：`mon-02/03 systemctl is-active=inactive`；還原時 `ceph -s` 出現 `748 slow ops … mon.ceph-lab-mon-01 has slow ops`——證明 mon-01 在窗內收到 client 的 mon 請求但因無 quorum 無法處理（塞成 slow ops），即 quorum 確實失守、而 mgr metric 仍讀 3。
+
+### 4.2 Thread B — IO 衝擊結果（confirmed）
+pre-connected client = 注入前已 mount + warm 的 fio pod；new client = 窗內才 apply 的 PVC+pod。
+
+**(a) 已連線 client：single/multi × random/seq 全部續跑，無質性衝擊。** 每 cell rc=0、無 stall/timeout，窗內吞吐 ≈ baseline（讀甚至更快，少了背景 mon/mgr chatter）：
+
+| pattern | baseline 1t / 4t | window 1t / 4t |
+|---|---|---|
+| randread 4k | 2847 / 36134 iops | 8766 / 38702 iops |
+| randwrite 4k | 10 / 13 iops | 9 / 19 iops |
+| read seq 1M | 172 / 1380 iops | 343 / 1376 iops |
+| write seq 1M | 1 / 3 iops | 2 / 2 iops |
+
+⇒ **H-B1 / H-B3 / H-B4 confirmed**：quorum 依賴在「map 分發 / 建 session」層，不在 data path；已持 cached osdmap 的 client 直打 OSD（OSD 全 up、PG 不 re-peer），rand/seq/thread/讀寫皆不受影響。
+
+**(b) 新連線 client：卡在 kernel `rbd map`，比 H-B2 更細緻的發現：**
+- 新 PVC `qio-newclient` 窗內竟 **Bound**（RBD image 建出來了）——因為 CSI **provisioner 本身也是個已連線的 rados client**，用 cached 連線就把 image 建了（= H-B1 延伸到 control plane）。
+- 但新 pod 卡在 **ContainerCreating**：node 上的 `rbd map` 是**全新 kernel client**，要向 mon 取 map ⇒ 阻塞。事件停在 `SuccessfulAttachVolume` 之後、mount 之前。
+- ⇒ **H-B2 修正版 confirmed**：阻塞的精確位置是「需要**新建 mon 連線**的動作（krbd map / 新 rados client）」，不是「PVC 建立」這件事本身。riding 既有連線的 control-plane 動作照過。
+- H-B5（新 mount 在 quorum 回來後恢復）未直接觀察（cleanup 在還原後即刪除該 pod）；依 Ceph 既有行為與 (a) 已證 data path 健康，回 quorum 後 map 會續成，屬預期。
+
+**還原**：trap 保證啟回 mon-02+mon-03，blackbox count 2→3、3-mon quorum 回（`ceph -s` age 秒級），窗內累積的 mon slow ops 隨即清空，回到實驗前 baseline WARN。
 
 ---
 

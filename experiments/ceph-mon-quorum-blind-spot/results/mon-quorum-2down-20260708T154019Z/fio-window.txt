@@ -1,0 +1,10 @@
+== fio matrix phase=window tmo=40 ==
+randread	1t	iops=8766	bw=34.2MB/s	lat_us=111	rc=0
+randread	4t	iops=38702	bw=151.2MB/s	lat_us=100	rc=0
+randwrite	1t	iops=9	bw=0.0MB/s	lat_us=110222	rc=0
+randwrite	4t	iops=19	bw=0.1MB/s	lat_us=205925	rc=0
+read	1t	iops=343	bw=343.2MB/s	lat_us=2868	rc=0
+read	4t	iops=1376	bw=1376.1MB/s	lat_us=2858	rc=0
+write	1t	iops=2	bw=1.5MB/s	lat_us=641944	rc=0
+write	4t	iops=2	bw=2.5MB/s	lat_us=1614604	rc=0
+== end phase=window ==
