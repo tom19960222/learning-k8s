@@ -1,0 +1,191 @@
+---
+layout: doc
+title: VM Disk IO 生產調教 — 線上可調性、卡死邊界與三個被原始碼推翻的直覺
+description: 生產關鍵系統的 KubeVirt VM（disk 在 Ceph RBD）要調 IO，第一個問題不是「哪個旋鈕快」而是「線上改得動嗎、會不會停機、degraded 時會怎樣」。本頁把全 stack 旋鈕按線上可調性分成四類（每類都有 pinned source 證據），並記錄三個被原始碼推翻的常見直覺：virtio-scsi 沒有你以為的 timeout、writeback 不會擋 live migration、krbd map options 在 PV 建立時就凍結。版本對齊 kubevirt v1.5.0 / ceph-csi v3.14.0 / linux 6.8 / libvirt v10.10.0 / qemu v9.1.0 / ceph v19.2.3；真機驗證在 Azure 專屬叢集（kernel 6.8、ceph 19.2.4）進行中，結果邊做邊回填。
+---
+
+## 場景：想調的那顆旋鈕，可能根本改不動
+
+[參數目錄](./rbd-io-tuning-catalog)列了五層 22 個旋鈕，[實驗計畫 v2](./rbd-io-experiment-plan) 在 PVE 上量過其中一部分。但把場景換成**生產關鍵系統**——一台跑著資料庫的 KubeVirt VM、disk 是 Ceph RBD、SLO 是 latency——你會發現排在「調哪個」前面的問題其實是三個：
+
+1. **這個旋鈕在線上系統改得動嗎？** 要重啟 VM？要重建 PVC？還是 `ceph config set` 打下去就生效？
+2. **改了會不會有不相容？** 例如：某個 cache 設定會不會讓 VM 從此不能 live migration？
+3. **degraded 的時候會怎樣？** Ceph 在 recovery、某顆 OSD 半死不活、pool 快滿——VM 的 IO 是變慢、還是卡死？
+
+這一頁是 charter v3 研究（穩定優先、效能其次；throughput 只有在 degraded 時允許變小）的主報告。研究方法沿用 hypothesis backlog + prediction 先行 + 三態 verdict，backlog 與逐步執行紀錄在 repo 的 `experiments/kubevirt-rbd-tuning/`（`HYPOTHESES.md`、`EXPERIMENT-PLAN.md`、`RUNBOOK.md`、`STATE.md`）。動手實驗前先做了五條純原始碼查證（P0），**其中兩條的預測被推翻**——那兩條正是本頁最有價值的部分。
+
+## 線上可調性四分類：每顆旋鈕先回答「怎麼改」
+
+把 KubeVirt / QEMU / guest / krbd / Ceph 全 stack 的旋鈕按「改動需要什麼動作才生效」分成四類。這張表是本頁的骨架，每一類的證據在後面各節：
+
+| 類 | 含義 | 成員 | 生產代價 |
+|---|---|---|---|
+| **A** | runtime 即生效 | `osd_mclock_profile`、`osd_memory_target`、scrub / backfill 節流、ceph-csi read-affinity（configmap）、guest sysfs（scheduler / nr_requests / readahead） | 零停機，隨時可調可回退 |
+| **B** | 需 VM 重啟 | VMI 層全部：`cache`、`io`、`bus`、`blockMultiQueue`、`dedicatedIOThread`、CPU 拓樸 | stop/start 一次停機視窗；**live migration 幫不上忙**（見下節） |
+| **C** | 需 OSD rolling restart | `osd_op_num_shards` | 每台 OSD 輪流重啟＝一段 degraded 視窗 |
+| **D** | 建置期定死 | krbd map options（`queue_depth`、`alloc_size`、`rxbounce`、**`osd_request_timeout`**）、image `object-size`/striping、pool `size` | 對存量磁碟實質不可改；要在 StorageClass / pool 設計期決定 |
+
+<Callout type="warning" title="D 類是最容易踩的坑">
+  krbd map options 看起來像「掛載參數」，直覺上改個 StorageClass 再重掛就好。實際上它們在 **PV 建立時就凍結**（證據見下），事後改 StorageClass 對存量磁碟完全無效。特別注意 `osd_request_timeout`（把「IO 卡死」變「有界失敗」的唯一 client 側旋鈕，見「卡死的邊界」一節）也在這一類——**要不要有界等待，是建置期的架構決策，不是出事後能補的**。
+</Callout>
+
+### B 類的證據：live migration 不能套用 disk 旋鈕
+
+KubeVirt 有兩種 rollout strategy，預設是 `Stage`——你改了 VM 物件的 template，變更會被「暫存」到下一次重開機（`File: kubevirt/pkg/virt-config/virt-config.go (line 93)`、`types.go (line 2621-2624)`）。那開 `LiveUpdate` 呢？controller 比對新舊 spec 時，會把「允許 live 更新的欄位」先抄平再比，剩下有差異就直接標 `RestartRequired`。disk 欄位只有 **hotplug volume** 的變更被放行——既有磁碟的 driver 欄位一改，就掉進 else：
+
+```go
+// File: kubevirt/pkg/virt-controller/watch/vm/vm.go (line 2843-2858)
+	for _, newDisk := range vm.Spec.Template.Spec.Domain.Devices.Disks {
+		v := vols[newDisk.Name]
+		oldDisk, okOld := oldDisks[newDisk.Name]
+		switch {
+		// Changes for disks associated to a hotpluggable volume are valid
+		case storagetypes.IsHotplugVolume(v):
+			delete(oldDisks, v.Name)
+		// The disk has been freshly added
+		case !okOld:
+			return false
+		// The disk has changed
+		case !equality.Semantic.DeepEqual(*oldDisk, newDisk):
+			return false
+```
+
+`validLiveUpdateDisks` 回傳 false → disk 欄位不被抄平 → spec 有差 → `setRestartRequired(vm, "a non-live-updatable field was changed in the template spec")`（同檔 line 2940-2942）。LiveUpdate 的白名單只有：hotplug volumes/disks、CPU sockets、memory guest、nodeSelector、affinity、tolerations（line 2901-2924）。
+
+這代表：**live migration 不是 disk 旋鈕的零停機套用工具**。migration 的目標端從同一份（沒變過的）VMI spec render domain，換到新 node 上還是舊設定。要套用 `cache` / `io` / `bus`，唯一路徑是 stop/start。（migration 仍然是節點維運的工具——它自己的 IO 代價由實驗 E-42 量化。）
+
+### D 類的證據：map options 在 provision 時凍結
+
+ceph-csi 在 NodeStage（把 RBD image map 到 node）時，map options 是從 **volume context** 讀的——也就是 PV 的 `volumeAttributes`，而那是 provision 當下從 StorageClass 參數抄進去、之後不再更新的：
+
+```go
+// File: ceph-csi/internal/rbd/rbd_attach.go (line 314)
+	krbdMapOptions, nbdMapOptions, err := parseMapOptions(req.GetVolumeContext()["mapOptions"])
+```
+
+所以「改 StorageClass 的 `mapOptions` → 重啟 VM」對存量磁碟是 no-op：新參數只會進**之後新建的 PV**。唯一的 runtime 例外是 read-affinity（`read_from_replica` + `crush_location`）——它走 CSI config（configmap），每次 map 重讀（`File: ceph-csi/internal/util/read_affinity.go (line 47-76)`、`internal/rbd/nodeserver.go (line 283-292)`）。
+
+### A / C 類的證據：Ceph 旋鈕的兩極分佈
+
+Ceph options 的 yaml 定義帶著 flags，直接讀就能分類：`osd_op_num_shards` 是 `startup`（`File: ceph/src/common/options/osd.yaml.in (line 945)`，改了要重啟 OSD 才生效）；`osd_scrub_sleep`（line 439）、`osd_max_backfills`（line 51）、`osd_memory_target`（`global.yaml.in (line 3818-3844)`，附 `min: 896_M`）都是 `runtime`。mClock profile 更進一步——scheduler 註冊了 config observer，`ceph config set` 打下去當場重算配額：
+
+```cpp
+// File: ceph/src/osd/scheduler/mClockScheduler.cc (line 580, 596)
+void mClockScheduler::handle_conf_change(
+  ...
+  if (changed.count("osd_mclock_profile")) {
+```
+
+這對 degraded 應變是好消息：**「recovery 打爆 client latency」的當下，你可以不停機把 profile 切到 `high_client_ops`**（實驗 E-39 量化它買到多少）。注意一個陷阱：mClock 生效時它接管 `osd_max_backfills` / `osd_recovery_max_active`，要手動調這兩個得先開 `osd_mclock_override_recovery_settings`。
+
+## 三個被原始碼推翻的直覺
+
+研究方法是 prediction 先行：先把「我以為會這樣」寫死，再翻 pinned source 對答案。五條查證中兩條被推翻（另有一條 T3 錨點被實錘）——**violated 的價值比 confirmed 高**，因為它們正是網路上流傳、你很可能照做的建議。
+
+### 直覺一（violated）：「換 virtio-scsi 就有 30 秒 timeout，卡死會變成 IO error」
+
+直覺的來源很合理：SCSI 中間層有 per-command timeout（sd 預設 30s）和一整套 error handler，virtio-blk 沒有。前半是對的——virtio-blk 的 `virtio_mq_ops` 沒有 `.timeout` 成員（`File: linux/drivers/block/virtio_blk.c (line 1239-1246)`），而 blk-mq 對沒有 handler 的裝置，逾時只做一件事：把 timer 重新掛上（`File: linux/block/blk-mq.c (line 1557-1569)` 的 `blk_mq_rq_timed_out` else 分支）。所以 virtio-blk 的 IO **永不逾時**，Ceph 不回應就永遠等。
+
+但後半錯了。virtio-scsi 的 host template 註冊了 `eh_timed_out`——內容是無條件叫 SCSI 層重掛 timer：
+
+```c
+// File: linux/drivers/scsi/virtio_scsi.c (line 786-789)
+static enum scsi_timeout_action virtscsi_eh_timed_out(struct scsi_cmnd *scmnd)
+{
+	return SCSI_EH_RESET_TIMER;
+}
+```
+
+`scsi_timeout` 收到 `SCSI_EH_RESET_TIMER` 就直接回 `BLK_EH_RESET_TIMER`，根本走不到後面的 `scsi_abort_command`（`File: linux/drivers/scsi/scsi_error.c (line 335-372)`）。sd 設的 30 秒形同虛設——**兩種 bus 都永不逾時**。bus 的選擇仍是效能實驗的變因（E-11），但「穩定性」理由不成立。
+
+### 那真正的有界等待在哪：`osd_request_timeout`（而且它是 D 類）
+
+往下一層找，libceph 有一個 map option `osd_request_timeout`（秒，預設 0 = 永不，`File: linux/include/linux/ceph/libceph.h (line 78)`）。設了之後，osd client 的定時器會掃描所有超齡 request，直接以 `-ETIMEDOUT` abort：
+
+```c
+// File: linux/net/ceph/osd_client.c (line 3479-3484)
+			if (opts->osd_request_timeout &&
+			    time_before(req->r_start_stamp, expiry_cutoff)) {
+				pr_err_ratelimited("tid %llu on osd%d timeout\n",
+				       req->r_tid, osd->o_osd);
+				abort_request(req, -ETIMEDOUT);
+			}
+```
+
+同一個迴圈連 **homeless request**（連目標 OSD 都算不出來的——PG 卡 peering、min_size 不滿的情境）也掃（同檔 line 3504 起）。這才是把「無限卡死」轉成「N 秒後 guest 收到 IO error」的旋鈕。但兩個代價：(1) 它是 krbd map option → **D 類**，要在 StorageClass 設計期決定；(2) N 設太小，正常 recovery 的暫態就會誤殺 IO，guest 檔案系統因此 remount read-only——比卡住更難自癒。「多少秒才對、error 真的比 hang 好嗎」由故障注入實驗 E-36 量化。
+
+### 直覺二（violated）：「cache=writeback 會被判 unsafe，擋掉 live migration」
+
+老經驗：shared storage 上非 direct cache 的 migration 有資料不一致風險，libvirt 會報 `VIR_ERR_MIGRATE_UNSAFE`。翻 `qemuMigrationSrcIsSafe` 發現判斷順序是：block device + `cache=none/directsync` → 安全；**否則檢查 QEMU 有沒有 `drop-cache` 能力，有就放行**（`File: libvirt/src/qemu/qemu_migration.c (line 1761-1773)`；能力探測對應 `blockdev-add/arg-type/+file/drop-cache`，`qemu_capabilities.c (line 1558)`，QEMU 4.0+ 都有）。KubeVirt 那層則只檢查 PVC 是不是 RWX（`File: kubevirt/pkg/virt-handler/vm.go (line 2484-2551)` 的 `checkVolumesForMigration`），完全不看 cache mode；預設也不帶 `MIGRATE_UNSAFE` flag（`virt-launcher/virtwrap/live-migration-source.go (line 99-107)`，只有顯式 `unsafeMigrationOverride` 才帶）。
+
+結論：在本頁版本錨點的 stack 上，**writeback 不會讓 VM 失去 migration 能力**。它的真實代價在別處——尾延遲（E-10）與 crash consistency（E-40：`kill -9` QEMU 後 writeback 會不會丟已 ack 的寫入）。舊 QEMU（4.0 之前、沒有 drop-cache 能力）才會被 libvirt 擋，讀到舊文章請對版本。
+
+### 直覺三（T3 實錘）：「什麼都不設」不是最樸素的 baseline
+
+v2 已從源碼證明「cache 留空 ⇒ 自動 `none`+`io=native`、`num-queues` 預設=vCPU 數」。這次在真機直接抓 QEMU 命令列驗收——一台什麼都沒設的 VM，資料盤的 blockdev 長這樣（bundle：`experiments/kubevirt-rbd-tuning/results/E-00-baseline-verify/`）：
+
+```json
+{"driver":"host_device","filename":"/dev/data","aio":"native",
+ "cache":{"direct":true,"no-flush":false}, ...}
+```
+
+guest 內 `/sys/block/vdb/mq/` 有 4 條 hw queue（= vCPU 數）。所以「調教」的起點不是零，是 KubeVirt 已經幫你選好的一組相當激進的預設。
+
+## 真機驗證：環境與已完成的部分
+
+T3 環境是 Azure 專屬實驗叢集（可任意破壞、與生產拓樸同型）：3 mon + 3 OSD node（L8s_v3，每台 1 顆 NVMe 切 3 OSD，共 9 OSD）+ k8s（1 cp + 2 worker，D8s_v5，nested KVM）+ KubeVirt v1.5.0 + ceph-csi v3.14.0，全節點 kernel 6.8（與 pinned linux 對齊；ceph 19.2.4 與 pinned 19.2.3 差一個 patch 版）。兩個開跑前就抓到的環境事實值得記：
+
+- **cephadm 的 autotune 會把 `osd_memory_target` 抬離預設**（本環境 64G 記憶體被抬到 15.7G/OSD）。已顯式釘回 4G——不是 4G 比較好，是 baseline 必須錨在文件預設值，否則 E-21（4G vs 8G 對照）的前提直接崩壞、且 47G 聚合 cache 會把 16G 測試盤整個吃進去，美化所有讀側數字。
+- **mClock 自測的 OSD 容量 ~6000 IOPS/OSD**（`osd_mclock_max_capacity_iops_ssd`）——這就是本環境 OSD 端天花板的量級，解讀高 QD 實驗時的分母。
+
+已完成的驗證（其餘見回填表）：
+
+| 項目 | 結果 | 證據 |
+|---|---|---|
+| 觀測三邊界互洽（E-03） | guest `iostat` 27005 r/s vs host rbd0 26998 r/s（差 0.03%）；`virsh domblkstat` 可用 | bundle `results/E-03/` |
+| 虛擬化稅初值 | 高載 qd32 下 guest await − host await ≈ 0.09ms/op | 同上 |
+| baseline 生效驗證 | `aio=native`+`cache.direct=true`+queues=4，見上節 | `results/E-00-baseline-verify/` |
+
+## 實驗總覽與結果回填
+
+完整協定（每實驗的目的／變因／做法／預期）在 `experiments/kubevirt-rbd-tuning/EXPERIMENT-PLAN.md`，逐步指令在 `RUNBOOK.md`。判準：n≥3、A/B 交錯、差異超過 E-01 實測噪音帶才算方向，verdict 三態由機器比對。下表跑完一個填一列（空格 = 尚未執行）：
+
+| 編號 | 變因 | 可調性 | 正常態 verdict | degraded 加測 | 關鍵數字 |
+|---|---|---|---|---|---|
+| E-01 噪音帶 | —（n=5 重複） | — | 進行中 | — | |
+| E-02 host 天花板 | 量測位置 | — | | — | |
+| E-10 cache mode | none/wt/wb | B | | ✔（E-40 crash） | |
+| E-11 bus | virtio-blk vs scsi | B | | — | |
+| E-12 io | native vs threads | B | | — | |
+| E-13 多 queue | blockMultiQueue on/off | B | | — | |
+| E-14 IOThread | dedicated on/off | B | | — | |
+| E-15 CPU limit | Guaranteed vs throttled | B | | — | |
+| E-16 CPU 拓樸 | dedicated+isolate ×競爭 | B | | — | |
+| E-17 guest scheduler | none vs mq-deadline | A | | — | |
+| E-18 readahead | 128/512/4096 | A | | — | |
+| E-19 queue_depth | 64/128/256 | **D** | | ✔ | |
+| E-20 image layout | object-size/striping | **D** | | — | |
+| E-21 osd_memory_target | 4G vs 8G | A | | — | |
+| E-22 op_num_shards | 8 vs 16 | C | | rolling 代價實錄 | |
+| E-30~38 degraded 矩陣 | 注入情境 ×9 | — | —（產出＝症狀對照表） | 本體 | |
+| E-39 mClock | balanced vs high_client_ops | A | | 本體 | |
+| E-41 failover 預算 | node 硬斷 | — | —（產出＝時間預算表） | 本體 | |
+| E-42 migration 代價 | 負載中遷移 | — | | 本體 | |
+
+## 邊界與除錯
+
+- **本頁的可調性結論是版本綁定的**。四分類與三個 violated 直覺都錨在 v1.5.0 / v3.14.0 / kernel 6.8 / libvirt 10.10 / qemu 9.1——KubeVirt 的 LiveUpdate 白名單每版都在長，換版本要重查 `validLiveUpdateDisks` 與白名單抄平那段。
+- **實驗數字是環境綁定的**。Azure 叢集量到的絕對值不能搬回你的生產；可移植的是相對排序、機制解釋與重測方法（harness 在 `experiments/kubevirt-rbd-tuning/`）。每個結論會標「機制級（可移植）」或「數值級（僅限本環境）」。
+- **本環境的已知侷限**：OSD 是 1 顆 NVMe 切 3（非獨立媒體），per-OSD 隔離類實驗（E-22、慢 OSD 注入）會帶同碟鄰居效應；nested 虛擬化 + 雲端共享宿主的噪音帶由 E-01 實測，所有 verdict 以它為判準。
+- **延遲歸因的除錯法**：三邊界（guest `iostat /dev/vdb` → host `iostat rbdX` → `ceph osd perf`）已驗證互洽，差分就是各層貢獻——guest−host 是 virtio+QEMU 段，host−OSD 是網路+krbd 段。librbd 路徑沒有 host block device，改用 `virsh domblkstat`。
+
+## 接下來 / 相關頁面
+
+<Callout type="info" title="這頁會隨實驗回填而更新">
+  P0 源碼查證與方法論已定案；正常態 A/B 與 degraded 矩陣的數字跑完就回填上表。研究的即時狀態看 repo `experiments/kubevirt-rbd-tuning/STATE.md`。
+
+  - [VM Disk IO 調教參數目錄](./rbd-io-tuning-catalog) — 五層旋鈕的機制與 impact 推論；本頁補上它缺的「可調性」與「穩定性」維度
+  - [效能實驗計畫 v2](./rbd-io-experiment-plan) — PVE 軸的前一輪實驗（krbd vs librbd、cache、雙軸方法論的起點）
+  - [VM Disk IO datapath](./rbd-io-datapath) — 每個旋鈕改變哪一跳的底圖
+  - [Ceph — OSD 與 BlueStore](/ceph/features/osd-and-bluestore) — osd_memory_target、mClock 的 OSD 端背景
+</Callout>

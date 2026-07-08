@@ -46,3 +46,7 @@
     RUNBOOK §3 的 SC 模板 secret 名改用 `csi-rbd-secret@ceph-csi-rbd`、clusterID=FSID。
   - guest key 用 `~/.ssh/azure-lab.pub`（非 repo key）；kubectl 可直接於 Mac 執行。
   - 生命週期歸 azure-iac-lab repo 的 make（stop=清 NVMe+自動重建）；共享訂閱只准動 cyshih-*。
+
+- 2026-07-08 MDX 專題頁上線：`next-site/content/vm-storage-perf/features/rbd-io-production-tuning.mdx`
+  （P0 四分類+三 violated 直覺+已完成 T3；實驗回填表留空——每完成一個實驗要同步回填此頁）。
+  slug 已入 projects.ts features+featureGroups(效能調教)。quiz 未加（等實驗數字齊再出題）。

@@ -517,11 +517,11 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
     submodulePath: '',
     color: 'cyan',
     accentClass: 'border-cyan-500 text-cyan-400',
-    features: ['linux-io-stack-primer', 'block-layer-blk-mq-primer', 'async-io-interfaces-primer', 'virtio-vring-primer', 'kvm-io-boundary-primer', 'kernel-async-and-net-primer', 'rbd-io-datapath', 'rbd-io-tuning-catalog', 'rbd-io-experiment-plan'],
+    features: ['linux-io-stack-primer', 'block-layer-blk-mq-primer', 'async-io-interfaces-primer', 'virtio-vring-primer', 'kvm-io-boundary-primer', 'kernel-async-and-net-primer', 'rbd-io-datapath', 'rbd-io-tuning-catalog', 'rbd-io-experiment-plan', 'rbd-io-production-tuning'],
     featureGroups: [
       { label: '底層基礎', icon: '📚', slugs: ['linux-io-stack-primer', 'block-layer-blk-mq-primer', 'async-io-interfaces-primer', 'virtio-vring-primer', 'kvm-io-boundary-primer', 'kernel-async-and-net-primer'] },
       { label: 'IO 路徑', icon: '🔬', slugs: ['rbd-io-datapath'] },
-      { label: '效能調教', icon: '🎛️', slugs: ['rbd-io-tuning-catalog', 'rbd-io-experiment-plan'] },
+      { label: '效能調教', icon: '🎛️', slugs: ['rbd-io-tuning-catalog', 'rbd-io-experiment-plan', 'rbd-io-production-tuning'] },
     ],
     usecases: [],
     difficulty: '🔴 進階',
