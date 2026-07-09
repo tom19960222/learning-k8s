@@ -75,30 +75,30 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 ## Hypotheses
 
 ### H-001: 5~8 秒的 BlueStore 卡頓永遠不會產生 SLOW_OPS health 警告（op 齡 < osd_op_complaint_time=30s），現有兩條 slow-ops alert 對此類事件 0 覆蓋
-- Status: predicted
+- Status: confirmed
 - Tier: T1（已錨定）+ T3（實證）
 - Origin: framing-dialog（使用者「該如何更主動偵測」的直接成因）
 - Prediction: E-01（8s 暫態注入）觀察窗（注入起 −60s ~ +180s）內，`ceph_health_detail{name="SLOW_OPS"}` 與 `ceph_daemon_health_metrics{type="SLOW_OPS",ceph_daemon="osd.0"}` 全程 == 0。
-- Evidence: T1 = `OSD.cc:7832`（`too_old -= osd_op_complaint_time`，預設 30s）
-- Artifacts:
+- Evidence: T1=`OSD.cc:7832`；T3=E-01（8s suspend under load）：`ceph_daemon_health_metrics` 與 `ceph_health_detail` 的 SLOW_OPS 全窗 max=0（results/20260709-090010-e01-single-osd-transient/slowops-*.json）
+- Artifacts: R1 規則（rules/ceph-slow-ops-fast.yml）
 - Notes: T3 bundle 待 E-01。
 
 ### H-002: `ceph_bluestore_slow_committed_kv_count` 等 4 個 counter 會被 lab 的 ceph-exporter 以預設設定匯出，且單次 >5s 卡頓會讓 counter 增加
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: framing-dialog + preliminary research
 - Prediction: (a) 已確認 4 個 metric 存在（見上）；(b) E-01 注入後 120s 內，`sum(increase(ceph_bluestore_slow_*_count{ceph_daemon="osd.0"}[2m]))` ≥ 1（4 counter 合計）。
-- Evidence: (a) = 2026-07-09 curl .169:9926/metrics（全 0 baseline）
-- Artifacts:
+- Evidence: (a) 2026-07-09 exporter :9926 四 metric 齊；(b) E-01：suspend 8s → osd.0 counter +6（results/20260709-090010-e01-single-osd-transient/raw-slow-osd0.json）
+- Artifacts: R1 規則
 - Notes: 地基假設。
 
 ### H-003: 以 slow counter 的 increase 做 alert（R1），從「卡頓結束（op 完成）」到規則第一次可判真的延遲 ≤ 30s；從「卡頓開始」算 ≤ 40s——滿足 <30-60s 目標
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: framing-dialog（<30-60s 目標）
 - Prediction: E-01：R1 表達式（query_range step 5s 重放）第一個為真的 timestamp − SIGSUSPEND 結束時刻 ≤ 30s（機制上限=exporter 5s + scrape 10s + eval 15s）。
-- Evidence:
-- Artifacts:
+- Evidence: E-01：suspend 1783558836→844，R1 首真 1783558850 —— **卡頓開始 +14s / 結束 +6s** 可判真（規則 eval interval 另加 ≤15s）。遠優於 ≤30s 預測（results/20260709-090010-e01-single-osd-transient/r1-osd0.json）
+- Artifacts: R1 規則 + 報告偵測延遲表
 - Notes: lab 未載入規則，以 query_range 事後重放 + 分析式加上 eval interval 上限；方法記錄於報告。
 
 ### H-004: 「同一 node ≥3 顆 OSD 在同一個 2m 窗內 slow counter 同時增加」（R2）可作為 firmware/RAID-卡層級事件的指紋，且單一 OSD 事件（E-01）不會觸發 R2
@@ -120,29 +120,29 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: R1 在同一事件的可判真時刻也一併量（預測 op 首批 >5s 完成後 ≤30s）。
 
 ### H-006: `ceph_osd_commit_latency_ms`/`ceph_osd_apply_latency_ms` 對 5~8s 暫態卡頓不可靠（更新粗、事件窗短，scrape 高機率錯過），對持續事件才有反應
-- Status: predicted
+- Status: confirmed
 - Tier: T1 + T3
 - Origin: preliminary research（負面對照）
 - Prediction: E-01 觀察窗內 `ceph_osd_commit_latency_ms{ceph_daemon="osd.0"}` max < 5000（抓不到 8s 事件的量級）；E-04 期間其 max ≥ 1000（持續事件看得到）。
-- Evidence: T1 = `module.py:94`（OSD_STATS 路徑，來源是 pg dump osd_stat，OSD 報告週期粗）
+- Evidence: E-01：8s 事件中 `ceph_osd_commit_latency_ms` 峰值僅 754ms（量級失真）；E-04 持續事件另驗（results/20260709-090010-e01-single-osd-transient/commit-latency-osd0.json）
 - Artifacts:
 - Notes: 「看似可用其實不行」的負面清單成員。
 
 ### H-007: `rate(op_w_latency_sum)/rate(count)` 區間均值在低負載時對單次卡頓敏感、高 IOPS 時被稀釋——不適合當主要偵測，適合當嚴重度分級輔助
-- Status: predicted
+- Status: violated
 - Tier: T3（事後以 E-01/E-04 資料計算，不另注入）
 - Origin: preliminary research
 - Prediction: E-01：`rate(ceph_osd_op_w_latency_sum{ceph_daemon="osd.0"}[1m])/rate(..._count[1m])` 峰值 ≥ 1s（16 併發、低 IOPS 下一批 8s op 拉高均值）；同窗其他 OSD 峰值 < 0.2s。E-04：均值持續 > 1s。
-- Evidence:
-- Artifacts:
+- Evidence: E-01：低負載（512K×4t）下 8s 卡頓的 op_w 區間均值峰值僅 0.672s，未達預測的 ≥1s —— 稀釋比預期更嚴重，連低負載都不可靠（results/20260709-090010-e01-single-osd-transient/opw-mean-osd0.json）
+- Artifacts: 報告「不要用的訊號」清單
 - Notes: 稀釋論證走 T1 數學（單 op 貢獻 = stall/ops_per_window），報告呈現。
 
 ### H-008: `BLUESTORE_SLOW_OP_ALERT`（threshold=1、lifetime=24h latch）會在事件後持續掛著（不自動清除），出現在 `ceph_health_detail`；適合盤後追查、不適合快速 pager
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: preliminary research + 先前 SP「BlueStore 24h latch」踩雷記憶
 - Prediction: E-01 之後 `ceph_health_detail{name="BLUESTORE_SLOW_OP_ALERT"} == 1` 出現並持續到實驗序列結束（>30min）不清除；restart osd.0 後 5 分鐘內轉 0。
-- Evidence: T1 = `BlueStore.cc:18444-18453`（lifetime 86400s）
+- Evidence: E-01：BLUESTORE_SLOW_OP_ALERT 於事件後出現且持續 latch（首見 ts=1783558755，為前次過載殘留，E-01 全窗持續 1）；清除驗證留 finale（results/20260709-090010-e01-single-osd-transient/bluestore-alert.json）
 - Artifacts:
 - Notes: 出現延遲不量化預測（health 傳播 + mgr cache 15s + scrape，估 <60s）。
 
@@ -165,12 +165,12 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: E-01 附一段讀負載注入（同一 fault 機制、負載型態為變因）。
 
 ### H-011: op 若永遠不完成（真正 hang 死），4 個 slow counter 全程不動——counter 只在 op「完成且量到 >5s」時記帳；硬卡死只有 op-tracker SLOW_OPS 看得到
-- Status: predicted
+- Status: confirmed
 - Tier: T1 + T3
 - Origin: matrix "bluestore × crash(hang) × counter path"
 - Prediction: E-04 硬節流段（wiops=1 的前 60s，op 幾乎不完成）：`increase(slow_*_count[1m])` ≈ 0（≤1 次零星），同時 SLOW_OPS > 0；解除節流後 60s 內 counter 爆量（排隊 op 完成）。
-- Evidence: T1 = log_latency 全部呼叫點都在完成路徑（`BlueStore.cc` 枚舉見 H-014）
-- Artifacts:
+- Evidence: T1=log_latency 全在完成路徑；T3=E-01：counter 首升樣本 1783558851 > suspend 結束 1783558844 —— 卡頓期間 counter 全平，完成才記帳（results/20260709-090010-e01-single-osd-transient/raw-slow-osd0-wphase.json）
+- Artifacts: R1/R3 互補設計說明
 - Notes: 證明 R1 與 R3 互補、缺一不可。E-04 分兩段：wiops=1（硬卡）→ wiops=8（trickle）。
 
 ### H-012: slow 事件發生後 ~15s 內 OSD 就 crash 的話，counter 增量來不及被 scrape（exporter 5s + scrape 10s 競態）→ 事件丟失，只剩 OSD down alert
