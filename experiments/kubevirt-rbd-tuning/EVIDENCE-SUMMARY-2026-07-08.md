@@ -244,3 +244,11 @@
 - **C 類 rolling restart 代價（本實驗真正產出）**：rolling 重啟 9 顆 OSD（帶 ok-to-stop gating）期間 client qd1 讀受創——`to16` 輪 mean **39ms（×39）**、p99 **1360ms**、max 2553ms（基線 ~1ms）；`to8` 輪較輕（mean 1.56ms、p99 12.8ms）。每顆 OSD 重啟時它作為 primary 的 PG 讀阻塞於 peering 窗，9 顆累積成秒級尖峰。
 - 生產結論：**改任何 Ceph startup-flag 參數（osd_op_num_shards 等）＝一次 rolling restart＝一段 client 讀延遲秒級惡化的 degraded 窗**。本例 shards 8→16 零收益，這個代價不值得付。要改 startup 參數請排維護窗、預期 client 尾延遲衝擊。
 - shards 已還原預設 8、HEALTH_OK。
+
+## E-41 + E-40 node 硬斷 → failover + crash consistency — done（兩個重大發現）
+
+- Bundle：`results/E-41/<ts>/`（az vm stop --skip-shutdown cyshih-k8s-2 = 拔電；cache=writeback）
+- **E-41 發現①（重大）：KubeVirt 硬 node 失效不自動 failover**。時間線：T0 硬斷 → T0+59s node NotReady → **T0+661s（11 分鐘）VMI 仍 `Running@dead-node`**，完全沒重排。手動 `force-delete VMI/pod` 被 stuck finalizer 擋（死 node 無法確認 pod termination）。恢復只能靠 node 回來（az vm start → node 16s Ready → VMI 自動重建冷開機 ~6min guest 可用）。**生產含義：KubeVirt VM 的 node 硬掛不會自癒，需要 node-loss 自動化（NodeHealthCheck/machine-health-check）或人工介入；預設行為＝VM 無限期卡死在 phantom Running。**
+- **E-40 發現②（confirmed）：cache=writeback 在 host 硬斷丟失已 ack 的寫入**。探針 O_DIRECT 寫 4k blocks（guest 認為寫完），硬斷後回讀：block ≤3800 存活、**≥3900 遺失（顯示舊資料）**，last acked=4235 → **損失最後 ~335 blocks ≈ 最後 6 秒的 acked 寫入**。機制：writeback=host page cache，kernel dirty_writeback(~5s) 只 flush 較舊寫入到 Ceph，最近 ~6s 仍在 host 記憶體、隨拔電消失。**這坐實了 E-10 的警告：writeback 的均值增益以 crash consistency 為代價——host/node 硬失效會丟資料，且只丟最近數秒（最難察覺）。**
+- **關鍵區分（方法論）**：光 kill QEMU/pod 不會丟（host page cache 存活+rbd unmap flush，見討論）；只有 **host 層硬失效（拔電/panic）** 才丟——所以這個代價只在 node 級災難時兌現，但兌現時 guest 檔案系統可能靜默損壞。
+- cache=none 對照組（預期 0 遺失，O_DIRECT 直穿 Ceph）：見下方（機制確定，控制組視時間決定是否補跑）。
