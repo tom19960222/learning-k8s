@@ -111,12 +111,12 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes:
 
 ### H-005: 現有 SLOW_OPS 鏈路的端到端偵測延遲 ≥ 2 分鐘（op 開始卡住 → CephDaemonSlowOps(for:1m) 可 fire），即使 op 持續卡住
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: framing-dialog（baseline 量測）
 - Prediction: E-04（持續 io.max 節流）：`ceph_daemon_health_metrics{type="SLOW_OPS",ceph_daemon="osd.0"} > 0` 第一次出現 ≥ 注入起 +35s；加上 for:1m 與 eval，`CephDaemonSlowOps` 可 fire 時刻 ≥ 注入起 +95s。對照 R3（for:0）可 fire 時刻 ≈ SLOW_OPS 出現 +15s 內。
-- Evidence:
-- Artifacts:
+- Evidence: E-04 v4（duty-cycle ~143s、op_w 均值峰值 32.9s）：三路 SLOW_OPS（daemon metric / health_detail / healthcheck_slow_ops）都在 **t_inj+45s** 首度非零。可 fire 時刻：R4/R3 型（for:0）≈ +45~60s；舊 CephDaemonSlowOps/CephClientIOBlocked（for:1m）≈ +120s，且 <60s 的事件會整段漏掉（results/20260709-094532-e04-sustained-throttle）
+- Artifacts: 報告偵測延遲表 + R3/R4
 - Notes: R1 在同一事件的可判真時刻也一併量（預測 op 首批 >5s 完成後 ≤30s）。
 
 ### H-006: `ceph_osd_commit_latency_ms`/`ceph_osd_apply_latency_ms` 對 5~8s 暫態卡頓不可靠（更新粗、事件窗短，scrape 高機率錯過），對持續事件才有反應
@@ -147,12 +147,12 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: 出現延遲不量化預測（health 傳播 + mgr cache 15s + scrape，估 <60s）。
 
 ### H-009: node_exporter 的 per-device 指標在 device 層看得到卡頓，可跨層佐證：多 VD 同時卡 → 指向控制器/firmware 而非單一碟
-- Status: predicted
+- Status: violated
 - Tier: T3（機制驗證）+ T2（歸因邏輯）
 - Origin: framing-dialog（環境：10 SSD 一張 RAID 卡）
 - Prediction: E-04 期間 `rate(node_disk_io_time_weighted_seconds_total{instance="ceph-lab-osd-01",device="dm-3"}[1m])` 明顯高於 baseline（≥5×）；E-01 的 8s suspend 在 [1m] rate 上也可見（io_time_weighted 累積 in-flight 時間）。
-- Evidence:
-- Artifacts:
+- Evidence: E-04 v4：dm suspend 期間 dm-3 的 io_time_weighted rate 反而降（0.71 vs pre 0.89）——synthetic 注入把 bio 擋在 device 之上，device 層看不到。對照第一次 E-00 自然過載（真 device 飽和）：sdb 峰值 2.17 s/s（~2-5× baseline）。結論：node_disk 只看得到「IO 真的卡在 device 內」的事件（真 firmware 卡頓屬此類），看不到 kernel 層合成的 stall；生產可用作佐證但倍率預測（≥5×）過高
+- Artifacts: 報告「跨層佐證」一節（含模擬保真度邊界）
 - Notes: lab 無 RAID 卡；生產歸因邏輯（多 VD 同秒 vs 單 VD）以報告論證。
 
 ### H-010: 讀路徑卡頓由 `slow_read_wait_aio_count`/`slow_read_onode_meta_count` 覆蓋，寫路徑由 `slow_committed_kv_count`/`slow_aio_wait_count` 覆蓋——規則需同時看 4 個 counter
@@ -183,13 +183,13 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: Gate 1 triage：不做 T3（時序競態 demo 價值低）；報告以管線時間常數推理，結論=此情境靠既有 OSD down alert 覆蓋。
 
 ### H-013: OSD process 凍結時 ceph-exporter 對該 OSD 回舊值（stale）而非缺值，exporter 的 up 仍 =1（observer lying/stale）
-- Status: predicted
+- Status: violated
 - Tier: T3
 - Origin: matrix "ceph-exporter × lying"；axes.md「Observer lying / stale telemetry」
 - Prediction: E-05（SIGSTOP osd.0 15s，無負載）：凍結期間 .169:9926/metrics 仍 200、osd.0 series 仍在且值不變（與凍結前相同）；`up{job=~".*ceph-exporter.*"}` 全程 1；SIGCONT 後 10s 內恢復更新。
-- Evidence:
+- Evidence: E-05（SIGSTOP osd.0 15s、輕負載）：凍結 +6s 兩顆 OSD 都回舊值（收集迴圈短暫整體卡住），+12s osd.0 series **從 /metrics 消失**而 osd.1 恢復更新；HTTP 全程 200、up 全程 1；SIGCONT 後恢復。預測的「持續回舊值」被推翻——真實行為是「短暫整體 stale → per-daemon 掉 series」
 - Artifacts:
-- Notes: 結果決定是否需要 staleness 防護規則（如 exporter 自身 metrics 或 absent()）。
+- Notes: 掉 series 比回舊值好偵測（absent 型規則可補）；且 >20s 凍結會被 peer 標 down、既有 OSDDown 接手。R1 對凍結中 OSD 的偵測延後到解凍後（與 H-011 完成語意一致）。
 
 ### H-014: BlueStore 內多數 log_latency 呼叫點沒帶 idx2 → 存在「打 log + 觸發 BLUESTORE_SLOW_OP_ALERT、但 4 個 counter 都不動」的 slow 類別；寫路徑靠 txc 全程量測傳遞性覆蓋
 - Status: confirmed
@@ -210,11 +210,11 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: 重要修正——R1 fire ≠ 硬體壞，而是「該 OSD 有 op 超過 5s」的事實；過載時 client 一樣痛，仍值得知道。但 severity 分級與「叢集級 vs 單 node」的區分（R2 只在單 node 聚集時升級）因此更重要。同窗還揭露 H-023。
 
 ### H-016: `bluestore_log_op_age` 可 runtime 調低（如 2s）提高對 <5s 卡頓的靈敏度、不需重啟 OSD；預設 5s 下 3s 卡頓完全不可見
-- Status: predicted
+- Status: confirmed
 - Tier: T1 + T3
 - Origin: negative-space（5s 門檻以下的事件全不可見）
 - Prediction: E-06a（預設 5s、suspend 3s、有負載）：counter 零增量。E-06b（`ceph config set osd.0 bluestore_log_op_age 2` 後同樣注入）：counter 增量 ≥1。config rm 後恢復。
-- Evidence: T1 = `log_latency` 每次呼叫都讀 `cct->_conf->bluestore_log_op_age`（legacy conf 值，config observer 更新後即生效）
+- Evidence: E-06：a 段（預設 5s）3s suspend → counter +0；b 段（`ceph config set osd.0 bluestore_log_op_age 2`，`ceph tell` 確認 daemon 收到）同樣 3s suspend → **+6**；config rm 後讀回 5.0。runtime 生效、不需重啟
 - Artifacts:
 - Notes: 若成立 → 生產可把門檻調到貼近 SSD 預期延遲（例如 1~2s）做更早偵測；代價（log 量、FP）寫報告。
 
@@ -289,6 +289,15 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Evidence: results/20260709-092856-e04-sustained-throttle（slowops-osd0.json max=0、opw-mean-osd0.json max=15.16、commit-latency-osd0.json max=15196）
 - Artifacts: 報告「三層盲區」一節；R1 的存在理由再 +1
 - Notes: 與 H-001（單發暫態 <30s 盲）、H-023（daemon metric 漏採樣）合成完整圖像：**op-tracker 的 30s 門檻讓「每個 op 都慢但都 <30s」的劣化模式整類不可見**。這正是 SSD 劣化/韌體問題最常見的表現形態。緩解：調低 `osd_op_complaint_time`（runtime 可調）或靠 R1（5s 門檻）。
+
+### H-025: SLOW_OPS 指向 primary OSD 而非元兇 device：replica 被卡時，client op 掛在（別台 node 的）primary op tracker 上超齡——SLOW_OPS 的 daemon label 會「怪錯人」
+- Status: confirmed
+- Tier: T3（E-04 v4 意外發現）
+- Origin: negative-space（E-04 v4 h005 檢查失敗的成因分析）
+- Prediction: （事後觀測）E-04 v4 卡 osd.0（osd-01 上），`ceph_daemon_health_metrics{type="SLOW_OPS"}` 非零的是 osd.4/6/7/8（osd-02/03 上的 primary）；osd.0 自己全程 0。
+- Evidence: 2026-07-09 query_range 1783561500-800：daemon SLOW_OPS 非零 = osd.4(2 樣本)/osd.6(6)/osd.7(4)/osd.8(4)，osd.0=0（results/20260709-094532-e04-sustained-throttle）
+- Artifacts: 報告「定位能力對照」一節
+- Notes: 直接影響 oncall 動線：SLOW_OPS 亮 osd.4 ≠ osd.4 的碟壞了。**R1（BlueStore counter）是 device-local 訊號、指向元兇**；SLOW_OPS 是 client-impact 訊號、指向受害者。兩者一起看：R1 亮 osd.0 + SLOW_OPS 亮一堆別台的 primary = osd.0 的 device 出事、且已波及 client。
 
 ## 實驗總覽（Automate 階段）
 
