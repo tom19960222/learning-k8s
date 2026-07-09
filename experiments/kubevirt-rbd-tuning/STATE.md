@@ -167,3 +167,4 @@
   ② E-40 confirmed：cache=writeback 硬斷丟最後~335 blocks≈6s acked 寫入（host page cache 未 flush）；≤3800存活/≥3900遺失。光 kill QEMU/pod 不丟（要 host 硬失效）。
   發現根因：Mac 只能連 public IP，腳本用 node internal IP(10.0.1.x) SSH 全逾時→改用 kubectl/CP。cache=none 對照組待補（機制確定=0丟失）。
 - 2026-07-09 `E-40 對照組 done — cache=none 硬斷 0 遺失（10/10 存活含最後 acked）；坐實 writeback 丟~6s/none 零丟失`。E-41 補充：none 輪 VMI 有 failover 到 k8s-1（預設 pod eviction ~300s 觸發），故 auto-failover 可能發生但慢且不可靠。VM 現於 k8s-1、cache=none baseline。
+- 2026-07-09 `E-31 done — 整 OSD host 硬斷（3/9 OSD）衝擊輕：僅一次 38ms peering 尖峰，min_size=2 撐住 IO 續存。失效顆數不重點，min_size 才是。跨 degraded 總結：失效本身無感，傷害在 backfill/flapping/gray`。授權擴大 cyshih-osd-2 可 az 動。

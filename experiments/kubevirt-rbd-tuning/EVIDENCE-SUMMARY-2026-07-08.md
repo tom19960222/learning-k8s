@@ -253,3 +253,10 @@
 - **關鍵區分（方法論）**：光 kill QEMU/pod 不會丟（host page cache 存活+rbd unmap flush，見討論）；只有 **host 層硬失效（拔電/panic）** 才丟——所以這個代價只在 node 級災難時兌現，但兌現時 guest 檔案系統可能靜默損壞。
 - **cache=none 對照組（已補跑，confirmed）**：同樣硬斷 cyshih-k8s-2，探針寫 Y-pattern blocks 6000~9475，回讀 **10/10 全存活（含最後一筆 acked 9475）＝0 遺失**。O_DIRECT 每筆寫入直穿到 Ceph、不經 host page cache → 硬斷零損失。**乾淨對照坐實：writeback 丟最近 ~6s、none 零丟失。**
 - **E-41 補充觀察**：none 對照輪這次 VMI **有 failover 到 cyshih-k8s-1**（不像 writeback 輪卡死 11min）——差別在這輪未手動 force-delete、KubeVirt 預設 pod eviction（unreachable NoExecute toleration ~300s）在 node 持續 NotReady 下觸發了重排。所以 auto-failover **可能發生但慢（~5min+）且不可靠**（手動 force-delete 反而被 stuck finalizer 擋）。生產結論不變：需要 NodeHealthCheck 才有可預期的快速 failover。
+
+## E-31 OSD node 硬斷（整台 3 OSD 同時失效）— done（min_size 撐住，衝擊輕）
+
+- Bundle：`results/E-31/<ts>/`（az vm stop --skip-shutdown cyshih-osd-2＝3/9 OSD 瞬間失效，down ~4min 後 az start 恢復）
+- 衝擊（vs pre rr 0.99ms/rw 1.54ms）：rr-qd1 mean 1.18ms、rw-qd8 mean 1.74ms（幾乎無變）；**僅一次 ~38ms peering 尖峰（p999 38ms、>10ms 只 1 秒）**；health 到 WARN（非 ERR）；恢復快（az start 後數十秒 HEALTH_OK）。
+- **結論（confirmed H-005 OSD-node 部分）**：整台 host 失效（3 OSD）與單 OSD down 的衝擊**幾乎相同**——只要 min_size=2 滿足（size=3 + CRUSH per-host，掉 1 host = 每 PG 仍剩 2 副本），IO 續存、只有 down 瞬間一次 peering 尖峰。**失效顆數不是重點，min_size 是否滿足才是**。
+- **跨 degraded 實驗總結**：失效本身（E-30 單 OSD、E-31 整 host）都近乎無感；真正的傷害在 **out→backfill（E-30 rr×24）**、**flapping（E-34 p999 1146ms）**、**gray 延遲（E-32 寫×40）**。維運重點＝控制 out 時機（noout/快恢復）與偵測 gray（health 看不到）。
