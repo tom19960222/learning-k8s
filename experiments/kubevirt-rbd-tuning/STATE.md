@@ -157,3 +157,6 @@
 - 2026-07-09 `E-19 done — H-009 部分 violated：queue_depth 256 高並行 +10~21% IOPS 且 p99 更好，qd1 零代價（預測的尾延遲懲罰不存在，因 cap 對低並行無影響）。純加分但 D 類建置期定死`
 - 2026-07-09 **E-15 已點火**（CPU throttle H-018：Guaranteed(lim=4) vs throttled(lim=2)+guest stress-ng --cpu 4，量 fio p99.9+cgroup throttled_usec，~18min）。剩餘 queue：E-15→E-35(mon 階梯)→E-22(shards)。E-40/E-31/E-41/E-16 待使用者。
 - 2026-07-09 `E-15 done — 強力 confirmed H-018：CPU limit<vCPU 使 p99 ×7.4（7.6→55.8ms）、IOPS 砍半、p50 不變。關鍵修正：門檻是 limit≥vCPU 數不是 QoS class（兩變體皆 Guaranteed）。catalog 缺的隱形旋鈕，最易誤設最難察覺`
+- 2026-07-09 **E-35 延後**（同 E-40：mon quorum 全失是唯一可能 brick 整個 Azure 叢集的實驗，無人看管不做，留給使用者在線監督）。
+- 2026-07-09 **E-22 已點火**（osd_op_num_shards 8 vs 16，C類；含兩次 rolling restart 帶 degraded 負載量 client 代價，~30min）。
+  **自動 queue 到此為止**：E-22 完成後，剩餘全部需使用者（E-35 mon/E-40 crash/E-31 az node/E-41 az/E-16 kubelet）。
