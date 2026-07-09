@@ -130,3 +130,4 @@
 - 2026-07-09 **E-37 已點火**（worktree，deep-scrub 齊發 × osd_scrub_sleep 0 vs 0.1，degraded 模板；
   兩段各 480s，結束自動 config rm 還原）。queue 順序微調：E-40→延後，改跑 E-37→E-34→…
 - worktree 補記：node_modules 從主 checkout symlink（make validate 才過）；接手 agent 若 worktree 重建要重做此 symlink。
+- 2026-07-09 `E-37 done — deep-scrub 確實跑（scrub 時戳在窗內）但 client 零擾動，scrub_sleep 兩檔無差。與 E-39 同模式：NVMe headroom 下 Ceph QoS 旋鈕不可分辨→合併結論「投資 headroom 而非 QoS 微調」`

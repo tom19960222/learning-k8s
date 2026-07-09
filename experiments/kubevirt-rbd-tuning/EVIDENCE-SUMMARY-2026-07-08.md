@@ -151,3 +151,11 @@
 - **但 virtio-scsi 的 max latency 全面較高**：rw-qd8 max +150%、rr-qd8 +70%、rr-qd32 +34%、sw-1m +20%——SCSI 中間層較長路徑在尾端露出代價。
 - 生產結論（機制級）：**維持 virtio-blk 預設**。結合 H-006 violated（scsi 並不提供想像中的 timeout 保護——見「三個被推翻的直覺」），virtio-scsi 對本研究的 latency-first 目標**沒有任何優勢、且尾延遲更差**——不要為了「以為有 timeout」而換 bus。
 - verdict 檔：`verdict-scsi.txt`。
+
+## E-37 deep-scrub × osd_scrub_sleep — done（indistinguishable；NVMe headroom 再次吸收）
+
+- Bundle：`results/E-37/<ts>/`（sleep=0 vs 0.1，各段對 kubevirt pool 全 64 PG 觸發 deep-scrub，rr-qd1+rw-qd8 負載 480s）
+- **scrub 確實執行**（PG scrub 時戳 01:42–01:45 落在實驗窗內；pool 76GiB/19.5k 物件非空）——但 **client rr-qd1 全程平坦 0.98ms、p99 1.0ms、max 1.0ms，兩檔位無差**，無 health 碼。
+- 機制結論：NVMe + headroom 下 deep-scrub 的背景 IO 不與輕量 client 競爭 → `osd_scrub_sleep` 無可觀測效果。**與 E-39（mClock 同因 headroom 無感）同一模式**。
+- **合併生產結論（跨 E-37/E-39，機制級）**：在 NVMe + 有 headroom 的叢集，Ceph 側 QoS 節流旋鈕（mClock profile、scrub_sleep）多半不可分辨——沒有爭用可仲裁。**該投資的是容量 headroom，不是 QoS 微調**；這些旋鈕的用武之地在媒體飽和（HDD、或 client 打滿）時，本環境測不到那個 regime（誠實標記）。
+- Caveat：輕 client（qd1/qd8）+ 快媒體；HDD 或飽和 client 下結論會不同。
