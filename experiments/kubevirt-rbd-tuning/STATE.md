@@ -151,3 +151,6 @@
 - 2026-07-09 `E-38 done — nearfull 只告警不擋寫（v1 意外驗到）；full 下寫入 hang 96s 非 EIO，恢復後成功完成（confirmed H-022，同 min_size hang 型）。踩雷：full_ratio 要三個 ratio 依序設(nearfull<backfillfull<full)否則 out-of-order 被拒。生產：nearfull 是必須行動告警線`
 - 2026-07-09 **E-51 已點火**（可調性真機：改 SC mapOptions（預期無效）vs patch PV volumeAttributes（escape hatch）；含 VM 重啟 ×3，~12min）。剩餘 queue：E-51→E-19(qdepth D類)→E-15(cpu throttle)→E-35(mon 階梯)→E-22(shards)。
 - 2026-07-09 `E-51 done — patch PV volumeAttributes 被 API 拒（source immutable）→ mapOptions 無 escape hatch，H-002 T3 完整閉環，D 類=建置期定死坐實。host nr_requests 讀取回空(size比對未中)但非關鍵`
+- 2026-07-09 **E-19 已點火**（queue_depth 64 vs 256，D類新 SC+PVC，各 3 輪 rr/rw qd1+qd32x4，~25min；含 cleanup 換回 baseline PVC + 刪變體 SC/PVC）。
+  ⚠ 生效驗證 nr_requests 讀取用 /sys/block/rbdN/size==33554432 比對，E-51/E-19 都回空（node ssh 也偶逾時）——
+  queue_depth 是否生效改由 fio 差異反推；接手 agent 若要修 host 驗證，先確認 rbd size 單位/多裝置問題。
