@@ -124,3 +124,4 @@
   feat/ceph-mon-quorum-blind-spot），之後所有 git 操作與實驗腳本都在此 worktree，不再碰共用 checkout。**
   接手 agent 注意：cd 到該 worktree 工作；results/ bundle 在 worktree 內（與主 checkout 的舊 results 分離）。
   E-11 heredoc 修正（scp re-push 偶發失敗 → 改每輪 heredoc 寫 run_matrix）也在此 worktree 重做並重啟。
+- 2026-07-09 `E-11 done — bus IOPS indistinguishable、virtio-scsi 尾延遲較差（max +20~150%）；結合 H-006 → 無理由換 bus`。E-11 收尾在 worktree 完成。下一棒：E-40（crash consistency）。

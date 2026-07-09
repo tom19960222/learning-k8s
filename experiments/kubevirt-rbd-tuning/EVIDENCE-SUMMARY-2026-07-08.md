@@ -143,3 +143,11 @@
 - **為什麼 indistinguishable（邊界條件，比 verdict 重要）**：測試盤 16G，4G×3 OSD=12G 聚合 cache 已足以涵蓋單盤熱資料 → 8G 沒有多命中可拿。**這證實 E-00 當初釘回 4G 的判斷**：若不釘、任 autotune 給 15.7G，baseline 讀側數字會被 cache 全命中美化。生產含義：`osd_memory_target` 的收益只在 **working set > 當前 cache** 時才出現——本環境單 VM 打不到那個 regime；大 working set 或多 VM 聚合負載才需要加記憶體（本環境無法量化該增益，誠實標記）。
 - verdict 檔：`verdict-8g.txt`。
 - ⚠ 執行 deviation：subagent 監聽器在 ALL-DONE（17:36）後死亡、未完成收尾；數據完整，由主線 orchestrator 事後補記錄+commit。此為「subagent 長時監聽不穩」的實證 → 改用「background bash 跑實驗 + 短命 subagent 只做收尾」模式。
+
+## E-11 bus virtio-blk vs virtio-scsi — done（IOPS indistinguishable，但 scsi 尾延遲較差）
+
+- Bundle：`results/E-11/<ts>/`（A=virtio-blk / scsi=virtio-scsi 交錯 n=3；cmdline device 型別斷言全過）
+- **IOPS 全 8 pattern indistinguishable**（差異 ≤4.4% 全落 5% 帶內）——兩 bus 穩態吞吐相同。
+- **但 virtio-scsi 的 max latency 全面較高**：rw-qd8 max +150%、rr-qd8 +70%、rr-qd32 +34%、sw-1m +20%——SCSI 中間層較長路徑在尾端露出代價。
+- 生產結論（機制級）：**維持 virtio-blk 預設**。結合 H-006 violated（scsi 並不提供想像中的 timeout 保護——見「三個被推翻的直覺」），virtio-scsi 對本研究的 latency-first 目標**沒有任何優勢、且尾延遲更差**——不要為了「以為有 timeout」而換 bus。
+- verdict 檔：`verdict-scsi.txt`。
