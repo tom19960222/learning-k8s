@@ -21,21 +21,20 @@ expect() {
   fi
 }
 
-# --- slow_sum_expr ---
-e=$(slow_sum_expr 1m 'ceph_daemon="osd.0"')
-case "${e}" in
-  *'increase(ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0"}[1m])'*) echo "ok   expr_aio" >&2 ;;
-  *) echo "FAIL expr_aio: ${e}" >&2; fails=$((fails+1)) ;;
-esac
-case "${e}" in
-  *slow_read_wait_aio_count*) echo "ok   expr_4th" >&2 ;;
-  *) echo "FAIL expr_4th" >&2; fails=$((fails+1)) ;;
-esac
+# --- slow_sum_expr（regex 形式，需與 rules/ceph-slow-ops-fast.yml 完全同構）---
+e=$(slow_sum_expr 1m ',ceph_daemon="osd.0"')
+expect "expr_sel" \
+  'sum by (ceph_daemon, instance) (increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count",ceph_daemon="osd.0"}[1m]))' \
+  "${e}"
 e2=$(slow_sum_expr 2m)
-case "${e2}" in
-  *'slow_committed_kv_count[2m]'*) echo "ok   expr_nosel" >&2 ;;
-  *) echo "FAIL expr_nosel: ${e2}" >&2; fails=$((fails+1)) ;;
-esac
+expect "expr_nosel" \
+  'sum by (ceph_daemon, instance) (increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"}[2m]))' \
+  "${e2}"
+
+# --- slow_raw_expr ---
+expect "raw_expr" \
+  'sum by (ceph_daemon) ({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count",ceph_daemon="osd.0"})' \
+  "$(slow_raw_expr ',ceph_daemon="osd.0"')"
 
 # --- osd_cgroup escaping ---
 cg=$(osd_cgroup 0)

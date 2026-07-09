@@ -54,14 +54,55 @@ prom_instant() {
 
 pj() { python3 "${LIB_DIR}/promjson.py" "$@"; }
 
-# PromQL fragment: per-OSD sum of the 4 BlueStore slow counters' increase.
-# $1 = range selector (e.g. 1m), $2 = extra label matcher (e.g. ceph_daemon="osd.0")
+# max_or_zero FILE — pj max, but an absent series reads as 0 ("signal never
+# appeared" must count as a pass for never-appears predictions).
+max_or_zero() {
+  local v
+  v=$(pj max "$1")
+  [ "${v}" = "none" ] && v=0
+  printf '%s' "${v}"
+}
+
+# R2 expression (must stay identical to rules/ceph-slow-ops-fast.yml)
+r2_expr() {
+  printf 'count by (instance) (%s > 0)' "$(slow_sum_expr 2m)"
+}
+
+# collect_std START END — dump the standard signal set for the window.
+collect_std() {
+  local s="$1" e="$2"
+  prom_range "$(slow_raw_expr)" "${s}" "${e}" 5 "${BUNDLE}/raw-slow-counters.json"
+  prom_range "$(slow_raw_expr ',ceph_daemon="osd.0"')" "${s}" "${e}" 5 "${BUNDLE}/raw-slow-osd0.json"
+  prom_range "$(slow_sum_expr 1m)" "${s}" "${e}" 5 "${BUNDLE}/r1-all.json"
+  prom_range "$(slow_sum_expr 1m ',ceph_daemon="osd.0"')" "${s}" "${e}" 5 "${BUNDLE}/r1-osd0.json"
+  prom_range "$(r2_expr)" "${s}" "${e}" 5 "${BUNDLE}/r2.json"
+  prom_range 'ceph_daemon_health_metrics{type="SLOW_OPS"}' "${s}" "${e}" 5 "${BUNDLE}/slowops-daemon.json"
+  prom_range 'ceph_health_detail{name="SLOW_OPS"}' "${s}" "${e}" 5 "${BUNDLE}/slowops-health.json"
+  prom_range 'ceph_health_detail{name="BLUESTORE_SLOW_OP_ALERT"}' "${s}" "${e}" 5 "${BUNDLE}/bluestore-alert.json"
+  prom_range 'ceph_osd_commit_latency_ms{ceph_daemon="osd.0"}' "${s}" "${e}" 5 "${BUNDLE}/commit-latency-osd0.json"
+  prom_range 'rate(ceph_osd_op_w_latency_sum{ceph_daemon="osd.0"}[1m]) / rate(ceph_osd_op_w_latency_count{ceph_daemon="osd.0"}[1m])' \
+    "${s}" "${e}" 5 "${BUNDLE}/opw-mean-osd0.json"
+  prom_range 'rate(node_disk_io_time_weighted_seconds_total{instance="ceph-lab-osd-01"}[1m])' \
+    "${s}" "${e}" 5 "${BUNDLE}/node-disk-osd01.json"
+}
+
+SLOW_NAME_RE='__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"'
+
+# PromQL: per-OSD sum of the 4 BlueStore slow counters' increase — must stay
+# structurally identical to R1 in rules/ceph-slow-ops-fast.yml (regex selector,
+# NOT increase()+increase(): vector addition inner-joins and goes silent when
+# any one counter series is missing).
+# $1 = range (e.g. 1m), $2 = extra matcher incl. leading comma (e.g. ',ceph_daemon="osd.0"')
 slow_sum_expr() {
   local win="$1" sel="${2:-}"
-  local m=""
-  [ -n "${sel}" ] && m="{${sel}}"
-  printf 'sum by (ceph_daemon, instance) (increase(ceph_bluestore_slow_aio_wait_count%s[%s]) + increase(ceph_bluestore_slow_committed_kv_count%s[%s]) + increase(ceph_bluestore_slow_read_onode_meta_count%s[%s]) + increase(ceph_bluestore_slow_read_wait_aio_count%s[%s]))' \
-    "${m}" "${win}" "${m}" "${win}" "${m}" "${win}" "${m}" "${win}"
+  printf 'sum by (ceph_daemon, instance) (increase({%s%s}[%s]))' \
+    "${SLOW_NAME_RE}" "${sel}" "${win}"
+}
+
+# PromQL: raw (non-rate) per-OSD sum of the 4 slow counters, for before/after
+# delta checks. $1 = extra matcher incl. leading comma.
+slow_raw_expr() {
+  printf 'sum by (ceph_daemon) ({%s%s})' "${SLOW_NAME_RE}" "${1:-}"
 }
 
 # --- Bundle -----------------------------------------------------------------
