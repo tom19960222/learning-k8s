@@ -155,3 +155,4 @@
   ⚠ 生效驗證 nr_requests 讀取用 /sys/block/rbdN/size==33554432 比對，E-51/E-19 都回空（node ssh 也偶逾時）——
   queue_depth 是否生效改由 fio 差異反推；接手 agent 若要修 host 驗證，先確認 rbd size 單位/多裝置問題。
 - 2026-07-09 `E-19 done — H-009 部分 violated：queue_depth 256 高並行 +10~21% IOPS 且 p99 更好，qd1 零代價（預測的尾延遲懲罰不存在，因 cap 對低並行無影響）。純加分但 D 類建置期定死`
+- 2026-07-09 **E-15 已點火**（CPU throttle H-018：Guaranteed(lim=4) vs throttled(lim=2)+guest stress-ng --cpu 4，量 fio p99.9+cgroup throttled_usec，~18min）。剩餘 queue：E-15→E-35(mon 階梯)→E-22(shards)。E-40/E-31/E-41/E-16 待使用者。
