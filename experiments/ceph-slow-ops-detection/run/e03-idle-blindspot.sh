@@ -23,7 +23,7 @@ trap rollback EXIT
 main() {
   bundle_init e03-idle-blindspot
   pre_check "${EXEMPT}"
-  lab_ssh "${ADMIN_HOST}" 'pgrep -f "rados bench" >/dev/null' \
+  lab_ssh "${ADMIN_HOST}" 'pgrep -x rados >/dev/null' \
     && die "rados bench is running; e03 requires an idle cluster"
   baseline_capture
   bundle_clock_skew "${OSD_HOST}"

@@ -295,11 +295,14 @@ ensure_bench_pool() {
   fi
 }
 
-# bench_write SECONDS THREADS — background rados bench on admin host; returns
-# nothing. Data kept (--no-cleanup) so seq reads can follow.
+# bench_write SECONDS THREADS [SIZE] — background rados bench on admin host.
+# Data kept (--no-cleanup) so seq reads can follow. SIZE defaults to 1M:
+# E-00 showed this lab's virtio disks hit 44s max latency under 16×4MB load
+# with NO injection — 4M objects would contaminate injection attribution.
 bench_write() {
+  local size="${3:-1M}"
   lab_ssh "${ADMIN_HOST}" \
-    "nohup sudo rados bench -p ${BENCH_POOL} $1 write -t $2 --no-cleanup >/tmp/bench-write.log 2>&1 &" \
+    "nohup sudo rados bench -p ${BENCH_POOL} $1 write -b ${size} -t $2 --no-cleanup >/tmp/bench-write.log 2>&1 &" \
     </dev/null
 }
 
@@ -309,9 +312,12 @@ bench_seq() {
     </dev/null
 }
 
+# NOTE: must be pgrep -x (exact process name). A remote `pgrep -f "rados
+# bench"` matches the very shell that wraps the pgrep call (its cmdline
+# contains the pattern) — the wait never terminates.
 bench_wait_done() {
   local tries=0
-  while lab_ssh "${ADMIN_HOST}" 'pgrep -f "rados bench" >/dev/null'; do
+  while lab_ssh "${ADMIN_HOST}" 'pgrep -x rados >/dev/null'; do
     tries=$((tries + 1))
     [ "${tries}" -gt 120 ] && die "rados bench did not finish"
     sleep 5

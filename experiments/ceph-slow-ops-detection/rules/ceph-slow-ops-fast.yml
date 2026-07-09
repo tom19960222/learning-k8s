@@ -67,3 +67,19 @@ groups:
         annotations:
           summary: "Slow ops (>30s, client-visible) on {{ $labels.ceph_daemon }}"
           description: "op tracker 回報有 op 卡超過 osd_op_complaint_time（預設 30s）——client I/O 已經被擋住。若 CephOSDTransientStall 先前已對同一 OSD 發警告，這是同一事件的惡化；若 OSD 同時失聯，優先看 OSD down/flapping。"
+
+      # R4: 同一訊號的 mon 端備援路徑。H-023 實證：44s 的真 slow op 事件，
+      # per-daemon metric（R3 的來源）可能整段漏採（op 完成即歸零、可見窗
+      # 只有「op 齡 − 30s」，穿不過 mgr 15s cache + scrape），mon 端
+      # health check 反而抓到 ~20s。兩路 OR 才有完整覆蓋；R4 無 daemon
+      # label，定位靠 R1/R3 補。
+      - alert: CephClusterSlowOpsFast
+        expr: |
+          max_over_time(ceph_health_detail{name="SLOW_OPS"}[1m]) > 0
+        keep_firing_for: 10m
+        labels:
+          severity: critical
+          source: ceph_slow_ops_fast
+        annotations:
+          summary: "Cluster-level SLOW_OPS health check active"
+          description: "mon 端 SLOW_OPS health check 亮起（有 op 卡超過 30s）。此為 R3 的備援路徑：per-daemon metric 對短暫事件會漏採（H-023），本規則吃 mon 端訊號補洞；哪顆 OSD 看 CephOSDTransientStall / CephDaemonSlowOpsFast 或 ceph health detail。"

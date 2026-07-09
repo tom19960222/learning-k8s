@@ -201,13 +201,13 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: 實務影響：kv_sync 慢（裝置 fsync 卡）不直接進 counter，但只要有 write txc 在飛，txc commit 全程量測（start→committed）會把同一事件記進 `slow_committed_kv_count`；純 omap/scrub 類 slow 事件是 counter 盲區、僅 health alert 可見。
 
 ### H-015: 純負載（recovery/backfill/compaction/過載）也能把單段 op 推過 5s → R1 false positive；「單 node vs 多 node」+ 持續性可作區分
-- Status: predicted
+- Status: violated
 - Tier: T3（負向對照）+ T2
 - Origin: pre-mortem（pager fatigue → 靜音 → 真事件漏掉）
 - Prediction: E-00（全速 rados bench 90s 無注入）：全叢集 `increase(slow_*_count[5m])` == 0（lab virtio 碟全速負載不產生 >5s 單段延遲）。
-- Evidence:
-- Artifacts:
-- Notes: lab 結果只證「這個 lab 不 FP」；生產 FP 風險與 severity 分級寫進報告（T2）。
+- Evidence: 2026-07-09 第一次 E-00（16 併發 ×4MB，無注入）：bench max latency 44.7s，全部 9 顆 OSD slow counter 增加（osd.4 +47 … osd.8 +4），BLUESTORE_SLOW_OP_ALERT latch。「過載不會產生 >5s 單段延遲」被推翻。
+- Artifacts: 報告「FP 風險與分級」一節；R1 定位改為「症狀偵測」而非「硬體故障證明」
+- Notes: 重要修正——R1 fire ≠ 硬體壞，而是「該 OSD 有 op 超過 5s」的事實；過載時 client 一樣痛，仍值得知道。但 severity 分級與「叢集級 vs 單 node」的區分（R2 只在單 node 聚集時升級）因此更重要。同窗還揭露 H-023。
 
 ### H-016: `bluestore_log_op_age` 可 runtime 調低（如 2s）提高對 <5s 卡頓的靈敏度、不需重啟 OSD；預設 5s 下 3s 卡頓完全不可見
 - Status: predicted
@@ -271,6 +271,15 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Evidence:
 - Artifacts:
 - Notes:
+
+### H-023: `ceph_daemon_health_metrics{type="SLOW_OPS"}` 的快照式採樣會整段漏掉短暫的 SLOW_OPS 事件——即使 mon 端 `ceph_health_detail{name="SLOW_OPS"}` 都短暫抓到了
+- Status: confirmed
+- Tier: T3（觀測性發現，來自第一次 E-00 的意外窗）
+- Origin: negative-space（第一次 E-00 過載窗的事後比對）
+- Prediction: （事後觀測，非先行預測——列 confirmed 是因為兩條時序資料已可機器比對）
+- Evidence: 2026-07-09 過載窗（50 分鐘 range，step 10s）：`ceph_health_detail{name="SLOW_OPS"}` 有 2 個非零樣本（~20s），`max(ceph_daemon_health_metrics{type="SLOW_OPS"})` 非零樣本數 = 0。既有 `CephDaemonSlowOps`（吃後者）完全看不到此事件；`CephClientIOBlocked`（吃前者、for:1m）2 個樣本也撐不過 for。**44 秒的真 slow op、兩條現有 alert 全沉默。**
+- Artifacts: R3 改吃哪個 metric 的依據（見報告）；`max_over_time` 窗寬論證
+- Notes: 成因：daemon 端 SLOW_OPS 只在「op 仍在飛且齡 >30s」的瞬間可見（op 完成即歸零），44s op 的可見窗只有 ~14s，要穿過 mgr 模組 15s cache + 10s scrape 存活下來機率低；mon 端 health check 有自己的節奏、稍寬。含意：**R3 應同時吃兩路（daemon metric OR health_detail），且 R1（counter 累積、事後仍可見）是唯一不怕採樣漏失的訊號。**
 
 ## 實驗總覽（Automate 階段）
 

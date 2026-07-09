@@ -70,4 +70,14 @@ v=$(emit_verdict)
 expect "verdict_confirmed" "VERDICT unit confirmed" "${v}"
 rm -rf "${BUNDLE}"
 
+# --- 回歸 tripwire：遠端 pgrep -f "rados bench" 會匹配包住它的 shell cmdline
+# （自我匹配 → bench_wait_done 永遠不返回，E-00 曾因此卡死 10 分鐘）。
+# 只允許 pgrep -x rados。
+if grep -rn 'pgrep -f "rados bench"' "${EXP_DIR}/lib" "${EXP_DIR}/run" >&2; then
+  echo "FAIL pgrep_self_match_regression" >&2
+  fails=$((fails + 1))
+else
+  echo "ok   pgrep_self_match_regression" >&2
+fi
+
 exit "${fails}"
