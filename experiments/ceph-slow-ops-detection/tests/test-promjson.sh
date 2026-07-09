@@ -33,6 +33,10 @@ expect "empty_delta"  "0.0"  "$(${PJ} delta_first_last "${FIX}/range-empty.json"
 expect "empty_series" "0"    "$(${PJ} series_count "${FIX}/range-empty.json")"
 
 expect "first_val"      "0.0"        "$(${PJ} first_val "${FIX}/range-two-series.json")"
+expect "cnt_ge3"        "1"          "$(${PJ} count_series_max_ge "${FIX}/range-two-series.json" 3)"
+expect "cnt_ge1"        "2"          "$(${PJ} count_series_max_ge "${FIX}/range-two-series.json" 1)"
+expect "cnt_ge99"       "0"          "$(${PJ} count_series_max_ge "${FIX}/range-two-series.json" 99)"
+expect "cnt_empty"      "0"          "$(${PJ} count_series_max_ge "${FIX}/range-empty.json" 1)"
 expect "empty_first_val" "none"       "$(${PJ} first_val "${FIX}/range-empty.json")"
 
 # instant vector fixture

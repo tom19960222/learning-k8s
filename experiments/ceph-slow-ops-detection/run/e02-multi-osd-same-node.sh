@@ -30,6 +30,7 @@ main() {
   baseline_capture
   bundle_clock_skew "${OSD_HOST}"
   ensure_bench_pool
+  wait_quiet
 
   DM0=$(osd_dm "${OSD_HOST}" 0)
   DM1=$(osd_dm "${OSD_HOST}" 1)
@@ -58,19 +59,21 @@ main() {
   t_end=$(remote_epoch "${ADMIN_HOST}")
 
   collect_std "$((t0 - 60))" "${t_end}"
+  # 注入後窗（alert 層歸因用；全窗 r2.json 保留當 context）
+  prom_range "$(r2_expr)" "${ts_start}" "${t_end}" 5 "${BUNDLE}/r2-postinject.json"
   local i
   for i in 0 1 2; do
     prom_range "$(slow_raw_expr ",ceph_daemon=\"osd.${i}\"")" "$((t0 - 60))" "${t_end}" 5 \
       "${BUNDLE}/raw-slow-osd${i}.json"
   done
 
-  # ---- verdicts ----
-  # H-004: R2 峰值 == 3（同 node 全部 3 顆都被抓到）
-  check "h004_r2_reaches_3" ge "$(max_or_zero "${BUNDLE}/r2.json")" 3
-  # H-004: R2 第一次可判真 ≤ 注入結束 +130s（2m 窗 + exporter 5s + scrape 10s）
-  check "h004_r2_within_130s" le "$(pj first_ts_gt "${BUNDLE}/r2.json" 2)" "$((ts_end + 130))"
-  # H-022: R2 只有一條 series（單一 instance = 該 node；跨 node 不聚合）
-  check "h022_single_instance" le "$(pj series_count "${BUNDLE}/r2.json")" 1
+  # ---- verdicts（一律用注入後窗，避免上一場景殘留污染歸因）----
+  # H-004: 注入後 R2 count 達 3（同 node 全部 3 顆都被抓到）
+  check "h004_r2_reaches_3" ge "$(max_or_zero "${BUNDLE}/r2-postinject.json")" 3
+  # H-004: R2 第一次達 3 ≤ 注入結束 +130s（2m 窗 + exporter 5s + scrape 10s）
+  check "h004_r2_within_130s" le "$(pj first_ts_gt "${BUNDLE}/r2-postinject.json" 2)" "$((ts_end + 130))"
+  # H-022: 達到 alert 門檻（≥3）的 instance 恰好一台（= 指紋不跨 node 誤報）
+  check "h022_single_instance_ge3" eq "$(pj count_series_max_ge "${BUNDLE}/r2-postinject.json" 3)" 1
   # 三顆 OSD「各自」都有 counter 增量
   for i in 0 1 2; do
     check "h004_osd${i}_delta" ge "$(pj delta_first_last "${BUNDLE}/raw-slow-osd${i}.json")" 1

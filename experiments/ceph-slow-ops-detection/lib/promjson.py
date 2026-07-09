@@ -11,6 +11,7 @@ Subcommands:
   series_count FILE      number of series in result
   last_val FILE          value of the last point of the first series; "none"
   first_val FILE         value of the first point of the first series; "none"
+  count_series_max_ge FILE THR   number of series whose max value >= THR
 """
 import json
 import sys
@@ -69,6 +70,20 @@ def cmd_series_count(result):
     print(len(result))
 
 
+def cmd_count_series_max_ge(result, threshold):
+    n = 0
+    for series in result:
+        vals = []
+        for _, v in _points(series):
+            try:
+                vals.append(float(v))
+            except ValueError:
+                continue
+        if vals and max(vals) >= threshold:
+            n += 1
+    print(n)
+
+
 def cmd_last_val(result):
     for series in result:
         pts = _points(series)
@@ -101,6 +116,8 @@ def main(argv):
         cmd_delta_first_last(result)
     elif cmd == "series_count":
         cmd_series_count(result)
+    elif cmd == "count_series_max_ge":
+        cmd_count_series_max_ge(result, float(argv[3]))
     elif cmd == "last_val":
         cmd_last_val(result)
     elif cmd == "first_val":

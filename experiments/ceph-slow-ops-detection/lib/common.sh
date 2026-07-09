@@ -107,6 +107,26 @@ slow_raw_expr() {
   printf 'sum by (ceph_daemon) ({%s%s})' "${SLOW_NAME_RE}" "${1:-}"
 }
 
+# wait_quiet — block until the R1 [2m] expression is silent cluster-wide, so a
+# previous scenario's slow-op noise can't leak into this scenario's lookback
+# window（E-02 曾被 E-01b fill 噪音污染 first-true 歸因）. Max ~5min.
+wait_quiet() {
+  local tries=0 f
+  f=$(mktemp)
+  while [ "${tries}" -lt 30 ]; do
+    prom_instant "$(slow_sum_expr 2m) > 0" "${f}"
+    if [ "$(pj series_count "${f}")" = "0" ]; then
+      rm -f "${f}"
+      log "quiet gate: cluster slow-op noise cleared"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 10
+  done
+  rm -f "${f}"
+  die "wait_quiet: cluster still noisy after 5min"
+}
+
 # --- Bundle -----------------------------------------------------------------
 
 BUNDLE=""

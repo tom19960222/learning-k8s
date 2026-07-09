@@ -156,11 +156,11 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: lab 無 RAID 卡；生產歸因邏輯（多 VD 同秒 vs 單 VD）以報告論證。
 
 ### H-010: 讀路徑卡頓由 `slow_read_wait_aio_count`/`slow_read_onode_meta_count` 覆蓋，寫路徑由 `slow_committed_kv_count`/`slow_aio_wait_count` 覆蓋——規則需同時看 4 個 counter
-- Status: predicted
+- Status: confirmed
 - Tier: T1（已錨定）+ T3
 - Origin: preliminary research
 - Prediction: E-01 寫負載 → 增量主要落在 `slow_committed_kv_count`（或 aio_wait）；讀負載段（rados bench seq read + suspend）→ 增量落在 `slow_read_*`。
-- Evidence: T1 = 讀路徑 `BlueStore.cc:12751-12756,13113-13118`；寫 `14471-14479`；aio wait `14175`
+- Evidence: T1=讀路徑 `BlueStore.cc:12751-12756,13113-13118`、寫 `14471-14479`；T3=E-01 寫段 +6（committed_kv 路徑）、E-01b 冷讀（fill→restart osd.0 清 cache→cold seq read）+ 8s suspend → slow_read_* +3。註：E-01 原讀段零增量＝資料全在 BlueStore cache、讀沒落盤——「讀不落盤就無讀路徑訊號」是 H-017 的另一面
 - Artifacts:
 - Notes: E-01 附一段讀負載注入（同一 fault 機制、負載型態為變因）。
 
