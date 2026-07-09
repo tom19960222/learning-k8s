@@ -156,3 +156,4 @@
   queue_depth 是否生效改由 fio 差異反推；接手 agent 若要修 host 驗證，先確認 rbd size 單位/多裝置問題。
 - 2026-07-09 `E-19 done — H-009 部分 violated：queue_depth 256 高並行 +10~21% IOPS 且 p99 更好，qd1 零代價（預測的尾延遲懲罰不存在，因 cap 對低並行無影響）。純加分但 D 類建置期定死`
 - 2026-07-09 **E-15 已點火**（CPU throttle H-018：Guaranteed(lim=4) vs throttled(lim=2)+guest stress-ng --cpu 4，量 fio p99.9+cgroup throttled_usec，~18min）。剩餘 queue：E-15→E-35(mon 階梯)→E-22(shards)。E-40/E-31/E-41/E-16 待使用者。
+- 2026-07-09 `E-15 done — 強力 confirmed H-018：CPU limit<vCPU 使 p99 ×7.4（7.6→55.8ms）、IOPS 砍半、p50 不變。關鍵修正：門檻是 limit≥vCPU 數不是 QoS class（兩變體皆 Guaranteed）。catalog 缺的隱形旋鈕，最易誤設最難察覺`

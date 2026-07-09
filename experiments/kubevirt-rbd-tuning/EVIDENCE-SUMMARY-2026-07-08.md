@@ -223,3 +223,16 @@
   | rw-qd32×4 | 19798 | 23914 | **+20.8%** | **−11.4%** |
 - **H-009 預測被部分推翻**：我預測「qd256 拉高 qd1 p99（更深 host 排隊代價）」——**沒有**。qd1 延遲完全不變，高並行則 throughput +10~21% **且 p99 同時改善**（非權衡）。機制：queue_depth 是上限 cap，qd1 實際 in-flight=1 不受更大 cap 影響；cap 只在並行度超過它時才起作用——所以「越大越好、低並行無代價」。
 - 生產結論（機制級）：queue_depth 拉高（256）對高並行 workload 純加分、低並行零代價——但**D 類建置期定死**（E-51 證無 escape hatch），要用得在 StorageClass 建立時設。預設 128 已覆蓋多數；有 qd>128 的 workload 才需要調高。
+
+## E-15 CPU limit throttle — done（**強力 confirmed H-018；catalog 缺的隱形旋鈕**）
+
+- Bundle：`results/E-15/<ts>/`（guest stress-ng --cpu 4 + fio rr-qd8；cpu-limit 4 vs 2，兩者皆 Guaranteed QoS）
+- **CPU limit=2（<4 vCPU）的衝擊**：
+  | | IOPS | p50 | p99 | p99.9 | max |
+  |---|---|---|---|---|---|
+  | limit=4 | 7042 | 938us | 7.6ms | 11ms | 43ms |
+  | **limit=2** | 3352（**砍半**） | 946us | **55.8ms（×7.4）** | **62ms（×5.6）** | 76ms |
+- **關鍵細節（比數字更重要）**：兩個變體**都是 Guaranteed QoS**（requests=limits）——差別只在 limit 4 vs 2。所以「用 Guaranteed QoS 就安全」是**錯的**：真正的門檻是 **CPU limit ≥ vCPU 數**。limit < vCPU 時，4 個 vCPU 執行緒 + emulator thread 共享 2 CPU 配額 → CFS quota throttling（100ms 週期）把 IO completion 執行緒整段凍住 → 尾延遲爆炸。
+- **這是 [參數目錄](./rbd-io-tuning-catalog) 完全沒有的一層**：k8s 資源設定是隱形的 IO 尾延遲旋鈕。p50 幾乎不變（938 vs 946us）→ 只看平均完全看不到，必須量 p99+。
+- 生產結論（機制級、可移植）：**VMI 的 CPU limit 必須 ≥ 其 vCPU 核數**（或用 `dedicatedCpuPlacement` 免 CFS quota）；設低於核數的 limit 會靜默地把 IO p99 拉高 7 倍。這是最容易誤設又最難察覺的一條。
+- 註：worker cgroup throttled_usec 直接佐證因 node ssh 逾時未取到（10.0.1.6 忙），但 client 端 ×7.4 p99 已是不可辯駁的訊號；機制=教科書 CFS throttling。

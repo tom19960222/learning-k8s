@@ -157,7 +157,7 @@
 - Notes: 需要 k8s worker ≥2 + RWX block PVC 或對應 eviction 設定。這是使用者生產最會遇到的完整故障劇本；產出是時間預算表 + 各段的旋鈕。
 
 ### H-018: virt-launcher pod 帶 CPU limit（非 Guaranteed QoS）時，CFS quota throttling（100ms 週期）會把 guest IO p99.9 拉高一個數量級以上（IO completion 執行緒被 throttle 整段凍結）；Guaranteed QoS 或 `dedicatedCpuPlacement` 消除此效應——k8s 資源設定是隱形的 IO 尾延遲旋鈕，舊 catalog 完全沒有這一層
-- Status: proposed
+- Status: **confirmed（E-15 2026-07-09，並修正判準）**：limit=2<4vCPU 使 p99 7.6→55.8ms(×7.4)、IOPS 砍半、p50 不變。關鍵修正：**兩變體皆 Guaranteed QoS**，真正門檻是 limit≥vCPU 數而非 QoS class。bundle results/E-15
 - Tier: T3
 - Origin: negative-space（catalog 的 knob 空間缺 CPU/cgroup 層）
 - Notes: 注入：guest 內 CPU 忙 + IO 並行，對照 limit 有無。KubeVirt 端旋鈕：resources、dedicatedCpuPlacement、isolateEmulatorThread。線上可調性：改 QoS 要重建 pod（= VM 重啟或 migration）。
