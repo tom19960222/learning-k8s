@@ -300,9 +300,11 @@ io_max_get() {
 }
 
 # ensure_io_unlimited HOST OSDID MAJMIN — rollback helper, verified by state.
+# cgroup v2 不接受 "MAJ:MIN max" 簡寫（Invalid argument，E-04 實測）——
+# 必須逐鍵寫 max；全部 max 後該行從 io.max 消失（空檔 = 無限制）。
 ensure_io_unlimited() {
   local host="$1" osd="$2" majmin="$3" cur
-  io_max_set "${host}" "${osd}" "${majmin}" "max" || true
+  io_max_set "${host}" "${osd}" "${majmin}" "rbps=max wbps=max riops=max wiops=max" || true
   cur=$(io_max_get "${host}" "${osd}")
   if printf '%s' "${cur}" | grep -q "${majmin}"; then
     die "rollback failed: io.max still limited: ${cur}"

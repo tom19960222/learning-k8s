@@ -27,6 +27,7 @@ main() {
     && die "rados bench is running; e03 requires an idle cluster"
   baseline_capture
   bundle_clock_skew "${OSD_HOST}"
+  wait_quiet
 
   DM=$(osd_dm "${OSD_HOST}" 0)
   [ -n "${DM}" ] || die "cannot resolve osd.0 dm device"

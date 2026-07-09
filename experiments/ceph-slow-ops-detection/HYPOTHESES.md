@@ -102,12 +102,12 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: lab 未載入規則，以 query_range 事後重放 + 分析式加上 eval interval 上限；方法記錄於報告。
 
 ### H-004: 「同一 node ≥3 顆 OSD 在同一個 2m 窗內 slow counter 同時增加」（R2）可作為 firmware/RAID-卡層級事件的指紋，且單一 OSD 事件（E-01）不會觸發 R2
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: framing-dialog（使用者事件形態：5~8 顆同一秒）
 - Prediction: E-02（同 node 3 OSD 同秒 suspend 8s）：R2 在注入後 ≤ 130s 內為真且 `count == 3`、label instance="ceph-lab-osd-01"；E-01 全程 R2 不為真。
-- Evidence:
-- Artifacts:
+- Evidence: E-02（quiet gate 後）：3 dm 同秒 suspend 1783559820→829，R2 count=3 首見 1783559840（**注入開始 +20s**），三顆 OSD 各自有增量；E-01 單 OSD 時 R2 峰值 1。教訓：第一輪被前場景噪音污染，[2m] lookback 需 quiet gate（results/20260709-091446-e02-multi-osd-same-node）
+- Artifacts: R2 規則
 - Notes:
 
 ### H-005: 現有 SLOW_OPS 鏈路的端到端偵測延遲 ≥ 2 分鐘（op 開始卡住 → CephDaemonSlowOps(for:1m) 可 fire），即使 op 持續卡住
@@ -219,11 +219,11 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: 若成立 → 生產可把門檻調到貼近 SSD 預期延遲（例如 1~2s）做更早偵測；代價（log 量、FP）寫報告。
 
 ### H-017: 卡住的 device 上若當下沒有 IO 經過（idle OSD），counter 與 op-tracker 都無訊號——「無 IO 即無偵測」是結構性盲區
-- Status: predicted
+- Status: confirmed
 - Tier: T1（推理）+ T3（描述性）
 - Origin: matrix "SSD/firmware × slow × 無觀測流量"
 - Prediction: E-03（suspend osd.0 15s、叢集無 client 負載）：觀察窗內 4 counter 增量 == 0 且 SLOW_OPS == 0（BlueStore 內部背景 IO 可能造成零星例外；若出現，記錄來源）。
-- Evidence:
+- Evidence: E-03：無負載 suspend osd.0 15s → 4 counter 增量 0、SLOW_OPS 0、R1 0（results/20260709-092028-e03-idle-blindspot）。旁證：E-01 讀段因資料在 cache、讀沒落盤而零訊號
 - Artifacts:
 - Notes: 緩解（週期性 synthetic IO，如低頻 rados bench cron）超出 Prometheus-only scope，報告列建議。
 
@@ -264,12 +264,12 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: 生產（10 VD 一張卡）：多 device 同窗異常 → 控制器嫌疑；單 device → 單碟嫌疑。
 
 ### H-022: 1m~2m 窗的聚合就足以區分「單 node 多 OSD 同時卡」（firmware/控制器指紋）與「跨 node 大範圍變慢」——不需秒級對齊
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: matrix "time × partial"（scrape 相位使秒級對齊不可觀測）
 - Prediction: E-02 的 R2 `count by (instance)` == 3 且僅 osd-01 一個 instance 出現；E-01 時 R2 無 series。跨 node 情境以 T1 論證（R2 的 count by instance 天然把跨 node 事件拆成多個 <3 的 group，除非每台都 ≥3 顆同時卡——那已是叢集級事件，另有 SLOW_OPS/health 規則）。
-- Evidence:
-- Artifacts:
+- Evidence: E-02：達 alert 門檻（count≥3）的 instance 恰 1 台（osd-01）；另一台僅零星 count=2 且低於門檻。1~2m 窗聚合足以區分、不需秒級對齊（results/20260709-091446-e02-multi-osd-same-node/r2-postinject.json）
+- Artifacts: R2 規則 + 報告
 - Notes:
 
 ### H-023: `ceph_daemon_health_metrics{type="SLOW_OPS"}` 的快照式採樣會整段漏掉短暫的 SLOW_OPS 事件——即使 mon 端 `ceph_health_detail{name="SLOW_OPS"}` 都短暫抓到了
