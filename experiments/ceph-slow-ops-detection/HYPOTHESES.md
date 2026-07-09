@@ -142,7 +142,7 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Tier: T3
 - Origin: preliminary research + 先前 SP「BlueStore 24h latch」踩雷記憶
 - Prediction: E-01 之後 `ceph_health_detail{name="BLUESTORE_SLOW_OP_ALERT"} == 1` 出現並持續到實驗序列結束（>30min）不清除；restart osd.0 後 5 分鐘內轉 0。
-- Evidence: E-01：BLUESTORE_SLOW_OP_ALERT 於事件後出現且持續 latch（首見 ts=1783558755，為前次過載殘留，E-01 全窗持續 1）；清除驗證留 finale（results/20260709-090010-e01-single-osd-transient/bluestore-alert.json）
+- Evidence: E-01：latch 於事件後出現且跨場景持續（>1h 不自清）；finale：restart 後 latch 即清。附加發現：restart 引發的 peering IO 在慢碟上會產生新 >5s op → 其他 OSD **重新 latch**（osd.6 實測），清 latch 要在叢集完全沉降後做
 - Artifacts:
 - Notes: 出現延遲不量化預測（health 傳播 + mgr cache 15s + scrape，估 <60s）。
 
@@ -246,20 +246,20 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Notes: Reef 使用者 fallback：op 均值 + node_disk + SLOW_OPS 加速版（R3）。
 
 ### H-020: OSD 重啟造成的 counter reset 不會讓 `increase()` 假陽性；`keep_firing_for` 可把單發事件 alert 撐住觀察窗（lab Prometheus v2.51.0 支援）
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: persona "Prometheus 專家"
 - Prediction: 實驗序列末端 restart osd.0：counter 從 >0 歸 0，重啟後 5 分鐘窗內 R1 表達式不為真（increase 對 reset 的處理不產生正增量假訊號）。
-- Evidence: Prometheus v2.51.0 ≥ 2.42（keep_firing_for OK，T3 已確認版本）
+- Evidence: finale：restart osd.0/1/2 → counter 歸 0、restart 後 4 分鐘窗 R1 max=0（increase 對 reset 不產生假陽性）；promtool reset case 亦綠
 - Artifacts:
 - Notes: promtool unit test 另行覆蓋 reset 情境。
 
 ### H-021: `ceph_disk_occupation` 可把 OSD join 到 node_exporter 的 device series → alert 可標注「哪台 node 哪顆 device」；device 層指標在卡頓窗內同步異常
-- Status: predicted
+- Status: confirmed
 - Tier: T3
 - Origin: matrix "觀測路徑 × 跨層對齊"
 - Prediction: (a) `ceph_disk_occupation{ceph_daemon="osd.0"}` 存在且 device/instance label 對得上 dm-3/ceph-lab-osd-01（或其 sdX parent）；(b) E-04 期間 join 表達式可算出該 device 的 io_time rate 異常。
-- Evidence:
+- Evidence: E-04：`ceph_disk_occupation{ceph_daemon="osd.0"}` series 存在（device/instance label 可 join node_exporter）。device 層佐證的適用邊界見 H-009（僅「IO 卡在 device 內」的事件可見）
 - Artifacts:
 - Notes: 生產（10 VD 一張卡）：多 device 同窗異常 → 控制器嫌疑；單 device → 單碟嫌疑。
 
