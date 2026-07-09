@@ -166,3 +166,4 @@
   ① E-41 重大：KubeVirt 硬 node 失效**不自動 failover**（VMI 卡 dead-node 11min+，force-delete 被 stuck finalizer 擋，恢復靠 az start node 回來）。生產需 NodeHealthCheck/machine-health-check。
   ② E-40 confirmed：cache=writeback 硬斷丟最後~335 blocks≈6s acked 寫入（host page cache 未 flush）；≤3800存活/≥3900遺失。光 kill QEMU/pod 不丟（要 host 硬失效）。
   發現根因：Mac 只能連 public IP，腳本用 node internal IP(10.0.1.x) SSH 全逾時→改用 kubectl/CP。cache=none 對照組待補（機制確定=0丟失）。
+- 2026-07-09 `E-40 對照組 done — cache=none 硬斷 0 遺失（10/10 存活含最後 acked）；坐實 writeback 丟~6s/none 零丟失`。E-41 補充：none 輪 VMI 有 failover 到 k8s-1（預設 pod eviction ~300s 觸發），故 auto-failover 可能發生但慢且不可靠。VM 現於 k8s-1、cache=none baseline。
