@@ -40,7 +40,7 @@ main() {
   local t0 ts_start ts_end t_end
   t0=$(remote_epoch "${ADMIN_HOST}")
   log "bench write 90s, simultaneous 3-dev suspend at +20s"
-  bench_write 90 16
+  bench_write 90 4 512K
   sleep 20
   ts_start=$(remote_epoch "${OSD_HOST}")
   # 同秒注入：單一遠端 shell，三個 suspend 背景化後 wait —— 模擬 RAID 卡/firmware

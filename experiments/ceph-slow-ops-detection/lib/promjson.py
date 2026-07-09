@@ -10,6 +10,7 @@ Subcommands:
   delta_first_last FILE  sum over series of (last - first); "0" if empty
   series_count FILE      number of series in result
   last_val FILE          value of the last point of the first series; "none"
+  first_val FILE         value of the first point of the first series; "none"
 """
 import json
 import sys
@@ -77,6 +78,15 @@ def cmd_last_val(result):
     print("none")
 
 
+def cmd_first_val(result):
+    for series in result:
+        pts = _points(series)
+        if pts:
+            print(float(pts[0][1]))
+            return
+    print("none")
+
+
 def main(argv):
     if len(argv) < 3:
         sys.stderr.write(__doc__)
@@ -93,6 +103,8 @@ def main(argv):
         cmd_series_count(result)
     elif cmd == "last_val":
         cmd_last_val(result)
+    elif cmd == "first_val":
+        cmd_first_val(result)
     else:
         sys.stderr.write("promjson: unknown subcommand %s\n" % cmd)
         return 1

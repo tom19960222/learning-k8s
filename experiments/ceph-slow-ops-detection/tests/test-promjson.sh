@@ -32,6 +32,9 @@ expect "empty_first"  "none" "$(${PJ} first_ts_gt "${FIX}/range-empty.json" 0)"
 expect "empty_delta"  "0.0"  "$(${PJ} delta_first_last "${FIX}/range-empty.json")"
 expect "empty_series" "0"    "$(${PJ} series_count "${FIX}/range-empty.json")"
 
+expect "first_val"      "0.0"        "$(${PJ} first_val "${FIX}/range-two-series.json")"
+expect "empty_first_val" "none"       "$(${PJ} first_val "${FIX}/range-empty.json")"
+
 # instant vector fixture
 expect "instant_max"  "3.0" "$(${PJ} max "${FIX}/instant-vector.json")"
 expect "instant_last" "3.0" "$(${PJ} last_val "${FIX}/instant-vector.json")"

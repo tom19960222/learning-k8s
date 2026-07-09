@@ -50,7 +50,7 @@ main() {
 
   # ---- phase W: write load + 8s suspend ----
   log "phase W: bench write 100s, suspend at +20s"
-  bench_write 100 16
+  bench_write 100 4 512K
   sleep 20
   tw_start=$(remote_epoch "${OSD_HOST}")
   suspend_for 8
@@ -61,7 +61,7 @@ main() {
 
   # ---- phase R: seq read load + 8s suspend ----
   log "phase R: bench seq 60s, suspend at +15s"
-  bench_seq 60 16
+  bench_seq 60 4
   sleep 15
   tr_start=$(remote_epoch "${OSD_HOST}")
   suspend_for 8
@@ -87,8 +87,9 @@ main() {
   # H-002: 整個窗內 osd.0 counter 增量 ≥ 1
   check "h002_counter_delta" ge "$(pj delta_first_last "${BUNDLE}/raw-slow-osd0.json")" 1
   # H-011: 第一個 counter 上升樣本不得早於 suspend 結束（-6s 容忍 scrape 相位 + 時鐘偏移）
+  # base 取自 osd.0 過濾後 range 的第一個樣本（該檔起點在注入前 30s）
   local base first_rise
-  base=$(pj last_val "${BUNDLE}/baseline-slow-counters.json")
+  base=$(pj first_val "${BUNDLE}/raw-slow-osd0-wphase.json")
   [ "${base}" = "none" ] && base=0
   first_rise=$(pj first_ts_gt "${BUNDLE}/raw-slow-osd0-wphase.json" "${base}")
   check "h011_completion_only" ge "${first_rise}" "$((tw_end - 6))"

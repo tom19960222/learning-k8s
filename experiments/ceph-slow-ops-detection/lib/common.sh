@@ -206,8 +206,7 @@ pre_check() {
 baseline_capture() {
   ceph_admin ceph -s > "${BUNDLE}/baseline-ceph-s.txt" 2>&1
   ceph_admin ceph health detail > "${BUNDLE}/baseline-health-detail.txt" 2>&1
-  prom_instant 'ceph_bluestore_slow_aio_wait_count + ceph_bluestore_slow_committed_kv_count + ceph_bluestore_slow_read_onode_meta_count + ceph_bluestore_slow_read_wait_aio_count' \
-    "${BUNDLE}/baseline-slow-counters.json"
+  prom_instant "$(slow_raw_expr)" "${BUNDLE}/baseline-slow-counters.json"
 }
 
 # assert_health [exempt_regex] — post-rollback health assertion.

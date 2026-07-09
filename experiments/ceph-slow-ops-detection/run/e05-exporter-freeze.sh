@@ -61,7 +61,7 @@ main() {
   local t0 tf_start tf_end t_end
   t0=$(remote_epoch "${ADMIN_HOST}")
   log "light bench write 90s; freeze at +20s for 15s"
-  bench_write 90 4
+  bench_write 90 4 512K
   sleep 20
 
   fetch_counters pre

@@ -47,7 +47,7 @@ main() {
   local t0 t_inj t_rel t_end
   t0=$(remote_epoch "${ADMIN_HOST}")
   log "bench write 300s, throttle at +30s for 150s"
-  bench_write 300 16
+  bench_write 300 8 512K
   sleep 30
   t_inj=$(remote_epoch "${OSD_HOST}")
   io_max_set "${OSD_HOST}" 0 "${MAJMIN}" "wiops=8"

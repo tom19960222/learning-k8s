@@ -48,7 +48,7 @@ main() {
   local t0 v_base v_after_a v_after_b
   t0=$(remote_epoch "${ADMIN_HOST}")
   log "bench write 180s (covers both sub-phases)"
-  bench_write 180 16
+  bench_write 180 4 512K
   sleep 15
 
   # ---- a 段：預設門檻 5s，3s suspend ----
