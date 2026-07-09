@@ -159,3 +159,16 @@
 - 機制結論：NVMe + headroom 下 deep-scrub 的背景 IO 不與輕量 client 競爭 → `osd_scrub_sleep` 無可觀測效果。**與 E-39（mClock 同因 headroom 無感）同一模式**。
 - **合併生產結論（跨 E-37/E-39，機制級）**：在 NVMe + 有 headroom 的叢集，Ceph 側 QoS 節流旋鈕（mClock profile、scrub_sleep）多半不可分辨——沒有爭用可仲裁。**該投資的是容量 headroom，不是 QoS 微調**；這些旋鈕的用武之地在媒體飽和（HDD、或 client 打滿）時，本環境測不到那個 regime（誠實標記）。
 - Caveat：輕 client（qd1/qd8）+ 快媒體；HDD 或飽和 client 下結論會不同。
+
+## E-34 OSD flapping × noout — done（confirmed：noout 砍尾延遲一半以上）
+
+- Bundle：`results/E-34/<ts>/`（osd.3 週期 stop60/start60 ×5，default vs `ceph osd set noout`；degraded 負載 rr-qd1+rw-qd8）
+- flapping 對 client 傷害顯著（vs pre 0.94ms）：
+  | | rr-qd1 mean | rr-qd1 p99 | rr-qd1 p999/max | rw-qd8 p999 |
+  |---|---|---|---|---|
+  | default | 11.19ms（×12） | 176ms | **1146ms** | 100ms |
+  | **noout** | 6.41ms（×7） | 128ms | **335ms** | 139ms |
+- **noout 效果 confirmed**：mean −43%、p999 **−71%（1146→335ms）**——不觸發 out→backfill 資料搬移，把傷害限縮在「純 peering」層級。但注意 **noout 不能消除傷害**：每次 down/up 的 PG re-peering 仍讓 qd1 讀尖峰到 335ms（primary 重選期間讀阻塞）。
+- 讀比寫痛：rr-qd1（單深度延遲敏感）受創遠大於 rw-qd8——flapping 期間每筆讀等 primary 重新可用。
+- 健康碼：default=OSD_DOWN/PG_DEGRADED；noout 多一個 OSDMAP_FLAGS（noout 旗標本身告警）。
+- 生產結論（機制級）：**偵測到 OSD flapping 立即 `ceph osd set noout`**（阻止重複 backfill），同時查 flap 根因（網路/碟）——noout 是止血、不是治本。與 E-30 合看：down 的傷害全在「out→backfill」那段，控制 out 就控制大部分傷害。
