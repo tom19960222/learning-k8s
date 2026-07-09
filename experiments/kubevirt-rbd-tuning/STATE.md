@@ -138,3 +138,8 @@
 - 2026-07-09 `E-34 done`（commit 9a66746）。
 - 2026-07-09 **E-32 已點火**（gray failure：osd.3=dm-0=252:0 systemd cgroup 限速 150 IOPS，~9min；
   斷言 ceph health 全程 OK=觀測盲區）。osd.3 device 對映：ceph osd metadata 3 → /dev/dm-0（cyshih-osd-1）。
+- 2026-07-09 E-32 兩次踩雷後改法（記錄供接手）：gray failure 的 cgroup 磁碟限速在 cephadm/podman OSD **不可行**——
+  (v1) dm-0(252:0) 限速：cgroup io.max 對 dm 裝置不咬；(v2) systemd unit cgroup 限速：ceph-osd 實際在
+  podman 子 cgroup `libpod-payload-<hash>`（每次重啟變）、且 io controller 未必下放。**改用 tc netem 50ms
+  延遲注入 osd host 網卡**（v3，一定生效）。osd.3 device 對映=dm-0/nvme0n1(259:0)@cyshih-osd-1。
+- 2026-07-09 **E-32 v3 已點火**（netem 50ms on osd-1 eth0+eth1，~9min）。**使用者 rate limit 已回，仍全自動接力**。
