@@ -194,3 +194,11 @@
 - **我的預測（p99.9 >5×，TCP RTO ~200ms）被推翻**。機制：低 RTT（<1ms）+ 現代 TCP（SACK/fast-retransmit），串流中的封包遺失由 3 個 dup-ACK 在 ~1 RTT 內快速重傳修復，**不觸發 RTO**；且 0.1-0.5% 下多數 op 根本沒中遺失。RTO 災難需要 tail-loss、高 RTT 或高得多的 loss 率。
 - **對比 E-32 的關鍵洞察（跨實驗）**：對 Ceph-on-TCP，**穩定的延遲/壅塞（E-32 +50ms→寫 ×40）遠比稀疏封包遺失（E-33 0.5%→1.1×）致命**。診斷網路型 degraded 時，先看 RTT/延遲不是丟包率。
 - 生產含義：低幅封包遺失（<1%）在低延遲 NVMe 叢集不是 client latency 的主要威脅；把監控與告警重心放在**延遲/RTT** 而非 loss。
+
+## E-38 pool full / nearfull — done（confirmed H-022；容量耗盡是 hang 邊界非 EIO）
+
+- Bundle：`results/E-38/<v2 ts>/`（用調 ratio 注入，非真填；v1 因 ratio out-of-order 只觸發 nearfull，反而驗到前半）
+- **nearfull（v1，ratio 0.15/—/—→只 nearfull 生效）**：HEALTH_ERR「nearfull」但 **寫入不受阻（91 筆全過）**——nearfull 只告警。
+- **full（v2，ratio 依序 0.10/0.15/0.20 全<用量0.26）**：health `9 full osd / 2 pool full`；client 寫入**卡 96 秒**（跨整個 FULL 窗），**恢復 ratio 後那筆寫入成功完成（非 ERR、非 ENOSPC）**，IO 完全停 97s，之後正常 resume。
+- **結論（confirmed H-022，可移植）**：容量耗盡是**穩定性 hang 邊界，不是優雅的 ENOSPC**——krbd 預設無 abort_on_full → 寫入無限期阻擋直到空間釋放，行為與 min_size 不滿（E-36）同型（guest 最終 jbd2 hung task）。**唯一告警視窗是 nearfull(0.85)→full(0.95) 之間**；跨過 full 就是 VM hang，救法只有釋放空間（加 OSD/刪資料）。生產：nearfull 是必須行動的告警線，不能當普通 warning 忽略。
+- ratio 已確認回退 0.85/0.90/0.95、HEALTH_OK。
