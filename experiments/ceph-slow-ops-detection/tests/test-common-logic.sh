@@ -22,13 +22,13 @@ expect() {
 }
 
 # --- slow_sum_expr（regex 形式，需與 rules/ceph-slow-ops-fast.yml 完全同構）---
-e=$(slow_sum_expr 1m ',ceph_daemon="osd.0"')
+e=$(slow_sum_expr 1m '{ceph_daemon="osd.0"}')
 expect "expr_sel" \
-  'sum by (ceph_daemon, instance) (increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count",ceph_daemon="osd.0"}[1m]))' \
+  'sum by (ceph_daemon, instance) (increase(ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0"}[1m]) + increase(ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.0"}[1m]) + increase(ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.0"}[1m]) + increase(ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.0"}[1m]))' \
   "${e}"
 e2=$(slow_sum_expr 2m)
 expect "expr_nosel" \
-  'sum by (ceph_daemon, instance) (increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"}[2m]))' \
+  'sum by (ceph_daemon, instance) (increase(ceph_bluestore_slow_aio_wait_count[2m]) + increase(ceph_bluestore_slow_committed_kv_count[2m]) + increase(ceph_bluestore_slow_read_onode_meta_count[2m]) + increase(ceph_bluestore_slow_read_wait_aio_count[2m]))' \
   "${e2}"
 
 # --- slow_raw_expr ---
@@ -61,6 +61,9 @@ check "d" eq none none
 if grep -q "PASS d" "${VERDICT_FILE}"; then echo "ok   none_eq_none" >&2; else echo "FAIL none_eq_none" >&2; fails=$((fails+1)); fi
 check "e" ge none 1
 if grep -q "FAIL e" "${VERDICT_FILE}"; then echo "ok   none_ge_fails" >&2; else echo "FAIL none_ge_fails" >&2; fails=$((fails+1)); fi
+# 空字串參數不得讓 check 崩潰（pj 失敗時會回空）——視同 none 記 FAIL
+check "f" le "" 0
+if grep -q "FAIL f" "${VERDICT_FILE}"; then echo "ok   empty_arg_no_crash" >&2; else echo "FAIL empty_arg_no_crash" >&2; fails=$((fails+1)); fi
 v=$(emit_verdict)
 expect "verdict_line" "VERDICT unit violated" "${v}"
 

@@ -1,20 +1,41 @@
 # R1: 單發 counter 增量 → 立即 fire；flat / reset 不 fire；keep_firing_for 撐住
+# 注意：R1 是 4 項 increase 相加（inner join），每顆 OSD 必須 4 個 counter series
+# 齊備才會有輸出——這符合真實 ceph-exporter 行為（4 個 counter 同一次 scrape 原子
+# 產生）。曾試過 __name__ regex 形式：increase 丟 __name__ 後同 OSD 重複 labelset，
+# 真 Prometheus 直接回錯（E-00 實測）。
 rule_files:
   - ../../rules/ceph-slow-ops-fast.yml
 evaluation_interval: 10s
 tests:
   - interval: 10s
     input_series:
-      # osd.0 在 t=60s 出現 2 次 slow op（只定義 1 個 counter，驗證 regex 選擇器
-      # 容忍其他 3 個 counter series 缺席）
+      # osd.0：committed_kv 在 t=60s +2、aio_wait 在 t=60s +1，其餘兩個全程 0
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2'
-      # osd.1 全程 flat → 不得 fire
-      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      # osd.1：全程 flat（含非零起始值）→ 不得 fire
+      - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
         values: '3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3'
-      # osd.2 在 t=60s counter reset（OSD 重啟）→ 不得 fire（H-020）
-      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      # osd.2：t=60s counter reset（OSD 重啟，4 個一起歸零）→ 不得 fire（H-020）
+      - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
         values: '5 5 5 5 5 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '2 2 2 2 2 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
     alert_rule_test:
       - eval_time: 50s
         alertname: CephOSDTransientStall
@@ -30,7 +51,6 @@ tests:
             exp_annotations:
               summary: "BlueStore slow op burst on osd.0 (h1)"
               description: "OSD 在最近 1 分鐘內至少有一個 BlueStore 內部操作超過 bluestore_log_op_age（預設 5s）。單顆 OSD 偶發＝該碟或其路徑短暫卡頓；請對照同 node 其他 OSD 是否同時出現（CephNodeMultiOSDStall）。"
-      # increase 窗過了（t>130s）但 keep_firing_for=10m 要撐住
       - eval_time: 5m
         alertname: CephOSDTransientStall
         exp_alerts:

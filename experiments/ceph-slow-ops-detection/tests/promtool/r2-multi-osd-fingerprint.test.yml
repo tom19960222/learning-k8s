@@ -1,17 +1,36 @@
 # R2: 同 node ≥3 OSD 同窗卡頓 → fire；2 顆不 fire；跨 node 分散不 fire（H-004/H-022）
+# 每顆 OSD 帶齊 4 個 counter series（inner-join 語意，見 r1 測試檔說明）
 rule_files:
   - ../../rules/ceph-slow-ops-fast.yml
 evaluation_interval: 10s
 tests:
-  # case 1: h1 上 3 顆 OSD 同一秒（t=60s）都出現 slow op → fire, count==3
+  # case 1: h1 上 3 顆 OSD 同秒（t=60s）出現 slow op → fire
   - interval: 10s
     input_series:
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 3 3 3 3 3 3'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 2 2 2 2 2 2'
-      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
     alert_rule_test:
       - eval_time: 1m10s
         alertname: CephNodeMultiOSDStall
@@ -28,21 +47,59 @@ tests:
     input_series:
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 3 3 3 3 3 3'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 2 2 2 2 2 2'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.1",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.2",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
     alert_rule_test:
       - eval_time: 1m10s
         alertname: CephNodeMultiOSDStall
         exp_alerts: []
-  # case 3: 3 顆分散在 3 台 node（叢集級變慢而非單卡指紋）→ 不 fire
+  # case 3: 3 顆分散在 3 台 node → 不 fire（叢集級變慢另有 SLOW_OPS 路徑）
   - interval: 10s
     input_series:
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 3 3 3 3 3 3'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.0",instance="h1",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.3",instance="h2",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 2 2 2 2 2 2'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.3",instance="h2",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.3",instance="h2",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.3",instance="h2",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
       - series: 'ceph_bluestore_slow_committed_kv_count{ceph_daemon="osd.6",instance="h3",job="ceph-exporter"}'
         values: '0 0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'ceph_bluestore_slow_aio_wait_count{ceph_daemon="osd.6",instance="h3",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_onode_meta_count{ceph_daemon="osd.6",instance="h3",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'ceph_bluestore_slow_read_wait_aio_count{ceph_daemon="osd.6",instance="h3",job="ceph-exporter"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
     alert_rule_test:
       - eval_time: 1m10s
         alertname: CephNodeMultiOSDStall

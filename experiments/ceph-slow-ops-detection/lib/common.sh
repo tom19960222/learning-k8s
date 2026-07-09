@@ -74,7 +74,7 @@ collect_std() {
   prom_range "$(slow_raw_expr)" "${s}" "${e}" 5 "${BUNDLE}/raw-slow-counters.json"
   prom_range "$(slow_raw_expr ',ceph_daemon="osd.0"')" "${s}" "${e}" 5 "${BUNDLE}/raw-slow-osd0.json"
   prom_range "$(slow_sum_expr 1m)" "${s}" "${e}" 5 "${BUNDLE}/r1-all.json"
-  prom_range "$(slow_sum_expr 1m ',ceph_daemon="osd.0"')" "${s}" "${e}" 5 "${BUNDLE}/r1-osd0.json"
+  prom_range "$(slow_sum_expr 1m '{ceph_daemon="osd.0"}')" "${s}" "${e}" 5 "${BUNDLE}/r1-osd0.json"
   prom_range "$(r2_expr)" "${s}" "${e}" 5 "${BUNDLE}/r2.json"
   prom_range 'ceph_daemon_health_metrics{type="SLOW_OPS"}' "${s}" "${e}" 5 "${BUNDLE}/slowops-daemon.json"
   prom_range 'ceph_health_detail{name="SLOW_OPS"}' "${s}" "${e}" 5 "${BUNDLE}/slowops-health.json"
@@ -89,18 +89,20 @@ collect_std() {
 SLOW_NAME_RE='__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"'
 
 # PromQL: per-OSD sum of the 4 BlueStore slow counters' increase — must stay
-# structurally identical to R1 in rules/ceph-slow-ops-fast.yml (regex selector,
-# NOT increase()+increase(): vector addition inner-joins and goes silent when
-# any one counter series is missing).
-# $1 = range (e.g. 1m), $2 = extra matcher incl. leading comma (e.g. ',ceph_daemon="osd.0"')
+# structurally identical to R1 in rules/ceph-slow-ops-fast.yml：顯式 4 項相加。
+# 不能用 __name__ regex + increase：increase 丟 __name__ 後同 OSD 的 4 個 counter
+# 變成重複 labelset，真 Prometheus 回錯（E-00 實測）。inner-join 在此安全：4 個
+# counter 由同一次 exporter scrape 原子性產生。
+# $1 = range (e.g. 1m), $2 = 完整 label matcher 含大括號（e.g. '{ceph_daemon="osd.0"}'）
 slow_sum_expr() {
-  local win="$1" sel="${2:-}"
-  printf 'sum by (ceph_daemon, instance) (increase({%s%s}[%s]))' \
-    "${SLOW_NAME_RE}" "${sel}" "${win}"
+  local win="$1" m="${2:-}"
+  printf 'sum by (ceph_daemon, instance) (increase(ceph_bluestore_slow_aio_wait_count%s[%s]) + increase(ceph_bluestore_slow_committed_kv_count%s[%s]) + increase(ceph_bluestore_slow_read_onode_meta_count%s[%s]) + increase(ceph_bluestore_slow_read_wait_aio_count%s[%s]))' \
+    "${m}" "${win}" "${m}" "${win}" "${m}" "${win}" "${m}" "${win}"
 }
 
 # PromQL: raw (non-rate) per-OSD sum of the 4 slow counters, for before/after
-# delta checks. $1 = extra matcher incl. leading comma.
+# delta checks. 這裡 regex 選擇器安全（沒有 increase、__name__ 保留到聚合前，
+# sum 聚合重複 labelset 是合法操作）。$1 = extra matcher incl. leading comma.
 slow_raw_expr() {
   printf 'sum by (ceph_daemon) ({%s%s})' "${SLOW_NAME_RE}" "${1:-}"
 }
@@ -142,6 +144,9 @@ bundle_clock_skew() {
 check() {
   # check LABEL OP A B  — OP in: ge le eq ne lt gt
   local label="$1" op="$2" a="$3" b="$4" ok=1
+  # pj 失敗時可能回空字串——視同 none，記 FAIL 而不是讓 python 崩潰
+  [ -z "${a}" ] && a=none
+  [ -z "${b}" ] && b=none
   if [ "${a}" = "none" ] || [ "${b}" = "none" ]; then
     ok=0
     [ "${op}" = "eq" ] && [ "${a}" = "${b}" ] && ok=1

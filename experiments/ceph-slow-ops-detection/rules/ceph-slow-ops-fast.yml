@@ -11,9 +11,11 @@
 # instance 對應到「host」的粒度，R2 的 count by (instance) 才有 per-node 意義。
 #
 # 設計說明：
-#   - 4 個 slow counter 用 __name__ regex 選，而不是 increase()+increase() 相加：
-#     PromQL 向量加法是 inner join，任何一個 counter series 缺席（如 OSD 剛重啟）
-#     會讓整條規則靜默；sum over regex-selected series 則自然容忍缺席。
+#   - 4 個 slow counter 用「顯式 increase()+increase() 相加」而非 __name__ regex：
+#     regex 選出的多個 counter 經 increase() 丟掉 __name__ 後，同一顆 OSD 會產生
+#     重複 labelset → 真 Prometheus 直接回錯（"vector cannot contain metrics with
+#     the same labelset"，E-00 實測）。向量加法的 inner-join 顧慮在此不成立：
+#     4 個 counter 由同一個 ceph-exporter scrape 原子性產生，永遠同進同出。
 #   - R1/R2 for: 0s + keep_firing_for：事件是「單發脈衝」（increase 只在一個
 #     eval 窗內 > 0），for > 0 會直接殺掉偵測能力；keep_firing_for 讓 alert
 #     撐住足夠久供人看到。
@@ -27,7 +29,10 @@ groups:
       - alert: CephOSDTransientStall
         expr: |
           sum by (ceph_daemon, instance) (
-            increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"}[1m])
+              increase(ceph_bluestore_slow_aio_wait_count[1m])
+            + increase(ceph_bluestore_slow_committed_kv_count[1m])
+            + increase(ceph_bluestore_slow_read_onode_meta_count[1m])
+            + increase(ceph_bluestore_slow_read_wait_aio_count[1m])
           ) > 0
         keep_firing_for: 10m
         labels:
@@ -43,7 +48,10 @@ groups:
         expr: |
           count by (instance) (
             sum by (ceph_daemon, instance) (
-              increase({__name__=~"ceph_bluestore_slow_(aio_wait|committed_kv|read_onode_meta|read_wait_aio)_count"}[2m])
+                increase(ceph_bluestore_slow_aio_wait_count[2m])
+              + increase(ceph_bluestore_slow_committed_kv_count[2m])
+              + increase(ceph_bluestore_slow_read_onode_meta_count[2m])
+              + increase(ceph_bluestore_slow_read_wait_aio_count[2m])
             ) > 0
           ) >= 3
         keep_firing_for: 15m
