@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# lib/common.sh — shared helpers for slow-ops detection scenarios.
+# bash 3.2 compatible; stdout is reserved for machine-readable verdict lines,
+# everything else goes to stderr.
+
+set -u
+
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXP_DIR="$(dirname "${LIB_DIR}")"
+REPO_ROOT="$(cd "${EXP_DIR}/../.." && pwd)"
+
+SSH_KEY="${REPO_ROOT}/.ssh/id_ed25519"
+ADMIN_HOST="192.168.18.166"
+PROM_URL="http://192.168.18.166:9095"
+FSID="0c9bf37e-514a-11f1-b72a-bc24113f1375"
+BENCH_POOL="slowops-bench"
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+die() { log "FATAL: $*"; exit 1; }
+
+lab_ssh() {
+  local host="$1"
+  shift
+  ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o IdentityAgent=none \
+    -o ConnectTimeout=10 -o BatchMode=yes "ikaros@${host}" "$@"
+}
+
+# Run a ceph CLI command on the admin node. Args are passed as one remote
+# command string; caller is responsible for quoting.
+ceph_admin() { lab_ssh "${ADMIN_HOST}" "sudo $*"; }
+
+remote_epoch() { lab_ssh "$1" 'date +%s'; }
+
+# --- Prometheus -------------------------------------------------------------
+
+# prom_range QUERY START END STEP OUTFILE — dump query_range JSON.
+prom_range() {
+  local query="$1" start="$2" end="$3" step="$4" out="$5"
+  curl -sG -m 20 "${PROM_URL}/api/v1/query_range" \
+    --data-urlencode "query=${query}" \
+    --data-urlencode "start=${start}" \
+    --data-urlencode "end=${end}" \
+    --data-urlencode "step=${step}" > "${out}" \
+    || die "prom_range failed: ${query}"
+}
+
+# prom_instant QUERY OUTFILE
+prom_instant() {
+  local query="$1" out="$2"
+  curl -sG -m 20 "${PROM_URL}/api/v1/query" \
+    --data-urlencode "query=${query}" > "${out}" \
+    || die "prom_instant failed: ${query}"
+}
+
+pj() { python3 "${LIB_DIR}/promjson.py" "$@"; }
+
+# PromQL fragment: per-OSD sum of the 4 BlueStore slow counters' increase.
+# $1 = range selector (e.g. 1m), $2 = extra label matcher (e.g. ceph_daemon="osd.0")
+slow_sum_expr() {
+  local win="$1" sel="${2:-}"
+  local m=""
+  [ -n "${sel}" ] && m="{${sel}}"
+  printf 'sum by (ceph_daemon, instance) (increase(ceph_bluestore_slow_aio_wait_count%s[%s]) + increase(ceph_bluestore_slow_committed_kv_count%s[%s]) + increase(ceph_bluestore_slow_read_onode_meta_count%s[%s]) + increase(ceph_bluestore_slow_read_wait_aio_count%s[%s]))' \
+    "${m}" "${win}" "${m}" "${win}" "${m}" "${win}" "${m}" "${win}"
+}
+
+# --- Bundle -----------------------------------------------------------------
+
+BUNDLE=""
+VERDICT_FILE=""
+SCENARIO_NAME=""
+SCENARIO_FAILED=0
+
+bundle_init() {
+  SCENARIO_NAME="$1"
+  BUNDLE="${EXP_DIR}/results/$(date +%Y%m%d-%H%M%S)-${SCENARIO_NAME}"
+  mkdir -p "${BUNDLE}"
+  VERDICT_FILE="${BUNDLE}/verdict.txt"
+  : > "${VERDICT_FILE}"
+  log "bundle: ${BUNDLE}"
+}
+
+bundle_note() { printf '%s\n' "$*" >> "${BUNDLE}/notes.txt"; }
+
+# record clock offsets of lab hosts vs admin host (evidence for timing claims)
+bundle_clock_skew() {
+  local host t_admin t_host
+  for host in "$@"; do
+    t_admin=$(remote_epoch "${ADMIN_HOST}")
+    t_host=$(remote_epoch "${host}")
+    printf '%s admin=%s host=%s skew=%s\n' \
+      "${host}" "${t_admin}" "${t_host}" "$((t_host - t_admin))" \
+      >> "${BUNDLE}/clock-skew.txt"
+  done
+}
+
+# --- Verdict ----------------------------------------------------------------
+# Each prediction check appends PASS/FAIL; scenario verdict is confirmed only
+# if every check passed. Comparison is scripted (no eyeballing).
+
+check() {
+  # check LABEL OP A B  — OP in: ge le eq ne lt gt
+  local label="$1" op="$2" a="$3" b="$4" ok=1
+  if [ "${a}" = "none" ] || [ "${b}" = "none" ]; then
+    ok=0
+    [ "${op}" = "eq" ] && [ "${a}" = "${b}" ] && ok=1
+    [ "${op}" = "ne" ] && [ "${a}" != "${b}" ] && ok=1
+  else
+    case "${op}" in
+      ge) ok=$(python3 -c "print(1 if float('${a}') >= float('${b}') else 0)") ;;
+      le) ok=$(python3 -c "print(1 if float('${a}') <= float('${b}') else 0)") ;;
+      gt) ok=$(python3 -c "print(1 if float('${a}') >  float('${b}') else 0)") ;;
+      lt) ok=$(python3 -c "print(1 if float('${a}') <  float('${b}') else 0)") ;;
+      eq) ok=$(python3 -c "print(1 if float('${a}') == float('${b}') else 0)") ;;
+      ne) ok=$(python3 -c "print(1 if float('${a}') != float('${b}') else 0)") ;;
+      *) die "check: bad op ${op}" ;;
+    esac
+  fi
+  if [ "${ok}" = "1" ]; then
+    printf 'PASS %s: %s %s %s\n' "${label}" "${a}" "${op}" "${b}" >> "${VERDICT_FILE}"
+    log "PASS ${label}: ${a} ${op} ${b}"
+  else
+    printf 'FAIL %s: %s %s %s\n' "${label}" "${a}" "${op}" "${b}" >> "${VERDICT_FILE}"
+    log "FAIL ${label}: ${a} ${op} ${b}"
+    SCENARIO_FAILED=1
+  fi
+}
+
+emit_verdict() {
+  local v="confirmed"
+  [ "${SCENARIO_FAILED}" = "1" ] && v="violated"
+  printf '%s\n' "${v}" > "${BUNDLE}/VERDICT"
+  # the one machine-readable stdout line:
+  printf 'VERDICT %s %s\n' "${SCENARIO_NAME}" "${v}"
+}
+
+# --- Cluster state helpers ---------------------------------------------------
+
+# pre_check [exempt_regex] — abort unless cluster is healthy (or only carries
+# health codes matching exempt_regex, e.g. the latched BLUESTORE_SLOW_OP_ALERT).
+pre_check() {
+  local exempt="${1:-^\$}" status detail
+  status=$(ceph_admin ceph health | head -1)
+  if printf '%s' "${status}" | grep -q HEALTH_OK; then
+    log "pre-check: HEALTH_OK"
+  else
+    detail=$(ceph_admin ceph health detail | grep '^\[' | grep -Ev "${exempt}" || true)
+    if [ -n "${detail}" ]; then
+      log "pre-check failed, non-exempt health issues:"
+      printf '%s\n' "${detail}" >&2
+      die "cluster not healthy"
+    fi
+    log "pre-check: WARN but all codes exempt (${exempt})"
+  fi
+  local up
+  up=$(ceph_admin ceph osd stat | grep -o '[0-9]* up' | grep -o '[0-9]*')
+  [ "${up}" = "9" ] || die "expected 9 osds up, got ${up}"
+}
+
+baseline_capture() {
+  ceph_admin ceph -s > "${BUNDLE}/baseline-ceph-s.txt" 2>&1
+  ceph_admin ceph health detail > "${BUNDLE}/baseline-health-detail.txt" 2>&1
+  prom_instant 'ceph_bluestore_slow_aio_wait_count + ceph_bluestore_slow_committed_kv_count + ceph_bluestore_slow_read_onode_meta_count + ceph_bluestore_slow_read_wait_aio_count' \
+    "${BUNDLE}/baseline-slow-counters.json"
+}
+
+# assert_health [exempt_regex] — post-rollback health assertion.
+assert_health() {
+  local exempt="${1:-^\$}" tries=0 detail
+  while [ "${tries}" -lt 30 ]; do
+    if ceph_admin ceph health | grep -q HEALTH_OK; then
+      log "assert: HEALTH_OK"
+      return 0
+    fi
+    detail=$(ceph_admin ceph health detail | grep '^\[' | grep -Ev "${exempt}" || true)
+    if [ -z "${detail}" ]; then
+      log "assert: WARN but all codes exempt"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 10
+  done
+  ceph_admin ceph health detail >&2
+  die "assert_health: cluster did not return to baseline"
+}
+
+# --- OSD device / process helpers -------------------------------------------
+
+# osd_dm HOST OSDID → prints /dev/dm-N
+osd_dm() {
+  lab_ssh "$1" "sudo readlink -f /var/lib/ceph/${FSID}/osd.$2/block"
+}
+
+# osd_pid HOST OSDID → real ceph-osd pid (not conmon / podman-init)
+osd_pid() {
+  lab_ssh "$1" "pgrep -f '^/usr/bin/ceph-osd -n osd.$2 ' | head -1"
+}
+
+# dm_state HOST DEV → ACTIVE | SUSPENDED
+dm_state() {
+  lab_ssh "$1" "sudo dmsetup info $2 | awk '/^State/ {print \$2}'"
+}
+
+# ensure_dm_active HOST DEV — rollback helper, idempotent, verified by state.
+ensure_dm_active() {
+  local host="$1" dev="$2" state
+  state=$(dm_state "${host}" "${dev}")
+  if [ "${state}" != "ACTIVE" ]; then
+    lab_ssh "${host}" "sudo dmsetup resume ${dev}"
+  fi
+  state=$(dm_state "${host}" "${dev}")
+  [ "${state}" = "ACTIVE" ] || die "rollback failed: ${dev} on ${host} is ${state}"
+  log "rollback verified: ${dev} ACTIVE"
+}
+
+# osd_cgroup_path OSDID → systemd service cgroup dir for the osd (on osd host)
+osd_cgroup() {
+  printf '/sys/fs/cgroup/system.slice/system-ceph\\x2d%s.slice/ceph-%s@osd.%s.service' \
+    "$(printf '%s' "${FSID}" | sed 's/-/\\x2d/g')" "${FSID}" "$1"
+}
+
+# io_max_set HOST OSDID MAJMIN SPEC — SPEC like "wiops=8" or "max".
+# The cgroup path contains literal backslashes (systemd \x2d escapes), so it
+# must be single-quoted in the remote command or the remote shell eats them.
+io_max_set() {
+  local host="$1" osd="$2" majmin="$3" spec="$4" cg
+  cg=$(osd_cgroup "${osd}")
+  lab_ssh "${host}" "printf '%s %s\n' '${majmin}' '${spec}' | sudo tee '${cg}/io.max' >/dev/null"
+}
+
+io_max_get() {
+  local host="$1" osd="$2" cg
+  cg=$(osd_cgroup "${osd}")
+  lab_ssh "${host}" "sudo cat '${cg}/io.max'"
+}
+
+# ensure_io_unlimited HOST OSDID MAJMIN — rollback helper, verified by state.
+ensure_io_unlimited() {
+  local host="$1" osd="$2" majmin="$3" cur
+  io_max_set "${host}" "${osd}" "${majmin}" "max" || true
+  cur=$(io_max_get "${host}" "${osd}")
+  if printf '%s' "${cur}" | grep -q "${majmin}"; then
+    die "rollback failed: io.max still limited: ${cur}"
+  fi
+  log "rollback verified: io.max unlimited"
+}
+
+# --- Bench pool --------------------------------------------------------------
+
+ensure_bench_pool() {
+  if ! ceph_admin ceph osd pool ls | grep -qx "${BENCH_POOL}"; then
+    ceph_admin ceph osd pool create "${BENCH_POOL}" 32 32 >&2
+    ceph_admin ceph osd pool application enable "${BENCH_POOL}" rbd >&2
+  fi
+}
+
+# bench_write SECONDS THREADS — background rados bench on admin host; returns
+# nothing. Data kept (--no-cleanup) so seq reads can follow.
+bench_write() {
+  lab_ssh "${ADMIN_HOST}" \
+    "nohup sudo rados bench -p ${BENCH_POOL} $1 write -t $2 --no-cleanup >/tmp/bench-write.log 2>&1 &" \
+    </dev/null
+}
+
+bench_seq() {
+  lab_ssh "${ADMIN_HOST}" \
+    "nohup sudo rados bench -p ${BENCH_POOL} $1 seq -t $2 >/tmp/bench-seq.log 2>&1 &" \
+    </dev/null
+}
+
+bench_wait_done() {
+  local tries=0
+  while lab_ssh "${ADMIN_HOST}" 'pgrep -f "rados bench" >/dev/null'; do
+    tries=$((tries + 1))
+    [ "${tries}" -gt 120 ] && die "rados bench did not finish"
+    sleep 5
+  done
+}
+
+bench_collect_logs() {
+  lab_ssh "${ADMIN_HOST}" 'cat /tmp/bench-write.log 2>/dev/null' > "${BUNDLE}/bench-write.log" || true
+  lab_ssh "${ADMIN_HOST}" 'cat /tmp/bench-seq.log 2>/dev/null' > "${BUNDLE}/bench-seq.log" || true
+}
