@@ -4,8 +4,11 @@
 #   signal: ceph_daemon_health_metrics{type="SLOW_OPS",osd.0}、R1、
 #           ceph_osd_commit_latency_ms、node_disk io_time_weighted、ceph_disk_occupation
 #   expected:
-#     - io.max wiops=8 節流 150s（寫負載持續）→ SLOW_OPS 第一次 >0 落在
-#       [T_inj+35, T_inj+90]（30s complaint + OSD→mgr→module→scrape 傳播）（H-005）
+#     - dmsetup duty-cycle（suspend 8s / resume 0.4s ×17 ≈ 143s，32 併發寫持續
+#       → 佇列增長、op 齡突破 30s）→ SLOW_OPS 第一次 >0 落在 [T_inj+35, T_inj+120]（H-005）
+#       （v2 wiops=8×t8 教訓＝H-024：op 各自 ~15s 完成、永不過 30s 門檻，SLOW_OPS
+#        全程 0；v3 教訓＝io.max 數值寫入在本 lab kernel 6.8 上 EINVAL（開機初期
+#        有效、之後全 device 失效，成因未解）→ 改用已驗證的 dmsetup 機制）
 #     - R1 第一次可判真 < SLOW_OPS 第一次出現（counter 路徑更快）（H-003/005 對照）
 #     - commit_latency_ms 峰值 ≥ 1000（持續事件 gauge 看得到）（H-006）
 #     - op_w 均值 ≥ 1s（H-007）
@@ -14,17 +17,17 @@
 #   window: 注入前 120s ~ 解除後 +120s
 # BASELINE: HEALTH_OK（豁免 BLUESTORE_SLOW_OP_ALERT）、9 up
 # PRE-CHECK: pre_check + ok-to-stop osd.0（最壞情況＝該 OSD 實質停擺，先確認可承受）
-# ROLLBACK: io.max 恢復 max（以 io.max 內容驗證）；SLOW_OPS 需自然排空後 HEALTH_OK
+# ROLLBACK: dmsetup resume（以 dm state 驗證）；SLOW_OPS 需自然排空後 HEALTH_OK
 set -u
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 
 EXEMPT='BLUESTORE_SLOW_OP_ALERT'
 OSD_HOST="192.168.18.169"
-MAJMIN=""
+DM=""
 
 rollback() {
-  [ -n "${MAJMIN}" ] && ensure_io_unlimited "${OSD_HOST}" 0 "${MAJMIN}"
+  [ -n "${DM}" ] && ensure_dm_active "${OSD_HOST}" "${DM}"
 }
 trap rollback EXIT
 
@@ -35,27 +38,24 @@ main() {
   baseline_capture
   bundle_clock_skew "${OSD_HOST}"
   ensure_bench_pool
+  wait_quiet
 
-  local dm majnum minnum
-  dm=$(osd_dm "${OSD_HOST}" 0)
-  [ -n "${dm}" ] || die "cannot resolve osd.0 dm device"
-  majnum=$(lab_ssh "${OSD_HOST}" "stat -c '%Hr' ${dm}")
-  minnum=$(lab_ssh "${OSD_HOST}" "stat -c '%Lr' ${dm}")
-  MAJMIN="${majnum}:${minnum}"
-  log "osd.0 device ${dm} = ${MAJMIN}"
+  DM=$(osd_dm "${OSD_HOST}" 0)
+  [ -n "${DM}" ] || die "cannot resolve osd.0 dm device"
+  log "osd.0 device ${DM}"
 
   local t0 t_inj t_rel t_end
   t0=$(remote_epoch "${ADMIN_HOST}")
-  log "bench write 300s, throttle at +30s for 150s"
-  bench_write 300 8 512K
+  log "bench write 300s (t32), dm duty-cycle at +30s (~143s)"
+  bench_write 300 32 512K
   sleep 30
   t_inj=$(remote_epoch "${OSD_HOST}")
-  io_max_set "${OSD_HOST}" 0 "${MAJMIN}" "wiops=8"
-  log "io.max now: $(io_max_get "${OSD_HOST}" 0)"
-  sleep 150
+  # duty-cycle：suspend 8s / resume 0.4s ×17 —— 等效持續慢盤（服務率 ~5%），
+  # 單一遠端 shell 避免 ssh 往返抖動；sh 相容寫法（無 seq 依賴）
+  lab_ssh "${OSD_HOST}" "sudo sh -c 'i=0; while [ \$i -lt 17 ]; do dmsetup suspend ${DM}; sleep 8; dmsetup resume ${DM}; sleep 0.4; i=\$((i+1)); done'"
   t_rel=$(remote_epoch "${OSD_HOST}")
   rollback
-  bundle_note "throttle window: ${t_inj} .. ${t_rel} (${MAJMIN} wiops=8)"
+  bundle_note "duty-cycle window: ${t_inj} .. ${t_rel} (suspend8/resume0.4 x17)"
 
   log "waiting for bench to drain + settle ..."
   bench_wait_done
@@ -72,15 +72,22 @@ main() {
     "${t_inj}" "${t_rel}" 5 "${BUNDLE}/node-disk-throttled.json"
   prom_range 'ceph_daemon_health_metrics{type="SLOW_OPS",ceph_daemon="osd.0"}' \
     "$((t0 - 120))" "${t_end}" 5 "${BUNDLE}/slowops-osd0.json"
+  # 注入後窗（歸因用；quiet gate 已擋前場景殘留，這是雙保險）
+  prom_range "$(slow_sum_expr 1m '{ceph_daemon="osd.0"}')" "${t_inj}" "${t_end}" 5 \
+    "${BUNDLE}/r1-osd0-postinject.json"
+  prom_range 'ceph_daemon_health_metrics{type="SLOW_OPS",ceph_daemon="osd.0"}' \
+    "${t_inj}" "${t_end}" 5 "${BUNDLE}/slowops-osd0-postinject.json"
+  prom_range 'max_over_time(ceph_health_detail{name="SLOW_OPS"}[1m])' "${t_inj}" "${t_end}" 5 \
+    "${BUNDLE}/r4-postinject.json"
 
-  # ---- verdicts ----
+  # ---- verdicts（全部用注入後窗）----
   local t_slowops t_r1
-  t_slowops=$(pj first_ts_gt "${BUNDLE}/slowops-osd0.json" 0)
-  t_r1=$(pj first_ts_gt "${BUNDLE}/r1-osd0.json" 0)
+  t_slowops=$(pj first_ts_gt "${BUNDLE}/slowops-osd0-postinject.json" 0)
+  t_r1=$(pj first_ts_gt "${BUNDLE}/r1-osd0-postinject.json" 0)
   bundle_note "t_inj=${t_inj} t_r1=${t_r1} t_slowops=${t_slowops}"
   # H-005: SLOW_OPS 出現時刻窗
   check "h005_slowops_after_35s"  ge "${t_slowops}" "$((t_inj + 35))"
-  check "h005_slowops_before_90s" le "${t_slowops}" "$((t_inj + 90))"
+  check "h005_slowops_before_120s" le "${t_slowops}" "$((t_inj + 120))"
   # R1 比 SLOW_OPS 快
   check "h005_r1_beats_slowops" lt "${t_r1}" "${t_slowops}"
   # R1 絕對延遲：注入後 ≤ 45s 可判真

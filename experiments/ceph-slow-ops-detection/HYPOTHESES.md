@@ -124,7 +124,7 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Tier: T1 + T3
 - Origin: preliminary research（負面對照）
 - Prediction: E-01 觀察窗內 `ceph_osd_commit_latency_ms{ceph_daemon="osd.0"}` max < 5000（抓不到 8s 事件的量級）；E-04 期間其 max ≥ 1000（持續事件看得到）。
-- Evidence: E-01：8s 事件中 `ceph_osd_commit_latency_ms` 峰值僅 754ms（量級失真）；E-04 持續事件另驗（results/20260709-090010-e01-single-osd-transient/commit-latency-osd0.json）
+- Evidence: E-01：8s 暫態 → gauge 峰值僅 754ms（量級失真、不可依賴）；E-04(v2)：150s 持續節流 → 峰值 15196ms（持續事件看得到）。結論：只能當持續性劣化的輔助訊號（results/20260709-092856-e04-sustained-throttle/commit-latency-osd0.json）
 - Artifacts:
 - Notes: 「看似可用其實不行」的負面清單成員。
 
@@ -133,7 +133,7 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Tier: T3（事後以 E-01/E-04 資料計算，不另注入）
 - Origin: preliminary research
 - Prediction: E-01：`rate(ceph_osd_op_w_latency_sum{ceph_daemon="osd.0"}[1m])/rate(..._count[1m])` 峰值 ≥ 1s（16 併發、低 IOPS 下一批 8s op 拉高均值）；同窗其他 OSD 峰值 < 0.2s。E-04：均值持續 > 1s。
-- Evidence: E-01：低負載（512K×4t）下 8s 卡頓的 op_w 區間均值峰值僅 0.672s，未達預測的 ≥1s —— 稀釋比預期更嚴重，連低負載都不可靠（results/20260709-090010-e01-single-osd-transient/opw-mean-osd0.json）
+- Evidence: E-01 低負載 8s 暫態：op_w 均值峰值 0.672s（預測 ≥1s 未達，稀釋比預期重）；E-04(v2) 持續節流：峰值 15.16s（持續事件明顯）。修正結論：均值對暫態不可靠、對持續性事件可當嚴重度分級輔助（results/20260709-092856-e04-sustained-throttle/opw-mean-osd0.json）
 - Artifacts: 報告「不要用的訊號」清單
 - Notes: 稀釋論證走 T1 數學（單 op 貢獻 = stall/ops_per_window），報告呈現。
 
@@ -280,6 +280,15 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Evidence: 2026-07-09 過載窗（50 分鐘 range，step 10s）：`ceph_health_detail{name="SLOW_OPS"}` 有 2 個非零樣本（~20s），`max(ceph_daemon_health_metrics{type="SLOW_OPS"})` 非零樣本數 = 0。既有 `CephDaemonSlowOps`（吃後者）完全看不到此事件；`CephClientIOBlocked`（吃前者、for:1m）2 個樣本也撐不過 for。**44 秒的真 slow op、兩條現有 alert 全沉默。**
 - Artifacts: R3 改吃哪個 metric 的依據（見報告）；`max_over_time` 窗寬論證
 - Notes: 成因：daemon 端 SLOW_OPS 只在「op 仍在飛且齡 >30s」的瞬間可見（op 完成即歸零），44s op 的可見窗只有 ~14s，要穿過 mgr 模組 15s cache + 10s scrape 存活下來機率低；mon 端 health check 有自己的節奏、稍寬。含意：**R3 應同時吃兩路（daemon metric OR health_detail），且 R1（counter 累積、事後仍可見）是唯一不怕採樣漏失的訊號。**
+
+### H-024: 「持續性 sub-30s 劣化」對 op-tracker 路徑完全不可見：op 只要在 30s 內完成，SLOW_OPS 永遠 0——不管 client 已經痛多久
+- Status: confirmed
+- Tier: T3（E-04 v2 意外發現）
+- Origin: negative-space（E-04 v2 的 prediction 被推翻後的成因分析）
+- Prediction: （事後觀測）E-04 v2：wiops=8 節流 150s，op_w 均值峰值 15.16s、commit_latency_ms 峰值 15196ms，`ceph_daemon_health_metrics{type="SLOW_OPS",osd.0}` 與 `ceph_health_detail{name="SLOW_OPS"}` 全程 0。
+- Evidence: results/20260709-092856-e04-sustained-throttle（slowops-osd0.json max=0、opw-mean-osd0.json max=15.16、commit-latency-osd0.json max=15196）
+- Artifacts: 報告「三層盲區」一節；R1 的存在理由再 +1
+- Notes: 與 H-001（單發暫態 <30s 盲）、H-023（daemon metric 漏採樣）合成完整圖像：**op-tracker 的 30s 門檻讓「每個 op 都慢但都 <30s」的劣化模式整類不可見**。這正是 SSD 劣化/韌體問題最常見的表現形態。緩解：調低 `osd_op_complaint_time`（runtime 可調）或靠 R1（5s 門檻）。
 
 ## 實驗總覽（Automate 階段）
 
