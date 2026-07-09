@@ -172,3 +172,17 @@
 - 讀比寫痛：rr-qd1（單深度延遲敏感）受創遠大於 rw-qd8——flapping 期間每筆讀等 primary 重新可用。
 - 健康碼：default=OSD_DOWN/PG_DEGRADED；noout 多一個 OSDMAP_FLAGS（noout 旗標本身告警）。
 - 生產結論（機制級）：**偵測到 OSD flapping 立即 `ceph osd set noout`**（阻止重複 backfill），同時查 flap 根因（網路/碟）——noout 是止血、不是治本。與 E-30 合看：down 的傷害全在「out→backfill」那段，控制 out 就控制大部分傷害。
+
+## E-32 gray failure（慢 OSD host）— done（**confirmed，本研究最重要 degraded 發現之一**）
+
+- Bundle：`results/E-32/<最新 ts>/`（v3 有效版：cyshih-osd-1 的 osd.3/4/5 網卡 +50ms netem；v1/v2 cgroup 磁碟限速無效見 STATE）
+- **一個 host +50ms 延遲的衝擊（vs pre）**：
+  | | pre | inject | 倍率 | health |
+  |---|---|---|---|---|
+  | rr-qd1（讀） | 1.05ms | mean **20.1ms** / p99 29.9 / max 32 | **×19** | HEALTH_OK 全程 |
+  | rw-qd8（寫） | 1.73ms | mean **69.6ms** / p99 76 / p999 79 | **×40** | HEALTH_OK 全程 |
+- **兩個一等結論**：
+  1. **觀測盲區 confirmed**：一台 host gray（NIC 問題/壅塞/半死）能讓 client 寫入慢 40 倍，但 `ceph health` 全程 OK、無 OSD 標 down、無告警——**光看 ceph health 完全看不到**。這正是 charter 最在意的失敗模式。
+  2. **size=3 + per-host replica 放置 → 一台慢 host 毒化「所有」寫入**：每個 write 要等 3 副本 ack，CRUSH 每 host 放一副本 → 每個 write 都碰到慢 host 的那顆副本 → 全域寫延遲 = 慢 host 延遲。讀只中 ~1/3（primary 落在慢 host 的 PG）故「僅」×19。
+- **生產含義（可移植）**：(a) 不能只靠 `ceph health` 判健康——要監控 client 端 p99 / `ceph osd perf` 的 per-OSD latency / 網路 RTT；(b) 3-host 叢集裡任何一台的網路/磁碟 gray 都會拖垮全叢集寫延遲，且無告警——host 級健康探針（網路 RTT、逐 OSD latency 告警）是必要補強。回饋 ceph-alert 專案：需要「client latency 高但 health OK」的 gray-failure 告警規則。
+- 恢復乾淨（post rr 1.45ms/rw 3.67ms 回落）；netem 已確認清除（fq_codel 預設）。
