@@ -135,3 +135,6 @@
   完成後接：E-32(gray)→E-33(netem)→E-38(pool full)→E-51(可調性)→E-19(qdepth)→E-15(cpu throttle)→E-35(mon 階梯)→E-22(shards)。
   **E-40 保留待使用者審方法論**（crash consistency）。E-31/E-41/E-16 需使用者（az/kubelet）。
 - 2026-07-09 `E-34 done — flapping 傷害大（rr-qd1 p999 1146ms）；noout confirmed 砍 mean −43%/p999 −71%（→335ms）但不消 peering 尖峰。生產：flapping 立即 set noout 止血+查根因。與 E-30 合：控制 out 就控制大部分 down 傷害`
+- 2026-07-09 `E-34 done`（commit 9a66746）。
+- 2026-07-09 **E-32 已點火**（gray failure：osd.3=dm-0=252:0 systemd cgroup 限速 150 IOPS，~9min；
+  斷言 ceph health 全程 OK=觀測盲區）。osd.3 device 對映：ceph osd metadata 3 → /dev/dm-0（cyshih-osd-1）。
