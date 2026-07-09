@@ -117,3 +117,10 @@
   背景 poller 等 ALL-DONE/FATAL（=E-01~E-18 用過的可靠通知路徑），主線每次完成才醒來收尾。
   E-11 已點火（bus virtio vs scsi）。踩雷：orchestrator 內巢狀 awk 偵測裝置的跳脫被 mangle→
   空 filename→fio 秒 FATAL；已改成 run_matrix.sh 自偵測 16GiB 盤（免外部傳裝置名）。
+- 2026-07-09 ⚠⚠ **重大事故與修復：多 session 共用同一 working tree、互相切 branch，導致本目錄 tracked 檔案從
+  working tree 消失**（只剩 gitignored 的 results/）。診斷：我的 commit 全部安全（在 branch
+  feat/ceph-mon-quorum-blind-spot，已 push origin，a462728 為最新），只是被別的 session 切走 checkout。
+  **根治：開獨立 git worktree `/Users/ikaros/Documents/code/learning-k8s-kubevirt-wt`（branch
+  feat/ceph-mon-quorum-blind-spot），之後所有 git 操作與實驗腳本都在此 worktree，不再碰共用 checkout。**
+  接手 agent 注意：cd 到該 worktree 工作；results/ bundle 在 worktree 內（與主 checkout 的舊 results 分離）。
+  E-11 heredoc 修正（scp re-push 偶發失敗 → 改每輪 heredoc 寫 run_matrix）也在此 worktree 重做並重啟。

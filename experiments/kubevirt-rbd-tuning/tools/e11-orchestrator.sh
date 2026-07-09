@@ -34,8 +34,6 @@ apply_variant(){ # $1 = A | wt | wb
   [ "$ok" = 1 ] || { log "FATAL guest ssh unreachable"; exit 1; }
   # containerDisk boot 每次重啟重置：等 cloud-init 重裝 fio，重推 run_matrix.sh
   vmx 'cloud-init status --wait >/dev/null 2>&1; which fio' >/dev/null || { log "FATAL fio missing after boot"; exit 1; }
-  scp -q $SSHO -o ProxyCommand="ssh $SSHO -W %h:%p $CP" \
-    "$(dirname "$0")/run_matrix.sh" "ubuntu@[$GUEST_IP]:/home/ubuntu/run_matrix.sh"
 }
 
 verify_variant(){ # $1 = A | wt | wb ；斷言 /dev/data 的 direct 與 ua-data 的 write-cache
@@ -62,7 +60,15 @@ run_round(){ # $1 = round dir name（如 round-1-wt）
     log "skip $1 (already done)"; return
   fi
   guardrail
-  vmx "rm -rf /home/ubuntu/m && bash run_matrix.sh /home/ubuntu/m" || { log "FATAL fio $1"; exit 1; }
+  vmx 'cat > /home/ubuntu/run_matrix.sh <<"RMEOF"
+OUT=$1; mkdir -p $OUT
+DEV=/dev/$(lsblk -bdno NAME,SIZE | awk "\$2==17179869184{print \$1; exit}")
+run(){ sudo fio --name=$1 --filename=$DEV --direct=1 --ioengine=libaio --rw=$2 --bs=$3 --iodepth=$4 --numjobs=1 --time_based --runtime=60 --ramp_time=15 --randseed=8675309 --group_reporting --output-format=json --output=$OUT/fio-$1.json --write_lat_log=$OUT/fio-$1 --log_avg_msec=1000 >/dev/null; }
+run rr-qd1 randread 4k 1; run rr-qd8 randread 4k 8; run rr-qd32 randread 4k 32
+run rw-qd1 randwrite 4k 1; run rw-qd8 randwrite 4k 8; run rw-qd32 randwrite 4k 32
+run sr-1m read 1M 16; run sw-1m write 1M 16
+RMEOF'
+  vmx "rm -rf /home/ubuntu/m && bash /home/ubuntu/run_matrix.sh /home/ubuntu/m" || { log "FATAL fio $1"; exit 1; }
   mkdir -p "$BUNDLE/$1"
   vmscp "/home/ubuntu/m/*" "$BUNDLE/$1/"
   cp "$BUNDLE/ceph-last.txt" "$BUNDLE/$1/ceph-before.txt"
