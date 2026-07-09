@@ -144,3 +144,6 @@
   延遲注入 osd host 網卡**（v3，一定生效）。osd.3 device 對映=dm-0/nvme0n1(259:0)@cyshih-osd-1。
 - 2026-07-09 **E-32 v3 已點火**（netem 50ms on osd-1 eth0+eth1，~9min）。**使用者 rate limit 已回，仍全自動接力**。
 - 2026-07-09 `E-32 v3 done — 一等發現：host +50ms gray 使 client 寫 ×40/讀 ×19，ceph health 全程 OK（觀測盲區 confirmed）；size=3 per-host replica → 一台慢 host 毒化全部寫入。生產：不能只看 ceph health，需 client p99+per-OSD latency+RTT 監控。回饋 ceph-alert`
+- 2026-07-09 **E-33 已點火**（netem loss 0.1%/0.5% on osd-1，兩段各 ~11min）。
+  剩餘 queue：E-33→E-38(pool full)→E-51(可調性)→E-19(qdepth)→E-15(cpu throttle)→E-35(mon 階梯)→E-22(shards)。
+  E-40 待使用者審方法論；E-31/E-41/E-16 待使用者操作。
