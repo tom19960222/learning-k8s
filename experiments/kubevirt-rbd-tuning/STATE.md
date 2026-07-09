@@ -160,3 +160,5 @@
 - 2026-07-09 **E-35 延後**（同 E-40：mon quorum 全失是唯一可能 brick 整個 Azure 叢集的實驗，無人看管不做，留給使用者在線監督）。
 - 2026-07-09 **E-22 已點火**（osd_op_num_shards 8 vs 16，C類；含兩次 rolling restart 帶 degraded 負載量 client 代價，~30min）。
   **自動 queue 到此為止**：E-22 完成後，剩餘全部需使用者（E-35 mon/E-40 crash/E-31 az node/E-41 az/E-16 kubelet）。
+- 2026-07-09 `E-22 done — shards 8/16 效果 indistinguishable（8 已足，同 E-37/39 headroom 模式）；但 rolling restart 9 OSD 使 client qd1 讀 p99→1360ms（C類代價實錄）。改 startup 參數＝degraded 窗。**自動 queue 全部完成**`
+- 2026-07-09 ===== 自動接力 queue 執行完畢。剩餘全需使用者監督：E-35(mon quorum)/E-40(crash consistency 方法論)/E-31(az node stop)/E-41(az node 硬斷 failover)/E-16(kubelet CPUManager)。下一步建議：使用者在線時做這 5 個 → 然後 Gate 3 收尾（HYPOTHESES 全 triage + 專題頁 quiz + 最終總結）=====

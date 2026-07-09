@@ -236,3 +236,11 @@
 - **這是 [參數目錄](./rbd-io-tuning-catalog) 完全沒有的一層**：k8s 資源設定是隱形的 IO 尾延遲旋鈕。p50 幾乎不變（938 vs 946us）→ 只看平均完全看不到，必須量 p99+。
 - 生產結論（機制級、可移植）：**VMI 的 CPU limit 必須 ≥ 其 vCPU 核數**（或用 `dedicatedCpuPlacement` 免 CFS quota）；設低於核數的 limit 會靜默地把 IO p99 拉高 7 倍。這是最容易誤設又最難察覺的一條。
 - 註：worker cgroup throttled_usec 直接佐證因 node ssh 逾時未取到（10.0.1.6 忙），但 client 端 ×7.4 p99 已是不可辯駁的訊號；機制=教科書 CFS throttling。
+
+## E-22 osd_op_num_shards 8 vs 16 — done（效果 indistinguishable；但量到 C 類 rolling restart 代價）
+
+- Bundle：`results/E-22/<ts>/`（shards 8 vs 16，各 3 pattern；含兩次 rolling restart 帶 qd1 負載量代價）
+- **效果 indistinguishable**：rr-qd32×4 +2.2%、rw-qd32×4 +0.1%、rr-qd1 −0.4% 全帶內——9 OSD NVMe 下預設 8 shards 已足。**與 E-37/E-39 同模式：headroom 下 Ceph 端旋鈕不可分辨**。
+- **C 類 rolling restart 代價（本實驗真正產出）**：rolling 重啟 9 顆 OSD（帶 ok-to-stop gating）期間 client qd1 讀受創——`to16` 輪 mean **39ms（×39）**、p99 **1360ms**、max 2553ms（基線 ~1ms）；`to8` 輪較輕（mean 1.56ms、p99 12.8ms）。每顆 OSD 重啟時它作為 primary 的 PG 讀阻塞於 peering 窗，9 顆累積成秒級尖峰。
+- 生產結論：**改任何 Ceph startup-flag 參數（osd_op_num_shards 等）＝一次 rolling restart＝一段 client 讀延遲秒級惡化的 degraded 窗**。本例 shards 8→16 零收益，這個代價不值得付。要改 startup 參數請排維護窗、預期 client 尾延遲衝擊。
+- shards 已還原預設 8、HEALTH_OK。
