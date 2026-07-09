@@ -97,7 +97,7 @@
 - Notes: baseline 實驗（E-0x）第一個要回答的問題。若 CoV 大到蓋掉多數旋鈕效果，實驗設計要升級（n≥5、更長 runtime、A/B 交錯粒度更細），或誠實縮小可回答的問題集。連帶要量 Azure local NVMe 的原生能力與 VM size 的 IOPS cap（規格書要選 cap 遠高於 Ceph 需求的 size）。
 
 ### H-009: krbd `queue_depth` 拉高（128→256+）提升高並行 throughput，但同時拉高 qd1 與中低並行的 p99（更深的 host 端排隊）——以 latency-first 判準，正確設定是「夠用就好」而非「越大越好」，且最佳值依 workload 並行度而異
-- Status: proposed
+- Status: **部分 violated（E-19 2026-07-09）**：高並行 throughput 提升成立（+10~21%），但「拉高 qd1 p99」不成立——qd1 零代價、高並行 p99 反而改善。queue_depth 是 cap，低並行不受更大 cap 影響 → 純加分。bundle results/E-19
 - Tier: T3
 - Origin: framing-dialog（latency 盡最大努力維持最小值）
 - Prediction:

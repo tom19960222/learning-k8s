@@ -154,3 +154,4 @@
 - 2026-07-09 **E-19 已點火**（queue_depth 64 vs 256，D類新 SC+PVC，各 3 輪 rr/rw qd1+qd32x4，~25min；含 cleanup 換回 baseline PVC + 刪變體 SC/PVC）。
   ⚠ 生效驗證 nr_requests 讀取用 /sys/block/rbdN/size==33554432 比對，E-51/E-19 都回空（node ssh 也偶逾時）——
   queue_depth 是否生效改由 fio 差異反推；接手 agent 若要修 host 驗證，先確認 rbd size 單位/多裝置問題。
+- 2026-07-09 `E-19 done — H-009 部分 violated：queue_depth 256 高並行 +10~21% IOPS 且 p99 更好，qd1 零代價（預測的尾延遲懲罰不存在，因 cap 對低並行無影響）。純加分但 D 類建置期定死`

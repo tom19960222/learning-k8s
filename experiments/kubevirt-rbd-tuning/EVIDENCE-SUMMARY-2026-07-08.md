@@ -210,3 +210,16 @@
   `spec.persistentvolumesource is immutable after creation`（diff 顯示嘗試加 `mapOptions: krbd:queue_depth=256` 被 forbidden）。
 - **結論（H-002 T3 confirmed，完整閉環）**：mapOptions 對存量 volume **真的無法線上修改**——改 SC 只影響新 PV（P0 源碼已證），而 PV 的 CSI source 欄位 k8s API 層 immutable、**連手動 patch 的 escape hatch 都不存在**。要改 krbd map option（queue_depth/alloc_size/rxbounce/osd_request_timeout）唯一路徑＝**重建 PVC**（資料要遷移）。這坐實了「D 類＝建置期定死」分類。
 - 附註：host nr_requests 讀取（size 比對）回空未取到，非關鍵——API 拒絕已是最強證據。SC/PV 已還原、VM Running、HEALTH_OK。
+
+## E-19 krbd queue_depth 64 vs 256 — done（H-009 部分 violated：無 qd1 尾延遲代價）
+
+- Bundle：`results/E-19/<ts>/`（D類：各建 SC ceph-rbd-qd{64,256}+PVC，換 data disk，n=3；生效由 fio 差異反推——verify 檔空是 size-比對 bug，非旋鈕未生效）
+- 結果：
+  | pattern | qd64 | qd256 | IOPS Δ | p99 Δ |
+  |---|---|---|---|---|
+  | rr-qd1 | 994 IOPS | 983 | −1.1% | −0.8%（帶內） |
+  | rr-qd32×4 | 49086 | 54129 | **+10.3%** | **−14.8%** |
+  | rw-qd1 | 588 | 590 | +0.2% | +0.4%（帶內） |
+  | rw-qd32×4 | 19798 | 23914 | **+20.8%** | **−11.4%** |
+- **H-009 預測被部分推翻**：我預測「qd256 拉高 qd1 p99（更深 host 排隊代價）」——**沒有**。qd1 延遲完全不變，高並行則 throughput +10~21% **且 p99 同時改善**（非權衡）。機制：queue_depth 是上限 cap，qd1 實際 in-flight=1 不受更大 cap 影響；cap 只在並行度超過它時才起作用——所以「越大越好、低並行無代價」。
+- 生產結論（機制級）：queue_depth 拉高（256）對高並行 workload 純加分、低並行零代價——但**D 類建置期定死**（E-51 證無 escape hatch），要用得在 StorageClass 建立時設。預設 128 已覆蓋多數；有 qd>128 的 workload 才需要調高。
