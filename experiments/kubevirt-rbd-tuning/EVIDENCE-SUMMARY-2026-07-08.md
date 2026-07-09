@@ -186,3 +186,11 @@
   2. **size=3 + per-host replica 放置 → 一台慢 host 毒化「所有」寫入**：每個 write 要等 3 副本 ack，CRUSH 每 host 放一副本 → 每個 write 都碰到慢 host 的那顆副本 → 全域寫延遲 = 慢 host 延遲。讀只中 ~1/3（primary 落在慢 host 的 PG）故「僅」×19。
 - **生產含義（可移植）**：(a) 不能只靠 `ceph health` 判健康——要監控 client 端 p99 / `ceph osd perf` 的 per-OSD latency / 網路 RTT；(b) 3-host 叢集裡任何一台的網路/磁碟 gray 都會拖垮全叢集寫延遲，且無告警——host 級健康探針（網路 RTT、逐 OSD latency 告警）是必要補強。回饋 ceph-alert 專案：需要「client latency 高但 health OK」的 gray-failure 告警規則。
 - 恢復乾淨（post rr 1.45ms/rw 3.67ms 回落）；netem 已確認清除（fq_codel 預設）。
+
+## E-33 封包遺失 0.1%/0.5% — done（prediction **violated**：TCP 快速重傳吸收，遠小於預期）
+
+- Bundle：`results/E-33/<ts>/`（osd-1 網卡 netem loss 0.1% 然後 0.5%，注入已驗證於 inject.txt）
+- **衝擊極小**：0.1% loss → rr/rw 皆 1.0×（無變化）；0.5% loss → rw-qd8 mean 1.1×、p999 才 2.6ms。health 全程 OK。
+- **我的預測（p99.9 >5×，TCP RTO ~200ms）被推翻**。機制：低 RTT（<1ms）+ 現代 TCP（SACK/fast-retransmit），串流中的封包遺失由 3 個 dup-ACK 在 ~1 RTT 內快速重傳修復，**不觸發 RTO**；且 0.1-0.5% 下多數 op 根本沒中遺失。RTO 災難需要 tail-loss、高 RTT 或高得多的 loss 率。
+- **對比 E-32 的關鍵洞察（跨實驗）**：對 Ceph-on-TCP，**穩定的延遲/壅塞（E-32 +50ms→寫 ×40）遠比稀疏封包遺失（E-33 0.5%→1.1×）致命**。診斷網路型 degraded 時，先看 RTT/延遲不是丟包率。
+- 生產含義：低幅封包遺失（<1%）在低延遲 NVMe 叢集不是 client latency 的主要威脅；把監控與告警重心放在**延遲/RTT** 而非 loss。

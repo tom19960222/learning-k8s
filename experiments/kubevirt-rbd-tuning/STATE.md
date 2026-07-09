@@ -147,3 +147,4 @@
 - 2026-07-09 **E-33 已點火**（netem loss 0.1%/0.5% on osd-1，兩段各 ~11min）。
   剩餘 queue：E-33→E-38(pool full)→E-51(可調性)→E-19(qdepth)→E-15(cpu throttle)→E-35(mon 階梯)→E-22(shards)。
   E-40 待使用者審方法論；E-31/E-41/E-16 待使用者操作。
+- 2026-07-09 `E-33 done — prediction violated：0.1/0.5% loss 對 client 幾乎無影響（TCP 快速重傳吸收，低RTT不觸發RTO）。跨實驗洞察：Ceph-on-TCP 延遲(E-32 ×40)遠比丟包(E-33 1.1×)致命→監控重心放 RTT`
