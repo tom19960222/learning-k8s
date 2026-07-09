@@ -65,6 +65,8 @@ ceph-csi 在 NodeStage（把 RBD image map 到 node）時，map options 是從 *
 
 所以「改 StorageClass 的 `mapOptions` → 重啟 VM」對存量磁碟是 no-op：新參數只會進**之後新建的 PV**。唯一的 runtime 例外是 read-affinity（`read_from_replica` + `crush_location`）——它走 CSI config（configmap），每次 map 重讀（`File: ceph-csi/internal/util/read_affinity.go (line 47-76)`、`internal/rbd/nodeserver.go (line 283-292)`）。
 
+真機也把最後一條退路堵死了（E-51）：`kubectl patch pv` 想直接改 PV 的 `volumeAttributes.mapOptions`，被 k8s API 以 `spec.persistentvolumesource is immutable after creation` 拒絕——**連手動 escape hatch 都沒有**。要改 krbd map option 唯一路徑就是重建 PVC。
+
 ### A / C 類的證據：Ceph 旋鈕的兩極分佈
 
 Ceph options 的 yaml 定義帶著 flags，直接讀就能分類：`osd_op_num_shards` 是 `startup`（`File: ceph/src/common/options/osd.yaml.in (line 945)`，改了要重啟 OSD 才生效）；`osd_scrub_sleep`（line 439）、`osd_max_backfills`（line 51）、`osd_memory_target`（`global.yaml.in (line 3818-3844)`，附 `min: 896_M`）都是 `runtime`。mClock profile 更進一步——scheduler 註冊了 config observer，`ceph config set` 打下去當場重算配額：

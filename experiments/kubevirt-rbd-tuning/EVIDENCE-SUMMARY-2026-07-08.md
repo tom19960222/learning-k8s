@@ -202,3 +202,11 @@
 - **full（v2，ratio 依序 0.10/0.15/0.20 全<用量0.26）**：health `9 full osd / 2 pool full`；client 寫入**卡 96 秒**（跨整個 FULL 窗），**恢復 ratio 後那筆寫入成功完成（非 ERR、非 ENOSPC）**，IO 完全停 97s，之後正常 resume。
 - **結論（confirmed H-022，可移植）**：容量耗盡是**穩定性 hang 邊界，不是優雅的 ENOSPC**——krbd 預設無 abort_on_full → 寫入無限期阻擋直到空間釋放，行為與 min_size 不滿（E-36）同型（guest 最終 jbd2 hung task）。**唯一告警視窗是 nearfull(0.85)→full(0.95) 之間**；跨過 full 就是 VM hang，救法只有釋放空間（加 OSD/刪資料）。生產：nearfull 是必須行動的告警線，不能當普通 warning 忽略。
 - ratio 已確認回退 0.85/0.90/0.95、HEALTH_OK。
+
+## E-51 mapOptions 線上可調性 — done（H-002 T3 confirmed；PV 無 escape hatch）
+
+- Bundle：`results/E-51/<ts>/`
+- **step2 決定性結果**：`kubectl patch pv <pv> volumeAttributes.mapOptions` **被 API 直接拒絕**——
+  `spec.persistentvolumesource is immutable after creation`（diff 顯示嘗試加 `mapOptions: krbd:queue_depth=256` 被 forbidden）。
+- **結論（H-002 T3 confirmed，完整閉環）**：mapOptions 對存量 volume **真的無法線上修改**——改 SC 只影響新 PV（P0 源碼已證），而 PV 的 CSI source 欄位 k8s API 層 immutable、**連手動 patch 的 escape hatch 都不存在**。要改 krbd map option（queue_depth/alloc_size/rxbounce/osd_request_timeout）唯一路徑＝**重建 PVC**（資料要遷移）。這坐實了「D 類＝建置期定死」分類。
+- 附註：host nr_requests 讀取（size 比對）回空未取到，非關鍵——API 拒絕已是最強證據。SC/PV 已還原、VM Running、HEALTH_OK。

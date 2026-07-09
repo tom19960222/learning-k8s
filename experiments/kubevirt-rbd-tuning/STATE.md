@@ -150,3 +150,4 @@
 - 2026-07-09 `E-33 done — prediction violated：0.1/0.5% loss 對 client 幾乎無影響（TCP 快速重傳吸收，低RTT不觸發RTO）。跨實驗洞察：Ceph-on-TCP 延遲(E-32 ×40)遠比丟包(E-33 1.1×)致命→監控重心放 RTT`
 - 2026-07-09 `E-38 done — nearfull 只告警不擋寫（v1 意外驗到）；full 下寫入 hang 96s 非 EIO，恢復後成功完成（confirmed H-022，同 min_size hang 型）。踩雷：full_ratio 要三個 ratio 依序設(nearfull<backfillfull<full)否則 out-of-order 被拒。生產：nearfull 是必須行動告警線`
 - 2026-07-09 **E-51 已點火**（可調性真機：改 SC mapOptions（預期無效）vs patch PV volumeAttributes（escape hatch）；含 VM 重啟 ×3，~12min）。剩餘 queue：E-51→E-19(qdepth D類)→E-15(cpu throttle)→E-35(mon 階梯)→E-22(shards)。
+- 2026-07-09 `E-51 done — patch PV volumeAttributes 被 API 拒（source immutable）→ mapOptions 無 escape hatch，H-002 T3 完整閉環，D 類=建置期定死坐實。host nr_requests 讀取回空(size比對未中)但非關鍵`
