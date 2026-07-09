@@ -125,3 +125,8 @@
   接手 agent 注意：cd 到該 worktree 工作；results/ bundle 在 worktree 內（與主 checkout 的舊 results 分離）。
   E-11 heredoc 修正（scp re-push 偶發失敗 → 改每輪 heredoc 寫 run_matrix）也在此 worktree 重做並重啟。
 - 2026-07-09 `E-11 done — bus IOPS indistinguishable、virtio-scsi 尾延遲較差（max +20~150%）；結合 H-006 → 無理由換 bus`。E-11 收尾在 worktree 完成。下一棒：E-40（crash consistency）。
+- 2026-07-09 **E-40 延後**（crash-consistency 方法論有陷阱：O_DIRECT 在 writeback 下是否帶 FUA、
+  fio verify_only 對未寫區也報錯——自動跑易出誤導資料，待使用者醒著確認方法論。tools/e40-run.sh 草稿已寫但未跑）。
+- 2026-07-09 **E-37 已點火**（worktree，deep-scrub 齊發 × osd_scrub_sleep 0 vs 0.1，degraded 模板；
+  兩段各 480s，結束自動 config rm 還原）。queue 順序微調：E-40→延後，改跑 E-37→E-34→…
+- worktree 補記：node_modules 從主 checkout symlink（make validate 才過）；接手 agent 若 worktree 重建要重做此 symlink。
