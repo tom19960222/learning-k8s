@@ -1,0 +1,100 @@
+{
+ "articles": [
+  {
+   "slug": "architecture",
+   "doc_type": "mechanism",
+   "self_contained": "完全自足的入口頁。開頭直接從零建立場景：「你 ssh 進 ceph cluster 任一台 host，跑 `ps -ef | grep ceph`，看到一堆 ceph-mon、ceph-osd、ceph-mgr (可能還有 ceph-mds、radosgw)。這些 daemon 各自做什麼？」不假設讀過任何其他頁；文末「接下來」段主動指向 crush-and-placement / osd-and-bluestore / rbd-and-csi，是整個 Ceph 系列的閱讀起點。",
+   "staleness": "無日期標記。版本錨點齊全（原始碼連結全部釘 v19.2.3，內文明寫「v19.2.3 預設是 128 MiB」）。未被後續研究推翻。「跟 k8s 的接點預告」段提到 rbd-and-csi，若導覽重構調整該頁需同步改連結。",
+   "keep_content": "MON/OSD/MGR/MDS/RGW 職責邊界表與 ASCII 架構圖；「MON 不在 data path」的 HDFS NameNode 對比表；「RADOS object 沒有固定等於 4 MiB」澄清（rbd_default_order=22 vs osd_max_object_size=128M，含 rbd.yaml.in:481 / global.yaml.in:3705 佐證）；BALANCE_READS/LOCALIZE_READS replica read 例外（Objecter.cc:2974）；client 寫 object 完整 path 圖；/diagrams/ceph/architecture.png。",
+   "assumed_prereqs": "無（系列入口頁，僅假設讀者會基本 Linux 操作與分散式儲存常識）。"
+  },
+  {
+   "slug": "crush-and-placement",
+   "doc_type": "mechanism",
+   "self_contained": "大致自足但有一處明確假設讀過 architecture：「`Objecter` (上一頁提到的 client dispatcher) 在 OSDMap 變動時自動重 route in-flight op」——「上一頁」即 architecture。開頭場景（HDFS NameNode 對比）本身可獨立閱讀。",
+   "staleness": "無日期標記。版本錨點在內文（「v19.2.3 的 placement seed 走 `pgp_num`」；「Squid 的 CRUSH code 裡已經有 MSR（multi-step retry）路徑」）。未被後續研究推翻。文末「PG 的常見狀態」段與 pg-health-states 內容重疊（較淺版本），重構時可考慮收斂為指向 pg-health-states。",
+   "keep_content": "object→PG→OSD 的完整公式鏈（raw_pg_to_pg 用 pg_num、raw_pg_to_pps 用 pgp_num，osd_types.cc:1806 佐證）；「CRUSH 不是最後一層」段——pg_upmap / pg_temp / primary_affinity 三種 OSDMap override 對照表（OSDMap.cc:2673-2724）；CRUSH 四 property 與 straw2 stable 直覺；EC/failure domain 湊不滿的邊界說明；/diagrams/ceph/crush-placement.png。",
+   "assumed_prereqs": "architecture（Objecter「上一頁」引用、OSDMap/MON 角色、RADOS 分層概念）。"
+  },
+  {
+   "slug": "crush-straw-straw2",
+   "doc_type": "mechanism",
+   "self_contained": "開頭即假設讀者已知 CRUSH 會把 PG 算到 OSD：「CRUSH 不是已經把 PG 算到 OSD 了嗎，為什麼還有 straw / straw2？」文末更明示閱讀順序：「[CRUSH 與 Placement](/ceph/features/crush-and-placement) — 先看 object / PG / CRUSHMap rule 的整體 placement 流程。」不能單獨當第一篇讀。",
+   "staleness": "無日期標記。版本錨點在內文（「在 v19.2.3 的 `crush.h` 裡，這個 tunable 被標成 backward compatibility」；「v19.2.3 的 `CrushWrapper` 預設 tunables」）。未被後續研究推翻；主題（straw2 演算法）本身高度穩定。",
+   "keep_content": "straw vs straw2 struct 對照（straws 預算 vs 即時 ln(draw)/weight，crush.h:328/341、mapper.c:208/315/342 逐行）；straw2_reweight 測試契約——「少搬資料」是 source 明確鎖定的行為而非期望值（test/crush/crush.cc:973/1068）；操作面線索三件套：set-all-straw-buckets-to-straw2 命令（MonCommands.h:670）、weight-set 的 straw2 前置檢查（OSDMonitor.cc:10754）、OLD_CRUSH_STRAW_CALC_VERSION health warning（OSDMap.cc:7557）；「straw_calc_version=1 不等於 straw2」的除錯澄清。",
+   "assumed_prereqs": "crush-and-placement（CRUSH rule traversal、bucket 階層、PG→OSD 流程）；間接 architecture。"
+  },
+  {
+   "slug": "pool-pgnum-pgpnum",
+   "doc_type": "mixed（mechanism 主體 + 「邊界與除錯」runbook 段 + Callout 操作指引）",
+   "self_contained": "開頭場景可獨立讀（「你的 pool 原本 `pg_num=128 / pgp_num=128`……`ceph osd pool get mypool pg_num` 回 `pg_num: 132` — 不是 512、也不是還沒變、是某個中間數」），且自行釘住 client 端公式（「這裡最容易被講錯，所以先把 client 端公式釘住」），但預設讀者已懂 PG / CRUSH placement seed 概念；相關頁面段把 crush-and-placement 列為延伸而非前置。",
+   "staleness": "無日期標記。版本錨點在標題（「在 v19.2.3 原始碼裡如何收斂」）。含一處自標的現場估算：「實務上『pg_num 128 → 512』對 100GB 級 pool 常見會落在 10~30 分鐘……這是現場估算，不是 source 保證」——非實測數據，重構為 experiment-report 體系時要保持此標註。未被後續研究推翻。",
+   "keep_content": "pg_pool_t 五欄位表（pg_num/pgp_num/pg_num_pending/pg_num_target/pgp_num_target，osd_types.h:1458）；user-facing vs mgr-facing 兩層命令（set 只寫 target、pg_num_actual 才動 actual，OSDMonitor.cc:8549/8516/8608）；merge 兩步握手與「pgp_num==pg_num 擋 merge」；adjust_pgs() throttle 全表（mgr_tick_period=2s、mgr_max_pg_num_change=128、target_max_misplaced_ratio=0.05）與 estmax 數字例（1024×0.025=26）；outpace-merge 保護（DaemonServer.cc:3022）；「卡在中間數字」除錯清單；pre-split 使用場景 Callout。",
+   "assumed_prereqs": "crush-and-placement（PG、placement seed、CRUSH 重算概念）；讀 mgr tick 段時需要 architecture 的 MGR 角色概念。"
+  },
+  {
+   "slug": "osd-and-bluestore",
+   "doc_type": "mechanism",
+   "self_contained": "開頭假設已知 primary/replica 與 RADOS write op 概念：「primary OSD 收到 client write op，到資料真的落盤、replicate 到 secondary、回 ack 給 client，這中間 OSD 內部跑了什麼？」沒有明示前置頁，但這句直接接續 architecture 的 write path 段；未讀 architecture 者會缺 primary/secondary/PG 的定義。",
+   "staleness": "無日期標記。版本錨點齊（「v19 (Squid) 預設且唯一推薦的就是 BlueStore」、原始碼連結釘 v19.2.3）。「Crimson：v19 Crimson 還是 experimental，預設不啟用」是版本相依陳述，升版時需重驗。未被後續研究推翻；BlueStore 細節已被 bluestore-deep-dive 深化（該頁明說不重複本頁骨架，兩頁是分工不是取代）。",
+   "keep_content": "OSD process 內部結構圖（Messenger→OpThreadPool→PG→ObjectStore）；waiting_for_commit 的關鍵澄清——「不是『先等所有 secondary，再 primary 自己 commit』的串列模型」（ReplicatedBackend.cc:510/568）；容量閘門表（nearfull/backfillfull/full/failsafe 會比 scheduler 更早擋住工作，含 PrimaryLogPG.cc:8904、PeeringState.cc:5660 佐證）——這段是 mclock 與 recovery-throttle 兩頁「scheduler 不是最終允許者」論點的共同底座；FileStore double-write 淘汰動機；recovery/backfill/scrubbing 三條後台流程定義；/diagrams/ceph/bluestore-internals.png。",
+   "assumed_prereqs": "architecture（primary/secondary、RADOS write path、MON/OSD 角色）；crush-and-placement（PG 是工作單位的概念）。"
+  },
+  {
+   "slug": "bluestore-deep-dive",
+   "doc_type": "mechanism（含 alert→source 對照表的輕量 debug-guide 成分）",
+   "self_contained": "十二篇中唯一用 Callout 明示前置的頁：「本頁假設你已讀過 [osd-and-bluestore](./osd-and-bluestore) 的 OSD daemon 大致結構，並對 `ObjectStore` 抽象、PG、RADOS write op flow 有印象。」開頭也自述「這頁不重複講『BlueStore 是 OSD backend』這種定義（[osd-and-bluestore] 已經建立過骨架了）」。",
+   "staleness": "無日期標記。版本錨點齊（v19.2.3 行號遍布全文）。BLUESTORE_SLOW_OP_ALERT 段（BlueStore.cc:18901）後續被 slow-ops-and-bluestore-alerts 大幅深化（5 秒門檻、24h 黏著、與 SLOW_OPS 兩條路幾乎不重疊）——本頁未提這些，屬「未推翻但已不完整」，重構時應加互鏈或移交該段。其餘（三裝置、key prefix、TransContext、deferred write）未被推翻。",
+   "keep_content": "BDEV_WAL/DB/SLOW 三裝置角色表與 symlink 對應（BlueFS.h:252/516）；BLUEFS_SPILLOVER 的精確條件澄清——「直接前提是 shared_bdev == BDEV_SLOW 且 bluefs->get_used(BDEV_SLOW) > 0」而非「DB 裝置已滿」（BlueStore.cc:18885）；RocksDB single-letter key prefix schema 全表（BlueStore.cc:120-131）；TransContext 狀態機與 perf dump 指標的逐 state 對應（state_kv_queued_lat 等）；min_alloc_size head/middle/tail 切分（_do_write_data 逐行）；deferred write 的 HDD 64K vs SSD 0 分水嶺與理由；tmpfs+symlink 的 OSD 目錄解釋（ceph-volume prepare.py）；文末 6 條 BLUESTORE_* alert→source 行號對照表。",
+   "assumed_prereqs": "osd-and-bluestore（頁內 Callout 明示）；間接 architecture、crush-and-placement。"
+  },
+  {
+   "slug": "mclock-osd-scheduler",
+   "doc_type": "mixed（mechanism 主體 + 「怎麼查與怎麼調」decision-guide/runbook 段）",
+   "self_contained": "開頭場景自足（recovery 與 client I/O 互搶），但 rollback 細節明確外包：「這段 rollback source 已經在 [Recovery throttle 動態調整與 mClock 互動](/ceph/features/recovery-throttle-runtime) 詳細拆過；這裡只放關鍵入口」——兩頁形成互依對（recovery-throttle 也預設讀者知道 mClock 是預設 scheduler）。",
+   "staleness": "無日期標記，但引用段有最強版本錨點：「引用的原始碼（v19.2.3, commit c92aebb）」。指令段自標驗證等級：「下面指令需要真實 Ceph cluster。本頁只用 v19.2.3 source 與 repo 內 doc 驗證語意；在你環境跑後再對照實際回傳值」——即 source-level 驗證、未真機跑過。未被後續研究推翻；並主動糾正外部舊文（「如果你看到某篇舊測試文章說 mClock profile 會把 osd_max_backfills 放大到 1000，不要直接套到 Squid」）。",
+   "keep_content": "「docs 說四類、source 只有三個 dmClock 桶（client/background_recovery/background_best_effort）」的澄清與 get_scheduler_class 對照表；built-in profile 三行數值表（balanced/high_client_ops/high_recovery_ops 的 res/wgt/lim）；built-in profile 會 rollback 低階 QoS key 的保護行為；capacity 換算（osd_bandwidth_cost_per_io、per-shard 分配）與「腳踏車登記成高鐵」風險；immediate/high-priority 不進 dmClock 的 bypass（enqueue/dequeue 雙向，含單元測試佐證）；「mClock 不是 recovery/backfill 最終允許者」——後面還有 _recover_now、reserver、fullness gate；HDD 多 shard 的 osd_op_num_shards_hdd=1 建議（需 restart）。",
+   "assumed_prereqs": "osd-and-bluestore（OSD 內部結構、容量閘門）；recovery-throttle-runtime（rollback 細節，頁內明示外包）；間接 architecture。"
+  },
+  {
+   "slug": "recovery-throttle-runtime",
+   "doc_type": "mixed（mechanism 主體 + runbook：「驗證指令」「正確順序」Callout 可直接照抄操作）",
+   "self_contained": "自足性佳：開頭場景（「半夜 backfill 雷暴，client latency 開始噴」）加「TL;DR — 結論先講」三答，不讀其他頁也能拿走結論。假設讀者知道 Squid 預設 mClock（「v19 (Squid) 預設 mClock scheduler 下，這個改動會不會悄悄被 rollback？」），但頁內自帶所需的 mClock 背景。",
+   "staleness": "無日期標記。引用段錨點明確：「引用的原始碼（v19.2.3, commit c92aebb）」。驗證指令段自標「在你的 cluster 上跑下面三條」＝預期值出自 source 推導、未附真機實測輸出。未被後續研究推翻；ping-pong 兩輪自動止血的分析（OSD.cc:10212）是本 repo 獨有推導。",
+   "keep_content": "TL;DR 三答（不 cancel in-flight／無 hysteresis／mClock 會 rollback）；_recover_now 單向閘門與「max 比的是 active+reserved」；自然收斂時序表（t0–t11）與 /diagrams/ceph/recovery-throttle-dynamics.png；「為什麼 max 調高了還是沒有進度」四層 gate 表；injectargs vs ceph config set 對照表（含「自殺式持久化」結論）；mon→OSD→mon ping-pong 完整時序（t0–t10）與兩輪止血證明；兩條 config rm（who=osd 與 who=osd.X）的原因；「先開 override 再 set」的順序 runbook 與驗證命令；osd_max_backfills 差異根因（stateful reserver vs 純讀取）。",
+   "assumed_prereqs": "osd-and-bluestore（recovery/backfill 概念）；mclock-osd-scheduler（scheduler 背景，頁內有簡版可撐）。"
+  },
+  {
+   "slug": "osd-flapping",
+   "doc_type": "mixed（mechanism 主體 + 6 情境推演分析——形似 experiment-report 但全為紙上推導，無真機實測）",
+   "self_contained": "自足場景開頭（「某個 ceph cluster：20 個 OSD node……某晚資料中心電力 / 交換器抖，6 種 flapping pattern 都可能出現」），並自述方法：「所有『會 / 不會 mark down』……都是直接看 v19.2.3 程式碼推出來的，不靠官方 doc 二手詮釋。」假設讀者已知 CRUSH rack bucket 與 MON/OSD 角色。",
+   "staleness": "無日期標記。版本錨點齊（v19.2.3 行號遍布）。關鍵風險：6 情境結論是推演非實測，頁內多處自承不確定（「結果：5 次 flap 中通常會有 1–3 次成功 mark down，難以給確切數字」「邊界依賴 cycle 是否『精準』12 分鐘」「實務上會剛好過關允許繼續 mark-out」）——重構為 experiment-report 體系時，此頁應明標為 hypothesis/推演等級，或用真機補實驗。另「要清掉得用 `ceph osd rm-noout` 之類 admin 操作」這句的命令名可疑（v19.2.3 無此命令名，unverifiable），遷移時建議重查。未被既有後續研究直接推翻。",
+   "keep_content": "三層 detection 全圖（peer heartbeat → failure_queue → MOSDFailure → failure_info → mark down → down_pending_out → mark out）；「斷電 vs process 乾淨退出走兩條路」——ms_handle_refused 的 FLAG_IMMEDIATE shortcut（OSD.cc:6756）；osd_markdown_log「比較式是 size() > 5，第 6 次才自殺」與「只防網路抖、不防整 node reboot」；laggy EMA 數列（0.3→0.51→0.657→0.760→0.832）與 grace 動態加長公式；mon_osd_down_out_subtree_limit=rack 護欄「只擋 mark-out 不擋 mark-down」「要求 rack 全 down、剩一顆就失效」；「錯開時間的 flap pattern 反而比同步 flap 更慘」洞察；6 情境對照表。",
+   "assumed_prereqs": "crush-and-placement（rack bucket、CRUSH 拓樸、failure domain）；architecture（MON/Paxos/OSDMap epoch）；讀後段 backfill 影響需 osd-and-bluestore 概念。"
+  },
+  {
+   "slug": "pg-health-states",
+   "doc_type": "mixed（mechanism：state→health check 的 source 鏈 + decision-guide：四類風險分類與「現場判讀順序」triage）",
+   "self_contained": "自足：開頭直接從 `ceph -s` 輸出切入（「`ceph -s` 裡同時出現 `inactive`、`incomplete`、`stale`、`down+peering`、`undersized+degraded`、`backfillfull`、`nearfull`、`full` 時，最麻煩的不是字很多」），三條訊號路徑在第二段自行定義完。假設讀者知道 PG/OSD/MON 是什麼但不要求讀過特定頁。",
+   "staleness": "無日期標記。版本錨點齊（v19.2.3 行號遍布）。兩處被後續研究補充（非推翻）：(1) SLOW_OPS 段——slow-ops-and-bluestore-alerts 後續拆出三層盲區、BLUESTORE_SLOW_OP_ALERT（5s 門檻）與 SLOW_OPS（30s 門檻）幾乎不重疊、SLOW_OPS 會怪錯 OSD（H-025），本頁只寫到「它是症狀聚合，不是單一根因」；(2) MON_DOWN 段——mon-quorum-detection-blind-spot 後續證實 2/3 mon down 時 mgr metric 凍結造成 Prometheus 偵測盲區，本頁的 health check 描述本身仍正確但讀者可能高估可觀測性。重構時這兩段應加互鏈。",
+   "keep_content": "四類風險分類表（可用性中斷／副本不足／repair 被擋／資料損壞）；state_to_response 完整映射（PGMap.cc:2425）與「inactive 不是一個 bit，是 PG_STATE_ACTIVE 的反向 stuck check」澄清；「HEALTH_WARN 不等於安全」（PG_AVAILABILITY 是 WARN 但已是可用性問題）；POOL_FULL 同名不同來源不同 severity 陷阱（OSDMap.cc:7613 WARN vs PGMap.cc:3041 ERR）；nearfull 用 pratio、full/backfillfull 用 ratio 的差異（OSD.cc:817）；OSDMAP flags 風險表（norecover/nobackfill/noout 的「自動恢復被改寫」視角）；「現場判讀順序」五步 triage 與對照表。",
+   "assumed_prereqs": "crush-and-placement（PG、acting set 概念）；osd-and-bluestore（recovery/backfill/scrub 三條後台流程）；architecture（MON/MGR 角色）。"
+  },
+  {
+   "slug": "mon-clock-skew-detection",
+   "doc_type": "mechanism（含時間鏈量化推算——152.5s/305s 為公式推導非實測，非 experiment-report）",
+   "self_contained": "自足：開頭場景完整（3-node cluster、chrony 指錯 NTP server），且關鍵術語當場定義：「（先記兩個角色，下圖就會用到：quorum 裡有一顆 mon 是 **leader**（Paxos 選出的主導者、timecheck 的發起方），其餘都是 **peon**（非 leader 的 mon）。）」不強制先讀 architecture。",
+   "staleness": "無日期標記（frontmatter description 內含所有關鍵數字，等於自帶摘要）。版本錨點齊（v19.2.3 行號遍布）。avg/max 數字全為推算（「均勻分布假設」自標）。後續 clock-skew-magnitude-ladder 明確引用本頁而非推翻（「`ceph -s` 多久才看到這條 WARN，拆在 [MON clock skew 偵測那一頁]」）。timesyncd-drift-lab 研究仍進行中（L3/L4 未完），未來實測可能回填這些推算值。",
+   "keep_content": "T0–T5 五段延遲全圖與加總表（healthy 平均 ≈152.5s／最壞 ≈305s；已在 skew 狀態 ≈17s/35s）；rounds_since_clean 的 30s×N backoff 表與 hysteresis 分支（Monitor.cc:4960）；stuck-round 例外（mon_timecheck_interval×3 保留，Monitor.cc:4852）；RTT 吸收效應與不對稱公式（「RTT 100ms：peon 慢需要 ≥100ms、peon 快需要 ≥200ms。真實漂 70ms 不會被偵測到」）；「leader 是 the eye of the storm、自己漂走會標錯人」盲點；leader_checks vs health_checks 兩個不同 field 的澄清；單 mon cluster ceph_abort；warn_on_future_time 第二路徑（單向、指數 backoff、不上 health check）；調 knob 的兩個 Callout。",
+   "assumed_prereqs": "architecture（MON quorum/Paxos 基本概念；leader/peon 已內文定義故依賴輕）。"
+  },
+  {
+   "slug": "cluster-time-skew-impact",
+   "doc_type": "mixed（mechanism + decision-guide：6×4 結論矩陣先行、「邊界與除錯」收尾）",
+   "self_contained": "自足：開頭場景（chrony 80ms + heartbeat 1.2s 兩個數字容易混淆）並當場切分核心概念：「這頁先把問題拆成兩種：**clock offset** 是兩台 node 的時鐘相差多少；**heartbeat latency** 是訊息來回花多久。」timecheck 機制自帶簡版，不強制先讀 mon-clock-skew-detection（該頁列為延伸）。",
+   "staleness": "無日期標記。版本錨點齊（「假設使用 v19.2.3 預設值」+ 行號遍布）。被 clock-skew-magnitude-ladder 明確延伸而非推翻：ladder 開頭寫「[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把毫秒級的差距攤開過了，結論是『沒有全域的 50ms 規則』。這頁把刻度往上拉」——ladder 補了 1min（mon_lease 崩）／1hr／1day（cephx 雙向爆）刻度，本頁 10ms–5s 範圍內的結論（含「5s 仍遠小於 service ticket 預設 TTL」）仍成立。重構時兩頁天然成上下集。",
+   "keep_content": "6 檔位 × 4 通道結論矩陣（10/50/100/500/1000/5000ms × MON-MON／MON-OSD／OSD-OSD latency／OSD-OSD lease）；「MON-OSD 沒有毫秒級 clock-skew health check」的否定性結論（beacon 用 mono clock 定頻、MON 用自己的 clock 記錄、timeout 是分鐘級）；slow-ping 門檻推導（mon_warn_on_slow_ping_time=0 時走 ratio：20s×0.05=1s，PGMap.cc:2776）；HeartbeatStamps mono-clock delta 與 read lease 補償（PeeringState.h:119、check_laggy）；read lease interval = 20s×0.8=16s 推導；「問題→入口→真正效果」原始碼路徑對照表；「某台 OSD 偏 5s 但找不到立即 health warning 規則」的 unverifiable-by-design 誠實結論。",
+   "assumed_prereqs": "architecture（MON quorum、OSD heartbeat 角色）；深入 timecheck 細節時需 mon-clock-skew-detection（頁內列為延伸）；mark-down path 細節在 osd-flapping。"
+  }
+ ]
+}

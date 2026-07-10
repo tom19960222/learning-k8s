@@ -1,0 +1,105 @@
+{
+ "findings": [
+  {
+   "what": "[Codex 逐項確認] auto detection 確實存在，且 `--mode auto` 是預設值，但文章只在參數表列出 `auto` 一詞、完全沒解釋",
+   "severity": "high",
+   "evidence": "工具端：run/collect.sh:328 `local mode=auto since=24h timeout=20 node_timeout=600 ...`；能力探測 run/collect.sh:67 `detect_node_caps()`（探 cephadm/ceph/kubectl）；runner 連線探測 run/collect.sh:95-120 `ceph_runner_probe()`/`ceph_runner_for()`（\"usable\" is defined as `ceph -s` succeeding, not merely the binary existing）；README.md:75 「預設 `--mode auto` 會逐台 node 經 ssh 偵測能力，再分層收集」、README.md:147-148 auto 的已知限制（挑第一台、逐台序列 ssh）。文章端：incident-bundle-runbook.mdx:136 只有「| `--mode` | `cephadm`、`rook` 或 `auto`。 |」一行，無任何 auto 行為說明。"
+  },
+  {
+   "what": "[Codex 逐項確認] Rook local/remote（--kube-mode、--kube-context）存在，文章完全沒提",
+   "severity": "high",
+   "evidence": "run/collect.sh:38-41 usage：`--kube-context CTX     kubectl context for the rook layer (default: none)` 與 `--kube-mode MODE       where the rook layer runs kubectl: remote (on an\\n                         inventory node, default) or local (this jump host)`；預設值 run/collect.sh:331 `kube_mode=remote`；驗證 run/collect.sh:443 `[[ \"$kube_mode\" == \"local\" || \"$kube_mode\" == \"remote\" ]] || die ...`；remote 時 kubectl 走 ssh：lib/collect-cluster-rook.sh:149 `ROOK_KUBECTL_ARGV=(ssh \"${sopts[@]}\" \"$ssh_target\" kubectl)`；測試 tests/test-collect.sh:522 「# --kube-mode local: rook layer uses the jump host's local kubectl (no ssh), not a node」、:531 檢查 `rook_source=local`。文章 mdx 全文無 kube-mode / kube-context 字樣。"
+  },
+  {
+   "what": "[Codex 逐項確認] external namespace 支援存在（--operator-namespace / ROOK_OPERATOR_NAMESPACE、external ceph+rook 混一份 inventory），文章完全沒提",
+   "severity": "high",
+   "evidence": "run/collect.sh:465 `rook_operator_namespace=${ROOK_OPERATOR_NAMESPACE:-rook-ceph}`；lib/collect-cluster-rook.sh:96-99 解析 `--operator-namespace`、:141 `[[ -n \"$operator_namespace\" ]] || operator_namespace=\"$namespace\"`、:187 operator pod 從 `$operator_namespace` 找；測試 tests/test-rook-collector.sh:210 `--namespace rook-ceph-external --operator-namespace rook-ceph`、:215 fail 訊息 \"external cluster operator logs were not collected from operator namespace\"；README.md:91-110 「## external ceph + rook（一份 inventory）」整節。文章只提到 ROOK_NAMESPACE（mdx:112），無 operator namespace 或 external 拓樸。"
+  },
+  {
+   "what": "[Codex 逐項確認] redaction 存在且文章有提，但文章漏掉 --redact/--no-redact 開關與現行遮蔽範圍（PEM 區塊、`key =` 金鑰材料、base64 blob、*.gz 解壓重遮、prometheus dump 排除）",
+   "severity": "medium",
+   "evidence": "開關：run/collect.sh:53-54 usage `--redact               redact sensitive-looking lines before packaging (default)` / `--no-redact            keep raw collected text without redaction`。範圍：lib/common.sh:171 `-----BEGIN[[:space:]].*PRIVATE[[:space:]]KEY-----` 多行 PEM、:179 `(password|secret|token|keyring|private([[:space:]_-]+)?key)`、:181 `(^|[^[:alnum:]])key[[:space:]]*[:=]`、:183 `[A-Za-z0-9+/]{38,}={1,2}`；gz 處理 lib/common.sh:201 `redact_gz_file()`；prometheus 排除 lib/bundle.sh:169-181（`-not -path \"$workdir/cluster/prometheus/*/*.json.gz\"`）。文章 mdx:288 只寫「它會遮蔽文字 artifact 中明顯含有 `password`、`secret`、`token`、`keyring`、`private key` 的整行，但這不是完整 DLP。」"
+  },
+  {
+   "what": "[Codex 逐項確認] SSH debug 存在（ssh 失敗時自動收 `ssh-debug/*.log`，含 -vvv 重試），文章完全沒提",
+   "severity": "medium",
+   "evidence": "lib/common.sh:57-93 `write_ssh_debug_log()`（`cmd=(ssh \"${sopts[@]}\" -vvv -o LogLevel=DEBUG3 \"$target\" true)` 寫入 `$workdir/ssh-debug/`）；觸發點：run/collect.sh:88（capability probe 失敗）、run/collect.sh:290-292（node ssh exit 255/124/137）、lib/collect-cluster-cephadm.sh:39-41（cluster ceph ssh 失敗）；測試 tests/test-collect.sh:46-47 斷言 archive 內有 `^ssh-debug/.*[.]log$`。文章全文無 ssh-debug。"
+  },
+  {
+   "what": "[Codex 逐項確認] progress 進度顯示與 --quiet 存在，文章完全沒提（含「stdout 只有 bundle: 一行」的機器可讀契約）",
+   "severity": "medium",
+   "evidence": "lib/common.sh:109-115 `progress()`（stderr、CEPH_INCIDENT_QUIET 抑制）；run/collect.sh:417-420 `--quiet) export CEPH_INCIDENT_QUIET=1`；逐條指令進度 lib/collect-cluster-cephadm.sh:179 `progress \"[$k/$total] ceph $command\"`；README.md:160 「執行時會把進度印到 **stderr**…**stdout 只會有最後一行 `bundle: <path>`**」；測試 tests/test-collect.sh:577 「# Progress: default-on goes to stderr; stdout stays just `bundle:`; --quiet silences it.」。文章全文無 progress/--quiet。"
+  },
+  {
+   "what": "[Codex 逐項確認] timeout 分層存在：--node-timeout（預設 600s）、dmesg/journal heavy timeout、無 timeout/gtimeout 時的警告、timeout-kill 的 # TRUNCATED 標記——文章只提單一 --timeout",
+   "severity": "high",
+   "evidence": "run/collect.sh:48 usage `--node-timeout SECONDS overall timeout for one node's full collection (default: 600)`；:47 `--timeout SECONDS      per-command / SSH-connect timeout (default: 20)`；heavy timeout lib/collect-node.sh:345-350（dmesg/journal 至少 120s）；無 timeout 警告 run/collect.sh:472-474 `WARNING: no 'timeout'/'gtimeout' found on this workstation...`；截斷標記 lib/common.sh:267-269 `# TRUNCATED: command timed out after %ss (exit %s)`；node 整輪逾時 run/collect.sh:295-299 寫 `SKIPPED: node collection timed out after %ss`。文章 mdx:138 只有「| `--timeout` | 每個 command 的 timeout 秒數。 |」，且範例用 `--timeout 60`（工具預設其實是 20）。"
+  },
+  {
+   "what": "[Codex 逐項確認] --prom-url Prometheus metrics dump 整層存在（--prom-job-regex/--prom-step/--prom-timeout、cluster/prometheus/<job>/<metric>.json.gz、dump-info.txt/index.txt/buildinfo/targets、budget 截斷、URL 帳密遮蔽、缺 curl/python3 → SKIPPED+exit 2），文章完全沒提",
+   "severity": "high",
+   "evidence": "run/collect.sh:42-46 usage（`--prom-url URL`…`--prom-timeout SECONDS overall time budget for the metrics dump (default: 600)`）；整個 lib/collect-prometheus.sh（:43-48 auto step `ceil(window/10000)`、min 15s；:51-60 `prom_mask_url` 遮 `user:***@`；:117-121 `prom_skip`；:265-272 budget 截斷寫 `TRUNCATED: budget %ss exceeded`；:293 `gzip -f -- \"$jobdir/$file\"`；:304-318 `dump-info.txt`）；README.md:117-143 「## Prometheus metrics dump（選用）」整節。文章全文無 prom 字樣。注意：README.md:142 仍寫「尚未對真 Prometheus 驗證（lab 機器備妥後補跑）」，與 2026-07-10 已完成真機驗證的進度不一致——README 本身也待更新。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] CONTENTS.md 人類可讀目錄（每個 artifact 的產生指令+exit code）一定會產生，文章的 bundle 結構圖漏列",
+   "severity": "high",
+   "evidence": "lib/bundle.sh:108-137 `write_catalog()`（`# Human-readable index of the bundle: what each file is, and the exact command (with exit code) that produced each captured artifact.`，輸出 `$workdir/CONTENTS.md`）；run/collect.sh:571 無條件呼叫 `write_catalog \"$workdir\"`；測試 tests/test-collect.sh:250-255。文章 mdx:184-203 bundle 結構列 README-FIRST.txt/summary.txt/environment.txt/manifest.jsonl/errors.log/redactions.log/cluster/nodes，無 CONTENTS.md，也無 cluster/prometheus/ 與 ssh-debug/。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] SSH host key 政策與 known_hosts 前置需求：BatchMode=yes、StrictHostKeyChecking=accept-new 預設、--no-trust-ssh-host-key 開關",
+   "severity": "medium",
+   "evidence": "lib/common.sh:33-44 `ssh_base_opts()`（`-o BatchMode=yes`…`if [[ \"${CEPH_INCIDENT_TRUST_SSH_HOST_KEY:-1}\" == \"1\" ]]; then printf '%s\\n' -o StrictHostKeyChecking=accept-new`）；run/collect.sh:50-52 usage `--trust-ssh-host-key   accept new SSH host keys automatically (default)` / `--no-trust-ssh-host-key`；README.md:20 「工具的 SSH 都用 `BatchMode=yes`(不互動),所以**第一次從一台新跳板機執行前**,跳板機的 `known_hosts` 必須已經有所有目標 node 的 host key」。文章 mdx:79-87 只教 `ssh ... hostname` 測連線，無 known_hosts/BatchMode/host-key 開關。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] verify 失敗時的證據保全：workdir 保留不打包（exit 1）、打包後驗證失敗會刪 tar.gz 留 workdir；另有 --keep-workdir、--out、Ctrl-C 立即中止（exit 130）",
+   "severity": "medium",
+   "evidence": "run/collect.sh:582-589（`CLEANUP_KEEP=1`…`printf 'VERIFY FAILED: workdir kept at %s (not packaged) — review errors.log\\n'`）；:599-605（`rm -f -- \"$bundle\"`…`VERIFY FAILED on packaged bundle; removed it, workdir kept at %s`）；usage :56 `--keep-workdir         keep temporary extracted workdir for debugging`、:36 `--out DIR              output dir (default: experiments/ceph-incident-bundle/results)`；lib/bundle.sh:153-161 `on_interrupt()`（`exit 130`，註解「Ctrl-C / SIGTERM: stop NOW.」）。README.md:215 「驗證失敗時不會打包可分享的 `.tar.gz`，而是**保留 workdir**（印出路徑）」。文章 exit code 表（mdx:176）只寫「檢查 inventory、SSH key、mode、bundle 結構或 forbidden path」。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] verify-bundle 的兩道新把關：檔名黑名單擴充到 *.pem/*.key/*.crt/*.pfx/*.p12，以及內容層級的殘留金鑰檢查",
+   "severity": "medium",
+   "evidence": "lib/verify-bundle.sh:27 `*keyring*|*.ssh*|*id_ed25519*|*private_key*|*.pem|*.key|*.crt|*.pfx|*.p12)`；:35-44 `verify_no_secret_content()`（grep `-----BEGIN[ A-Za-z]*PRIVATE KEY-----` 與 `^[[:space:]]*key[[:space:]]*=[[:space:]]*[A-Za-z0-9+/]{20,}={0,2}`，注解「Defense-in-depth: even if redaction missed something」）。文章 mdx:289 只寫「它會在驗證階段擋掉路徑中含有 `keyring`、`.ssh`、`id_ed25519`、`private_key` 的檔案。」——仍為真但已是子集。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] SEED_HOST 變成選填（auto 自動挑第一台 ceph 連得上的 node）；HOSTS 壞格式容錯（記 errors.log、rc=2、不中止）；node archive 完整性檢查（缺 manifest.jsonl 視為失敗）",
+   "severity": "medium",
+   "evidence": "README.md:69 「`SEED_HOST`：**選填**。手動指定 cluster-level `ceph` command 要在哪台跑;不填則 `auto` 會自動挑第一台「ceph 連得上」的 node」；run/collect.sh:499-504（`append_error \"$workdir\" \"skipped malformed HOSTS entry: $entry\"; rc=2; continue`）；run/collect.sh:304-307（`SKIPPED: node archive from %s is incomplete (no manifest.jsonl); treated as failure`）。文章 mdx:111 表格寫 SEED_HOST 為「cephadm mode 用來跑 cluster-level `ceph` command 的 node」，未提選填與自動挑選。"
+  },
+  {
+   "what": "[工具有/文章沒提·其他] 2026-06-30 真機 multi-fault 驗證矩陣（OSD down / MON down / node 不可達 / seed 不可達）已存在於 README，比文章的單次健康收集實測新",
+   "severity": "low",
+   "evidence": "README.md:232-244 「## Lab 驗證（multi-fault）」表格（「| OSD down | 停 osd.0 | 收到 `OSD_DOWN`（text+json）| 0 |」等 5 列）與 :244 「詳見 `docs/superpowers/reviews/2026-06-30-lab-validation.md`」。文章 mdx:295-353 只有 2026-06-29 健康狀態一次實測。另 README.md:213 明確化 exit 0 語意：「OSD/MON down 這類**叢集故障本身**會被收進 bundle，不算收集失敗，仍是 `0`」——文章 exit code 表沒講這個。"
+  },
+  {
+   "what": "[文章與現行為不符 #1] 「Rook mode 會在本機跑 kubectl」已不是預設行為：現行預設 --kube-mode remote，kubectl 在第一台有 kubectl 的 inventory node 上經 ssh 執行；本機只是 --kube-mode local 的選項",
+   "severity": "high",
+   "evidence": "文章 mdx:51 「Rook mode 會在本機跑 `kubectl ...`，有 toolbox Pod 時才進 toolbox 跑 read-only 的 `ceph status`。」；mdx:64 流程圖「`-- rook: local kubectl + optional toolbox ceph status」；mdx:273 「Rook mode 會先檢查本機是否有 `kubectl`，再確認 namespace 存在。」。工具端：run/collect.sh:331 `kube_mode=remote`（預設）；usage :39-41 「--kube-mode MODE       where the rook layer runs kubectl: remote (on an\\n                         inventory node, default) or local (this jump host)」；lib/collect-cluster-rook.sh:159 本機 kubectl 檢查僅在 `[[ -z \"$ssh_target\" ]]` 時做（註解 :158 「(When kubectl is remote we already probed it exists, so skip the local check.)」）。"
+  },
+  {
+   "what": "[文章與現行為不符 #2] 「cephadm mode 會透過 seed node 跑 sudo cephadm shell -- ceph ...」已過時：現行 runner 依連線性自動挑 direct ceph → sudo -n ceph → sudo -n cephadm shell，即使指定 --seed 也一樣",
+   "severity": "high",
+   "evidence": "文章 mdx:51 「cephadm mode 會透過 seed node 跑 `sudo cephadm shell -- ceph ...`」；mdx:224 「它會在 seed node 上透過 `sudo cephadm shell -- ceph ...` 收集 JSON 與文字版狀態。」。工具端：lib/collect-cluster-cephadm.sh:10-20 `ceph_runner_argv()`（「direct  -> ceph                          (fast: no container per command)」「sudo    -> sudo -n ceph」「cephadm -> sudo -n cephadm shell -- ceph (default; spins a container each call)」）；run/collect.sh:109-113 `for m in direct sudo cephadm; do`；:155-156 註解「explicit --seed pins the cluster-ceph source; the runner is still chosen by connectivity (so direct ceph is preferred on the seed too).」；選到的 runner 記錄在 environment.txt `ceph_runner=`（run/collect.sh:240）。"
+  },
+  {
+   "what": "[文章與現行為不符 #3] 「單一 log 檔案預設只複製 1 MiB 以下的檔案」已過時：超過 cap 的非壓縮 log 現在會收 tail 並附 .TRUNCATED 標記；過大的 *.gz 只記錄不收",
+   "severity": "high",
+   "evidence": "文章 mdx:264 「未跳過時，單一 log 檔案預設只複製 1 MiB 以下的檔案。」。工具端 lib/collect-node.sh:229-245：`elif [[ \"$source\" == *.gz ]]; then`（寫 `note=oversized compressed log skipped (gzip tail is not usable)` 到 `$dest.TRUNCATED`）與 else 分支註解「Oversized: keep the most recent cap_bytes (tail) instead of dropping the file silently」+ `node_tail_file \"$source\" \"$cap_bytes\" \"$dest\"` 並寫 `note=captured trailing bytes only (file exceeded cap)`；cap 常數 :210 `local cap_bytes=${CEPH_INCIDENT_LOG_FILE_CAP_BYTES:-1048576}`；README.md:154 「大型 Ceph log…不會被靜默丟棄，而是收最後一段（tail）並附 `<檔名>.TRUNCATED`」。"
+  },
+  {
+   "what": "[文章與現行為不符 #4] 「macOS / BSD tar 在打包時可能印出 extended header warning」的實測觀察已被工具修掉：bsdtar 偵測 + --no-xattrs + COPYFILE_DISABLE=1 在源頭去除 xattr",
+   "severity": "medium",
+   "evidence": "文章 mdx:352 「macOS / BSD tar 在打包時可能印出 extended header warning；這次實測它不影響 gzip integrity 或 verifier 結果。」。工具端 run/collect.sh:278-282 「# macOS bsdtar embeds com.apple.* xattr headers that make the remote GNU tar\\n  # print \"Ignoring unknown extended header keyword\" noise; strip them at source.」+ `if tar --version 2>&1 | grep -qi 'bsdtar'; then noxattrs='--no-xattrs'`；:286 `COPYFILE_DISABLE=1 tar $noxattrs -cf - ...`；:594 `COPYFILE_DISABLE=1 tar -czf \"$bundle\" ...`。"
+  },
+  {
+   "what": "[文章與現行為不符 #5] environment.txt 的欄位描述不完整：現行還會附 ceph_source / ceph_runner / rook_source（auto 偵測結果），有 --prom-url 時再加 prom_url / prom_jobs",
+   "severity": "medium",
+   "evidence": "文章 mdx:211 「| `environment.txt` | 收集時間、script 所在 git commit、mode、seed、時間窗。 |」。工具端 run/collect.sh:238-242 `printf 'ceph_source=%s\\n' ...; printf 'ceph_runner=%s\\n' ...; printf 'rook_source=%s\\n' ...` >>environment.txt；lib/collect-prometheus.sh:320-323 `printf 'prom_url=%s\\n' ...; printf 'prom_jobs=%s\\n' ...` >>environment.txt；README.md:201 「`environment.txt`：收集時間、mode、seed、git commit,以及選到的 `ceph_source`/`ceph_runner`/`rook_source`」。"
+  },
+  {
+   "what": "[文章仍正確] 核心流程與收集清單全部對得上：單一入口 + lib 經 SSH 串流、verify→tar→verify、exit code 0/2/1 語意、cephadm 20 個 JSON + 4 個 text artifact、crash info 上限 10 筆+安全檔名、node-level 清單（含 timesyncd 一等公民）、Rook 收集清單、inventory 格式、--skip-logs 語意、redaction 存在且非完整 DLP、results/*.tar.gz 被 ignore",
+   "severity": "info",
+   "evidence": "串流：run/collect.sh:286 `tar $noxattrs -cf - -C \"$COLLECT_ROOT\" lib/common.sh lib/collect-node.sh | gzip -c | \"${ssh_cmd[@]}\"`（對 mdx:53）。verify 兩段：run/collect.sh:579 與 :596 各跑一次 `\"$COLLECT_ROOT/lib/verify-bundle.sh\"`，:608 `printf 'bundle: %s\\n'` 在最後（對 mdx:55）。exit code：usage :63 「0 complete, 2 partial collection failure with bundle produced, 1 usage/config/verify failure」（對 mdx:170-178）。cephadm 清單：lib/collect-cluster-cephadm.sh:142-163 json_specs 20 項與 mdx:230-246 逐一相同；:165-170 text_specs=status/health-detail/osd-tree/orch-ps（對 mdx:247）；crash 上限 :63 `head -n 10`、安全檔名 :80-88（對 mdx:247）。node-level：lib/collect-node.sh:351-431 與 mdx:255-265 相符（hostname/uname/uptime/free/iostat/df/lsblk/pvs/vgs/lvs/ip addr/dmesg -T/systemctl --failed/journalctl -u 'ceph*'/chronyc/ntpq/timedatectl×3/systemd-timesyncd status+journal+conf/podman/docker/cephadm ls/var-lib-ceph 排除 keyring — :263 `\\( -iname '*keyring*' -o -iname '*private_key*' -o -path '*/.ssh/*' \\) -prune`）。Rook 清單：lib/collect-cluster-rook.sh:173-205（pods -o wide、events --sort-by=.lastTimestamp、cephclusters/cephblockpools/cephfilesystems/cephobjectstores、operator log、toolbox `ceph status`，對 mdx:275-280）。inventory：inventory/ceph-lab.example.env 與 mdx:93-104 完全一致；ROOK_NAMESPACE 預設 rook-ceph（run/collect.sh:464，對 mdx:112）。--skip-logs：lib/collect-node.sh:438-439（對 mdx:139/291）。redaction 非 DLP：lib/common.sh:164-168 註解「Best-effort redaction (NOT a complete DLP)」（對 mdx:293）。ignore：experiments/ceph-incident-bundle/.gitignore `/results/*`、`/*.tar.gz`（對 mdx:354）。--seed 覆蓋 inventory：run/collect.sh:466-470（對 mdx:135）。summary.txt 欄位：lib/bundle.sh:59-68 與 mdx:336-345 相同。"
+  }
+ ],
+ "summary": "Codex 提的 8 項能力（auto detection、Rook local/remote、external namespace、redaction 開關與擴充、SSH debug、progress/--quiet、雙層 timeout、--prom-url Prometheus dump）全部在工具端確認存在（各附 file:line），文章 incident-bundle-runbook.mdx 除 redaction 有部分著墨外全數未涵蓋。文章另有 5 處與現行為不符：(1) Rook 層預設已改為 remote kubectl（在 inventory node 上經 ssh 跑），「本機跑 kubectl」只剩 --kube-mode local；(2) cephadm 層不再固定走 sudo cephadm shell，改為 direct ceph → sudo -n ceph → cephadm shell 的連線性擇優（--seed 也適用）；(3) 超過 1 MiB 的 log 不再直接不收，改收 tail + .TRUNCATED；(4) BSD tar extended header warning 已在源頭用 --no-xattrs/COPYFILE_DISABLE 修掉；(5) environment.txt 現含 ceph_source/ceph_runner/rook_source（+prom 欄位）。文章仍正確的核心：入口/串流/verify→tar→verify 流程、exit code 0/2/1、cephadm 20 JSON+4 text 清單、crash 上限 10、node-level 與 Rook 收集清單、inventory 格式、--skip-logs、redaction 非 DLP 定位、results ignore。v3 runbook 需涵蓋的能力清單：(a) --mode auto 預設與能力探測/第一台選源/auto 限制（大 inventory 建議 --seed 跳過探測）；(b) ceph runner 三階擇優與 environment.txt 的 ceph_runner 記錄；(c) --kube-mode remote|local + --kube-context；(d) --operator-namespace / ROOK_OPERATOR_NAMESPACE 與 external ceph+rook 單一 inventory 拓樸；(e) --prom-url/--prom-job-regex/--prom-step/--prom-timeout 與 cluster/prometheus/ 結構、budget 截斷、credential 遮蔽、不 redact metrics 的理由；(f) --timeout(20) vs --node-timeout(600) 分層、heavy timeout、無 timeout/gtimeout 警告、# TRUNCATED 標記；(g) progress + --quiet 與「stdout 只有 bundle:」契約；(h) ssh-debug/ 自動診斷 log；(i) SSH BatchMode/known_hosts 前置、--no-trust-ssh-host-key；(j) CONTENTS.md、大 log tail+.TRUNCATED、oversized gz 只記錄；(k) verify 檔名黑名單擴充 + 內容級金鑰檢查、verify 失敗保留 workdir 不打包、打包後驗證失敗刪檔留 workdir；(l) --out/--keep-workdir/--redact/--no-redact、Ctrl-C 立即中止 exit 130；(m) SEED_HOST 選填、HOSTS 壞格式容錯、node archive 缺 manifest 視為失敗；(n) exit 0 語意澄清（叢集故障本身不算收集失敗）與 2026-06-30 multi-fault 驗證矩陣。附帶發現：README.md:142 仍寫 --prom-url「尚未對真 Prometheus 驗證」，與 2026-07-10 已完成真機驗證的進度不符，v3 時 README 該行也應一併更新。"
+}

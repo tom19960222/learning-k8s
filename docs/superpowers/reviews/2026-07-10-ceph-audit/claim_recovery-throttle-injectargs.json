@@ -1,0 +1,60 @@
+{
+ "claim_id": "recovery-throttle-injectargs",
+ "verdict": "confirmed",
+ "evidence": [
+  {
+   "source": "next-site/content/ceph/features/recovery-throttle-runtime.mdx:27",
+   "quote": "**Squid 預設 mClock scheduler 會把這次 inject rollback。** `OSD::handle_conf_change` 內部呼叫 `maybe_override_options_for_qos`，會以 mon command `config rm` 把改動撤掉並發 cluster log warning。要實際生效必須先 `ceph config set osd osd_mclock_override_recovery_settings true`。"
+  },
+  {
+   "source": "next-site/content/ceph/features/recovery-throttle-runtime.mdx:206",
+   "quote": "| mClock rollback | `maybe_override_options_for_qos()` | `config set` 或 `injectargs` 看似成功，但 cluster log 有 `did not take effect`，`ceph config dump` 查不到 key |"
+  },
+  {
+   "source": "next-site/content/ceph/features/recovery-throttle-runtime.mdx:341-344（danger Callout）",
+   "quote": "- 命令會回 success（因為 config 解析成功）\n- `ceph -s` 沒有錯誤\n- 但 mon db 端會被 `config rm` 撤掉，cluster log 留一條 warn\n- 下次 OSD 重啟、或別人 query 都會看到舊預設"
+  },
+  {
+   "source": "next-site/content/ceph/features/recovery-throttle-runtime.mdx:359（自相矛盾處：對照表其實已承認 cct 端值不會被撤）",
+   "quote": "| mClock rollback 結果 | `config rm` 對 mon db 是 no-op；cct 端值還在直到 OSD 重啟 | mon db 真被寫入、再被 `config rm` 移除；OSD cct 短暫變動隨即還原 |"
+  },
+  {
+   "source": "ceph/src/common/config.cc:851（injectargs 寫入 CONF_OVERRIDE 層）",
+   "quote": "int r = parse_option(values, tracker, args, i, oss, CONF_OVERRIDE);"
+  },
+  {
+   "source": "ceph/src/common/config.h:30-38（層級 enum：CONF_OVERRIDE 高於 CONF_MON）",
+   "quote": "enum {\n  CONF_DEFAULT,\n  CONF_MON,\n  CONF_FILE,\n  CONF_ENV,\n  CONF_CMDLINE,\n  CONF_OVERRIDE,\n  CONF_FINAL\n};"
+  },
+  {
+   "source": "ceph/src/common/config_values.cc:60-62（讀值取最高優先層）",
+   "quote": "// use highest-priority value available (see CONF_*)\n    if (level < 0) {\n      return {p->second.rbegin()->second, true};"
+  },
+  {
+   "source": "ceph/src/osd/OSD.cc:10229-10231（rollback 路徑的唯一動作＝對 mon 發 config rm，沒有改本機 conf）",
+   "quote": "dout(1) << __func__ << \" Removing Key: \" << key\n                    << \" for \" << osd << \" from Mon db\" << dendl;\n            monc->start_mon_command(vcmd, {}, nullptr, nullptr, nullptr);"
+  },
+  {
+   "source": "ceph/src/osd/OSD.cc:10234-10239（rollback 路徑另一動作＝clog warning；函式內對 recovery key 無任何本機 set/rm）",
+   "quote": "// Raise a cluster warning indicating that the changes did not\n          // take effect and indicate the reason why.\n          clog->warn() << \"Change to \" << key << \" on osd.\"\n                       << std::to_string(whoami) << \" did not take effect.\""
+  },
+  {
+   "source": "ceph/src/common/config.cc:308（mon push 只寫 CONF_MON 層）",
+   "quote": "int r = _set_val(values, tracker, i.second, *o, CONF_MON, &err);"
+  },
+  {
+   "source": "ceph/src/common/config.cc:334（mon push 清值也只清 CONF_MON 層，動不到 CONF_OVERRIDE）",
+   "quote": "values.rm_val(name, CONF_MON);"
+  },
+  {
+   "source": "ceph/src/common/config_values.cc:24-26（低層寫入蓋不掉高層值）",
+   "quote": "if (p->second.rbegin()->first > level) {\n      // there was a higher priority value; no effect\n      return SET_NO_EFFECT;"
+  },
+  {
+   "source": "ceph/src/common/config.cc:77（CONF_OVERRIDE 的官方註解）",
+   "quote": "case CONF_OVERRIDE: return \"override\"; // injectargs or 'config set' at runtime"
+  }
+ ],
+ "implication": "這頁不能原樣保留，需改寫（非 archive——injectargs 路徑、_recover_now gate、config set ping-pong 等其餘內容仍有價值且正確）。必改點：(1) TL;DR 第三點（line 27）與 danger Callout（line 338-347）錯誤宣稱「mClock 會把 injectargs rollback、必須先開 override 才實際生效」——實際上 injectargs 寫入最高優先層 CONF_OVERRIDE，mClock 防寫只對 mon config db 發 config rm（對 injectargs 是 no-op）＋發 clog warning，本機 cct->_conf 完全不動、mon push 的 set_mon_vals 也只管 CONF_MON 層，所以注入值在該 OSD 上「會生效」直到重啟；(2) line 206 表格把 injectargs 與 config set 混為一談的「did not take effect」描述要拆開；(3) line 359 對照表其實已寫對（「cct 端值還在直到 OSD 重啟」），改寫可以此列為軸心，把 injectargs（生效但 ephemeral、warning 訊息誤導）vs config set（真被 rollback 還原）的差異講清楚；clog 的「did not take effect」在 injectargs 情境是原始碼自身的誤導文案，值得當 source-level quirk 專門點出。建議改寫後在真 lab 用 `ceph daemon osd.N config show`（值會顯示 level=override）+ 觀察 recovery 併發數做一次真機驗證再收稿。",
+ "notes": "Codex 指控成立（verdict=confirmed=文章錯）。關鍵鏈：injectargs → parse_injectargs(CONF_OVERRIDE)（config.cc:851）→ get_value 取最高層（config_values.cc:62）→ OSD::maybe_override_options_for_qos 防寫分支（OSD.cc:10192-10241）只有 monc->start_mon_command(\"config rm\") 與 clog->warn，無任何本機 conf 變更 → mon 回推的 set_mon_vals 僅操作 CONF_MON（config.cc:308,334），無法移除 CONF_OVERRIDE。注意文章內部自相矛盾：line 359 已正確寫出「cct 端值還在直到 OSD 重啟」，但 TL;DR/Callout/§206 卻說沒生效。另 config set 路徑的 rollback 描述（值進 mon db 後被 config rm 真移除、cct 值隨 push 還原為 default）與原始碼一致，該部分不需改。附帶：osd.yaml.in 對 osd_recovery_max_active 的 note「This setting is automatically reset when the mClock scheduler is used」指的是 boot-up 時 set_val_default 分支（OSD.cc:10242-10265），不影響上述 runtime 結論。文章引用的 OSD.cc:10171-10241 程式碼片段本身與 v19.2.3 原文相符（僅註解改寫），錯的是對機制範圍的詮釋。"
+}

@@ -1,0 +1,56 @@
+{
+ "claim_id": "rbd-csi-datapath",
+ "verdict": "confirmed",
+ "evidence": [
+  {
+   "source": "next-site/content/ceph/features/rbd-and-csi.mdx:112-121（IO 流程圖）",
+   "quote": "guest kernel → /dev/rbd0\n              │\n              ▼\nkernel rbd module 或 rbd-nbd + librbd\n   ├─ chunk_index = 100 MiB / 4 MiB = 25\n...\nlibrados → Objecter → primary OSD (用 CRUSH 算)"
+  },
+  {
+   "source": "next-site/content/ceph/features/rbd-and-csi.mdx:127",
+   "quote": "真正切 object 的地方在 `ImageRequest`：先把 image-level extents 丟給 `area_to_object_extents()`，後者再呼叫 generic `Striper::file_to_extents()`。"
+  },
+  {
+   "source": "next-site/content/ceph/features/rbd-and-csi.mdx:314（文章自己承認 krbd 是 kernel 實作，與上面的 librados→Objecter 漏斗圖自相矛盾）",
+   "quote": "**kernel `rbd` module**：由 kernel 實作 RBD client path，性能好但需要 host kernel 支援對應 feature"
+  },
+  {
+   "source": "next-site/content/ceph/features/rbd-and-csi.mdx:301-305（CSI 流程圖，volumeMode 混淆處）",
+   "quote": "├─ NodeStage: map RBD image 成 /dev/rbdN (用 kernel rbd module 或 rbd-nbd)\n   └─ NodePublish: bind-mount /dev/rbdN 進 Pod 的 volume path\n        │\n        ▼\n   Pod 看到 mounted filesystem，可以 read/write"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/rbd_util.go:54-55（CSI 預設 mounter 是 krbd，不是 rbd-nbd/librbd）",
+   "quote": "rbdDefaultMounter        = \"rbd\"\n\trbdNbdMounter            = \"rbd-nbd\""
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:213-214",
+   "quote": "if rv.Mounter, ok = req.GetVolumeContext()[\"mounter\"]; !ok {\n\t\t\trv.Mounter = rbdDefaultMounter\n\t\t}"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:253-261（krbd 不支援 feature 時預設直接報錯，要顯式 tryOtherMounters:true 才 fallback 到 rbd-nbd）",
+   "quote": "if rv.Mounter == rbdDefaultMounter && !isFeatureExist {\n\t\tif !parseBoolOption(ctx, req.GetVolumeContext(), tryOtherMounters, false) {\n\t\t\tlog.ErrorLog(ctx, \"unsupported krbd Feature, set `tryOtherMounters:true` or fix krbd driver\")\n\t\t\terr = errors.New(\"unsupported krbd Feature\")\n\n\t\t\treturn nil, status.Error(codes.Internal, err.Error())\n\t\t}\n\t\t// fallback to rbd-nbd,\n\t\trv.Mounter = rbdNbdMounter"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/rbd_attach.go:399（預設 map 走 --device-type krbd → /dev/rbdX）",
+   "quote": "cmdArgs = append(cmdArgs, \"--device-type\", accessTypeKRbd, \"--options\", \"noudev\")"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:840-844（NodeStage：Block mode 是 bind device 檔；Filesystem mode 是 mkfs+FormatAndMount 到 stagingPath——不是文章寫的 NodePublish 才處理）",
+   "quote": "if isBlock {\n\t\topt = append(opt, \"bind\")\n\t\terr = diskMounter.MountSensitiveWithoutSystemd(devicePath, stagingPath, fsType, opt, nil)\n\t} else {\n\t\terr = diskMounter.FormatAndMount(devicePath, stagingPath, fsType, opt)\n\t}"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:875（NodePublish bind-mount 的來源是 stagingPath，不是 /dev/rbdN）",
+   "quote": "if err := util.Mount(ns.Mounter, stagingPath, targetPath, fsType, mountOptions); err != nil {"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:896-897（Filesystem vs Block 在 target path 也分流：filesystem 建目錄、block 建檔案）",
+   "quote": "// filesystem volume needs a directory\n\tif !isBlock {"
+  },
+  {
+   "source": "ceph-csi/internal/rbd/nodeserver.go:800（只有非 Block 才 mkfs）",
+   "quote": "if existingFormat == \"\" && !staticVol && !readOnly && !isBlock {"
+  }
+ ],
+ "implication": "這頁不必整頁 archive——RADOS object layout、feature dependency、cls_rbd 等段落經查與 source 相符——但兩處必須改寫：(1) librbd IO 流程圖（mdx:108-127）要拆成兩條 data path：userspace（rbd-nbd/QEMU librbd → ImageRequest.cc → librados/Objecter）與 kernel（krbd → kernel 內自行 striping，不經過文章引用的任何 librbd 碼），並明講 ceph-csi 預設 mounter=krbd（rbd_util.go:54），所以預設部署下文章引的 ImageRequest.cc/Utils.cc 根本不在 data path 上；(2) CSI 流程 step 6 與 Day 18 段（mdx:300-305、373-378）要按 volumeMode 分寫：Filesystem mode = NodeStage 做 mkfs+mount 到 stagingPath、NodePublish 把 stagingPath bind-mount 進 Pod（Pod 看到 filesystem）；Block mode = bind-mount device 檔（Pod 看到 raw device，KubeVirt VM disk 即此路徑）。順帶可補 tryOtherMounters fallback（nodeserver.go:253-261），正好接上文章已有的「krbd 不支援 feature」地雷段。",
+ "notes": "Codex 兩項指控都有實質根據，但第一項的強度要打折：文章並非完全不分 krbd/librbd——mdx:314-315 對兩種 mounter 的文字描述是正確的，mdx:228 也正確指出 mapping client 可能是 kernel rbd 或 rbd-nbd。實質錯誤集中在：(a) IO 流程圖把 krbd 也導進 librados→Objecter（僅 userspace 路徑成立），且「真正切 object 的地方在 ImageRequest」寫成通用敘述；(b) 文章從未提及 CSI 預設 mounter 是 krbd，讀者會誤以為預設 data path 走文章詳解的 librbd 碼；(c) NodePublish 描述「bind-mount /dev/rbdN 進 Pod」+「Pod 看到 mounted filesystem」與 source 兩種 volumeMode 的實際行為都不符（Filesystem mode 在 NodeStage 就 mkfs+mount，NodePublish bind 的是 stagingPath；Block mode 才 bind device 檔但那時 Pod 看到的是 raw device）。文章全篇僅 mdx:308 提過一次 volumeMode 字樣，未做任何 Filesystem/Block 區分。判 confirmed 是按本任務給的操作定義（文章有實質混淆＝confirmed）；若按字面嚴格度應算 partial-leaning-confirmed。"
+}

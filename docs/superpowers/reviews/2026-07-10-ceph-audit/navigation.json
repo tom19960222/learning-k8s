@@ -1,0 +1,104 @@
+{
+ "learning_path_coverage": "10/24 slugs（41.7%）被至少一條 learning path 涵蓋。出處：next-site/lib/projects.ts:340-364（learningPaths：beginner 3 條目、intermediate 5、advanced 9，slug 聯集=10）；24 篇 features 清單在 projects.ts:314，與 content/ceph/features/ 下 24 個 .mdx 一一對應。未涵蓋的 14 篇中，featureGroups 的「OSD 維運命令」組 0/2、「監控與告警」組 1/7（只有 slow-ops-and-bluestore-alerts 在 advanced，projects.ts:359）、「故障偵測與恢復」組 2/6（只有 osd-flapping、pg-health-states）。",
+ "covered_slugs": [
+  "architecture",
+  "rbd-and-csi",
+  "crush-and-placement",
+  "crush-straw-straw2",
+  "osd-and-bluestore",
+  "mclock-osd-scheduler",
+  "bluestore-deep-dive",
+  "osd-flapping",
+  "pg-health-states",
+  "slow-ops-and-bluestore-alerts"
+ ],
+ "uncovered_slugs": [
+  "pool-pgnum-pgpnum",
+  "recovery-throttle-runtime",
+  "mon-clock-skew-detection",
+  "cluster-time-skew-impact",
+  "clock-skew-magnitude-ladder",
+  "mon-quorum-loss-impact",
+  "osd-ok-to-stop",
+  "osd-safe-to-destroy",
+  "prometheus-alert-design",
+  "prometheus-alert-testing",
+  "prometheus-alert-real-lab-findings",
+  "prometheus-alert-real-cluster",
+  "mon-quorum-detection-blind-spot",
+  "incident-bundle-runbook"
+ ],
+ "cycles": [
+  "cluster-time-skew-impact -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "crush-and-placement -> osd-and-bluestore -> osd-flapping -> crush-and-placement",
+  "mon-quorum-detection-blind-spot -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot",
+  "prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> prometheus-alert-design",
+  "clock-skew-magnitude-ladder -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> clock-skew-magnitude-ladder",
+  "crush-and-placement -> pool-pgnum-pgpnum -> osd-and-bluestore -> osd-flapping -> crush-and-placement",
+  "prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> slow-ops-and-bluestore-alerts -> prometheus-alert-design",
+  "crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> osd-and-bluestore -> osd-flapping -> crush-and-placement",
+  "mon-clock-skew-detection -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection",
+  "cluster-time-skew-impact -> osd-flapping -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "mon-clock-skew-detection -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection",
+  "mon-clock-skew-detection -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection",
+  "cluster-time-skew-impact -> osd-flapping -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "mon-clock-skew-detection -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection",
+  "cluster-time-skew-impact -> osd-flapping -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> osd-and-bluestore -> bluestore-deep-dive",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> osd-and-bluestore -> bluestore-deep-dive",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> osd-and-bluestore -> bluestore-deep-dive",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> pg-health-states -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> pool-pgnum-pgpnum -> osd-and-bluestore -> bluestore-deep-dive",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> osd-and-bluestore -> bluestore-deep-dive",
+  "cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> pg-health-states -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact",
+  "bluestore-deep-dive -> slow-ops-and-bluestore-alerts -> prometheus-alert-design -> prometheus-alert-testing -> prometheus-alert-real-lab-findings -> mon-quorum-detection-blind-spot -> mon-quorum-loss-impact -> mon-clock-skew-detection -> cluster-time-skew-impact -> osd-flapping -> crush-and-placement -> crush-straw-straw2 -> pool-pgnum-pgpnum -> osd-and-bluestore -> bluestore-deep-dive"
+ ],
+ "prerequisite_declarations": [
+  {
+   "slug": "bluestore-deep-dive",
+   "declares": "唯一有正式 Callout 的頁。bluestore-deep-dive.mdx:18-19：「<Callout type=\"info\" title=\"前置閱讀\">」「本頁假設你已讀過 [osd-and-bluestore](./osd-and-bluestore) 的 OSD daemon 大致結構，並對 `ObjectStore` 抽象、PG、RADOS write op flow 有印象。」另 :16 敘明「這頁不重複講「BlueStore 是 OSD backend」這種定義（[osd-and-bluestore](./osd-and-bluestore) 已經建立過骨架了）」。→ 前提：osd-and-bluestore"
+  },
+  {
+   "slug": "clock-skew-magnitude-ladder",
+   "declares": "開頭敘事接續宣告。clock-skew-magnitude-ladder.mdx:9：「[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把毫秒級的差距攤開過了，結論是「沒有全域的 50ms 規則」。這頁把刻度往上拉」。→ 前提：cluster-time-skew-impact"
+  },
+  {
+   "slug": "prometheus-alert-testing",
+   "declares": "開頭「緣起」宣告。prometheus-alert-testing.mdx:9：「[Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design) 那頁不是小修小補，它做了幾個**很強的宣稱**」。→ 前提：prometheus-alert-design"
+  },
+  {
+   "slug": "prometheus-alert-real-cluster",
+   "declares": "開頭「結論先講」宣告兩個前置頁。prometheus-alert-real-cluster.mdx:9：「把 [Prometheus alert 設計](./prometheus-alert-design) 那套搬上一個真的 cephadm ceph v19.2.3 叢集」；:20：「[Alert 測試計劃](./prometheus-alert-testing) 那頁用四層測試（promtool/amtool/live/真 ceph）把整套設計逐條驗過」。→ 前提：prometheus-alert-design、prometheus-alert-testing"
+  },
+  {
+   "slug": "mon-quorum-detection-blind-spot",
+   "declares": "開頭場景宣告兩個前置頁。mon-quorum-detection-blind-spot.mdx:9：「你照 [Prometheus alert 補強](./prometheus-alert-design) 設好 `CephMonQuorumLost`……[client I/O 開始出問題](./mon-quorum-loss-impact)、新 pod 掛不上 volume——但你的 pager **一聲都沒響**」。→ 前提：prometheus-alert-design、mon-quorum-loss-impact"
+  },
+  {
+   "slug": "prometheus-alert-design",
+   "declares": "宣告的是環境前提、非頁面前提。prometheus-alert-design.mdx:9：「假設你已經套用 ceph v19.2.3 內建的 `ceph-mixin/prometheus_alerts.yml`——`CephHealthError`、`CephHealthWarning`……這些預設 rule 都在。」"
+  },
+  {
+   "slug": "crush-straw-straw2",
+   "declares": "「先看」建議，但放在文末「接下來 / 相關頁面」段（:319），不在開頭。crush-straw-straw2.mdx:321：「- [CRUSH 與 Placement](/ceph/features/crush-and-placement) — 先看 object / PG / CRUSHMap rule 的整體 placement 流程。」→ 前提：crush-and-placement"
+  },
+  {
+   "slug": "mon-clock-skew-detection",
+   "declares": "「前提」字樣但放在文末「相關頁面 / 延伸閱讀」Callout（:820-822），不在開頭。mon-clock-skew-detection.mdx:823：「- [Ceph — 整體架構](./architecture) — MON Paxos quorum 是 timecheck 跑得起來的前提；leader / peon 角色定義」。→ 前提：architecture"
+  },
+  {
+   "slug": "osd-safe-to-destroy",
+   "declares": "隱性前提（無連結、無「先讀」字樣）。osd-safe-to-destroy.mdx:9：「`ok-to-stop` 回答的是「現在 stop 這顆 daemon、PG 還活著嗎」。`safe-to-destroy` 回答的是更激烈的問題」——開頭直接以 ok-to-stop 頁的結論當已知。→ 隱性前提：osd-ok-to-stop"
+  }
+ ],
+ "notes": "【檔案位置】learningPaths：next-site/lib/projects.ts:340-364；featureGroups（7 組）：projects.ts:315-323；features 24 slugs：projects.ts:314；feature-map：next-site/content/ceph/feature-map.json（nodes=24、edges=48，每個 node 的 featureSlug 都對得上 MDX）。cycle detection 腳本跑在 scratchpad（未寫入 repo），Tarjan SCC 確認 24 個 node 中 16 個構成單一強連通分量（不在任何 cycle 的 8 個：architecture、mclock-osd-scheduler、recovery-throttle-runtime、osd-ok-to-stop、osd-safe-to-destroy、rbd-and-csi、incident-bundle-runbook、prometheus-alert-real-cluster），元素迴圈共 32 條（已全列於 cycles）。造成 cycle 的 5 條回饋邊：e-flapping-crush（feature-map.json:39 \"subtree_limit\"）、e-quorum-clockskew（:60 \"shares lease path\"）、e-reallab-alertdesign（:66 \"v2 修訂\"）、e-slowops-alerts（:70 \"補三層 alert\"）、e-blindspot-testing（:77 \"blackbox 規則測試\"）。\n\n【三套結構的敘事順序一致性】\n1) featureGroups vs learning paths — 部分矛盾：(a) groups 把 rbd-and-csi 放最後一組（projects.ts:322「RBD + k8s 接點」），但 beginner path 把它排第 2（:343「從 PVC 反推 ceph，最容易動手」），在 crush-and-placement 之前；feature-map 的 e-rbd-crush（:42 \"queries\"）語意上也是 rbd 依賴 crush，三者對 rbd 的位置不一致。(b) advanced path 以 architecture 收尾（:362），groups 把 architecture 放第一組「從這裡開始」（:316）——可解讀為刻意回訪，但順序相反。(c) learning paths 完全跳過第 5 組「OSD 維運命令」（0/2）與幾乎整個第 6 組「監控與告警」（1/7）、第 4 組 4/6 未涵蓋——三條 path 只走「架構→placement→storage 引擎」主線，2025 下半年後新增的 clock-skew 三部曲、quorum、alert 系列、維運命令全部不在任何 path。\n2) featureGroups vs feature-map — 大方向一致但無法拓撲對齊：architecture 是 map 的根（out-edges :30,:31,:49,:59 無 in-edge）符合「從這裡開始」；監控組內 design→testing→real-lab-findings 的 edge 鏈（:64,:65）與 group 6 排列順序一致；但 16-node SCC 意味 map 無法排出與 group 2→3→4→6 一致的閱讀序（例如 osd-flapping〔group 4〕有邊指回 crush-and-placement〔group 2〕:39；mon-quorum-loss-impact〔group 4〕指回 mon-clock-skew-detection :60）。另 group 6 把 prometheus-alert-real-lab-findings 排在 prometheus-alert-real-cluster 前，但 feature-map 中兩者是 testing 的平行分支（:65 與 :74），彼此無 edge，兩套結構都沒宣告這兩頁的先後。\n3) MDX 前提宣告 vs 前兩者 — 現有的明確宣告全部與 featureGroups 組內順序及 feature-map 對應 edge 方向一致：bluestore-deep-dive←osd-and-bluestore（edge :35 \"dives into\"）、ladder←cluster-time-skew-impact（:53 \"scales up\"）、testing←design（:64）、real-cluster←testing（:74）、blind-spot←design/quorum-loss（:75,:76）。唯 24 篇中只有 5 篇在開頭宣告前提（bluestore-deep-dive、ladder、testing、real-cluster、blind-spot），15 篇完全沒有宣告；監控系列內部靠開頭敘事互連，但 slow-ops-and-bluestore-alerts 依賴 design 頁技法（slow-ops-and-bluestore-alerts.mdx:385「沿用 [alert 設計頁](./prometheus-alert-design) 的 `group_left` 技法」）卻只在文中段落提及，開頭無宣告。\n\n【其他】cluster-time-skew-impact 開頭（:9-11）未宣告 mon-clock-skew-detection 為前提，但 feature-map 有 e-clockskew-matrix（:51 \"expands\"）且 ladder 頁把兩者當三部曲——三部曲的第 2 頁缺前提宣告。grep 到的其餘「前提」「先看」命中（如 incident-bundle-runbook.mdx:156「### 5. 先看三個檔案」、osd-ok-to-stop.mdx:182、prometheus-alert-real-lab-findings.mdx:11 等）都是技術語境內用詞，非閱讀前提宣告，已排除。"
+}
