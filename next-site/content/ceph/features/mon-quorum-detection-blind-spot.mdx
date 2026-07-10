@@ -1,0 +1,140 @@
+---
+layout: doc
+title: Ceph — CephMonQuorumLost 的盲區：quorum 失守時 mgr metric 凍結
+description: 停 2/3 mon 時 CephMonQuorumLost 不會 fire——不是規則寫錯，是唯一資料來源 active mgr prometheus module 在 quorum 失守後拿不到新 map、把 ceph_mon_quorum_status 凍結在 stale=1（三顆都在 quorum）。sensor 與被測物同生共死。真機實證這個盲區，並用 blackbox_exporter TCP 探 mon msgr port 補一條不經 mgr 的偵測。
+---
+
+## 場景
+
+你照 [Prometheus alert 補強](./prometheus-alert-design) 設好 `CephMonQuorumLost`，`for: 1m` 的 critical page，心想「3-mon cluster 掉到剩 1 台時它會叫」。某天機房抽了兩台 mon node，quorum 真的失守了——[client I/O 開始出問題](./mon-quorum-loss-impact)、新 pod 掛不上 volume——但你的 pager **一聲都沒響**。
+
+`ceph -s` 這時連都連不上（monclient hunting timeout），可是 Prometheus 上 `ceph_mon_quorum_status` 三顆 mon 全都好端端顯示 `1`。規則沒錯、Prometheus 沒掛，偵測卻整個瞎了。這一頁拆的就是這個盲區：為什麼會這樣、怎麼用純 Prometheus metrics 補起來。
+
+## 盲區的本質：sensor 跟被測物同生共死
+
+`CephMonQuorumLost` 的判斷式（[本站 stability-first 規則](./prometheus-alert-design)）長這樣：
+
+```
+(count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+```
+
+`or vector(0)` 是先前抓到的修正：**全部** mon 掛掉時 `== 1` 過濾成空 vector、`count(空)` 沒有 sample、`< 2` 算不出結果反而不 fire，`or vector(0)` 讓它退回 0 照樣叫。但這只救「series 完全消失」。
+
+停 2/3 mon 是另一回事——series **沒消失，它凍結了**。關鍵在資料只有一個來源：
+
+```
+        ┌──────────────┐   scrape :9283    ┌────────────┐
+        │  active mgr  │◀──────────────────│ Prometheus │
+        │ prometheus   │                   └────────────┘
+        │   module     │
+        └──────┬───────┘
+               │ self.get('mon_status')   ← 讀 mgr 快取的 cluster state
+        ┌──────▼───────┐
+        │ mgr 對 mon    │  quorum 失守後這條斷掉、
+        │ quorum 的 session│  快取停在最後一次好值
+        └──────────────┘
+```
+
+`ceph_mon_quorum_status` 由 active mgr 的 prometheus module 匯出，而這個值是從 mgr **自己快取的 cluster state** 算出來的。quorum 一失守，mgr 拿不到新的 map / status，快取就凍結在最後看到的狀態——那時三顆 mon 都還在 quorum 裡。於是每次 scrape 都回同一組 `1`，`count(==1)` 永遠是 3，`3 < 2` 永遠 false。
+
+**要偵測 mon 失去 quorum，訊號不能來自「需要 quorum 才能更新」的東西。** mgr 的 metric 剛好就是——它既是 sensor 又是受害者。
+
+## 原始碼路徑：metric 值怎麼來的
+
+mgr prometheus module 每次被 scrape 就重跑一次 `collect()`，其中 `get_quorum_status()` 對 monmap 裡**每一顆** mon 設定 metric：
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 1018)
+
+```python
+def get_quorum_status(self) -> None:
+    mon_status = json.loads(self.get('mon_status')['json'])
+    for mon in mon_status['monmap']['mons']:
+        rank = mon['rank']
+        id_ = mon['name']
+        ...
+        in_quorum = int(rank in mon_status['quorum'])
+        self.metrics['mon_quorum_status'].set(in_quorum, (
+            'mon.{}'.format(id_),
+        ))
+```
+
+兩個重點：
+
+1. **每顆 mon 都會有一條 series**（`in_quorum` = 該 rank 是否在 `quorum` list 裡）。所以停掉的 mon 不會讓 series 消失——只會讓它的值變 0，**前提是這段程式讀得到真實的 `mon_status`**。
+2. 資料源是 `self.get('mon_status')`（line 1019）。`self.get()` 回傳的是 **mgr 快取的** cluster 資料，由 active mgr 與 mon quorum 的 session 餵新。quorum 斷掉後這條 session 更新不了，`self.get('mon_status')` 就一直回上一次的值——那份 snapshot 裡 `quorum` 還列著三顆，`rank in quorum` 全為真 → 三條 series 全凍在 `1`。
+
+換句話說：program 沒 bug、`or vector(0)` 也沒錯，是**輸入資料**在說謊。同一份 `mon_status` 快取也餵 `mon_metadata`（line 659 起），所以連 metadata 都是 stale 的。
+
+## 真機實證
+
+在真 cephadm v19.2.3（3 mon + 9 OSD）上停 mon-02 + mon-03（留 mon-01 與它上面的 active mgr），用 Prometheus 同時看兩個來源。實驗 harness 與 evidence bundle 在 `experiments/ceph-mon-quorum-blind-spot/`。
+
+| 時間 | mgr `count(ceph_mon_quorum_status==1)` | blackbox `count(probe_success==1)` | mgr `up` | `CephMonQuorumLost` |
+|---|---|---|---|---|
+| baseline | 3 | 3 | 1 | — |
+| 注入 +3s | **3（stale）** | **1** | 1 | 沒進 pending |
+| +30s | **3** | **1** | 1 | **仍沒 fire** |
+| +2.5min | **3** | **1** | 1 | 全程沒 fire |
+
+三件事同時成立：
+
+- **mgr metric 全窗停在 3**，`CephMonQuorumLost` 從頭到尾連 `pending` 都沒進過。
+- **`up{job="ceph"}` 也一直是 1**——停的是 mon daemon、不是 mgr 進程，mgr host 還活著、還在吐 stale，所以連「exporter 掛了」這類 `up`-based 規則也偵測不到。
+- **ground truth 是真的失守**：mon-02/03 的 systemd unit 是 `inactive`；還原時 `ceph -s` 冒出 `748 slow ops … mon.ceph-lab-mon-01 has slow ops`——證明 mon-01 在窗內確實收到 client 的 mon 請求卻因無 quorum 處理不了（塞成 slow ops），偏偏 metric 還讀 3。
+
+## 解法：blackbox_exporter 探 mon 的 msgr port
+
+盲區的修法不在 PromQL、在**資料來源**：加一個不經過 mgr、逐 mon 獨立的訊號。最省的是 [blackbox_exporter](https://github.com/prometheus/blackbox_exporter) 用 `tcp_connect` 探每顆 mon 的 v2 msgr port（3300）。mon daemon 停掉 → port 關 → `probe_success=0`；跟 mgr 凍不凍結完全無關。
+
+Prometheus 對三顆 mon 各發一次探測（relabel 把 target 塞進 blackbox 的 `/probe`）：
+
+```yaml
+- job_name: mon-tcp
+  metrics_path: /probe
+  params: { module: [tcp_connect] }
+  static_configs:
+    - targets: ['MON1:3300', 'MON2:3300', 'MON3:3300']
+  relabel_configs:
+    - { source_labels: [__address__], target_label: __param_target }
+    - { source_labels: [__param_target], target_label: mon_addr }
+    - { target_label: __address__, replacement: blackbox:9115 }
+```
+
+規則沿用同一套「majority」寫法，只是資料換成 `probe_success`：
+
+```yaml
+- alert: CephMonQuorumLostBlackbox
+  expr: (count(probe_success{job="mon-tcp"} == 1) or vector(0)) < 2
+  for: 30s
+  labels: { severity: critical }
+  annotations:
+    summary: "MON quorum lost — 少於 2/3 mon msgr port 可達（blackbox，不經 mgr）"
+```
+
+真機實測：注入後**一個 scrape（≤5s）** `count(probe_success==1)` 就掉到 1，`for: 30s` 後 fire；還原 3 個 scrape 內回 3。
+
+blackbox 相對 mgr metric 還有個好處：down 的 target 它匯出 `probe_success=0`（series 不消失），所以動態 majority `< (floor(count(probe_success)/2)+1)` 的分母穩定、連全掉都算得出來，比 mgr metadata 動態版更耐。
+
+**分層而非取代**：留著現行 mgr 版當互補——mgr 健康時它能抓「port 開著但沒進 quorum（分區/選舉卡住）」這種 blackbox 看不出的退化。兩條取聯集當 pager，再加一條 `up{job="mon-tcp"}` 全掉的守門 alert，把「探針自己死了」跟「mon 掛了」分開。真正要抓 in-quorum 語意（port 開卻沒進 quorum）得逐台跑 ceph-exporter，成本高，非必要不上。
+
+## 為什麼一定要有這條 pager
+
+有人會問：反正 quorum 失守 client 遲早會叫，需要專門一條嗎？需要——因為[已連線的 client 在 quorum 失守下多半無感](./mon-quorum-loss-impact)。真機同一個窗裡跑 fio 矩陣：已 map/mount 的 RBD volume，single/multi thread × random/seq × 讀寫**全部照跑、吞吐約等於 baseline**（cached osdmap 直打 OSD，dataplane 不經 mon）。
+
+真正卡住的是「任何要新建 mon 連線」的動作：k8s 上就是 node 端 kernel `rbd map`——實驗中新 pod 卡在 `ContainerCreating`（有趣的是新 PVC 反而會 Bound，因為 CSI provisioner 自己是既有連線）。這涵蓋新部署、pod 重啟、node 重開、drain 後重排、HPA 擴容。
+
+所以存量 workload 不會替你發現 quorum 失守，反而讓你誤以為一切正常——直到下一次排程。這條偵測的價值就在這裡：在「還沒有人要新掛 volume」的空窗期就叫你。也因此，**quorum 失守期間不要 drain node / 重排 pod**，會把「無感」瞬間變成「全卡」。
+
+## 邊界與除錯
+
+- **blackbox 探的是「可達性」不是「in-quorum」**：mon 進程活、port 開、但因網路分區或選舉卡在 probing 沒進 quorum 時，TCP 探測仍成功、這條會誤判健康。實務上 quorum 失守最常見成因（mon daemon 掛、host 掛、網路整段斷）都會讓 port 不可達，抓得到；要覆蓋 corner case 才需要 per-host ceph-exporter 的 in-quorum 視角。
+- **探 v2(3300) 還是 v1(6789)**：兩個都是 mon 的 msgr port，探任一個都行；本站探 v2。要更嚴可兩個都探、要求都通。
+- **`ceph -s` 在窗內會 hang**：quorum 失守時 CLI 走 monclient hunting、預設會等很久。除錯要用 `--connect-timeout` 或看單台 mon 的 admin socket `mon_status`（不需 quorum），別傻等。
+- **還原順序**：確認網路/時間/磁碟正常後，先起一台已知健康的 mon 回 quorum，**不要同時重啟多台**；quorum 一回，blackbox 的 `probe_success` 會在幾個 scrape 內回滿，卡住的新 mount 也隨即續成。
+
+## 接下來 / 相關頁面
+
+- [3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響](./mon-quorum-loss-impact) — 這頁「已連線無感、新連線卡」的 dataplane/control plane 分界，從 v19.2.3 的 Paxos lease 與 cephx ticket 追根。
+- [Prometheus alert 補強](./prometheus-alert-design) — `CephMonQuorumLost` 與 `or vector(0)` 修正的來龍去脈。
+- [真機 alert findings](./prometheus-alert-real-lab-findings) — 第一次在真機撞到 mgr exporter stale 的紀錄。
+- [Alert 測試計劃](./prometheus-alert-testing) — 用 promtool 把「stale 下 mgr 版盲、blackbox 版 fire」寫成可重跑的單元測試。

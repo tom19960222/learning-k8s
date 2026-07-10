@@ -1,0 +1,21 @@
+  cluster:
+    id:     0c9bf37e-514a-11f1-b72a-bc24113f1375
+    health: HEALTH_WARN
+            7 OSD(s) experiencing slow operations in BlueStore
+            3 hosts fail cephadm check
+            748 slow ops, oldest one blocked for 153 sec, mon.ceph-lab-mon-01 has slow ops
+ 
+  services:
+    mon: 3 daemons, quorum ceph-lab-mon-01,ceph-lab-mon-02,ceph-lab-mon-03 (age 3s)
+    mgr: ceph-lab-mon-01.jvgpfh(active, since 33m), standbys: ceph-lab-mon-02.wmkpax
+    osd: 9 osds: 9 up (since 32m), 9 in (since 5w)
+ 
+  data:
+    pools:   2 pools, 33 pgs
+    objects: 262 objects, 578 MiB
+    usage:   662 MiB used, 899 GiB / 900 GiB avail
+    pgs:     33 active+clean
+ 
+  io:
+    client:   1.3 MiB/s wr, 0 op/s rd, 1 op/s wr
+ 

@@ -9,3 +9,4 @@ experiments/timesyncd/.ssh
 
 # superpowers SDD scratch / progress ledger (do not commit)
 .superpowers/
+experiments/kubevirt-rbd-tuning/results/

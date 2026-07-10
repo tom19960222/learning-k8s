@@ -1,0 +1,54 @@
+# Ceph MON quorum-loss detection that survives the mgr blind spot.
+#
+# WHY THIS EXISTS (真機實證 run 20260708T154019Z):
+#   現行 CephMonQuorumLost 用 ceph_mon_quorum_status（active mgr :9283 匯出）。
+#   quorum 一失守，mgr 拿不到新 map、續吐 stale=1 給三顆 mon ⇒ count(==1) 停在 3、
+#   規則永不 fire。sensor 與被測物同生共死。停 2/3 mon 實測：mgr metric 全窗 =3、
+#   規則從未 pending；up{ceph} 亦=1（mgr 續 serve）。
+#
+# FIX：引入一個「不經過 mgr、逐 mon 獨立」的訊號——blackbox_exporter tcp_connect
+#   探每顆 mon 的 v2 msgr port(3300)。停掉的 mon → probe_success=0（scrape 仍成功、
+#   值=0，series 不消失）。實測注入 ≤1 scrape(≤5s) count(probe_success==1) 掉到 1、
+#   for:30s 後 fire；還原 3 scrape 內回復。與 mgr 是否凍結無關。
+#
+# scrape 設定見 ../manifests/monitoring.yaml（job "mon-tcp" + blackbox relabel）。
+# 這層與現行 mgr-based CephMonQuorumLost 互補：mgr 版在 mgr 健康時能抓「port 開著
+# 但沒進 quorum」等 blackbox 抓不到的退化；blackbox 版在 mgr 盲時仍能抓「mon 不可達」。
+groups:
+  - name: ceph-mon-quorum-blackbox
+    rules:
+      # 主推：寫死 3-mon majority。fewer than 2 mon port 可達即 page。
+      # or vector(0)：全部 mon port 不可達（count(==1) 空）或 blackbox 掛掉時，
+      # 退回 0 < 2 照樣 fire——最壞情況（對 mon 全盲）不靜默。
+      - alert: CephMonQuorumLostBlackbox
+        expr: (count(probe_success{job="mon-tcp"} == 1) or vector(0)) < 2
+        for: 30s
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost — fewer than 2 of 3 mon msgr ports reachable (blackbox, mgr-independent)"
+          runbook: "blackbox 探 mon:3300 少於 majority。先確認是 mon daemon 掛、host 掛、還是網路分區；ceph quorum_status（若還能連）；勿同時重啟多台 mon。此訊號不依賴 mgr，quorum 真失守時 mgr metric 會 stale。"
+
+      # 動態 majority 版（非 3-mon cluster 用）。blackbox 對 down target 匯出 0（series 仍在），
+      # 故分母 count(probe_success) 穩定 = 總 mon 數；連全掉都能算（優於 mgr metadata 動態版）。
+      - alert: CephMonQuorumLostBlackboxDynamic
+        expr: (count(probe_success{job="mon-tcp"} == 1) or vector(0)) < (floor(count(probe_success{job="mon-tcp"}) / 2) + 1)
+        for: 30s
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost — reachable mon ports below dynamic majority (blackbox)"
+
+      # 守門：blackbox 自己掛掉時，上面兩條的「訊號來源」沒了。probe_success 全 absent →
+      # 寫死版靠 or vector(0) 仍會 fire，但那是「探針死了」不是「mon 掛了」，會誤導 runbook。
+      # 這條把兩者分開：mon-tcp job 全部 scrape 失敗（up==0）才 fire。
+      - alert: CephMonProbeExporterDown
+        expr: (count(up{job="mon-tcp"} == 1) or vector(0)) == 0
+        for: 2m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: "mon-tcp blackbox probe target all down — quorum blind spot detector is itself blind"

@@ -1,0 +1,32 @@
+# Applied DURING the quorum-loss window to test whether a brand-new client
+# (fresh RBD provision + map) blocks. Expected: PVC stuck Pending / pod
+# stuck ContainerCreating until quorum returns.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qio-newclient
+  namespace: default
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-rbd
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fio-newclient
+  namespace: default
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 3
+  containers:
+  - name: fio
+    image: xridge/fio:latest
+    command: ["sh","-c","fio --name=n --filename=/vol/tf --size=256M --rw=randwrite --bs=4k --ioengine=libaio --direct=1 --runtime=10 --time_based --output-format=terse; echo NEWCLIENT_DONE"]
+    volumeMounts:
+    - { name: vol, mountPath: /vol }
+  volumes:
+  - name: vol
+    persistentVolumeClaim: { claimName: qio-newclient }

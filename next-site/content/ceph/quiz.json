@@ -226,5 +226,17 @@
     ],
     "answer": 1,
     "explanation": "這是架構層盲區，不是規則層 bug。F1（count(空 vector) 無 sample）是 PromQL 語意問題，or vector(0) 修得了；但真 quorum loss 時是 metric 來源凍結——偵測者（mgr 匯出的 metric）依賴它要偵測的東西（mon quorum）。mgr 凍結時 count 是 stale 的 3、3<2 不成立，連空 vector 都到不了。規則層修不了，要可靠偵測 quorum loss 必須走 out-of-band：blackbox 探每台 mon 的 port、cluster 外的 quorum 檢查、或對 metric 凍結/staleness 告警。"
+  },
+  {
+    "id": 20,
+    "question": "在 mon quorum 失守（2/3 down）的窗內，client 的 RBD I/O 會怎樣？",
+    "options": [
+      "已 map/mount 的既有 volume：single/multi thread、random/seq 讀寫都照跑（cached osdmap 直打 OSD）；真正卡住的是要新建 mon 連線的動作，例如 node 端 kernel rbd map（新 pod 卡 ContainerCreating）",
+      "所有讀寫立刻全部中斷，因為每個 I/O 都要先問 mon 拿位置",
+      "只有寫入會卡（要 mon 確認 map），讀取一律正常",
+      "隨機 I/O 會卡、循序 I/O 正常，因為兩者走不同的 mon 路徑"
+    ],
+    "answer": 0,
+    "explanation": "mon 負責 map 分發與建立新 session，不在 dataplane 的 critical path。已持有 cached osdmap 的 client 直接對 OSD 讀寫，OSD 全 up、PG 不 re-peer，所以既有連線的 IO pattern（rand/seq）與併發度都不受影響——真機 fio 矩陣窗內吞吐約等於 baseline。會卡的是任何需要向 mon 取新 map 的新連線：node kernel rbd map、新 rados client，對應 k8s 的新部署 / pod 重啟 / node 重開 / drain 重排 / HPA 擴容。因此存量 workload 對 quorum 失守幾乎無感，這也是為什麼一定要有獨立的 quorum pager。"
   }
 ]

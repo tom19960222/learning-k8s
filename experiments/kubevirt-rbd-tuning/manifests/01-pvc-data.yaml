@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-baseline
+  namespace: vmtest
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Block
+  storageClassName: ceph-rbd
+  resources:
+    requests:
+      storage: 16Gi

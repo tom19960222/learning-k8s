@@ -1,0 +1,2 @@
+persistentvolumeclaim/qio-newclient created
+pod/fio-newclient created
