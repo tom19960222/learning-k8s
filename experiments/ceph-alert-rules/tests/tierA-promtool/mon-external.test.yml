@@ -1,0 +1,83 @@
+# Tier A — CephMonQuorumLostExternal（發現二緩解）：out-of-band TCP 探針的 quorum 生命線。
+# 與 CephMonQuorumLost 同 majority 邏輯，但讀獨立來源 ceph_mon_tcp_up（不會像 mgr 那樣凍結）。
+rule_files:
+  - ../../rules/ceph-mon-external.yml
+evaluation_interval: 1m
+tests:
+  # 3 台都可達 → count=3，不 fire
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_tcp_up{mon="m1", addr="a"}'
+        values: '1x5'
+      - series: 'ceph_mon_tcp_up{mon="m2", addr="b"}'
+        values: '1x5'
+      - series: 'ceph_mon_tcp_up{mon="m3", addr="c"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostExternal
+        exp_alerts: []
+
+  # 1 台不可達 → count=2，不 fire（majority 還在）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_tcp_up{mon="m1", addr="a"}'
+        values: '1x5'
+      - series: 'ceph_mon_tcp_up{mon="m2", addr="b"}'
+        values: '1x5'
+      - series: 'ceph_mon_tcp_up{mon="m3", addr="c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostExternal
+        exp_alerts: []
+
+  # 2 台不可達 → count=1 < 2 → fire（這正是真機 S4 中 mgr-based 規則盲掉、而這條會 fire 的情況）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_tcp_up{mon="m1", addr="a"}'
+        values: '1x5'
+      - series: 'ceph_mon_tcp_up{mon="m2", addr="b"}'
+        values: '0x5'
+      - series: 'ceph_mon_tcp_up{mon="m3", addr="c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostExternal
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_external}
+            exp_annotations:
+              summary: "Ceph MON quorum at risk (out-of-band probe): fewer than 2 mons reachable"
+              runbook: "從叢集外確認 mon 可達性；mgr metric 此時可能已凍結，改信此探針與 ceph quorum_status"
+
+  # 全部不可達 → ==1 過濾成空 → or vector(0) 退 0 < 2 → fire（套用 F1 教訓）
+  - interval: 1m
+    input_series:
+      - series: 'ceph_mon_tcp_up{mon="m1", addr="a"}'
+        values: '0x5'
+      - series: 'ceph_mon_tcp_up{mon="m2", addr="b"}'
+        values: '0x5'
+      - series: 'ceph_mon_tcp_up{mon="m3", addr="c"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostExternal
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_external}
+            exp_annotations:
+              summary: "Ceph MON quorum at risk (out-of-band probe): fewer than 2 mons reachable"
+              runbook: "從叢集外確認 mon 可達性；mgr metric 此時可能已凍結，改信此探針與 ceph quorum_status"
+
+  # 探針本身掛掉（完全沒有 series）→ count 空 → fire（監控的監控也壞了，值得叫）
+  - interval: 1m
+    input_series:
+      - series: 'up{job="ceph-mon-probe"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CephMonQuorumLostExternal
+        exp_alerts:
+          - exp_labels: {severity: critical, source: ceph_external}
+            exp_annotations:
+              summary: "Ceph MON quorum at risk (out-of-band probe): fewer than 2 mons reachable"
+              runbook: "從叢集外確認 mon 可達性；mgr metric 此時可能已凍結，改信此探針與 ceph quorum_status"

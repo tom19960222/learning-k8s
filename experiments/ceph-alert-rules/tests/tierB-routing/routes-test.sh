@@ -36,6 +36,7 @@ check pager-ceph alertname=CephOSDDaemonDownScoped source=ceph_scoped severity=c
 check pager-ceph alertname=CephMonDownScoped     source=ceph_scoped severity=critical
 check pager-ceph alertname=CephMetricsAbsent     source=ceph_coverage severity=critical
 check pager-ceph alertname=CephDataDamage        source=ceph_coverage severity=critical
+check pager-ceph alertname=CephMonQuorumLostExternal source=ceph_external severity=critical
 
 echo "## watchdog-ceph：dead-man heartbeat"
 check watchdog-ceph alertname=Watchdog source=ceph_coverage severity=none

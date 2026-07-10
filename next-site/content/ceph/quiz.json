@@ -202,5 +202,29 @@
     ],
     "answer": 1,
     "explanation": "collector 會把 systemd-timesyncd 當成一等公民：收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，並複製 `/etc/systemd/timesyncd.conf` 與 `/etc/systemd/timesyncd.conf.d/*.conf`。chrony/ntpq 仍保留，是為了支援不同 Linux 發行版或既有環境。"
+  },
+  {
+    "id": 18,
+    "question": "真 ceph 實驗發現：維護一台 OSD node 時 CephClientRisk 會誤 page（叫醒 oncall），但 dev 的四層測試全綠卻沒抓到。真機揭露的根因是什麼？",
+    "options": [
+      "dev 測試的斷言寫錯了，所以假性通過",
+      "promtool 不支援這個 metric 所以跳過了該情境",
+      "dev 的測試 fixture 是照著設計頁的 health-check 名字（OSDMAP_FLAGS）手刻的，而設計頁那個名字本身就錯——ceph 的 maintenance enter 對 host subtree 設 noout 升的是 OSD_FLAGS。測試與被測對象用同一個錯名、一致地綠，驗不出名字假設本身錯了",
+      "dev 根本沒測維護情境"
+    ],
+    "answer": 2,
+    "explanation": "maintenance enter 對 host subtree 設 noout 升的是 OSD_FLAGS（per-subtree），不是 cluster-wide ceph osd set noout 才升的 OSDMAP_FLAGS。設計頁排除清單寫成 OSDMAP_FLAGS，dev 的 maintenance-thesis fixture 照抄同一個錯名，於是『測試驗證設計』退化成『設計自己跟自己對帳』——名字錯得一致，照樣全綠。這類錯誤結構上只有引入獨立事實來源（真 ceph 或 ceph 原始碼當 oracle）才抓得到。修法是排除清單與 LowPriorityNotice 都列 OSD_FLAGS|OSDMAP_FLAGS。"
+  },
+  {
+    "id": 19,
+    "question": "真機實驗：停掉 2/3 mon、quorum 真的失守時，CephMonQuorumLost 還是不 fire——而且就算把 F1 的 (count(...) or vector(0)) < 2 修正套上去也救不了。為什麼這個修正在這裡無效？",
+    "options": [
+      "因為 or vector(0) 應該寫成 or vector(1)",
+      "因為它讀的 ceph_mon_quorum_status 是 mgr 匯出的，而 mgr 要有 mon quorum 才能更新 cluster 視圖；quorum 一沒，mgr 就把 metric 凍結在『三台都在 quorum』並繼續吐這份 stale 資料，count 永遠是 stale 的 3，根本走不到空 vector，or vector(0) 自然沒機會生效",
+      "因為 Alertmanager 把這條 alert silence 了",
+      "因為真機的 for: 時長還沒到"
+    ],
+    "answer": 1,
+    "explanation": "這是架構層盲區，不是規則層 bug。F1（count(空 vector) 無 sample）是 PromQL 語意問題，or vector(0) 修得了；但真 quorum loss 時是 metric 來源凍結——偵測者（mgr 匯出的 metric）依賴它要偵測的東西（mon quorum）。mgr 凍結時 count 是 stale 的 3、3<2 不成立，連空 vector 都到不了。規則層修不了，要可靠偵測 quorum loss 必須走 out-of-band：blackbox 探每台 mon 的 port、cluster 外的 quorum 檢查、或對 metric 凍結/staleness 告警。"
   }
 ]

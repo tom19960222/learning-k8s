@@ -11,7 +11,7 @@ echo ""
 echo "### promtool check rules（lint）"
 "$PROMTOOL" check rules "$ROOT"/rules/ceph-stability-first.yml "$ROOT"/rules/ceph-scoped-availability.yml \
   "$ROOT"/rules/ceph-production-coverage.yml "$ROOT"/rules/_default-mixin.yml \
-  "$ROOT"/rules/ceph-mon-quorum-dynamic.yml || exit 1
+  "$ROOT"/rules/ceph-mon-quorum-dynamic.yml "$ROOT"/rules/ceph-mon-external.yml || exit 1
 echo ""
 echo "### promtool test rules（單元測試）"
 "$PROMTOOL" test rules "$ROOT"/tests/tierA-promtool/*.test.yml | tee "$ROOT/results/tierA.txt"

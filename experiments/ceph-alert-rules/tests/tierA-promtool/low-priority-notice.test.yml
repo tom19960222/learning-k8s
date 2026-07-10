@@ -73,7 +73,7 @@ tests:
           - exp_labels: {name: PG_DEGRADED, severity: info, source: ceph_stability}
             exp_annotations: {summary: "Ceph low-priority notice: PG_DEGRADED"}
 
-  # 跨規則一致性 OSDMAP_FLAGS（noout 的元兇）：LowPriority fire、ClientRisk 不 fire
+  # 跨規則一致性 OSDMAP_FLAGS（cluster-wide noout）：LowPriority fire、ClientRisk 不 fire
   - interval: 1m
     input_series:
       - series: 'ceph_health_detail{name="OSDMAP_FLAGS", severity="HEALTH_WARN"}'
@@ -87,3 +87,21 @@ tests:
         exp_alerts:
           - exp_labels: {name: OSDMAP_FLAGS, severity: info, source: ceph_stability}
             exp_annotations: {summary: "Ceph low-priority notice: OSDMAP_FLAGS"}
+
+  # 跨規則一致性 OSD_FLAGS —— 真機 Tier D 發現：ceph v19.2.3 的 `maintenance enter` 對 host subtree
+  # 設 noout 升的是 OSD_FLAGS（不是頁面早期假設的 OSDMAP_FLAGS）。在真叢集上觀測到舊版排除清單沒列
+  # OSD_FLAGS → CephClientRisk{name=OSD_FLAGS} 在例行維護時 firing（pages oncall）。修正後此 case 鎖住：
+  # OSD_FLAGS 必須只進 LowPriority(Slack)、不得讓 CephClientRisk fire。
+  - interval: 1m
+    input_series:
+      - series: 'ceph_health_detail{name="OSD_FLAGS", severity="HEALTH_WARN"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CephClientRisk
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CephLowPriorityNotice
+        exp_alerts:
+          - exp_labels: {name: OSD_FLAGS, severity: info, source: ceph_stability}
+            exp_annotations: {summary: "Ceph low-priority notice: OSD_FLAGS"}

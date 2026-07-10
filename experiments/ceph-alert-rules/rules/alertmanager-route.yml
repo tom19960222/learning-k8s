@@ -14,7 +14,7 @@ route:
     - receiver: pager-ceph
       matchers:
         - severity="critical"
-        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage|ceph_external"
 
     - receiver: pager-ceph
       matchers:
@@ -23,7 +23,7 @@ route:
 
     - receiver: slack-ceph
       matchers:
-        - source=~"ceph_stability|ceph_scoped|ceph_coverage"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage|ceph_external"
 
     - receiver: slack-ceph
       matchers:
