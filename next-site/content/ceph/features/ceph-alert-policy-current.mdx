@@ -1,0 +1,575 @@
+---
+layout: doc
+title: Ceph — 現行 alert policy（該部署哪 29 條 rule、severity、routing、silence）
+description: 這頁是 Ceph Prometheus alert 規則的 single source of truth：現行該部署哪 29 條 alert rule、每條的 severity 與 routing、維護時怎麼精準 silence、以及 MON quorum 生命線該用哪一條。規則 YAML 逐字取自 experiments/ceph-alert-rules/rules/ 現檔（防漂移 guard 綁定），每條附驗證狀態。隨 rules/ 目錄更新，不是某天的快照。
+category: decision-guide
+---
+
+## 本頁定位
+
+- **文章類型**：decision-guide。它回答「**現在**該部署哪些 rule、為什麼、驗證到什麼程度」，是這系列 alert 內容的 **single source of truth**。它**隨 `experiments/ceph-alert-rules/rules/` 目錄更新**，不是某一天的實驗快照——所有規則 YAML 逐字取自該目錄現檔，由防漂移 guard `experiments/ceph-alert-rules/lib/check-rules-match-page.sh` 綁定本頁與 rules 目錄，任一邊漂移 CI 就紅。
+- **版本錨點**：ceph v19.2.3（Squid LTS）。upstream `ceph-mixin` 預設 rule 取自 pinned commit `c92aebb279`。本頁對照的自訂 rule 集 = `experiments/ceph-alert-rules/rules/` 在本頁落地 commit 的現檔。
+- **本頁可獨立閱讀，前提：無**。不需要先讀舊的 alert 系列頁。要 pager / Alertmanager 基礎概念即可上手。
+- **證據層級**：下面每條 rule 都標驗證狀態，四個層級的語意固定為——
+  - **promtool（Tier A）**：`tests/tierA-promtool/` 的單元測試，餵**合成** series 證「IF metric 長這樣 THEN 規則如預期 fire/不 fire」。它證規則邏輯，**不證 ceph 真的會匯出那樣的 metric**。
+  - **Tier B**：`tests/tierB-routing/routes-test.sh` 用 `amtool config routes test` 驗「這個 label set 會落到哪個 receiver」的路由合約。
+  - **Tier C**：`run/tierC.sh` 把規則載入**真 Prometheus** + live Alertmanager 驗 routing / silence / 端到端。
+  - **真機**：真 cephadm v19.2.3 lab 故障注入。兩套獨立編號——**real-lab S1–S22**（22 場故障注入，帳在 `experiments/ceph-alert-real-lab/EVIDENCE-INDEX-2026-07.md`）與 **Tier D obs S1–S5**（`experiments/ceph-alert-rules/tests/tierD-realceph/results/observations.md`）。兩套的 `S` 前綴指不同場景，本頁一律標明是哪一套。
+- **本頁取代 `prometheus-alert-design`** 作為「現行該部署什麼」的來源。設計理由的**歷史敘事**（F1 空 vector bug 的來龍去脈、`OSD_FLAGS` 命名 bug 怎麼被真機抓到、四層驗證方法論）移到 [Ceph - alert 驗證方法論](./ceph-alert-validation-methodology)；22 場真機故障注入的**逐場證據**在 [Ceph - alert 真機 lab 報告](./ceph-alert-real-lab-report)。本頁只講現況決策，不重述故事。
+
+## 一眼看懂：現行部署什麼
+
+| 群組（rules 檔） | 條數 | 角色 | routing 預設 |
+|---|---|---|---|
+| `ceph-stability-first` | 6 | client 風險 + quorum + exporter 盲區；多數不可 silence | critical → pager、info/warning → slack |
+| `ceph-scoped-availability` | 3（＋2 recording rule） | 帶 `hostname`/`ceph_daemon` 的 OSD/MON down，維護可精準 silence | critical → pager |
+| `ceph-production-coverage` | 18 | 早期風險 / coverage（網路、容量、crash、資料完整性…） | critical → pager、warning → slack、`Watchdog` → dead-man |
+| `ceph-mon-quorum-dynamic` | 1 | 非 3-mon cluster 的動態 majority 版 | 只在非 3-mon 環境替換用 |
+| `ceph-mon-external` | 1 | out-of-band quorum 生命線（第一版實作） | critical → pager |
+
+共 **29 條 alert rule**（6 + 3 + 18 + 1 + 1）＋ 2 條 recording rule。此外保留 5 條 upstream `ceph-mixin` 預設 rule（`_default-mixin.yml`）當 context——它們仍會 fire，但 routing 只讓 `CephHealthError` 進 pager，其餘進 slack。
+
+> 舊頁常寫「27 條」——那個數字**不含** `CephMonQuorumLostDynamic` 與 `CephMonQuorumLostExternal`。現行 rules 目錄是 29 條。
+
+## 設計原則（濃縮）
+
+整套設計繞三個原則，完整的原始碼推導在 [驗證方法論頁](./ceph-alert-validation-methodology)，這裡只給決策要點。
+
+### 原則一：`ceph_health_detail` 沒有 host label → OSD/MON down 的 pager 主訊號不能直接讀它
+
+mgr/prometheus module 匯出的 `ceph_health_detail` 只帶 `name` 與 `severity`，**沒有 host / daemon label**。所以 `MON_DOWN` / `OSD_DOWN` / `OSD_HOST_DOWN` 在它裡面都是 cluster-wide 的一個 `name`，維護一台時**無法用 `hostname=...` 精準 silence**。host / daemon 資訊在**另一個** metric（`ceph_osd_metadata` / `ceph_mon_metadata`，帶 `hostname`、`ceph_daemon`）——所以 down 的 pager 主訊號要用 recording rule 把狀態接上 metadata 拿 label。
+
+### 原則二：三種角色決定 routing 與能不能 silence
+
+| 角色 | 意思 | 維護時能 silence 嗎 |
+|---|---|---|
+| **Page 主訊號** | client I/O blocked、quorum lost、metrics 盲區、scoped 的 host/daemon down | 只有 scoped 的能按目標 silence；client/quorum/exporter 類**不可** |
+| **Slack / ticket context** | 預設 aggregate rule、低優先 notice | 可短時間 silence 降噪 |
+| **維護可 silence** | scoped host/daemon down（帶 `hostname`/`ceph_daemon`） | 維護時只 silence 目標那台 |
+
+### 原則三：scoped 去重
+
+`ceph:osd_host_down:scoped` 判定「整台 OSD host 的 OSD 全 down」；`CephOSDDaemonDownScoped` 用 `unless on (hostname) ceph:osd_host_down:scoped` 排掉已被 host alert 接手的 hostname。效果：只掉一顆 OSD → 只 page daemon alert；整台掛掉 → 只 page host alert 一次，**不會每顆 OSD 各叫**。真機 Tier D obs S1（單顆）/ S2（整台）雙向驗證去重成立。
+
+## 群組一：`ceph-stability-first`（6 條）
+
+client 風險、quorum、exporter 盲區。共通點是「真的出事才 active」，多數是 page 主訊號、維護時不該 silence。
+
+```yaml
+groups:
+  - name: ceph-stability-first
+    rules:
+      - alert: CephClientBlocked
+        expr: ceph_health_detail{name=~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client I/O blocked: {{ $labels.name }}"
+
+      - alert: CephClientRisk
+        expr: |
+          ceph_health_detail{
+            name!~"PG_AVAILABILITY|SLOW_OPS|OSD_FULL|POOL_FULL|OSD_DOWN|OSD_HOST_DOWN|MON_DOWN|HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL|OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT|MON_CLOCK_SKEW|RECENT_CRASH|OSD_NEARFULL|OSD_BACKFILLFULL|MON_DISK_LOW|MON_DISK_CRIT|PG_DAMAGED|OSD_SCRUB_ERRORS|OBJECT_UNFOUND"
+          } == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph client-risk check active: {{ $labels.name }}"
+
+      - alert: CephMonQuorumLost
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost or below 3-mon majority"
+
+      - alert: CephExporterAllDown
+        expr: (count(up{job="ceph"} == 1) or vector(0)) == 0
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "All Ceph Prometheus exporter targets are down"
+
+      - alert: CephExporterTargetDown
+        expr: up{job="ceph"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          source: ceph_stability
+        annotations:
+          summary: "Ceph exporter target {{ $labels.instance }} is down"
+
+      - alert: CephLowPriorityNotice
+        expr: |
+          ceph_health_detail{
+            name=~"HOST_IN_MAINTENANCE|OBJECT_MISPLACED|PG_SLOW_SNAP_TRIMMING|PG_DEGRADED|OSD_FLAGS|OSDMAP_FLAGS|POOL_APP_NOT_ENABLED|POOL_NEARFULL"
+          } == 1
+        for: 30m
+        labels:
+          severity: info
+          source: ceph_stability
+        annotations:
+          summary: "Ceph low-priority notice: {{ $labels.name }}"
+```
+
+**決策要點：**
+
+- `CephClientRisk` 的 `name!~` 排除清單現行是 **26 個 name**（含 `OSD_FLAGS` **與** `OSDMAP_FLAGS` 並列）。兩個 flags 都要在：真機 Tier D obs S2 抓到 `maintenance enter` 對 host subtree 設 `noout` 升的是 **`OSD_FLAGS`**（per-subtree），cluster-wide `ceph osd set noout` 才升 `OSDMAP_FLAGS`——少了 `OSD_FLAGS`，例行 OSD 維護會被這條 catch-all 接走照樣 page oncall。
+- `CephLowPriorityNotice` 的 name 清單現行是 **8 個**（同樣含 `OSD_FLAGS`）——這些是「維護常態、不該 page」的 health check，歸 slack-only。
+- `CephMonQuorumLost` 的 `or vector(0)` 不可省：全部 mon down 時 `ceph_mon_quorum_status == 1` 過濾成空 vector，`count(空) < 2` 在 PromQL **算不出結果反而不 fire**，剛好在最壞情況靜默。`or vector(0)` 讓空 count 退回 0 → `0 < 2` 成立照 fire。**但這條有更深的架構盲區**，見文末「MON quorum 生命線」。
+
+| Rule | severity · for | promtool | Tier B | 真機 |
+|---|---|---|---|---|
+| `CephClientBlocked` | critical · 1m | `client-blocked.test.yml` | pager | real-lab S1(`SLOW_OPS`)、S2(`PG_AVAILABILITY`)、S16(`OSD_FULL`)、S17(`POOL_FULL`) |
+| `CephClientRisk` | critical · 5m | `client-risk.test.yml`（餵全 26 排除 + 2 非排除） | pager | real-lab S9(`OSD_NO_DOWN_OUT_INTERVAL`)；Tier D obs S2/S3 驗排除清單（`OSD_FLAGS` 修正） |
+| `CephMonQuorumLost` | critical · 1m | `mon-quorum-lost.test.yml` | pager | real-lab S3（empty-series 路徑 fire）；**Tier D obs S4：真失守時 mgr metric 凍結 → 不 fire（架構盲區）** |
+| `CephExporterAllDown` | critical · 5m | `exporter-down.test.yml` | pager | real-lab S7 |
+| `CephExporterTargetDown` | warning · 15m | `exporter-down.test.yml` | slack | promtool + Tier B；真機未單獨注入（S7 注入的是 all-down） |
+| `CephLowPriorityNotice` | info · 30m | `low-priority-notice.test.yml` | slack | real-lab S10(`OSDMAP_FLAGS`)；Tier D obs S2(`HOST_IN_MAINTENANCE`/`PG_DEGRADED`) |
+
+## 群組二：`ceph-scoped-availability`（3 條 alert + 2 recording rule）
+
+用 metadata metric 把 down 狀態接上 `hostname` / `ceph_daemon`，維護可精準 silence。
+
+```yaml
+  - name: ceph-scoped-availability
+    rules:
+      - record: ceph:osd_up:with_hostname
+        expr: |
+          ceph_osd_up
+            * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+
+      - record: ceph:osd_host_down:scoped
+        expr: |
+          count by (hostname) (ceph:osd_up:with_hostname == 0)
+          ==
+          count by (hostname) (ceph:osd_up:with_hostname)
+
+      - alert: CephOSDHostDownScoped
+        expr: ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph OSD host down: {{ $labels.hostname }}"
+          runbook: "ceph osd tree; ceph health detail; check host power/network/systemd"
+
+      - alert: CephOSDDaemonDownScoped
+        expr: |
+          (ceph:osd_up:with_hostname == 0)
+          unless on (hostname) ceph:osd_host_down:scoped
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph OSD down: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+          runbook: "ceph osd tree; ceph osd ok-to-stop {{ $labels.ceph_daemon }}; inspect daemon log"
+
+      - alert: CephMonDownScoped
+        expr: |
+          (
+            (1 - ceph_mon_quorum_status)
+              * on (ceph_daemon) group_left(hostname) ceph_mon_metadata
+          ) == 1
+        for: 30s
+        labels:
+          severity: critical
+          source: ceph_scoped
+        annotations:
+          summary: "Ceph MON down or out of quorum: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+          runbook: "ceph quorum_status; ceph health detail; inspect mon log and host network"
+```
+
+**決策要點：** `CephMonDownScoped` 對 **graceful 單台下線**有效（quorum 還在、mgr 能更新，停掉的 mon 仍在 monmap → `ceph_mon_quorum_status{mon}=0` 與帶 hostname 的 metadata 都在，silence matcher 接得到，Tier D obs S3 驗證）。但它跟 `CephMonQuorumLost` 讀同一份 mgr 匯出的 metric，**真 quorum 失守時一樣盲**——別把它當第二台掉的生命線。
+
+| Rule | severity · for | promtool | Tier B | 真機 |
+|---|---|---|---|---|
+| `CephOSDHostDownScoped` | critical · 5m | `osd-host-down-scoped.test.yml`、`recording-rules.test.yml`、`transition-partial-to-full.test.yml` | pager | real-lab S5；Tier D obs S2（silence 真機有效） |
+| `CephOSDDaemonDownScoped` | critical · 5m | `osd-daemon-down-scoped.test.yml` | pager | real-lab S4；Tier D obs S1 |
+| `CephMonDownScoped` | critical · 30s | `mon-down-scoped.test.yml` | pager | real-lab S6；Tier D obs S3 |
+
+## 群組三：`ceph-production-coverage`（18 條）
+
+真機故障注入後補的「早期風險 / coverage」層，避免 `CephClientRisk` 變成垃圾桶。
+
+```yaml
+  - name: ceph-production-coverage
+    rules:
+      - alert: CephMetricsAbsent
+        expr: absent(ceph_health_status)
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph metrics absent from Prometheus (blind monitoring)"
+
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          source: ceph_coverage
+        annotations:
+          summary: "Always-firing heartbeat; wire to external dead-man switch"
+
+      - alert: CephOSDSlowHeartbeat
+        expr: ceph_health_detail{name=~"OSD_SLOW_PING_TIME_BACK|OSD_SLOW_PING_TIME_FRONT"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD heartbeat pings are slow: {{ $labels.name }}"
+
+      - alert: CephOSDFlapping
+        expr: |
+          (changes(ceph_osd_up[15m]) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata) >= 4
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD flapping: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephMonClockSkew
+        expr: ceph_health_detail{name="MON_CLOCK_SKEW"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON clock skew detected"
+
+      - alert: CephOSDLatencyOutlier
+        expr: |
+          (
+            ceph_osd_commit_latency_ms > 100
+            and
+            ceph_osd_commit_latency_ms > 3 * scalar(quantile(0.5, ceph_osd_commit_latency_ms))
+          ) * on (ceph_daemon) group_left(hostname) ceph_osd_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD commit latency outlier: {{ $labels.ceph_daemon }} on {{ $labels.hostname }}"
+
+      - alert: CephDaemonSlowOps
+        expr: max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon has slow ops: {{ $labels.ceph_daemon }}"
+
+      - alert: CephDaemonRecentCrash
+        expr: ceph_health_detail{name="RECENT_CRASH"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph daemon crash reported in the last two weeks"
+
+      - alert: CephMgrNoStandby
+        expr: (count(ceph_mgr_status) or vector(0)) < 2
+        for: 5m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph mgr has no standby (failover capacity lost)"
+
+      - alert: CephOSDNearFull
+        expr: ceph_health_detail{name="OSD_NEARFULL"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) near full"
+
+      - alert: CephOSDBackfillFull
+        expr: ceph_health_detail{name="OSD_BACKFILLFULL"} == 1
+        for: 5m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph OSD(s) backfill-full: recovery is blocked"
+
+      - alert: CephMonDiskLow
+        expr: ceph_health_detail{name="MON_DISK_LOW"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space low"
+
+      - alert: CephMonDiskCritical
+        expr: ceph_health_detail{name="MON_DISK_CRIT"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph MON data disk space critically low"
+
+      - alert: CephPoolNearQuota
+        expr: |
+          (
+            ceph_pool_bytes_used > 0.8 * ceph_pool_quota_bytes
+            and
+            ceph_pool_quota_bytes > 0
+          ) * on (pool_id) group_left(name) ceph_pool_metadata
+        for: 10m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} above 80% of quota"
+
+      - alert: CephCapacityForecast
+        expr: |
+          max(predict_linear(ceph_cluster_total_used_bytes[1h], 259200))
+          > 0.85 * max(ceph_cluster_total_bytes)
+        for: 30m
+        labels:
+          severity: warning
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph raw capacity projected to exceed 85% within 3 days"
+
+      - alert: CephDataDamage
+        expr: max_over_time(ceph_health_detail{name=~"PG_DAMAGED|OSD_SCRUB_ERRORS"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph data damage detected: {{ $labels.name }} — identify bad replica before repair"
+
+      - alert: CephObjectUnfound
+        expr: max_over_time(ceph_health_detail{name="OBJECT_UNFOUND"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph objects unfound: latest replica unavailable"
+
+      - alert: CephPGUnhealthyStates
+        expr: |
+          (
+            (ceph_pg_down + ceph_pg_incomplete + ceph_pg_unknown + ceph_pg_stale + ceph_pg_peered)
+            * on (pool_id) group_left(name) ceph_pool_metadata
+          ) > 0
+        for: 3m
+        labels:
+          severity: critical
+          source: ceph_coverage
+        annotations:
+          summary: "Ceph pool {{ $labels.name }} has PGs in unhealthy states"
+```
+
+**決策要點：**
+
+- **`CephDataDamage` / `CephObjectUnfound` 用 `max_over_time(...[5m]) > 0` 而非 `== 1`**：真機 real-lab S19 觀測到 mgr 對 `OSD_SCRUB_ERRORS` 這類 check 的匯出是 **transient**——CLI `ceph health detail` 持續顯示 6 分鐘，但 Prometheus 同段時間 97 個 sample 裡值 1 只出現約 3 次零星 scrape，舊版 `== 1` + `for: 1m` 永遠湊不滿連續 1 分鐘。窗化撐住 flicker（`CephDaemonSlowOps` 同一種修法）。
+- **`Watchdog`（`vector(1)`）恆 firing**，走獨立 receiver 接外部 dead-man switch——它不叫 = 整條告警管線死了。severity `none`，不進 pager/slack 常規路。
+- 這 18 條都有 promtool 單元測試，且 real-lab S4–S22 逐條真機注入涵蓋（下表 S# 為各自的 run of record）。
+
+| Rule | severity · for | promtool | Tier B | 真機 |
+|---|---|---|---|---|
+| `CephMetricsAbsent` | critical · 5m | `coverage-metrics-absent.test.yml` | pager | real-lab S7 |
+| `Watchdog` | none · —（恆 firing） | `coverage-watchdog.test.yml` | watchdog（dead-man） | real-lab S22（baseline 管線驗證） |
+| `CephOSDSlowHeartbeat` | critical · 2m | `coverage-osd-slow-heartbeat.test.yml` | pager（依 source 合約） | real-lab S12 |
+| `CephOSDFlapping` | critical · —（`>= 4`） | `coverage-osd-flapping.test.yml` | pager（依 source 合約） | real-lab S15 |
+| `CephMonClockSkew` | critical · 2m | `coverage-mon-clock-skew.test.yml` | pager（依 source 合約） | real-lab S13 |
+| `CephOSDLatencyOutlier` | warning · 10m | `coverage-osd-latency-outlier.test.yml` | slack（依 source 合約） | real-lab S11（PASS\*：正向斷言全過，rollback 後留 BlueStore 24h latch，`HEALTH_OK` 由下一場跨 run 證） |
+| `CephDaemonSlowOps` | warning · 1m | `coverage-daemon-slow-ops.test.yml` | slack（依 source 合約） | real-lab S1 |
+| `CephDaemonRecentCrash` | warning · 5m | `coverage-daemon-recent-crash.test.yml` | slack | real-lab S14 |
+| `CephMgrNoStandby` | warning · 5m | `coverage-mgr-no-standby.test.yml` | slack（依 source 合約） | real-lab S8 |
+| `CephOSDNearFull` | warning · 10m | `coverage-osd-near-full.test.yml` | slack | real-lab S16 |
+| `CephOSDBackfillFull` | critical · 5m | `coverage-osd-backfill-full.test.yml` | pager（依 source 合約） | real-lab S16 |
+| `CephMonDiskLow` | warning · 10m | `coverage-mon-disk-low.test.yml` | slack（依 source 合約） | real-lab S21 |
+| `CephMonDiskCritical` | critical · 1m | `coverage-mon-disk-critical.test.yml` | pager（依 source 合約） | real-lab S21 |
+| `CephPoolNearQuota` | warning · 10m | `coverage-pool-near-quota.test.yml` | slack（依 source 合約） | real-lab S17 |
+| `CephCapacityForecast` | warning · 30m | `coverage-capacity-forecast.test.yml` | slack（依 source 合約） | real-lab S18 |
+| `CephDataDamage` | critical · 1m | `coverage-data-damage.test.yml` | pager | real-lab S19 |
+| `CephObjectUnfound` | critical · 1m | `coverage-object-unfound.test.yml` | pager（依 source 合約） | real-lab S20 |
+| `CephPGUnhealthyStates` | critical · 3m | `coverage-pg-unhealthy-states.test.yml` | pager（依 source 合約） | real-lab S2 |
+
+> Tier B 標「依 source 合約」= 該 label set（`source=ceph_coverage` + 對應 severity）由 routing matcher 決定去向，`routes-test.sh` 以同 source/severity 的代表（`CephMetricsAbsent`、`CephDataDamage`、`CephDaemonRecentCrash`、`CephOSDNearFull`、`Watchdog`）逐條斷言路由；未逐條命名者走同一條 matcher，路由行為相同。
+
+## 群組四／五：quorum 的兩條特例 rule
+
+```yaml
+  - name: ceph-mon-quorum-dynamic
+    rules:
+      - alert: CephMonQuorumLostDynamic
+        expr: (count(ceph_mon_quorum_status == 1) or vector(0)) < (floor(count(ceph_mon_metadata) / 2) + 1)
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_stability
+        annotations:
+          summary: "Ceph MON quorum lost or below dynamic majority"
+```
+
+```yaml
+  - name: ceph-mon-external
+    rules:
+      - alert: CephMonQuorumLostExternal
+        expr: (count(ceph_mon_tcp_up == 1) or vector(0)) < 2
+        for: 1m
+        labels:
+          severity: critical
+          source: ceph_external
+        annotations:
+          summary: "Ceph MON quorum at risk (out-of-band probe): fewer than 2 mons reachable"
+          runbook: "從叢集外確認 mon 可達性；mgr metric 此時可能已凍結，改信此探針與 ceph quorum_status"
+```
+
+| Rule | severity · for | promtool | Tier B | 真機 |
+|---|---|---|---|---|
+| `CephMonQuorumLostDynamic` | critical · 1m | `mon-quorum-dynamic.test.yml` | 依 source 合約（`ceph_stability`/critical） | promtool only——非 3-mon 變體，3-mon lab 未注入 |
+| `CephMonQuorumLostExternal` | critical · 1m | `mon-external.test.yml` | pager（逐條命名） | **Tier D obs S5：真失守時正確 fire（探針不經 mgr）** |
+
+- **`CephMonQuorumLostDynamic`**：非 3-mon cluster（5-mon、7-mon）把 `CephMonQuorumLost` 的 hard-code `< 2` 換成 `floor(count(ceph_mon_metadata)/2)+1` 的動態 majority。**替換而非並存**——3-mon 環境用寫死版即可，別兩條一起部署造成重複 page。
+- **`CephMonQuorumLostExternal`**：讀叢集外 TCP 探針 `ceph_mon_tcp_up`（`mon-tcp-probe.py` 自製 probe），是 out-of-band 生命線的**第一版實作**，仍在現行 rule 集內。它與現在欽定的 Blackbox 版是**同機制、不同 exporter**，見下節。
+
+## MON quorum 生命線：mgr 路徑先天盲，該用哪條
+
+這是整套 alert 最重要的單一決策，值得單獨一節。
+
+**別把 `CephMonQuorumLost` 當「第二台 mon 掉就會叫」的生命線。** 真機 Tier D obs S4 實測：3-mon cluster 停掉 2 台、quorum 真失守的 90 秒內，唯一資料來源（active mgr 的 prometheus module）**拿不到新 map，把 `ceph_mon_quorum_status` 凍結在 stale=1（三台都在 quorum）**，`up{job="ceph"}` 也一直 =1。結果 `count(...==1)` 永遠是 stale 的 3、`3 < 2` 不成立 → **`CephMonQuorumLost` 沒 fire**。這不是 PromQL bug（`or vector(0)` 修的是另一回事），是 **sensor 與被測物同生共死**的架構盲區：規則層修不了。
+
+**要可靠偵測真 quorum loss，必須走不經 mgr 的 out-of-band 訊號。** 欽定的 canonical 做法是 **Blackbox 版**：
+
+- 用 [blackbox_exporter](https://github.com/prometheus/blackbox_exporter) 的 `tcp_connect` module 探每顆 mon 的 v2 msgr port `3300`，匯出 `probe_success{job="mon-tcp"}`。mon daemon 停 → port 關 → `probe_success=0`，跟 mgr 凍不凍結完全無關。
+- 規則沿用同一套 majority 寫法，資料換成 `probe_success`：
+
+```yaml
+- alert: CephMonQuorumLostBlackbox
+  expr: (count(probe_success{job="mon-tcp"} == 1) or vector(0)) < 2
+  for: 30s
+```
+
+- 完整推導、真機對照表（注入後一個 scrape ≤5s 就掉到 `count=1`、`for: 30s` 後 fire）與部署細節在 [Ceph - MON quorum 偵測盲區](./mon-quorum-detection-blind-spot)。
+
+**現行 rule 集裡的 `CephMonQuorumLostExternal`** 是同機制的**第一版實作**（自製 `mon-tcp-probe.py` 取代標準 blackbox_exporter），Tier D obs S5 已真機驗證有效，因此仍保留在 rule 集內。新部署優先採 Blackbox 版（標準 exporter、最新真機驗證），把自製 probe 視為等價前身。
+
+**分層而非取代**：mgr 版（`CephMonQuorumLost` / `CephMonDownScoped`）在 mgr 健康時仍有用——它能抓「port 開著但沒進 quorum（網路分區、選舉卡住）」這種 blackbox 探針看不出的退化。兩層取聯集當 pager，再加一條 `up{job="mon-tcp"}` 全掉的守門 alert 把「探針自己死了」跟「mon 掛了」分開。
+
+## Alertmanager routing（現行版）
+
+因為 upstream mixin 預設 rule 仍在，routing 不能寫成「所有 `severity=critical` 都送 pager」——那會讓預設 aggregate（`CephMonDownQuorumAtRisk`、`CephOSDDownHigh`）在維護期繼續叫。用 label 導向把三種角色映射到 receiver：
+
+```yaml
+route:
+  receiver: slack-ceph
+  group_by: ['alertname', 'name', 'hostname', 'ceph_daemon']
+  routes:
+    - receiver: watchdog-ceph
+      matchers:
+        - alertname="Watchdog"
+
+    - receiver: pager-ceph
+      matchers:
+        - severity="critical"
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage|ceph_external"
+
+    - receiver: pager-ceph
+      matchers:
+        - type="ceph_default"
+        - alertname="CephHealthError"
+
+    - receiver: slack-ceph
+      matchers:
+        - source=~"ceph_stability|ceph_scoped|ceph_coverage|ceph_external"
+
+    - receiver: slack-ceph
+      matchers:
+        - type="ceph_default"
+```
+
+**決策要點：**
+
+- pager 的 source matcher 現行是 **四個 source**：`source=~"ceph_stability|ceph_scoped|ceph_coverage|ceph_external"`。`ceph_external` 一定要在——否則 `CephMonQuorumLostExternal`（`severity=critical`、`source=ceph_external`）會 fall through 到預設 slack，把唯一可靠的 quorum 生命線排除在 pager 外。
+- pager 的第二條 route 只讓 upstream mixin 的 `CephHealthError` 進 pager；其餘 `type=ceph_default` 的 aggregate（含 critical 的）留 slack 當 context，與 upstream 慣例一致但不吵 pager。
+- **label 導向而非 alertname regex**：新增 coverage rule 時，只要 `severity`/`source` 正確就自動路由，不會漏。Tier B `routes-test.sh` 逐條斷言這份合約（`CephMonQuorumLostExternal → pager`、`CephHealthWarning`/`CephMonDownQuorumAtRisk`/`CephOSDDownHigh → slack` 等）。
+
+## 維護時怎麼 silence（三粒度 SOP）
+
+scoped rule 帶 `hostname` / `ceph_daemon`，維護可只 silence 目標那台。破壞性操作前一律先 `ok-to-stop`。
+
+### 維護單顆 OSD（換硬碟）
+
+```bash
+ceph osd ok-to-stop 5
+
+amtool silence add \
+  alertname="CephOSDDaemonDownScoped" \
+  ceph_daemon="osd.5" \
+  --duration=1h \
+  -c "replace osd.5"
+```
+
+換硬碟一定會升 `PG_DEGRADED`、對 subtree 設 `noout` 還會升 `OSD_FLAGS`——這兩個**不用**額外 silence，它們歸 slack-only 的 `CephLowPriorityNotice`、且在 `CephClientRisk` 排除清單裡，本來就不 page。唯一仍會 page 的是真出事（PG 掉到 `min_size` 以下變 `PG_AVAILABILITY` → `CephClientBlocked`）——那時**不該** silence，`ceph osd ok-to-stop 5` 通過就是在確認不會走到這一步。若該 host 只有一顆 OSD，另加 `alertname="CephOSDHostDownScoped" hostname="..."` 的 silence。
+
+### 維護整台 OSD node
+
+```bash
+ceph orch host ok-to-stop osd-host-a
+
+amtool silence add \
+  'alertname=~"CephOSDHostDownScoped|CephOSDDaemonDownScoped"' \
+  hostname="osd-host-a" \
+  --duration=2h \
+  -c "planned maintenance osd-host-a"
+
+ceph orch host maintenance enter osd-host-a
+```
+
+只 silence `hostname="osd-host-a"`；維護期間 `osd-host-b` 掛掉，`CephOSDHostDownScoped{hostname="osd-host-b"}` 照樣 page。**不要 silence `CephClientBlocked` / `CephClientRisk` / `CephHealthError`。** Tier D obs S2 驗證：整台進 maintenance 升 `OSD_HOST_DOWN`/`OSD_DOWN`/`OSD_FLAGS`/`PG_DEGRADED`/`HOST_IN_MAINTENANCE`，上面兩條 scoped silence + 排除清單就完整蓋掉 pager，其餘進 slack。
+
+### 維護 MON node
+
+```bash
+ceph orch host ok-to-stop mon-host-a
+ceph mon ok-to-stop a
+ceph quorum_status
+
+amtool silence add \
+  alertname="CephMonDownScoped" \
+  hostname="mon-host-a" \
+  ceph_daemon="mon.a" \
+  --duration=1h \
+  -c "planned maintenance mon.a on mon-host-a"
+
+ceph orch host maintenance enter mon-host-a
+```
+
+**不要 silence `CephMonQuorumLost`**——但也別把它當生命線（見上節，真失守它是盲的；真正的第二台生命線是 Blackbox / external 探針）。維護 1 台時 `count==2` 本來就不觸發。Tier D obs S3 驗證：停掉的 mon 仍在 monmap，`CephMonDownScoped{ceph_daemon="mon.a"}` 能被 silence 精準 match；`MON_DOWN` 在 `CephClientRisk` 排除清單 → 不會 cluster-wide page。
+
+## 並存的快速偵測層（slow-ops）
+
+`CephDaemonSlowOps` / `CephClientBlocked{SLOW_OPS}` 是「已經卡了才叫」的 health-check 層。要更早抓到 slow ops（在 `SLOW_OPS` health check 升起前），有一組獨立的**快速偵測層**（R1–R4：BlueStore latency histogram、op 佇列深度、firmware 指紋等），與本頁的 health-check 層並存、不互斥。設計與真機驗證見 [Ceph - slow ops 偵測機制](./slow-ops-detection-mechanisms) 與 [Ceph - slow ops 快速偵測 lab](./slow-ops-fast-detection-lab)。
+
+## 相關閱讀
+
+- [Ceph - alert 驗證方法論](./ceph-alert-validation-methodology)：四層驗證（promtool / amtool / live / 真機）的方法論、F1 空 vector bug 與 `OSD_FLAGS` 命名 bug 的來龍去脈（本頁只給結論，過程在這）。
+- [Ceph - alert 真機 lab 報告](./ceph-alert-real-lab-report)：22 場真機故障注入的逐場證據帳（注入命令、ceph 端證據、receiver 證據、rollback）；「22/22」的正確解讀（各場在其最終 rules 版本下通過，非單一 snapshot 一次跑綠）與 G-1～G-7 誠實限制。
+- [Ceph - MON quorum 偵測盲區](./mon-quorum-detection-blind-spot)：Blackbox 生命線的完整推導、真機對照表與部署細節。
+- [Ceph - slow ops 偵測機制](./slow-ops-detection-mechanisms) / [slow ops 快速偵測 lab](./slow-ops-fast-detection-lab)：並存的快速偵測層。
