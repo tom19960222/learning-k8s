@@ -87,6 +87,7 @@ GIT_SSH_COMMAND='ssh -i .ssh/id_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=n
 
 - `skills/enumerating-adversarial-boundaries/SKILL.md`：對任何設計／alert 集合做結構化邊界窮舉（review 把關可單用）。
 - `skills/designing-falsifiable-experiments/SKILL.md`：寫任何「可回退、prediction 先行」的實驗 scenario 時單用。
+- `skills/writing-experiment-reports/SKILL.md`：研究收官後要把證據整理成「給沒參與的人只看一份就懂」的完整報告時用（含逐實驗五欄格式、參數建議總表、主管 persona review gate）。
 
 ## Lab 指令的驗證等級
 
