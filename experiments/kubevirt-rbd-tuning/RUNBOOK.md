@@ -3,6 +3,7 @@
 > **你是誰**：接手執行本研究 T3 實驗的 agent（可能不是原本設計實驗的那位）。
 > **讀檔順序**：`HYPOTHESES.md`（charter + 假設）→ `EXPERIMENT-PLAN.md`（每實驗的目的/變因/預期）→ 本文件（怎麼做）→ `STATE.md`（做到哪）。
 > **鐵則**：本文件的指令照抄可跑；任何偏離（環境不符、指令失敗改用替代方案）都要記進 `STATE.md` 的 deviation log。預期（prediction）在 `EXPERIMENT-PLAN.md` 各實驗已寫死——**跑之前**把它抄進 bundle 的 `prediction.md`，跑完只准比對、不准改寫。
+> **鐵則（E-35 事故換來的）**：破壞性 + 可能 IO-hang 的實驗**必須配外部 watchdog**——與主腳本完全獨立的計時器（另一個 shell / 本機 background loop），硬期限（建議 5min）一到**無條件**執行恢復（restart mon/OSD、清注入）。絕不能只靠 in-script `timeout`（guest D-state 免疫 SIGKILL）或 trap（腳本 hang 住就不觸發）。E-35 就是這樣把叢集滯留在 quorum 失 + OSD down 狀態 8 小時。
 
 ---
 

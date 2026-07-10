@@ -168,3 +168,11 @@
   發現根因：Mac 只能連 public IP，腳本用 node internal IP(10.0.1.x) SSH 全逾時→改用 kubectl/CP。cache=none 對照組待補（機制確定=0丟失）。
 - 2026-07-09 `E-40 對照組 done — cache=none 硬斷 0 遺失（10/10 存活含最後 acked）；坐實 writeback 丟~6s/none 零丟失`。E-41 補充：none 輪 VMI 有 failover 到 k8s-1（預設 pod eviction ~300s 觸發），故 auto-failover 可能發生但慢且不可靠。VM 現於 k8s-1、cache=none baseline。
 - 2026-07-09 `E-31 done — 整 OSD host 硬斷（3/9 OSD）衝擊輕：僅一次 38ms peering 尖峰，min_size=2 撐住 IO 續存。失效顆數不重點，min_size 才是。跨 degraded 總結：失效本身無感，傷害在 backfill/flapping/gray`。授權擴大 cyshih-osd-2 可 az 動。
+- 2026-07-09 `E-35 done — STAGE2 quorum 失但穩態 IO 照跑（client 不需 mon）；STAGE3 複合故障寫入 D-state 無限 hang，恢復順序=先 mon 後 OSD`。
+  **⚠ 8 小時滯留事故**：STAGE3 D-state 使腳本 timeout/trap 全失效、poller 不報告，叢集滯留故障態 ~8h 由使用者發現手動恢復（無損，HEALTH_OK/65 PG active+clean）。
+  **鐵律（已入 RUNBOOK 鐵則）：破壞性 + 可能 IO-hang 實驗必須配外部 watchdog（硬期限無條件恢復），不能只靠 in-script timeout（D-state 免疫）或 trap（hang 不觸發）。**
+- 2026-07-10 git 環境事故補記：多 session 共用 checkout、worktree 被別的 session prune → E-35 bundle 留在死 worktree 未回收；另 iTerm2 對 ~/Documents 的 macOS TCC 權限失效 → 本輪收尾在 /private/tmp 的 GitHub clone 上完成（base=e439280）。教訓：**每個 session 用獨立 worktree；別在主 checkout 直接切 branch**。
+- 2026-07-10 ===== Gate 3 收尾完成 =====：E-35 記錄回填（EVIDENCE-SUMMARY/RUNBOOK 鐵則/頁面 degraded 矩陣）；
+  HYPOTHESES.md 34 條全數 triage（confirmed 11、violated 8＋部分 violated 2、indistinguishable 1、synthesized 7、not-run 4、open 1；proposed 歸零）；
+  頁面補「最終結論」段 + 回填 E-16/E-17/E-18/E-20 列；vm-storage-perf/quiz.json 出 10 題（全部錨實驗證據）。
+  開放題留 backlog：H-034（osd_request_timeout PG inactive 不觸發機制）、H-033 閉環變體、H-030 完整決策樹。研究收官。

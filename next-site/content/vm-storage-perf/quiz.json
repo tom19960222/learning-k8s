@@ -1,1 +1,122 @@
-[]
+[
+  {
+    "id": 1,
+    "question": "在 KubeVirt + ceph-csi + krbd 的標準鏈上，你想把存量 PVC 的 krbd `queue_depth` 從 128 改成 256。下列哪個做法真的改得動？",
+    "options": [
+      "改 StorageClass 的 mapOptions，等下次 VM 重啟重新 map 就生效",
+      "kubectl patch PV 的 volumeAttributes，然後讓 VM 換 node 觸發 unstage/restage",
+      "對運行中的 VM 做 live migration，migration 會用新參數重新 map",
+      "都改不動——mapOptions 在 PV 建立時凍結，唯一路徑是新 StorageClass + 新 PVC + 搬資料"
+    ],
+    "answer": 3,
+    "explanation": "H-002（T1）：ceph-csi 在 attach 時從 PV 的 volumeAttributes 讀 mapOptions（rbd_attach.go:314-318），SC 參數只在 provision 時寫入 PV。E-51 真機閉環：連 kubectl patch PV volumeAttributes 都被 API 以 source immutable 拒絕——沒有 escape hatch。krbd 層旋鈕（queue_depth / alloc_size / osd_request_timeout）對存量磁碟是「建置期定死」（D 類），要在 StorageClass 設計期決定。"
+  },
+  {
+    "id": 2,
+    "question": "「換 virtio-scsi 就有 30 秒 SCSI timeout，Ceph 卡死時 guest 會收到 IO error 而不是無限 hang」——這個常見說法在 kernel 6.8 上實際如何？",
+    "options": [
+      "不成立：virtio-scsi 的 eh_timed_out 無條件回 RESET_TIMER，計時器永遠重設，永不進 abort——兩種 bus 都永不逾時",
+      "成立：sd 層預設 30s timeout 會觸發 abort，virtio-blk 才會無限 hang",
+      "部分成立：要手動把 /sys/block/sdX/device/timeout 改小才會觸發",
+      "成立但只對讀有效，寫入因為 journal 順序約束不能 abort"
+    ],
+    "answer": 0,
+    "explanation": "H-006 violated（T1）：drivers/scsi/virtio_scsi.c:786-789 的 virtscsi_eh_timed_out 無條件回傳 SCSI_EH_RESET_TIMER，scsi_error.c 收到就重設計時器——永遠不會進入 abort/error handler，sd 層的 30s timeout 形同虛設。virtio-blk 則根本沒註冊 .timeout handler。結論：bus 選擇不是「把卡死轉成可控失敗」的旋鈕，guest 端沒有這種救命索。"
+  },
+  {
+    "id": 3,
+    "question": "krbd map option `osd_request_timeout=30` 理論上會在 30 秒後以 -ETIMEDOUT abort 卡住的 IO。E-36 在 min_size 不滿（PG inactive）的真機注入中觀察到什麼？",
+    "options": [
+      "如預期 30 秒後 guest 收到 Input/output error，檔案系統 remount read-only",
+      "timeout 完全不觸發：寫入 blocked 302.8 秒直到 OSD 回歸，無 -ETIMEDOUT、dmesg 零 timeout 訊息，恢復後該筆 op 直接成功",
+      "timeout 有觸發但被 krbd 自動重試吃掉，guest 看到 60 秒延遲",
+      "guest kernel panic，因為 jbd2 等不到 journal commit"
+    ],
+    "answer": 1,
+    "explanation": "H-032 violated（E-36）：即使 host config_info 實證 osd_request_timeout=30 生效，在「這個旋鈕最該出場的情境」（PG inactive）它沒有出場——blocked 302.8s 至恢復、零 abort。與 osd_client.c:3479/3504 的源碼閱讀矛盾，機制環節仍在追查（H-034）。生產含義：不要把它當「防卡死」的救命索；防線只能是不讓 PG inactive + application 層 timeout。"
+  },
+  {
+    "id": 4,
+    "question": "E-15 中，virt-launcher pod 的 CPU limit 從 4（=vCPU 數）改成 2，guest 內同時有 CPU 負載時，disk IO 表現如何變化？",
+    "options": [
+      "p50 與 p99 等比例惡化約 2 倍（CPU 減半）",
+      "IOPS 不變但 p99 輕微上升，因為 IO 走 host kernel 不受 pod limit 影響",
+      "p99 從 7.6ms 飆到 55.8ms（×7.4）、IOPS 砍半，但 p50 幾乎不變——只看均值完全看不到",
+      "VM 直接 OOMKilled，因為 CFS throttle 連帶影響記憶體回收"
+    ],
+    "answer": 2,
+    "explanation": "H-018 confirmed（E-15，強）：CFS quota 以 100ms 週期 throttle，IO completion 路徑被整段凍結，表現為尾延遲災難（p99 ×7.4）而非均值劣化。關鍵修正：兩個變體都是 Guaranteed QoS——真正門檻是 limit ≥ vCPU 數，不是 QoS class。這是 catalog 上完全沒有、卻最容易誤設又最難察覺的隱形旋鈕。"
+  },
+  {
+    "id": 5,
+    "question": "E-32 對一台 OSD host 注入 +50ms 網路延遲（gray failure，OSD 沒死）。對 client 寫入與 Ceph 告警的影響是？",
+    "options": [
+      "寫入變慢約 2 倍，HEALTH_WARN 出現 slow ops 告警",
+      "只有 primary 在那台 host 的 PG 變慢（約 1/3 寫入），health 顯示 OSD laggy",
+      "mon 在幾分鐘內把該 host 的 OSD 標 down，觸發 rebalance",
+      "寫入 ×40、讀 ×19，但 ceph -s 全程 HEALTH_OK、零告警——因為 size=3 的 per-host replica 使每筆寫入都要等那台慢 host"
+    ],
+    "answer": 3,
+    "explanation": "H-011 confirmed（E-32）：這是本研究最重要的 degraded 發現之一。寫入要等全部 3 副本 ack，CRUSH per-host 分佈下每個 PG 的 acting set 都含慢 host 的一顆 OSD → 一台慢 host 毒化全部寫入；而 heartbeat 沒超時、OSD 沒死，ceph health 完全不露餡。生產監控必須有 client p99 + per-OSD commit latency + host RTT，「ceph health OK」不等於「storage 沒問題」。"
+  },
+  {
+    "id": 6,
+    "question": "cache=writeback 的 VM 所在 k8s node 被硬斷電（E-40）。guest 已收到寫入完成回報的資料會怎樣？",
+    "options": [
+      "全部安全——writeback 只是延遲回寫，rbd 層有 journal 保護",
+      "丟失最後約 6 秒的已 ack 寫入（host page cache 未 flush 的部分）；cache=none 對照組則 0 遺失",
+      "整顆 image 損毀需要 rbd repair",
+      "與 cache=none 一樣只丟 in-flight 中的那幾筆"
+    ],
+    "answer": 1,
+    "explanation": "H-015 修正後 confirmed（E-40）：writeback = host page cache，kernel dirty writeback（~5s 週期）只 flush 較舊資料，最近 ~6 秒的 acked 寫入還在 host 記憶體、隨斷電消失（實測 last acked block 4235、≥3900 遺失）。cache=none 的 O_DIRECT 直穿到 Ceph，同注入 10/10 存活。關鍵區分：光 kill QEMU/pod 不丟（page cache 在 host 存活）——這個代價只在 node 級災難兌現，而且丟的是「最近幾秒」，最難察覺。"
+  },
+  {
+    "id": 7,
+    "question": "k8s node 硬斷後，上面的 KubeVirt VM（RWX Block PVC，LIVE-MIGRATABLE）預設會多快在別的 node 恢復？",
+    "options": [
+      "krbd watcher 30s 逾時後自動重排，總停機約 1 分鐘",
+      "node NotReady（~60s）後 pod 被驅逐，VM 約 2 分鐘恢復",
+      "可能永遠不會：實測 VMI 卡在 dead node 上 phantom Running 11 分鐘以上，force-delete 還被 stuck finalizer 擋；另一輪靠 ~300s pod eviction 才重排——慢且不可靠，生產需要 NodeHealthCheck",
+      "KubeVirt 會立即 live migrate 到健康 node"
+    ],
+    "answer": 2,
+    "explanation": "H-017 violated——比預測更糟（E-41）：預測的「timeout 疊加的 failover 時間預算表」根本無從談起，因為預設行為是不 failover。writeback 輪 VMI 卡 phantom Running 11min+（死 node 無法確認 pod termination，finalizer 卡住）；none 輪未手動介入，unreachable NoExecute toleration（~300s）觸發了重排。結論：KubeVirt VM 的 node 級高可用需要 NodeHealthCheck / machine-health-check 這類 node-loss 自動化，預設沒有。"
+  },
+  {
+    "id": 8,
+    "question": "mon quorum 全失（2/3 mon down）的當下，正在跑穩態 IO 的 VM 會怎樣？此時再死一顆 OSD 呢？（E-35）",
+    "options": [
+      "quorum 失 → 所有 IO 立即中斷；OSD 再死只是雪上加霜",
+      "穩態 IO 照跑（client 用既有 osdmap 直連 OSD，不需要 mon）；但疊加 OSD 死亡後，對受影響 PG 的寫入進入無限期 D-state hang——沒有 mon 發新 osdmap，叢集無法自癒",
+      "IO 降級為 read-only，等 mon 回來自動恢復",
+      "krbd 會自動 failover 到剩下的那顆 mon 繼續拿 map"
+    ],
+    "answer": 1,
+    "explanation": "H-014 confirmed（E-35）：quorum 失去殺死的是「變更平面」不是「資料平面」——已連線 client 拿著舊 osdmap 照常直連 OSD。危險在複合故障：quorum 失 + OSD 死 = client 永遠不知道 OSD 死了、也沒有 peering/recovery 能繞開，寫入卡進不可中斷 D-state（SIGKILL 都殺不掉）。恢復順序是硬約束：先救 mon quorum、再救 OSD，反過來無效。這也解釋為什麼 mon 監控不能只靠 mgr metrics（quorum 失時觀測面一起死）。"
+  },
+  {
+    "id": 9,
+    "question": "綜合 E-30（單 OSD down）、E-31（整台 host 3 OSD down）、E-34（flapping）、E-39（mClock），degraded 期間 client 延遲的「真正傷害來源」排序是？",
+    "options": [
+      "失效當下的 peering 風暴最傷，flapping 其次，backfill 最輕",
+      "失效顆數決定傷害：整台 host down 遠比單 OSD down 嚴重",
+      "mClock profile 沒調對是主因，high_client_ops 能救大半",
+      "失效本身近乎無感（min_size 滿足時只有秒級 peering 尖峰）；真正的痛是 auto-out 後的 backfill 債（rr ×24）、flapping（noout 砍 p999 71%）與 gray failure（×40 且無告警）"
+    ],
+    "answer": 3,
+    "explanation": "跨實驗總結：E-30 down-未-out 無感、E-31 整台 host down 也只有一次 38ms 尖峰（min_size=2 撐住，「失效顆數不是重點，min_size 才是」）；E-30 auto-out 後 backfill 使 rr-qd1 ×24，E-30 vs E-39 對照指向熱物件 recovery 債（H-033）；E-34 flapping 靠 noout 砍 p999 71%；E-39 顯示 headroom 足夠時 mClock profile indistinguishable。維運重點=控制 out 時機、偵測 gray，不是調 QoS 旋鈕。"
+  },
+  {
+    "id": 10,
+    "question": "E-38 把 pool 推到 full_ratio。client 寫入收到什麼？nearfull 到 full 之間的正確定位是？",
+    "options": [
+      "寫入 hang（實測 96 秒直到解除）而非 ENOSPC/EIO，恢復後該筆寫入成功完成；nearfull 是唯一的告警視窗，必須當「立即行動」線",
+      "寫入立即收到 ENOSPC，應用層可以優雅處理；nearfull 只是資訊性告警",
+      "寫入被限速（backpressure）但不中斷；full 時才報錯",
+      "guest 檔案系統先 remount read-only 保護資料"
+    ],
+    "answer": 0,
+    "explanation": "H-022 confirmed（E-38）：容量耗盡是「穩定性邊界」不是單純容量問題——full 之後寫入的症狀與 min_size hang 同型（無限期阻擋、非錯誤），guest 應用只會看到卡住。nearfull 只告警不擋寫（v1 意外驗證），所以 nearfull→full 之間是唯一能行動的視窗。附帶踩雷：注入時 nearfull/backfillfull/full 三個 ratio 要依序設，out-of-order 會被拒。"
+  }
+]
