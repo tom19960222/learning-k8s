@@ -1,0 +1,6 @@
+{"status":"success","data":{"resultType":"matrix","result":[
+{"metric":{"ceph_daemon":"osd.0","instance":"ceph-lab-osd-01"},
+ "values":[[1700000000,"0"],[1700000010,"2"],[1700000020,"4"],[1700000030,"7"]]},
+{"metric":{"ceph_daemon":"osd.1","instance":"ceph-lab-osd-01"},
+ "values":[[1700000000,"0"],[1700000030,"2"]]}
+]}}

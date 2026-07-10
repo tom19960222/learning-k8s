@@ -1,0 +1,40 @@
+# R4: mon 端 health_detail 短暫 blip（2 個樣本，H-023 實測形態）也要 fire；
+# 舊 CephClientIOBlocked(for:1m) 對同樣輸入撐不過 for（此處以 R4 的行為對照驗證）
+rule_files:
+  - ../../rules/ceph-slow-ops-fast.yml
+evaluation_interval: 10s
+tests:
+  - interval: 10s
+    input_series:
+      # 只亮 20 秒（t=30~40s 兩個樣本）就熄——第一次 E-00 過載窗的真實形態
+      - series: 'ceph_health_detail{name="SLOW_OPS",instance="mgr-host",job="ceph"}'
+        values: '0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 20s
+        alertname: CephClusterSlowOpsFast
+        exp_alerts: []
+      - eval_time: 40s
+        alertname: CephClusterSlowOpsFast
+        exp_alerts:
+          - exp_labels:
+              name: SLOW_OPS
+              instance: mgr-host
+              job: ceph
+              severity: critical
+              source: ceph_slow_ops_fast
+            exp_annotations:
+              summary: "Cluster-level SLOW_OPS health check active"
+              description: "mon 端 SLOW_OPS health check 亮起（有 op 卡超過 30s）。此為 R3 的備援路徑：per-daemon metric 對短暫事件會漏採（H-023），本規則吃 mon 端訊號補洞；哪顆 OSD 看 CephOSDTransientStall / CephDaemonSlowOpsFast 或 ceph health detail。"
+      # blip 結束 + max_over_time 窗過後，keep_firing_for 仍撐住（oncall 來得及看到）
+      - eval_time: 5m
+        alertname: CephClusterSlowOpsFast
+        exp_alerts:
+          - exp_labels:
+              name: SLOW_OPS
+              instance: mgr-host
+              job: ceph
+              severity: critical
+              source: ceph_slow_ops_fast
+            exp_annotations:
+              summary: "Cluster-level SLOW_OPS health check active"
+              description: "mon 端 SLOW_OPS health check 亮起（有 op 卡超過 30s）。此為 R3 的備援路徑：per-daemon metric 對短暫事件會漏採（H-023），本規則吃 mon 端訊號補洞；哪顆 OSD 看 CephOSDTransientStall / CephDaemonSlowOpsFast 或 ceph health detail。"

@@ -1,0 +1,42 @@
+# R3: SLOW_OPS 一出現就 fire（不等 for:1m）；spiky gauge 歸零後 keep_firing_for 撐住
+rule_files:
+  - ../../rules/ceph-slow-ops-fast.yml
+evaluation_interval: 10s
+tests:
+  - interval: 10s
+    input_series:
+      # t=30s 出現 4 個 slow ops，t=60s 起 mgr 回報歸零（spiky snapshot gauge）
+      - series: 'ceph_daemon_health_metrics{ceph_daemon="osd.0",type="SLOW_OPS",instance="mgr-host",job="ceph"}'
+        values: '0 0 0 4 4 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 20s
+        alertname: CephDaemonSlowOpsFast
+        exp_alerts: []
+      # 第一個含 >0 樣本的 eval → 立即 firing（舊規則 for:1m 要再等 60s）
+      - eval_time: 40s
+        alertname: CephDaemonSlowOpsFast
+        exp_alerts:
+          - exp_labels:
+              ceph_daemon: osd.0
+              type: SLOW_OPS
+              instance: mgr-host
+              job: ceph
+              severity: critical
+              source: ceph_slow_ops_fast
+            exp_annotations:
+              summary: "Slow ops (>30s, client-visible) on osd.0"
+              description: "op tracker 回報有 op 卡超過 osd_op_complaint_time（預設 30s）——client I/O 已經被擋住。若 CephOSDTransientStall 先前已對同一 OSD 發警告，這是同一事件的惡化；若 OSD 同時失聯，優先看 OSD down/flapping。"
+      # gauge 已歸零、max_over_time 窗也過了，keep_firing_for=10m 仍要撐住
+      - eval_time: 6m
+        alertname: CephDaemonSlowOpsFast
+        exp_alerts:
+          - exp_labels:
+              ceph_daemon: osd.0
+              type: SLOW_OPS
+              instance: mgr-host
+              job: ceph
+              severity: critical
+              source: ceph_slow_ops_fast
+            exp_annotations:
+              summary: "Slow ops (>30s, client-visible) on osd.0"
+              description: "op tracker 回報有 op 卡超過 osd_op_complaint_time（預設 30s）——client I/O 已經被擋住。若 CephOSDTransientStall 先前已對同一 OSD 發警告，這是同一事件的惡化；若 OSD 同時失聯，優先看 OSD down/flapping。"

@@ -1,0 +1,93 @@
+# ceph-slow-ops-fast.yml — 快速偵測 BlueStore 暫態卡頓與 client-blocking slow ops
+#
+# 版本依賴（H-019 實證）：
+#   - R1/R2 需要 ceph_bluestore_slow_*_count → Squid v19.2.0+ 且由 ceph-exporter
+#     匯出（exporter_prio_limit 預設 5 即可，counter 是 PRIO_USEFUL=5）。
+#   - R3 只需 mgr prometheus module 的 ceph_daemon_health_metrics（Reef 可用）。
+#   - keep_firing_for 需要 Prometheus v2.42+（lab 為 v2.51.0）。
+#
+# label 假設：ceph-exporter 的 series 帶 ceph_daemon（osd.N）與 instance（cephadm
+# 部署時 instance 被 relabel 成 hostname）。外部 Prometheus 自行 scrape 時，請確認
+# instance 對應到「host」的粒度，R2 的 count by (instance) 才有 per-node 意義。
+#
+# 設計說明：
+#   - 4 個 slow counter 用「顯式 increase()+increase() 相加」而非 __name__ regex：
+#     regex 選出的多個 counter 經 increase() 丟掉 __name__ 後，同一顆 OSD 會產生
+#     重複 labelset → 真 Prometheus 直接回錯（"vector cannot contain metrics with
+#     the same labelset"，E-00 實測）。向量加法的 inner-join 顧慮在此不成立：
+#     4 個 counter 由同一個 ceph-exporter scrape 原子性產生，永遠同進同出。
+#   - R1/R2 for: 0s + keep_firing_for：事件是「單發脈衝」（increase 只在一個
+#     eval 窗內 > 0），for > 0 會直接殺掉偵測能力；keep_firing_for 讓 alert
+#     撐住足夠久供人看到。
+#   - counter 只在 op「完成」時記帳（H-011/H-014）：op 永久卡死不會進 R1，
+#     必須保留 SLOW_OPS 路徑（R3 與既有 CephClientIOBlocked）互補。
+groups:
+  - name: ceph-slow-ops-fast
+    rules:
+      # R1: 任一 OSD 在 1m 窗內出現 ≥1 次 BlueStore slow op（>bluestore_log_op_age，
+      # 預設 5s）。偵測延遲實測見 EVIDENCE-SUMMARY（目標：op 完成後 <30s 可判真）。
+      - alert: CephOSDTransientStall
+        expr: |
+          sum by (ceph_daemon, instance) (
+              increase(ceph_bluestore_slow_aio_wait_count[1m])
+            + increase(ceph_bluestore_slow_committed_kv_count[1m])
+            + increase(ceph_bluestore_slow_read_onode_meta_count[1m])
+            + increase(ceph_bluestore_slow_read_wait_aio_count[1m])
+          ) > 0
+        keep_firing_for: 10m
+        labels:
+          severity: warning
+          source: ceph_slow_ops_fast
+        annotations:
+          summary: "BlueStore slow op burst on {{ $labels.ceph_daemon }} ({{ $labels.instance }})"
+          description: "OSD 在最近 1 分鐘內至少有一個 BlueStore 內部操作超過 bluestore_log_op_age（預設 5s）。單顆 OSD 偶發＝該碟或其路徑短暫卡頓；請對照同 node 其他 OSD 是否同時出現（CephNodeMultiOSDStall）。"
+
+      # R2: 同一 node ≥3 顆 OSD 在同一 2m 窗內都出現 slow op —— SSD firmware /
+      # RAID 卡層級事件的指紋（單碟故障不會同時打中多顆 OSD）。
+      - alert: CephNodeMultiOSDStall
+        expr: |
+          count by (instance) (
+            sum by (ceph_daemon, instance) (
+                increase(ceph_bluestore_slow_aio_wait_count[2m])
+              + increase(ceph_bluestore_slow_committed_kv_count[2m])
+              + increase(ceph_bluestore_slow_read_onode_meta_count[2m])
+              + increase(ceph_bluestore_slow_read_wait_aio_count[2m])
+            ) > 0
+          ) >= 3
+        keep_firing_for: 15m
+        labels:
+          severity: critical
+          source: ceph_slow_ops_fast
+        annotations:
+          summary: "Multiple OSDs stalled simultaneously on {{ $labels.instance }}"
+          description: "同一台 node 有 ≥3 顆 OSD 在 2 分鐘窗內同時回報 BlueStore slow op。此模式指向共用元件：RAID/HBA 卡、SSD firmware（同型號同批次同時 GC/卡頓）、背板或該 node 的記憶體壓力，而非單一磁碟。"
+
+      # R3: SLOW_OPS（op 卡超過 osd_op_complaint_time=30s）一出現就 fire，
+      # 不等 for:1m —— 對「client 已經被卡住」的事件把偵測延遲砍掉 60s+。
+      # 與既有 CephDaemonSlowOps(for:1m) 並存：R3 快、舊規則穩。
+      - alert: CephDaemonSlowOpsFast
+        expr: |
+          max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
+        keep_firing_for: 10m
+        labels:
+          severity: critical
+          source: ceph_slow_ops_fast
+        annotations:
+          summary: "Slow ops (>30s, client-visible) on {{ $labels.ceph_daemon }}"
+          description: "op tracker 回報有 op 卡超過 osd_op_complaint_time（預設 30s）——client I/O 已經被擋住。若 CephOSDTransientStall 先前已對同一 OSD 發警告，這是同一事件的惡化；若 OSD 同時失聯，優先看 OSD down/flapping。"
+
+      # R4: 同一訊號的 mon 端備援路徑。H-023 實證：44s 的真 slow op 事件，
+      # per-daemon metric（R3 的來源）可能整段漏採（op 完成即歸零、可見窗
+      # 只有「op 齡 − 30s」，穿不過 mgr 15s cache + scrape），mon 端
+      # health check 反而抓到 ~20s。兩路 OR 才有完整覆蓋；R4 無 daemon
+      # label，定位靠 R1/R3 補。
+      - alert: CephClusterSlowOpsFast
+        expr: |
+          max_over_time(ceph_health_detail{name="SLOW_OPS"}[1m]) > 0
+        keep_firing_for: 10m
+        labels:
+          severity: critical
+          source: ceph_slow_ops_fast
+        annotations:
+          summary: "Cluster-level SLOW_OPS health check active"
+          description: "mon 端 SLOW_OPS health check 亮起（有 op 卡超過 30s）。此為 R3 的備援路徑：per-daemon metric 對短暫事件會漏採（H-023），本規則吃 mon 端訊號補洞；哪顆 OSD 看 CephOSDTransientStall / CephDaemonSlowOpsFast 或 ceph health detail。"
