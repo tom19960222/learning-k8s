@@ -387,7 +387,7 @@ groups:
 
 - **`CephDataDamage` / `CephObjectUnfound` 用 `max_over_time(...[5m]) > 0` 而非 `== 1`**：真機 real-lab S19 觀測到 mgr 對 `OSD_SCRUB_ERRORS` 這類 check 的匯出是 **transient**——CLI `ceph health detail` 持續顯示 6 分鐘，但 Prometheus 同段時間 97 個 sample 裡值 1 只出現約 3 次零星 scrape，舊版 `== 1` + `for: 1m` 永遠湊不滿連續 1 分鐘。窗化撐住 flicker（`CephDaemonSlowOps` 同一種修法）。
 - **`Watchdog`（`vector(1)`）恆 firing**，走獨立 receiver 接外部 dead-man switch——它不叫 = 整條告警管線死了。severity `none`，不進 pager/slack 常規路。
-- 這 18 條都有 promtool 單元測試，且 real-lab S4–S22 逐條真機注入涵蓋（下表 S# 為各自的 run of record）。
+- 這 18 條都有 promtool 單元測試，且逐條真機注入涵蓋（見下表各自的 real-lab S 編號，為該條的 run of record）。
 
 | Rule | severity · for | promtool | Tier B | 真機 |
 |---|---|---|---|---|
