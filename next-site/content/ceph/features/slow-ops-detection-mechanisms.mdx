@@ -1,0 +1,478 @@
+---
+layout: doc
+title: Ceph — SLOW_OPS／BLUESTORE slow op 的偵測機制與三層盲區
+description: 從 v19.2.3 原始碼追三條互不重疊的訊號路徑——OpTracker 的 SLOW_OPS(門檻 30s、即時快照)、BlueStore 的 BLUESTORE_SLOW_OP_ALERT(門檻 5s、24h latch) 與同一條 log_latency 路徑上的 4 個 slow counter(門檻 5s、累積不歸零)。再用真機實證拆出 SLOW_OPS 的三層盲區(暫態／持續 sub-30s 劣化／採樣漏失)與「SLOW_OPS 會怪錯人」的定位陷阱，說明為什麼「BlueStore 在喊慢、SLOW_OPS 卻不亮」是機制必然。
+category: mechanism
+---
+
+## 本頁定位
+
+- **文章類型**：mechanism（機制拆解）。這頁只回答「這些 slow op 訊號各自是怎麼產生的、彼此量的是不是同一件事、什麼情況下會漏」，不給你可以照抄的 alert 規則。規則的參數與真機偵測延遲屬於[實驗頁](./slow-ops-fast-detection-lab)，文末指過去。
+- **版本錨點**：ceph **v19.2.3**（Squid LTS），submodule commit `c92aebb`。所有 `File:` 行號都對這個 pin 開檔驗過；不同版本行號會漂。
+- **本頁可獨立閱讀**：不預設你讀過本站任何其他頁。需要的前置（OpTracker、BlueStore、mgr、Prometheus 匯出）都在本頁自帶。
+- **證據層級**：機制描述以 **T1**（pinned 原始碼）為主；三層盲區與定位陷阱另有 **T3**（cephadm v19.2.3、3 mon + 9 OSD 的真機注入）實證。每個結論後標 `T1` / `T3`，讓你分得清「原始碼一定如此」與「我在這個 lab 上量到如此」。T3 的 harness 與 evidence bundle 在 `experiments/ceph-slow-ops-detection/`。
+- **本頁取代**：舊頁 `slow-ops-and-bluestore-alerts` 的**機制部分**。舊頁上半的來源鏈查證為正確、在此改寫沿用並用真機證據強化；舊頁下半的 alert 建議（三層架構、`osd_op_complaint_time` 調法等）已被實驗推翻，本頁不沿用。舊頁將標 archive。
+
+## 場景
+
+某天 KubeVirt VM 上的應用變慢，你 ssh 進 OSD node，`grep` OSD log 看到一整排：
+
+```
+bluestore(/var/lib/ceph/osd/ceph-7) log_latency slow operation observed for _txc_committed_kv, latency = 8.21s
+```
+
+BlueStore 明明在抱怨慢操作，可是你 Prometheus 上盯著的 `ceph_healthcheck_slow_ops` 一直是 0，`SLOW_OPS` 這個 health check 也沒亮，pager 一聲都沒響。你開始懷疑自己的 alert 是不是寫錯了。
+
+**它沒寫錯。** 「BlueStore 喊慢」與「SLOW_OPS 亮」量的是**不同層、不同門檻、不同時間特性**的東西——它們幾乎不重疊，這是機制上的必然，不是設定問題。這頁把三條訊號路徑從原始碼追到底，再用真機注入證明 SLOW_OPS 對哪幾類事件結構性失明。
+
+先講一句總綱：v19.2.3 裡跟「op 慢」相關的可匯出訊號其實有**三條互相獨立的路徑**——
+
+| 路徑 | 量在哪一層 | 門檻 | 時間特性 |
+|---|---|---|---|
+| `SLOW_OPS`（two metrics） | OSD/MON 的 `OpRequest`（RADOS op 生命週期） | in-flight 且 age > `osd_op_complaint_time`（**30s**） | 即時快照，op 完成即消失 |
+| `BLUESTORE_SLOW_OP_ALERT` | BlueStore 單一內部操作 | 單次 latency > `bluestore_log_op_age`（**5s**） | latch，事件後黏約 24h |
+| 4 個 `slow_*_count` counter | BlueStore 單一內部操作 | 同上 5s | 累積 counter，不歸零 |
+
+後兩條同源（都在 BlueStore 的 `log_latency`），跟第一條完全是兩套機制。逐條拆。
+
+## 路徑一：兩個 SLOW_OPS metric 的來源鏈
+
+`ceph_healthcheck_slow_ops`（cluster 級）與 `ceph_daemon_health_metrics{type="SLOW_OPS"}`（per-daemon）這兩個 metric，一路上溯都會回到同一個地方：OSD/MON 的 `OpTracker`。
+
+```
+client / peer / sub op
+   └─ 包成 OpRequest，註冊進 OSD（或 MON）的 OpTracker in-flight registry
+            │  每個 OSD tick：OSD::get_health_metrics()
+            │  數「還在 in-flight 且 age > osd_op_complaint_time(30s)」的 op
+            ▼
+   DaemonHealthMetric{ SLOW_OPS, n1 = slow 計數, n2 = oldest 已卡秒數 }
+            │  mgrc.update_daemon_health() → active mgr
+            ▼
+   mgr DaemonServer 把所有 osd + mon 的 SLOW_OPS metric 累加
+            │  任一 daemon n1>0 或 n2>0 → 升 health check
+            ▼
+   health check "SLOW_OPS" (HEALTH_WARN)
+     summary = "{n1} slow ops, oldest one blocked for {n2} sec, daemons [...] have slow ops."
+            │
+   ┌────────┴──────────────────────────────────┐
+   ▼                                            ▼
+ mgr/prometheus 解析 summary 第一個數字         逐 daemon dump n1
+ ceph_healthcheck_slow_ops = n1（cluster 總數）  ceph_daemon_health_metrics{
+   不 active 時 = 0                                type="SLOW_OPS", ceph_daemon="osd.N"}
+```
+
+### 第一段：OpTracker 怎麼定義「slow」
+
+op 進 OSD 會被包成 `OpRequest` 註冊進 `OpTracker`。判斷「慢」的門檻 `complaint_time` 在 OSD 啟動時從 `osd_op_complaint_time` 設定：
+
+File: `ceph/src/osd/OSD.cc` (line 2406)
+
+```cpp
+op_tracker.set_complaint_and_threshold(cct->_conf->osd_op_complaint_time,
+                                       cct->_conf->osd_op_log_threshold);
+```
+
+`osd_op_complaint_time` 預設 **30 秒**：
+
+File: `ceph/src/common/options/global.yaml.in` (line 3130)
+
+```yaml
+- name: osd_op_complaint_time
+  type: float
+  level: advanced
+  default: 30
+```
+
+MON 端對應的是 `mon_op_complaint_time`，預設同樣是 30 秒（`ceph/src/common/options/mon.yaml.in` line 1139）。
+
+掃 in-flight op 的邏輯在 `visit_ops_in_flight`：找「最舊 op」時會**跳過** continuous op 與 `warn_interval_multiplier == 0` 的 op——
+
+File: `ceph/src/common/TrackedOp.cc` (line 342)
+
+```cpp
+for (auto& op : sdata->ops_in_flight_sharded) {
+  if (!op.warn_interval_multiplier || op.is_continuous())
+    continue;
+  ...
+}
+```
+
+接著只要最舊的都還沒超過 `complaint_time`，整輪直接放棄、回報沒有 slow op：
+
+File: `ceph/src/common/TrackedOp.cc` (line 364)
+
+```cpp
+if (*oldest_secs < complaint_time)
+  return false;
+```
+
+<Callout type="warning" title="第一個盲點就埋在這裡">
+  `OpTracker` 看的是「**此刻還卡在 in-flight 的 op**」。op 一旦完成就 unregister 離開 registry。所以一個跑了 8 秒就完成的 BlueStore 慢操作，從來不會在這個 registry 裡停留到 30 秒——它對 `SLOW_OPS` 完全隱形。這句在下面「三層盲區」會被真機逐字驗證。（T1）
+</Callout>
+
+### 第二段：OSD 把 slow 計數打包成 daemon metric
+
+每個 OSD tick 呼叫 `get_health_metrics()`，自己數一遍 in-flight 且超過 `osd_op_complaint_time` 的 op：
+
+File: `ceph/src/osd/OSD.cc` (line 7825)
+
+```cpp
+vector<DaemonHealthMetric> OSD::get_health_metrics()
+{
+  vector<DaemonHealthMetric> metrics;
+  {
+    utime_t oldest_secs;
+    const utime_t now = ceph_clock_now();
+    auto too_old = now;
+    too_old -= cct->_conf.get_val<double>("osd_op_complaint_time");
+    int slow = 0;
+    ...
+    auto count_slow_ops = [&](TrackedOp& op) {
+      if (op.get_initiated() < too_old) {
+        ...
+        slow++;
+```
+
+數完把結果塞進 `DaemonHealthMetric`，型別 `SLOW_OPS`，帶兩個數字：`slow`（計數）與 `oldest_secs`（最舊那個卡了幾秒）：
+
+File: `ceph/src/osd/OSD.cc` (line 7906)
+
+```cpp
+      metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
+    } else {
+      // no news is not good news.
+      metrics.emplace_back(daemon_metric::SLOW_OPS, 0, 0);
+    }
+```
+
+注意 `else` 那行：**沒有 slow op 時，OSD 仍回報一筆 `SLOW_OPS, 0, 0`。** 這代表 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 對每顆 OSD（和每個 MON）平常都有一筆 0 值。MON 端在 `ceph/src/mon/Monitor.cc` line 5985 做的是同一件事。這些 metric 每個 tick 透過 `mgrc.update_daemon_health(get_health_metrics())`（`OSD.cc` line 6460）送往 active mgr。
+
+### 第三段：mgr 把所有 daemon 累加成一個 health check
+
+mgr 收到各 daemon 的 health metric 後，把同型別的累加：
+
+File: `ceph/src/mgr/DaemonServer.cc` (line 2741)
+
+```cpp
+std::map<daemon_metric, unique_ptr<DaemonHealthMetricCollector>> accumulated;
+for (auto service : {"osd", "mon"} ) {
+  auto daemons = daemon_state.get_by_service(service);
+  for (const auto& [key,state] : daemons) {
+    ...
+    for (const auto& metric : state->daemon_health_metrics) {
+      ...
+```
+
+`SLOW_OPS` 的 collector 邏輯很短，但決定了 health check 何時亮——只要**任一** daemon 回報 `num_slow > 0` 或 `blocked_time > 0` 就 active：
+
+File: `ceph/src/mgr/DaemonHealthMetricCollector.cc` (line 20)
+
+```cpp
+bool _update(const DaemonKey& daemon,
+             const DaemonHealthMetric& metric) override {
+  auto num_slow = metric.get_n1();
+  auto blocked_time = metric.get_n2();
+  value.n1 += num_slow;
+  value.n2 = std::max(value.n2, blocked_time);
+  if (num_slow || blocked_time) {
+    daemons.push_back(daemon);
+    return true;
+  } else {
+    return false;
+  }
+}
+```
+
+summary 字串就是你在 `ceph health detail` 看到的那行：
+
+File: `ceph/src/mgr/DaemonHealthMetricCollector.cc` (line 50)
+
+```cpp
+check.summary =
+    fmt::format("{} slow ops, oldest one blocked for {} sec, {}",
+                value.n1, value.n2, ss.str());
+```
+
+`value.n1` 是 cluster 範圍的 slow op 總數，`value.n2` 是所有 daemon 裡最舊那個卡了幾秒。
+
+### 第四段：prometheus module 把 health check 變成兩個 metric
+
+mgr/prometheus module 對 `SLOW_OPS` 做了件很土炮的事——**直接切 summary 字串的第一個 token**：
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 908)
+
+```python
+if check.name in active_names:
+    check_data = active_healthchecks[check.name]
+    message = check_data['summary'].get('message', '')
+    v, err = 0, 0
+
+    if check.name == "SLOW_OPS":
+        # 42 slow ops, oldest one blocked for 12 sec, daemons [osd.0, osd.3] have
+        # slow ops.
+        v, err = _get_value(message)
+```
+
+`_get_value` 就是空白切開取第一個 token，能轉整數就回傳：
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 885)
+
+```python
+def _get_value(message: str, delim: str = ' ', word_pos: int = 0) -> Tuple[int, int]:
+    """Extract value from message (default is 1st field)"""
+    v_str = message.split(delim)[word_pos]
+    if v_str.isdigit():
+        return int(v_str), 0
+    return 0, 1
+```
+
+所以 **`ceph_healthcheck_slow_ops` = summary 第一個數字 = cluster 範圍 slow op 總數**；`SLOW_OPS` 沒 active 時設 0（`module.py` line 929）。這裡有個脆弱耦合：哪天 C++ 端改了 summary 格式、第一個 token 不再是數字，`err` 會是 1、metric 直接被 `del` 掉整個消失（line 918-924），連 C++ 端註解都特別警告過（`DaemonHealthMetricCollector.cc` line 37：`Note this message format is used in mgr/prometheus`）。
+
+另一個 metric 走 per-daemon 路徑，逐 daemon 匯出：
+
+File: `ceph/src/pybind/mgr/prometheus/module.py` (line 1630)
+
+```python
+def get_all_daemon_health_metrics(self) -> None:
+    daemon_metrics = self.get_daemon_health_metrics()
+    for daemon_name, health_metrics in daemon_metrics.items():
+        for health_metric in health_metrics:
+            path = 'daemon_health_metrics'
+            self.metrics[path].set(health_metric['value'], labelvalues=(
+                health_metric['type'], daemon_name,))
+```
+
+而 `value` 的來源只 dump 了 `n1`（計數），**沒有 dump `n2`（卡了幾秒）**：
+
+File: `ceph/src/mgr/ActivePyModules.cc` (line 1473)
+
+```cpp
+for (const auto &metric : state->daemon_health_metrics) {
+  f.open_object_section(metric.get_type_name());
+  f.dump_int("value", metric.get_n1());
+  f.dump_string("type", metric.get_type_name());
+  f.close_section();
+}
+```
+
+**小結（T1）**：`ceph_daemon_health_metrics{type="SLOW_OPS", ceph_daemon="osd.N"}` = 該 OSD/MON 當下的 slow op 計數（n1），帶 `ceph_daemon` label 可定位是哪顆、且不吃 summary 字串解析；cluster 那個 `ceph_healthcheck_slow_ops` 沒有任何 host/daemon label。兩者同源（`OpTracker`、30s 門檻），也共享同一個要命的前提：**op 必須在被觀測的那一刻還卡在 in-flight。** 兩個 metric 都沒有人 export `n2`（oldest blocked 秒數）成乾淨的數值系列。
+
+## 路徑二＆三：BLUESTORE_SLOW_OP_ALERT 與 4 個 slow counter（同一條 log_latency）
+
+場景裡那行 `log_latency slow operation observed` 是另一套完全獨立的機制。BlueStore 內部每個關鍵操作（onode 讀取、txc commit、kv sync、omap 迭代…）完成時都會過 `log_latency`，門檻是 `bluestore_log_op_age`（預設 **5 秒**）：
+
+File: `ceph/src/os/bluestore/BlueStore.cc` (line 18465)
+
+```cpp
+void BlueStore::log_latency(
+  const char* name, int idx, const ceph::timespan& l,
+  double lat_threshold, const char* info, int idx2)
+{
+  logger->tinc(idx, l);
+  if (lat_threshold > 0.0 &&
+      l >= make_timespan(lat_threshold)) {
+    dout(0) << __func__ << " slow operation observed for " << name
+      << ", latency = " << l << info << dendl;
+    _add_slow_op_event();
+    if (idx2 > l_bluestore_first && idx2 < l_bluestore_last) {
+      logger->inc(idx2);
+    }
+  }
+}
+```
+
+這 11 行裡藏了**三件事**，也就是三個獨立的下游訊號：
+
+1. `dout(0) ... slow operation observed`——你在 log 看到的那行字。
+2. `_add_slow_op_event()`——推進 `BLUESTORE_SLOW_OP_ALERT` 的事件 queue（路徑二）。
+3. `if (idx2 ...) logger->inc(idx2)`——**只有帶 idx2 的呼叫點**會 inc 一個專用 slow counter（路徑三）。
+
+`log_latency_fn`（line 18487）是同構的第二個版本，差別只在 info 字串用 lambda 產生。兩個函式在 `BlueStore.cc` 裡一共被呼叫 **31 次**（口徑：`grep -cE 'log_latency(_fn)?\(' BlueStore.cc` 得 33，扣掉 line 18465／18487 兩個函式定義本身 = 31 個呼叫點）。這 31 個呼叫點都會過 `_add_slow_op_event()`，但只有一小部分帶 idx2——這個不對稱是路徑三一個盲區的根源（見下面 H-014）。
+
+### 路徑二：BLUESTORE_SLOW_OP_ALERT（latch 型 health 警告）
+
+`_add_slow_op_event()` 把事件推進一個有時效的 queue：
+
+File: `ceph/src/os/bluestore/BlueStore.cc` (line 18455)
+
+```cpp
+void BlueStore::_add_slow_op_event() {
+  if (!cct->_conf->bluestore_slow_ops_warn_threshold) {
+    return;
+  }
+  std::lock_guard lock(qlock);
+  auto cur_time = mono_clock::now();
+  slow_op_event_queue.push(cur_time);
+  _trim_slow_op_event_queue(cur_time);
+}
+```
+
+（順帶一提：`bluestore_slow_ops_warn_threshold` 設 0 等於**關掉**這整條偵測，見上面 line 18456 的 early return。）queue 的 trim 邏輯決定了它的 latch 特性——事件保留 `bluestore_slow_ops_warn_lifetime`：
+
+File: `ceph/src/os/bluestore/BlueStore.cc` (line 18444)
+
+```cpp
+size_t BlueStore::_trim_slow_op_event_queue(mono_clock::time_point cur_time) {
+  ceph_assert(ceph_mutex_is_locked(qlock));
+  auto warn_duration = std::chrono::seconds(cct->_conf->bluestore_slow_ops_warn_lifetime);
+  while (!slow_op_event_queue.empty() &&
+    ((slow_op_event_queue.front() < cur_time - warn_duration) ||
+      (slow_op_event_queue.size() > cct->_conf->bluestore_slow_ops_warn_threshold))) {
+      slow_op_event_queue.pop();
+  }
+  return slow_op_event_queue.size();
+}
+```
+
+然後在 `_log_alerts` 裡，只要時效內事件數 `>= bluestore_slow_ops_warn_threshold` 就升 `BLUESTORE_SLOW_OP_ALERT`：
+
+File: `ceph/src/os/bluestore/BlueStore.cc` (line 18901)
+
+```cpp
+if (cct->_conf->bluestore_slow_ops_warn_threshold) {
+  size_t qsize = _trim_slow_op_event_queue(mono_clock::now());
+  if (qsize >= cct->_conf->bluestore_slow_ops_warn_threshold) {
+    ostringstream ss;
+    ss << "observed slow operation indications in BlueStore";
+    alerts.emplace("BLUESTORE_SLOW_OP_ALERT", ss.str());
+  }
+}
+```
+
+兩個 config 的預設值把它跟 `SLOW_OPS` 的敏感度拉到相反：門檻 5s（vs 30s）、threshold 1（一次就算）、lifetime 24h（vs 即時消失）。連 config 文件都特別寫明它跟 `osd_op_complaint_time` 不是同一回事：
+
+File: `ceph/src/common/options/global.yaml.in` (line 5447)
+
+```yaml
+- name: bluestore_slow_ops_warn_lifetime
+  type: uint
+  desc: ... This is not the same as `osd_op_complaint_time`, which is about
+    RADOS ops at the OSD level.
+  default: 86400
+- name: bluestore_slow_ops_warn_threshold
+  ...
+  default: 1
+```
+
+OSD 把這個 alert 掛到 `osd_stat.os_alerts`（`OSD.cc` line 1024-1025），隨 beacon 上報 mon，mon 在 `PGMap` 累加成 cluster health check：
+
+File: `ceph/src/mon/PGMap.cc` (line 3237)
+
+```cpp
+} else if (asum.first == "BLUESTORE_SLOW_OP_ALERT") {
+  summary += " experiencing slow operations in BlueStore";
+}
+...
+auto& d = checks->add(asum.first, HEALTH_WARN, summary, asum.second.first);
+for (auto& s : asum.second.second) {
+  d.detail.push_back(s);   // 每顆 osd.N 一行 detail
+}
+```
+
+在 Prometheus 是 `ceph_health_detail{name="BLUESTORE_SLOW_OP_ALERT"}`。同一段還有 `BLOCK_DEVICE_STALLED_READ_ALERT` / `WAL_DEVICE_STALLED_READ_ALERT` / `DB_DEVICE_STALLED_READ_ALERT`（`PGMap.cc` line 3239-3244），偵測 block / WAL / DB device 的 stalled read。metric 本身沒有 host label，只有 `ceph health detail` 的 detail 文字會列出是哪幾顆 OSD。
+
+<Callout type="info" title="BLUESTORE_SLOW_OP_ALERT 是「盤後追查器」，不是 pager 訊號">
+  真機（E-01）注入 8s 卡頓後，這個 alert 出現並跨場景持續 &gt;1h 不自清；restart 該 OSD 才清掉 latch（finale 驗證）。它適合回答「昨晚這顆盤有沒有出過事」，不適合當即時 page——latch 24h 意味著它亮著不代表「現在」有問題。（T3）另有踩雷：restart 清 latch 會引發 peering IO，在慢碟上產生新的 &gt;5s op、讓別的 OSD 重新 latch（osd.6 實測中招一次），要在叢集 active+clean 後一次清一顆。
+</Callout>
+
+### 路徑三：4 個 slow counter（device-local 的累積訊號）
+
+`log_latency` 裡的 `logger->inc(idx2)` 對應 4 個專用 counter，全部 `PRIO_USEFUL`：
+
+File: `ceph/src/os/bluestore/BlueStore.cc` (line 6456)
+
+```cpp
+b.add_u64_counter(l_bluestore_slow_aio_wait_count,
+  "slow_aio_wait_count", "Slow op count for aio wait", "sawc",
+  PerfCountersBuilder::PRIO_USEFUL);
+b.add_u64_counter(l_bluestore_slow_committed_kv_count,
+  "slow_committed_kv_count", "Slow op count for committed kv", "sckc",
+  PerfCountersBuilder::PRIO_USEFUL);
+b.add_u64_counter(l_bluestore_slow_read_onode_meta_count,
+  "slow_read_onode_meta_count", "Slow op count for read onode meta", "sroc",
+  PerfCountersBuilder::PRIO_USEFUL);
+b.add_u64_counter(l_bluestore_slow_read_wait_aio_count,
+  "slow_read_wait_aio_count", "Slow op count for read wait aio", "srwc",
+  PerfCountersBuilder::PRIO_USEFUL);
+```
+
+這 4 個 counter 被打中的呼叫點只有 **5 個帶 idx2 的 `log_latency` 呼叫 + 1 個直接 inc**（T1，逐一開檔驗過）：
+
+| counter | 打中它的呼叫點 | 路徑 |
+|---|---|---|
+| `slow_committed_kv_count` | `BlueStore.cc:14471`（`log_latency_fn`，idx2） | 寫：txc 從 start 到 committed &gt;5s |
+| `slow_read_wait_aio_count` | `BlueStore.cc:12751`、`13113`（`log_latency_fn`，idx2） | 讀：等 aio 完成 |
+| `slow_read_onode_meta_count` | `BlueStore.cc:12368`、`12708`、`13080`（`log_latency`，idx2） | 讀：讀 onode metadata |
+| `slow_aio_wait_count` | `BlueStore.cc:14175`（不經 log_latency，直接 `logger->inc`） | 寫：txc AIO wait 段 |
+
+`ceph_bluestore_txc_commit_lat`（`BlueStore.cc:6217`，`PRIO_CRITICAL`）與 `kv_sync_lat`（line 6252）這類 time-avg counter 是另一回事——那是均值 counter、不是「超過 5s 就 +1」的 slow counter，別搞混。這 4 個 slow counter 才是「超過門檻計次」的離散訊號：ceph-exporter 以 `promethize` 把 daemon perf counter 換成 `ceph_` 前綴系列（`ceph/src/exporter/util.cc` line 54），在 lab 的 exporter :9926 確認匯出成 `ceph_bluestore_slow_{aio_wait,committed_kv,read_onode_meta,read_wait_aio}_count{ceph_daemon="osd.N"}`（T3）。它們帶 `ceph_daemon` label、累積不歸零、5s 門檻——正是下一節那些 SLOW_OPS 盲區裡**唯一還看得到**的訊號。
+
+## SLOW_OPS 的三層盲區（真機實證）
+
+把路徑一攤開，`SLOW_OPS` 的 30s + 即時快照特性造成三類結構性失明。每一類都在 lab 上注入驗過，數字如下（T3；harness 見 `experiments/ceph-slow-ops-detection/`）。
+
+### 第 1 層：暫態盲區（H-001）
+
+op 齡 &lt;30s 的單發卡頓，`OpTracker` 路徑物理上不可見——op 完成得比門檻還快。
+
+- **E-01**：`dmsetup suspend` 注入單 OSD 卡 8s（寫負載）。整個觀察窗 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 與 `ceph_health_detail{name="SLOW_OPS"}` **兩路全程 0**。
+- 同一事件，路徑三的 slow counter 在**卡頓開始 +14s** 就可判真（counter 首升樣本晚於 suspend 結束——見下面 H-011）。
+
+一句話：8s 的 BlueStore 卡頓對 SLOW_OPS 是零覆蓋，對 slow counter 是 14 秒可見。（T3）
+
+### 第 2 層：持續性 sub-30s 劣化盲區（H-024）
+
+比暫態更陰險：**每個 op 都慢、但每個都在 30s 內完成**。這正是 SSD 劣化／firmware 問題最常見的表現形態。
+
+- **E-04 v2**：cgroup `io.max` 對 osd.0 持續節流 150 秒。`ceph_osd_op_w_latency` 的區間均值峰值衝到 **15.2s**、`ceph_osd_commit_latency_ms` 峰值 15196ms——client 痛了兩分半。
+- 同一窗內 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 與 `ceph_health_detail{name="SLOW_OPS"}` **全程 0**，因為沒有任何單一 op 撐過 30s。
+
+「持續劣化」這一整類，SLOW_OPS 看不到。（T3）
+
+### 第 3 層：採樣漏失盲區（H-023）
+
+就算 op 真的破了 30s，per-daemon 那個 metric 是**快照 gauge**——op 完成即歸零，可見窗只有「op 齡減 30s」那短短幾秒，還得穿過 mgr module 的 15s cache + scrape interval 才能被 Prometheus 抓到。
+
+- 一次 max latency **44.7s** 的真事件：mon 端 `ceph_health_detail{name="SLOW_OPS"}` 只抓到 **2 個非零樣本**（撐不過 `for: 1m` 這類等待條件），per-daemon `ceph_daemon_health_metrics` 則**整段漏掉、0 個樣本**。
+- 結論：**44 秒的真 slow op，兩條吃 SLOW_OPS 的既有 alert 全部沉默。**（T3）
+
+<Callout type="warning" title="三層合起來看">
+  30s 門檻（第 1、2 層）+ 快照式採樣（第 3 層）疊加，讓 SLOW_OPS 對「短」與「持續但都 &lt;30s」兩類事件系統性失明，對「破 30s 但短命」的事件則靠運氣採樣。路徑三的 slow counter（累積、5s 門檻、事後仍在）是唯一不怕採樣漏失的訊號——這是它存在的理由。（T3）
+</Callout>
+
+## 定位陷阱：SLOW_OPS 會「怪錯人」（H-025）
+
+就算 SLOW_OPS 亮了，它指的 `ceph_daemon` label 也可能把 oncall 帶去查錯機器。
+
+- **E-04 v4**：卡住的是 **osd.0**（在 node osd-01 上）。但 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 非零的是 **osd.4 / osd.6 / osd.7 / osd.8**（osd-02、osd-03 上的 primary）；osd.0 自己全程 0。
+
+機制：client op 記在 **primary** 的 op tracker 上，primary 等被卡的 **replica**（osd.0）回 ack 等到超齡——於是超齡的計數掛在別台 node 的 primary 頭上。oncall 看到 SLOW_OPS 亮 osd.4 就去查 osd.4 的碟，方向完全錯。
+
+分工要記牢（T3）：
+
+- **slow counter 是 device-local 訊號、指向元兇**（osd.0 自己的 counter 會動）。
+- **SLOW_OPS 是 client-impact 訊號、指向受害者**（哪些 primary 的 client op 被拖累）。
+- 兩者一起看：`slow_*_count` 亮 osd.0 + SLOW_OPS 亮一堆別台 primary = **osd.0 的 device 出事、且已波及 client**。
+
+## 訊號的邊界（連 slow counter 也有盲區）
+
+路徑三補了 SLOW_OPS 的三層盲區，但它不是萬能。四個必須知道的邊界：
+
+| 邊界 | 內容 | 錨點 |
+|---|---|---|
+| **完成才記帳（H-011）** | slow counter 只在 op「完成且量到 &gt;5s」時 inc。op **永久卡死**（真 hang）時 counter 全程不動，只有 `SLOW_OPS`（op 一直在飛、齡會破 30s）看得到。E-01 實測 counter 首升樣本晚於 suspend 結束——卡頓期間 counter 全平。所以 counter 與 SLOW_OPS **互補、缺一不可**。 | `BlueStore.cc:18473`（log 前先 `tinc`，inc 在完成路徑） |
+| **omap／scrub 盲區（H-014）** | 4 個 counter 只覆蓋上面那 5+1 個呼叫點。31 個 `log_latency` 呼叫點裡帶 idx2 的僅 5 個，其餘 26 個（omap iterator、csum、decompress、kv_flush/commit/sync、submit/throttle…）**只打 log + `_add_slow_op_event()`、不 inc counter**。純 omap／scrub 類 slow 事件因此是 counter 盲區，只有 `BLUESTORE_SLOW_OP_ALERT`（health 路徑）看得到。（寫路徑靠 txc 全程量測 `slow_committed_kv_count` 有傳遞性覆蓋。） | `BlueStore.cc:18480`（`_add_slow_op_event` 無條件呼叫）vs `18481` 的 idx2 條件 |
+| **idle 盲區（H-017）** | 「無 IO 即無偵測」是結構性盲區。device 卡住但當下沒有 IO 經過（idle OSD）時，counter 與 op-tracker **都無訊號**。E-03 實測：idle OSD 卡 15s，4 counter 增量 0、SLOW_OPS 0、全部靜默。緩解只能靠低頻 synthetic IO（如每分鐘一次小寫入），超出 Prometheus-only 範圍。 | E-03（T3） |
+| **版本依賴（H-019）** | 4 個 slow counter 是 **Squid v19.2.0+ 才有**（Reef 全系列沒有）；`BLUESTORE_SLOW_OP_ALERT` 是 **v19.2.1+／Reef v18.2.6+**。生產若還在 Reef，路徑三不可用，只剩 SLOW_OPS 加上 device 層 metric 兜底。本頁機制錨在 v19.2.3，用前務必先確認你的版本。 | GitHub 逐版原始碼比對（T2） |
+
+還有一個 FP 心理預期要先建立（H-015，T3）：slow counter 亮 **≠ 硬體壞**。純過載（recovery、backfill、深佇列）也會把單段 op 推過 5s——lab 上 16 併發純 bench（無注入）就讓 9/9 OSD 的 slow counter 全增、bench max latency 44.7s。counter 的語意是「這顆 OSD 有 op 超過 5s」的**症狀**，不是硬體定罪；真要歸因到 firmware／RAID 卡，得看「同一 node 多顆 OSD 同窗一起亮」的聚集指紋 + 持續性。這類分級與具體規則屬於實驗頁。
+
+## 一句話關於 alert 規則
+
+上面每條訊號要**怎麼組成規則**（表達式、`for` / `keep_firing_for`、severity、真機量到的偵測延遲：slow counter +14s、同 node 聚集 +20s、加速版 SLOW_OPS +45~60s vs 舊規則 ~120s），全部在 [slow ops 快速偵測實驗頁](./slow-ops-fast-detection-lab)——本頁只負責讓你懂「為什麼需要那些規則」。
+
+## 相關閱讀
+
+- [Ceph — slow ops 快速偵測實驗](./slow-ops-fast-detection-lab)：把本頁三條訊號組成可部署的 alert 規則，附真機偵測延遲量測與四條規則設計。
+- [Ceph — PG health states](./pg-health-states)：`SLOW_OPS` 與其他 health check 在體系裡如何對應 client 風險。
+- [Ceph — BlueStore deep dive](./bluestore-deep-dive)：`txc_commit_lat` / `kv_sync_lat` 背後的 TransContext 狀態機與 deferred write，幫你看懂 log 裡那行 slow op 慢在哪個階段。
