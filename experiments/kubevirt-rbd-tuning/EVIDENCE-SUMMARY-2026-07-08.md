@@ -260,3 +260,13 @@
 - 衝擊（vs pre rr 0.99ms/rw 1.54ms）：rr-qd1 mean 1.18ms、rw-qd8 mean 1.74ms（幾乎無變）；**僅一次 ~38ms peering 尖峰（p999 38ms、>10ms 只 1 秒）**；health 到 WARN（非 ERR）；恢復快（az start 後數十秒 HEALTH_OK）。
 - **結論（confirmed H-005 OSD-node 部分）**：整台 host 失效（3 OSD）與單 OSD down 的衝擊**幾乎相同**——只要 min_size=2 滿足（size=3 + CRUSH per-host，掉 1 host = 每 PG 仍剩 2 副本），IO 續存、只有 down 瞬間一次 peering 尖峰。**失效顆數不是重點，min_size 是否滿足才是**。
 - **跨 degraded 實驗總結**：失效本身（E-30 單 OSD、E-31 整 host）都近乎無感；真正的傷害在 **out→backfill（E-30 rr×24）**、**flapping（E-34 p999 1146ms）**、**gray 延遲（E-32 寫×40）**。維運重點＝控制 out 時機（noout/快恢復）與偵測 gray（health 看不到）。
+
+## E-35 mon quorum 階梯 + 複合故障 — done（發現達成；附一次嚴重操作失誤）
+
+- Bundle：`results/E-35/20260709-155637/`（原始 bundle 留在被 prune 的 worktree 內未能回收；本節依當時記錄回填）
+- **STAGE1（1/3 mon down）**：quorum 撐住（2/3：mon-0+mon-1）、HEALTH_WARN、client 完全無感。
+- **STAGE2（2/3 mon down → quorum 失）**：**guest 穩態讀 IO 照跑（alive=1）**——client 做穩態 IO 不需要 mon：用既有 osdmap 直連 OSD。quorum 失 ≠ IO 立即中斷；死的是「變更平面」（新 map、新 client、恢復協調）。與 ceph-mon-quorum-blind-spot 研究的「已連線無感」結論互證。
+- **STAGE3（quorum 失 + osd.3 kill＝複合故障）**：guest 對受影響 PG 的寫入**無限期 hang、卡死在不可中斷 D-state**——quorum 失去後沒有 mon 能發新 osdmap，client 永遠不知道 osd.3 死了，也沒有 peering/recovery 可以繞開。**恢復順序是硬約束：先救 mon quorum、再救 OSD**（反過來無效）。
+- **⚠⚠ 操作失誤（8 小時滯留事故，本實驗最重要教訓）**：STAGE3 guest 寫入進 D-state → 腳本 `timeout 30` 殺不掉（SIGKILL 不中斷 uninterruptible sleep）→ vmx SSH 永久 hang → 腳本不 exit → trap 保底不觸發 → poller 只在 ALL-DONE 報告 → **叢集滯留在 quorum 失 + osd.3 down 狀態約 8 小時**，直到使用者詢問才發現、手動恢復。
+- 恢復無損：mon-1/mon-2 + osd.3 `systemctl start` → quorum 秒回、D-state 自解、guest 讀寫恢復、HEALTH_OK、65 PG active+clean。
+- **方法論鐵律（已寫進 RUNBOOK 鐵則）**：破壞性 + 可能 IO-hang 的實驗**必須有外部 watchdog**——獨立於主腳本的計時器，硬期限（如 5min）無條件執行恢復。in-script `timeout`（D-state 免疫）與 trap（hang 不觸發）都不是保底。

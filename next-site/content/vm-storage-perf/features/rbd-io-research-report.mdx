@@ -1,0 +1,122 @@
+---
+layout: doc
+title: VM Disk IO 研究總結報告 — 30 個真機實驗的完整故事
+description: kubevirt-rbd-tuning 研究（charter v3）的收官報告：在可任意破壞的 Azure 專屬叢集上，用 30 個真機實驗回答生產最在意的三個問題——旋鈕線上改得動嗎、改了值不值得、degraded 時 VM 會怎樣。結論濃縮成三句：預設值幾乎全對（唯一數量級旋鈕是 CPU limit）；一半旋鈕有線上可調性硬牆（D 類建置期定死）；真正的威脅是三個盲區（gray failure 無告警、KubeVirt 預設不 failover、複合故障 D-state hang）。含完整方法論、傷害排序表、生產行動清單與 8 小時事故的誠實記錄。
+---
+
+## 場景：老闆問「我們的 VM storage 到底穩不穩」
+
+你維運一批生產關鍵的 KubeVirt VM，disk 走 ceph-csi + krbd 放在 Ceph RBD 上。某天被問到三個問題：
+
+1. **效能還有多少可以調？** 網路上的調教文章一大堆，哪些在我們的版本上是真的？
+2. **要調的話，線上改得動嗎？** 會不會停機？會不會要動整個 Ceph？
+3. **故障的時候會發生什麼？** OSD 掛掉、網路半死、node 斷電——VM 是變慢、卡死、還是丟資料？告警會響嗎？
+
+這份報告是 [效能調教系列](./rbd-io-tuning-catalog)的收官：在一座**可任意破壞**的 Azure 專屬叢集（3 mon + 9 OSD + KubeVirt，與生產拓樸同型）上，用 30 個真機實驗、34 條 hypothesis 把三個問題量完。受測 VM = 4 vCPU / 8Gi、Ubuntu 24.04、16Gi RBD Block 資料盤；正常態負載 = 4k 隨機讀寫 ×（qd1/qd8/qd32）+ 1M 循序讀寫，共 8 個 pattern（O_DIRECT、n≥3、A/B 交錯），judged 以 E-01 實測噪音帶為門檻。本頁是完整故事——方法、發現、行動清單、連失誤都照實記；逐旋鈕的細節表與源碼證據在 [生產調教](./rbd-io-production-tuning)。
+
+先給等著開會的人三句結論：
+
+<Callout type="info" title="TL;DR">
+  ① **預設值幾乎全對**——30 個實驗裡唯一的數量級旋鈕不在 storage stack，是 virt-launcher 的 **CPU limit**（低於 vCPU 數 → p99 ×7.4、IOPS 砍半、p50 不變）。
+  ② **一半的旋鈕線上改不動**——VMI 層要停機、krbd map options 建置期定死（連 patch PV 都被 API 拒），要在 StorageClass 設計期決定。
+  ③ **真正的威脅是三個盲區**——gray failure 寫入 ×40 但 ceph health 全程 OK；KubeVirt 預設沒有可靠的 node 失效 failover；mon quorum 失後 IO 照跑是假象、再疊一個 OSD 故障就是無限期 hang。
+</Callout>
+
+## 研究是怎麼做的（為什麼可以信）
+
+這輪研究（charter v3）的判準先於實驗定案：**穩定優先、latency 優先**——degraded 時允許 throughput 下降，但 p99/p99.9 要可控、不雪崩、不卡死。方法有五道防線：
+
+- **prediction 先行**：34 條 hypothesis，實驗前把預測寫死進 bundle，跑完只准比對不准改寫。被推翻的照實標 violated——本研究約三成假說被推翻，那三成正是最有價值的部分（都是網路流傳、你很可能照做的建議）。
+- **機器判 verdict**：confirmed / violated / indistinguishable 三態，由腳本比對差異是否超出實測噪音帶。
+- **噪音帶先量**（E-01）：同設定重複 5 輪取 CoV，判準 = `max(2×CoV, 5%)`。附帶發現：這座專屬叢集的噪音（IOPS CoV 0.4–2.0%）比前一輪 PVE 生產環境（23%）穩一個數量級——「差異大於噪音帶」才有資格叫發現。
+- **生效驗證前置**：每個變體開跑前，先從 QEMU cmdline、host sysfs、`ceph config` 斷言參數真的生效，杜絕「調了個寂寞」。
+- **觀測三邊界互洽**（E-03）：guest iostat 與 host rbd iostat 差 0.03%，三層差分可以把延遲歸因到 virtio/QEMU 段或網路/Ceph 段。
+
+每條結論都標移植性：**機制級**（可移植——機制、相對排序、重測方法）或**數值級**（僅限本環境——絕對數字與倍率；本環境 OSD 是單 NVMe 切 3，同碟效應會放大倍率）。
+
+## 發現一：調教的答案短得驚人
+
+15 個正常態 A/B 實驗跑完，能寫進調教手冊的東西非常少——**因為預設值幾乎全對**：
+
+| 你可能想調的 | 實測 verdict | 該做的事 |
+|---|---|---|
+| cache mode | writeback 均值 +272~1997% 好看，**p999 +2064%、秒級 stall**（E-10） | 維持預設 none |
+| io=native vs threads | threads 不輸、qd32 讀還 +12.4%（E-12，違反「native 必勝」常識） | 維持預設，沒有改的理由 |
+| virtio-blk vs scsi | IOPS 同、scsi 尾延遲較差、timeout 保護是迷思（E-11 + H-006） | 維持 virtio-blk |
+| blockMultiQueue | 開了=沒開（QEMU AUTO 本就= vCPU 數，E-13） | 不用開 |
+| dedicatedIOThread | 單盤無感（E-14） | 單盤 VM 不用開 |
+| guest scheduler | **none 比 mq-deadline 快 30~40%（seq）**（E-17） | 維持 none；這是檢查清單項——發現被改要改回 |
+| krbd queue_depth | 256 高並行 +10~21% 且 p99 更好、qd1 零代價（E-19） | 純加分，但 **D 類**——SC 設計期就要設 |
+| Ceph 端（memory_target / shards / scrub / mClock） | **全部 indistinguishable**（E-21/22/37/39） | headroom 充足時別調；投資容量不是參數 |
+
+唯一的例外在 storage stack 之外（E-15，機制級）：
+
+| virt-launcher CPU limit | IOPS | p50 | p99 |
+|---|---|---|---|
+| limit=4（= vCPU 數） | 7042 | 938us | 7.6ms |
+| **limit=2（< vCPU 數）** | **3352** | 946us | **55.8ms（×7.4）** |
+
+兩個變體**都是 Guaranteed QoS**——「用 Guaranteed 就安全」是錯的。真正門檻是 **CPU limit ≥ vCPU 數**：低於它，CFS quota（100ms 週期）會把 IO completion 執行緒整段凍結，尾延遲爆炸而 p50 幾乎不動——**只看均值永遠找不到**。這是[參數目錄](./rbd-io-tuning-catalog)五層 22 個旋鈕之外的隱形第六層。
+
+還有一面牆要先知道：**想調也未必改得動**。VMI 層旋鈕 live migration 套用不了、只能停機（E-50 實錘，且 revert 不清 `RestartRequired`）；krbd map options 在 PV 建立時凍結，E-51 實測連 `kubectl patch pv` 都被 API 以 immutable 拒絕——四分類（A/B/C/D）與源碼證據見[生產調教](./rbd-io-production-tuning)。
+
+## 發現二：degraded 的傷害地圖——失效本身無感
+
+10 個故障注入實驗拼出的全景，一張表看完（數值級倍率）：
+
+| 情境 | client 衝擊 | ceph 告警 |
+|---|---|---|
+| 單 OSD down、未 out（E-30） | ≈0（peering 瞬間 3.8ms 尖峰） | OSD_DOWN |
+| 整台 host 3 OSD down（E-31，斷 ~4min 未跨 out 門檻） | ≈0（一次 38ms 尖峰） | WARN |
+| auto-out 後 backfill（E-30） | **隨機讀 ×24** | PG_DEGRADED |
+| OSD flapping（E-34） | mean ×12、p999 1146ms；**noout 後 −71%** | OSD_DOWN |
+| **一台 host +50ms gray（E-32）** | **寫 ×40、讀 ×19** | **全程 HEALTH_OK** |
+| 封包遺失 0.1–0.5%（E-33） | ≈0（TCP 快速重傳吸收） | 無 |
+| deep-scrub（E-37） | 0 | 無 |
+| min_size 不滿（E-36） | 寫入無限 blocked（302.8s 至恢復） | PG_AVAILABILITY |
+| pool full（E-38） | **hang 96s，非 ENOSPC** | nearfull→full |
+| mon quorum 失 + OSD 死（E-35） | **無限期 D-state hang** | 觀測面一起死 |
+
+三個機制級結論值得背下來：
+
+1. **「失效顆數」不是重點，min_size 才是**。掉一顆 OSD 和掉整台 host（3 OSD）衝擊幾乎相同——每個 PG 還剩 min_size 份副本就續存。注意 E-31 的 host 只斷了 ~4 分鐘、未跨過 600 秒 auto-out 門檻：**長時間斷 host 會觸發 1/3 資料的 backfill（進入 E-30 的 ×24 劇本、規模三倍）**，「無感」只在及時救回或先設 noout 的前提下成立。真正的痛在 **out 之後**：E-30 與 E-39 對照顯示傷害來自 down-未-out 期間累積的熱物件 recovery 債，不是 backfill 搬資料本身。維運上「控制 out 時機」（短維護先 `noout`；flapping 立即 noout 止血）比調任何 QoS 都有效。
+2. **gray failure 是觀測盲區（本研究最重要的單一發現）**。size=3 + CRUSH per-host 放置 → 每筆寫入要等三台 host 各一份 ack → **任何一台 host 變慢＝全叢集寫入變慢**，而 OSD 沒死、heartbeat 沒超時，`ceph health` 完全不露餡。E-32/E-33 對照還給了診斷優先序：Ceph-on-TCP 對**延遲**（+50ms → ×40）遠比對**丟包**（0.5% → 1.1×）敏感，網路排查先看 RTT。
+3. **guest IO 只會「無限等」，不會「失敗」**。virtio-blk/scsi 都永不逾時、`osd_request_timeout` 在最該出場的情境不觸發（E-36，機制矛盾開放中 H-034）、pool full 也是 hang 不是 ENOSPC。client 側沒有救命索——防線只能建在不讓 PG inactive（min_size 設計、nearfull 當行動線、快速換件）與 application 層 timeout。
+
+複合故障（E-35）是壓軸：mon quorum 全失時**穩態 IO 照跑**——client 拿既有 osdmap 直連 OSD，看起來沒事，其實「變更平面」已死。此時再死一顆 OSD，寫入卡進**不可中斷的 D-state**（SIGKILL 都殺不掉），叢集無法自癒。恢復順序是硬約束：**先救 mon quorum、再救 OSD**——而且 quorum 失時 `ceph -s` 自己也連不上，mon 監控必須有 mgr 之外的 blackbox 路徑。
+
+## 發現三：KubeVirt 的 node 失效比想像中危險
+
+**E-41（重大）**：k8s node 硬斷電後，VMI 卡在死 node 上「假 Running」**11 分鐘以上**完全沒重排，force-delete 還被 stuck finalizer 擋（死 node 無法確認 pod 終止）；另一輪靠預設 pod eviction（~300s）才觸發重排。結論：**KubeVirt 預設的 node 失效 failover 慢且不可靠——生產要 VM 高可用，NodeHealthCheck / machine-health-check 是必需品**。
+
+**E-40**：cache=writeback 的 VM 遇到 node 硬斷，guest 已收到完成回報的寫入**丟失最後 ~6 秒**（host page cache 未 flush）；cache=none 對照組 0 遺失。光 kill QEMU/pod 不丟——代價只在 node 級災難兌現，兌現時丟的是最近幾秒、最難察覺。cache mode 因此是 correctness 決策，不只是效能選擇。
+
+**E-42** 是好消息：高 IO 負載中 live migration，IO 零中斷、最差 1 秒窗 8ms——節點維運放心用（只是別想用它套用 disk 參數）。
+
+## 生產行動清單
+
+**建置期（之後改不動或很貴）**：StorageClass 定案 krbd map options（高並行 workload 設 queue_depth=256；osd_request_timeout 不要依賴）；VM 模板 cache/io 留空、bus 用 virtio-blk；**CPU limit ≥ vCPU 數寫進模板審查**；pool size=3/min_size=2、nearfull 當硬線。
+
+**監控（ceph health 看不到的）**：client 端 p99/p99.9（E-15/E-32 兩場災難 p50 都近乎不動）；`ceph osd perf` per-OSD latency + host 間 RTT（gray failure 唯一訊號）；degraded objects 數（backfill 債領先指標）；mon quorum 走 blackbox 探測。
+
+**維運應變**：短維護先 `ceph osd set noout`；flapping 立即 noout 止血再查根因；複合故障恢復**先 mon 後 OSD**；改 C 類參數排維護窗（rolling restart 本身就是 degraded）；部署 NodeHealthCheck 並演練 node 硬斷。
+
+## 誠實記錄：一次 8 小時的事故
+
+E-35 執行時，guest 寫入卡進 D-state → 腳本的 `timeout` 殺不掉（SIGKILL 對不可中斷睡眠免疫）→ SSH 永久 hang → trap 保底不觸發 → 回報機制只在全部完成時發聲——**實驗叢集在「quorum 失 + OSD down」狀態滯留了約 8 小時**，直到人工發現手動恢復（無資料損失）。
+
+教訓已寫成 RUNBOOK 鐵則：**破壞性 + 可能 IO-hang 的實驗，必須配一個獨立於主腳本的外部 watchdog**——硬期限一到無條件執行恢復。in-script timeout 對 D-state 免疫、trap 在 hang 時不觸發，兩者都不是保底。這條也適用於任何自動化維運腳本：只要操作可能製造不可中斷的 IO 等待，恢復機制就不能活在同一個行程樹裡。
+
+## 邊界與侷限
+
+- **數值是環境綁定的**：單 NVMe 切 3 OSD 的同碟效應會放大倍率（E-30 的 ×24）；nested 虛擬化。可移植的是機制、相對排序與 harness。
+- **headroom regime**：Ceph 端 QoS 旋鈕「不可分辨」只在媒體有餘裕時成立；HDD 或打滿的叢集要重測。
+- **開放問題**：H-034（`osd_request_timeout` 在 PG inactive 下為何不觸發——源碼讀起來必觸發、真機就是不觸發）、H-033 recovery 債的閉環驗證。
+- 重測方法：repo `experiments/kubevirt-rbd-tuning/`（RUNBOOK 照抄可跑、fio_stats.py 機器判 verdict、band.json 判準）。
+
+## 接下來 / 相關頁面
+
+- [VM Disk IO 生產調教](./rbd-io-production-tuning) — 本報告的細節版：可調性四分類的源碼證據、30 實驗回填表、三個被推翻直覺的完整推導
+- [VM Disk IO 調教參數目錄](./rbd-io-tuning-catalog) — 五層旋鈕的機制底圖
+- [VM Disk IO datapath](./rbd-io-datapath) — 一筆 IO 從 guest 到 OSD 穿過哪些層
+- [效能實驗計畫 v2](./rbd-io-experiment-plan) — PVE 軸的前一輪（本輪繼承其方法論六規則）
