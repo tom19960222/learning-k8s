@@ -2,7 +2,7 @@
 
 ## 這是做什麼的
 
-這套 script 是事故發生時的「先保留現場」工具。它會從一台工作機透過 SSH 到所有 Ceph node 收集系統狀態、Ceph 狀態、log 清單與必要 log，最後打包成一個 `.tar.gz`。
+這套 script 是事故發生時的「先保留現場」工具。它會從一台工作機透過 SSH 到所有 Ceph node 收集系統狀態、time sync 狀態、Ceph 狀態、log 清單與必要 log，最後打包成一個 `.tar.gz`。
 
 它不會修復 Ceph，也不會執行 restart、delete、repair、scrub 這類會改變 cluster 狀態的操作。
 
@@ -12,7 +12,7 @@
 
 - `ceph health detail` 出現 `HEALTH_WARN` 或 `HEALTH_ERR`
 - OSD down、PG stuck、I/O latency 異常、MON quorum 異常
-- node CPU、RAM、disk、網路看起來異常，但還不確定是不是 Ceph 問題
+- node CPU、RAM、disk、網路或 time sync 看起來異常，但還不確定是不是 Ceph 問題
 - 準備請別人或 AI 協助判讀，需要保留當下證據
 
 ## 前置需求（known_hosts）
@@ -204,7 +204,9 @@ BUNDLE=$(bash .../run/collect.sh --inventory inv.env --ssh-key key --since 24h -
 - `redactions.log`：每個檔遮蔽了幾行。
 - `cluster/`：cephadm(直接 `ceph` 或 `cephadm shell`)或 Rook cluster-level 狀態。
 - `cluster/prometheus/` — 選用的 metrics dump（有給 `--prom-url` 才存在）
-- `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、Ceph log 與 cephadm 狀態。
+- `nodes/<alias>/`：每台 node 的系統、資源、disk、kernel、systemd、time sync、Ceph log 與 cephadm 狀態。
+
+time sync 會同時保留常見工具的狀態：`timedatectl` / `systemd-timesyncd`、`chronyc`、`ntpq`。如果 node 使用 `systemd-timesyncd`，bundle 會收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，以及 `/etc/systemd/timesyncd.conf` 與 `/etc/systemd/timesyncd.conf.d/*.conf`。
 
 ## exit code 怎麼看
 
