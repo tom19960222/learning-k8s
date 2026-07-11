@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: Ceph — clock skew 的三條故障線：MON lease、cephx rotation、OSD mono clock（因果鏈修正版）
-description: 用 v19.2.3 原始碼逐行回答「node 時鐘差會壞掉什麼」。三條獨立的線：MON↔MON 的 Paxos lease 用 wall clock（skew > mon_lease 讓那個 peon「永久不可讀」，而不是 election churn）；MON↔OSD 的 cephx rotating secret 由 mon 蓋絕對時間戳，雙向都會爆——OSD 快到 1hr 級起不來 exit(1)，mon 先快再校時跳回則讓 rotation 凍結（不是「跳回那一刻大量掉線」）；OSD↔OSD 走 mono_clock 免疫。並澄清 client ticket 為何對 skew 免疫。
+description: 用 v19.2.3 原始碼逐行回答「node 時鐘差會壞掉什麼」。三條獨立的線：MON↔MON 的 Paxos lease 用 wall clock（skew > mon_lease 讓那個 peon「永久不可讀」，而不是 election churn）；MON↔OSD 的 cephx rotating secret 由 mon 蓋絕對時間戳，雙向都會爆——OSD 快到 1hr 級起不來 exit(1)，mon 先快再校時跳回則讓 rotation 凍結（不是「跳回那一刻大量掉線」）；OSD↔OSD 靠同機比較＋mono delta 免疫。並澄清 client ticket 為何對 skew 免疫。
 category: mechanism
 ---
 
@@ -42,7 +42,7 @@ category: mechanism
 |---|---|---|---|---|
 | **線 1 MON↔MON lease** | `real_clock`（wall） | leader 蓋 `leader_now + 5s`／peon 拿**自己**的 wall clock 比 | 不免疫 | peon 領先 leader 超過 `mon_lease`(5s) → **該 peon 永久不可讀**（不是 election churn） |
 | **線 2 MON↔OSD cephx** | `ceph_clock_now()`（wall） | **mon 蓋絕對 expiration**／OSD 拿自己的 wall clock 比 | 不免疫（雙向） | 方向 A（OSD 快到 1hr 級）→ 起不來 `exit(1)`；方向 B（mon 先快再跳回）→ **rotation 凍結**（不是「跳回那刻大量掉線」） |
-| **線 3 OSD↔OSD** | `mono_clock` | heartbeat 帶 mono delta，**同軸換算** | 免疫 | 無（wall skew 不影響 heartbeat / read lease） |
+| **線 3 OSD↔OSD** | heartbeat 判死用本機 wall、read lease 換算用 `mono_clock` | heartbeat **同機蓋＋同機檢查**；read lease 走 mono delta | 免疫 | 無（wall skew 不影響 heartbeat / read lease） |
 | （對照）**client ticket** | wall | client **自己蓋** `now + validity`／自己檢查 | 免疫（同機抵消） | 無 |
 
 量級門檻的三個數字，只是「跨過哪一條線的分界」：
@@ -57,7 +57,7 @@ category: mechanism
 
 一條線會不會被 skew 弄爆，只取決於兩個問題：**用哪種時鐘**，以及**到期時間是「誰蓋、誰檢查」**。
 
-- **同一台機器蓋、同一台檢查**（client ticket、線 3 的 mono delta）→ 固定 offset 在減法裡抵消 → **免疫**。
+- **同一台機器蓋、同一台檢查**（client ticket、線 3 的 heartbeat 同機比較與 mono delta）→ 固定 offset 在減法裡抵消 → **免疫**。
 - **一台蓋、另一台檢查**（線 1 lease、線 2 cephx）→ 兩台時鐘直接比大小 → skew 一到門檻就爆。
 
 線 1 的到期是 `real_clock`（wall clock），不是 monotonic：
@@ -230,7 +230,7 @@ cutoff -= std::min(30.0, cct->_conf->auth_service_ticket_ttl / 4.0);
 utime_t issued_at_lower_bound = now;
 issued_at_lower_bound -= cct->_conf->auth_service_ticket_ttl;
 if (!rotating_secrets->need_new_secrets(cutoff)) {
-  // have uptodate secrets
+  // ...
   return 0;
 }
 ```
@@ -291,7 +291,7 @@ while (r.need_new_secrets(now)) {
   ek.expiration += ttl;
 ```
 
-OSD 收下這批（自己時間是對的），`have_key()` 檢查 `ceph_clock_now() < expires`（真實 now `<` 真實 now+1年）為真 → 全部視為有效。所以 mon 時鐘錯的當下 cluster 表面正常，沒人掉線。**這一步舊頁是對的。**
+OSD 收下這批 rotating secret（自己時間是對的），判「夠不夠新、要不要 renew」走的是 `need_new_secrets(cutoff)`（`MonClient.cc:1108`，方向 A 引過的同一段）：secret 的 expiration（+1 年）遠在 cutoff 之後 → 判定「還很新」、不 renew、照常持有使用。所以 mon 時鐘錯的當下 cluster 表面正常，沒人掉線。**這一步舊頁結論是對的。**
 
 **Step 2 — mon 校時跳回。這裡舊頁翻車：mon 根本不會 rotate。** mon 時鐘回到正確值後想 rotate，第一件事就是問 `need_new_secrets(now)`：
 
@@ -340,7 +340,7 @@ if (!keys.get_service_secret(service_id, ticket.secret_id, service_secret)) {
     << ceph_entity_type_name(service_id) << " secret_id=" << ticket.secret_id << dendl;
 ```
 
-那真實後果是什麼？**rotation 凍結長達偏移量的時間。** mon 校時跳回後，只要 `current().expiration`（+1 年）還在真實 now 的未來，`need_new_secrets(now)` 就一直是 false，mon 端**完全不 rotate**——直到真實時間追上那個 +1 年的 expiration 為止。這段期間 rotating secret 不換手（renewal / 安全性問題），但不是「大量掉線」。而且**就算**它 rotate，新 key 的 expiration = `max(now+ttl, next().expiration) + ttl`（`CephxKeyServer.cc:189`）錨在既有的未來值上，只會**更**未來，永遠生不出一把「正確時間」的 key 去擠掉未來那批。
+那真實後果是什麼？**rotation 凍結長達偏移量的時間。** mon 校時跳回後，只要 `current().expiration`（+1 年）還在真實 now 的未來，`need_new_secrets(now)` 就一直是 false，mon 端**完全不 rotate**——直到真實時間追上那個 +1 年的 expiration 為止。這段期間 rotating secret 不換手（renewal / 安全性問題），但不是「大量掉線」。而且**就算**它 rotate，新 key 的 expiration = `max(now+ttl, next().expiration) + ttl`（`CephxKeyServer.cc:189-193`）錨在既有的未來值上，只會**更**未來，永遠生不出一把「正確時間」的 key 去擠掉未來那批。
 
 <Callout type="warning" title="方向 B 的操作性警告：降級為假說，不是斷言">
   舊頁把「對一台時間錯很多的 mon 校時跳回」列為**高風險動作**（會大量掉線）。逐行查證後，這個**故障機制在 source 層不成立**——`need_new_secrets(now)` 讓 mon 跳回後根本不 rotate、未來 key 不被淘汰。
@@ -352,7 +352,7 @@ if (!keys.get_service_secret(service_id, ticket.secret_id, service_secret)) {
 
 `auth_service_ticket_ttl`(1hr) 這個數字在 cephx 裡被**兩條不同路徑**用到，skew 對它們的影響相反。線 2 講的是 **daemon rotating secret**（mon 蓋、會被 skew 弄爆）；這裡是另一條 **client service ticket**（client 自己蓋、對 skew 免疫），很容易混。
 
-client（librbd / kernel rbd 等）的 ticket，到期是用**自己一台機器的 wall clock 量的 duration**：
+client（librbd 等 userspace client；kernel client 的 cephx 實作在 Linux kernel `net/ceph/`，不在本頁引用範圍）的 ticket，到期是用**自己一台機器的 wall clock 量的 duration**：
 
 File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 199)
 
@@ -385,9 +385,22 @@ bool CephXTicketHandler::have_key()
 | **client service ticket** | client 自己 `now + validity`（相對 duration） | client 自己 | **免疫**（同機抵消） |
 | **daemon rotating secret** | **mon** `now + ttl`（絕對時間點） | OSD | **不免疫**（跨兩台時鐘比） |
 
-## 線 3 — OSD ↔ OSD：走 mono clock，skew 免疫
+## 線 3 — OSD ↔ OSD：同機比較＋mono delta，skew 免疫
 
-OSD 之間跟時間有關的路徑**都不看 wall clock**。OSD service 的「現在」用 monotonic clock：
+OSD 之間跟時間有關的路徑對 wall-clock skew 都免疫，但理由分兩種。
+
+第一種，**heartbeat 判死是同機比較**——它其實用 wall clock，但蓋章與檢查都在本機：`handle_osd_ping` 收到回覆時記下本機的 `ceph_clock_now()`（`OSD.cc:5799` 取 now、`:5914` 記 `last_rx_back = now`），`heartbeat_check()` 再拿本機的 now 去比，固定 offset 在減法裡相消：
+
+File: `ceph/src/osd/OSD.cc` (line 6151)
+
+```cpp
+void OSD::heartbeat_check()
+{
+  ceph_assert(ceph_mutex_is_locked(heartbeat_lock));
+  utime_t now = ceph_clock_now();
+```
+
+第二種，**read lease 的跨機換算走 mono delta**。OSD service 的「現在」用 monotonic clock：
 
 File: `ceph/src/osd/OSD.cc` (line 331)
 
@@ -398,7 +411,7 @@ ceph::signedspan OSDService::get_mnow() const
 }
 ```
 
-heartbeat deadline、read lease 的 `readable_until` 全建在 `get_mnow()` 上。跨 OSD 的 read lease 要把對方時間軸換算成自己的，用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
+跨 OSD 的 read lease 要把對方時間軸換算成自己的，用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
 
 File: `ceph/src/osd/PeeringState.h` (line 119)
 
@@ -437,7 +450,7 @@ File: `ceph/src/osd/PeeringState.h` (line 119)
 | MON-MON log | `Paxos::warn_on_future_time()`（`:1025`） | `> 50ms` 寫 cluster log（非 health check） |
 | MON-OSD 方向 A | `KeyServer::_rotate_secret()` / `MonClient::_check_auth_rotating()`（`:1103`）/ `OSD::init() wait_auth_rotating`（`OSD.cc:4068`） | OSD 比 mon 快到 1hr 級 → secret 太舊 → 啟動重試 10 次 `exit(1)` |
 | MON-OSD 方向 B（**修正**） | `_rotate_secret()`（`CephxKeyServer.cc:180`）/ `need_new_secrets(now)`（`Auth.h:324`）/ `RotatingSecrets::add()`（`Auth.h:314`） | mon 跳回 → `need_new_secrets(now)` false → **不 rotate、不淘汰** → rotation 凍結（非大量掉線；`verify_authorizer` 失敗前提不成立） |
-| OSD-OSD | `OSDService::get_mnow()`（mono，`OSD.cc:331`）/ `HeartbeatStamps` delta（`PeeringState.h:119`） | 無 clock-skew 門檻 |
+| OSD-OSD | `heartbeat_check()`（本機 wall 同機比較，`OSD.cc:6151`）/ `OSDService::get_mnow()`（mono，`OSD.cc:331`）/ `HeartbeatStamps` delta（`PeeringState.h:119`） | 無 clock-skew 門檻 |
 | （對照）client ticket | `CephXTicketHandler`（`CephxProtocol.cc:199`/`215`） | 同機蓋、同機檢查 → skew 免疫 |
 
 ## 相關閱讀
