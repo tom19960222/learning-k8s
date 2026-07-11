@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — slow ops 兩個 metric 怎麼得出，以及 BlueStore 慢操作為何可能漏掉
+archived: true
+supersededBy: [slow-ops-detection-mechanisms, slow-ops-fast-detection-lab]
 description: 從原始碼追 ceph_healthcheck_slow_ops 與 ceph_daemon_health_metrics{type="SLOW_OPS"} 的完整來源鏈：OpTracker 用 osd_op_complaint_time(預設 30s) 數 in-flight op → daemon metric → mgr 累加成 SLOW_OPS health check → prometheus module 解析 summary 字串。再對照另一條獨立路徑 BLUESTORE_SLOW_OP_ALERT(門檻 5s、24h 黏著)，解釋為什麼「OSD slow ops on bluestore」很可能不觸發 SLOW_OPS，以及該怎麼補 alert。
 ---
 

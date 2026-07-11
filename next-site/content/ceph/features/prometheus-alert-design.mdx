@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計
+archived: true
+supersededBy: ceph-alert-policy-current
 description: 已套用 ceph v19.2.3 內建 prometheus_alerts.yml 的前提下，補一層分層設計：保留 CephHealthError 當 page 總開關、用帶 hostname/ceph_daemon 的 scoped rule 取代直接 page OSD/MON down、把維護期 silence 與 client 風險訊號分開。核心洞見是 ceph_health_detail 只有 name/severity 沒有 host label，所以維護時不能靠它精準 silence。
 ---
 

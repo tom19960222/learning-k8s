@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — 把這套 alert 設計搬上真 3-node ceph 叢集（Tier D 真機觀測，兩個只有真機抓得到的 bug）
+archived: true
+supersededBy: ceph-alert-real-lab-report
 description: dev 四層測試證明的是「IF metric/health check 以假設的 label 存在，規則就如設計行為」。這頁是 Tier D：把同一套設計搬到真 cephadm ceph v19.2.3（3 mon + 9 OSD）跑 baseline + S1–S4 四情境，回答 dev 答不了的 ceph 端「IF」。核心 label 假設全部成立、scoped silence/去重/monmap 持久化都守住；但抓到兩個 bug——維護升的是 OSD_FLAGS 不是 OSDMAP_FLAGS（排除清單名字錯，例行維護照樣 page），以及 CephMonQuorumLost 對真 quorum loss 是盲的（mgr metric 凍結，架構級盲區）。
 ---
 

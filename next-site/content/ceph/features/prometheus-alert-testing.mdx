@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — 在開發環境驗證這套維護友善的 alert 設計（四層測試，附抓到的真 bug）
+archived: true
+supersededBy: ceph-alert-validation-methodology
 description: prometheus-alert-design 那頁宣稱「維護噪音壓掉、scoped 可精準 silence、生命線保留」。這頁用 promtool / amtool / live / 真 ceph 四層把每條規則逐一驗過，並完整交代測試怎麼抓到 CephMonQuorumLost 在「全部 mon 掛掉」時靜默不 fire 的真 bug——以及修正後一個誠實的 trade-off。
 ---
 

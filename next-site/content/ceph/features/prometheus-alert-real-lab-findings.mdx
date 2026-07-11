@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — 22 個真機故障注入場景全數驗證的 alert 韌性報告
+archived: true
+supersededBy: ceph-alert-real-lab-report
 description: 27 條自訂 alert rule、22 個真實故障注入場景，在 cephadm v19.2.3 lab 上 22/22 全數驗證 firing 並送達正確 receiver。過程中「每條 alert 都要真機驗證」的鐵律逼出 16 個 fake/promtool 測試全部綠燈、只有真機才現形的 bug——從 crash sidecar 缺 keyring、指標本質是 spiky snapshot gauge，到 rados bench 的物件命名語意。
 ---
 
