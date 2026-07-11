@@ -378,7 +378,7 @@ bool CephXTicketHandler::have_key()
 }
 ```
 
-`expires` 和檢查它的時鐘在**同一台機器**，固定 skew offset 在減法裡抵消——**client 跟誰差多少，對它自己這張 ticket 的壽命沒有影響**。所以「skew 1 小時讓 *client* I/O 斷」是誤解，但「skew 弄垮 *OSD daemon*」是真的。（`auth_service_ticket_ttl` 在「mon **掛掉**」而非 skew 的情境下讓 client renew 不到而斷，那是另一回事，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-impact)。）
+`expires` 和檢查它的時鐘在**同一台機器**，固定 skew offset 在減法裡抵消——**client 跟誰差多少，對它自己這張 ticket 的壽命沒有影響**。所以「skew 1 小時讓 *client* I/O 斷」是誤解，但「skew 弄垮 *OSD daemon*」是真的。（`auth_service_ticket_ttl` 在「mon **掛掉**」而非 skew 的情境下讓 client renew 不到而斷，那是另一回事，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-io-lab)。）
 
 | | 誰蓋到期 | 誰檢查 | 對 skew |
 |---|---|---|---|
@@ -457,5 +457,5 @@ File: `ceph/src/osd/PeeringState.h` (line 119)
 
 - [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](./cluster-time-skew-impact) — 毫秒級 pair-by-pair 矩陣、heartbeat *latency* 跟 clock *offset* 的差別
 - [Ceph — MON clock 漂移多久後 ceph -s 才變 HEALTH_WARN](./mon-clock-skew-detection) — 50ms WARN 那條線的偵測延遲（平均 ~2.5 分、最壞 ~5 分）
-- [Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響](./mon-quorum-loss-impact) — lease timeout → election 鏈，以及 1hr cephx ticket TTL 在「mon 掛掉」（非 skew）情境下的角色
+- [Ceph — quorum 失守的 I/O 衝擊真機報告](./mon-quorum-loss-io-lab) — lease/quorum 機制底 + fio 實證，以及 1hr cephx ticket TTL 在「mon 掛掉」（非 skew）情境下的角色
 - [systemd-timesyncd — service 重啟對系統時間的影響](/systemd/features/timesyncd-restart-impact) — 是誰在修這些 skew：timesyncd 的 slew / jump 邊界與重啟行為

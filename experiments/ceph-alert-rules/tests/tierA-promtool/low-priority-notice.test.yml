@@ -1,4 +1,4 @@
-# Tier A — CephLowPriorityNotice：7 個低優先 name，30m，severity info（slack-only）。spec §4.7
+# Tier A — CephLowPriorityNotice：8 個低優先 name，30m，severity info（slack-only）。spec §4.7
 # 強化（analyzer I3）：跨規則一致性對 PG_DEGRADED 與 OSDMAP_FLAGS 雙驗——
 # 兩者都該 fire LowPriorityNotice(info) 但 NOT fire CephClientRisk(critical)。
 # v2：regex 加入 POOL_APP_NOT_ENABLED、POOL_NEARFULL（兩者都只是提醒，非 client 風險）。

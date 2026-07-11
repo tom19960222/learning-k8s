@@ -597,7 +597,7 @@ ceph tell osd.1 config get osd_max_backfills
 | 值即時可見（無快取） | `OSD::get_recovery_max_active`（`OSD.cc:3695-3703`） | 每次重讀 `cct->_conf` |
 | op 完成再 queue | `OSDService::finish_recovery_op`（`OSD.cc:9644-9664`，`_maybe_queue_recovery`） | 自然收斂的驅動點 |
 | observer 入口 | `OSD::handle_conf_change`（`OSD.cc:9918-9933`） | injectargs 與 mon push 共用這條回呼 |
-| `osd_max_backfills` 行為層同步點（僅四處） | reserver 建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true（`:10189-10190`）、boot-up（`:10262-10263`） | mClock + override=false 下四點皆不執行 → cct 值變、backfill 實際併發不變 |
+| `osd_max_backfills` 行為層同步點（僅四處） | reserver 建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true（`:10189-10190`）、boot-up（`:10262-10263`） | mClock + override=false 下四點皆不執行（改值當下） → cct 值變、backfill 實際併發不變 |
 | option 定義與 note | `osd.yaml.in:1372-1424`（`This setting is automatically reset when the mClock scheduler is used` 在 `:1384`） | 「automatically reset」＝boot-up 重置，非 runtime rollback |
 
 ## 相關閱讀
