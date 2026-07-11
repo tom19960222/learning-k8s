@@ -34,6 +34,9 @@ category: experiment-report
 - **fio pattern**：I/O 存取型態。本實驗四種——`randread`（隨機讀）／`randwrite`（隨機寫）／`read`（順序讀，seq）／`write`（順序寫，seq）。隨機用 4k block、順序用 1M block。
 - **qd（queue depth）**：fio 的 `iodepth`，一次在飛的 I/O 數。**本實驗全程固定 qd=1**（`direct=1 iodepth=1`），變因只有 pattern 與 thread 數。
 - **thread（1t／4t）**：fio 的併發 job 數（`numjobs`）。1t = 單 thread、4t = 4 個並行 thread。
+- **rc=0**：指令的 return code 為 0＝成功完成。本頁用它當「照跑」的判準——fio cell rc=0 表示該組讀寫完整跑完、無 stall／timeout。
+- **iops**：每秒完成的 I/O 次數（I/O operations per second），本頁效果量表的單位。
+- **PG（placement group）**：RADOS 把 object 分組放到 OSD 的單位；client 讀寫先算 object 落在哪個 PG、再由 PG 對到一組 OSD。「PG 不 re-peer」（成員組合不變、不需重新協商）是本頁多個結論的機制支點。
 - **krbd（kernel rbd map）**：Linux kernel 內建的 RBD client。k8s node 要把一顆 RBD image 掛成 block device 給 pod 用時，就在 node 上做 `rbd map`——這是一個**全新的 rados client**，開機要先向 mon 取 map。**這是本實驗唯一會卡住的動作。**
 - **CSI provisioner**：ceph-csi 裡負責「建 RBD image／回應 PVC」的 controller 元件。它是一個**長駐、早就連上 mon 的 rados client**——這個身份是 §5 頭牌翻案的關鍵。
 - **PVC `Bound`**：PersistentVolumeClaim 已成功綁到一顆 PV（底層 RBD image 已備妥）。是 control-plane 動作的結果。
@@ -203,7 +206,7 @@ client ─ RADOS op ──▶ OSD ─ replicate ─▶ OSD ─ ack ─▶ client
 在講 I/O 之前，先證明注入有效（否則「fio 沒崩」毫無意義）。三條獨立證據：
 
 1. **mon daemon 真的停了**：`mon-isactive.txt` 記錄 `mon-02: inactive`、`mon-03: inactive`。
-2. **mon-01 收到 client 的 mon 請求卻處理不了**：還原後 `postcheck-ceph-s.txt` 冒出 `748 slow ops, oldest one blocked for 153 sec, mon.ceph-lab-mon-01 has slow ops`。窗長 ~153s 恰好對上——證明整個窗內 client 一直在敲 mon-01，但它無 quorum、`is_readable`/`is_writeable` 全 false、只能把請求塞成 slow ops。**這就是 quorum 確實失守的鐵證。**
+2. **mon-01 收到 client 的 mon 請求卻處理不了**：還原後 `postcheck-ceph-s.txt` 冒出 `748 slow ops, oldest one blocked for 153 sec, mon.ceph-lab-mon-01 has slow ops`。oldest op 齡 153s 與 ~156s 的觀察窗（注入 15:40:22Z → 收尾 15:42:58Z）量級吻合——slow op 起算晚於注入瞬間，差 3 秒合理——表示整個窗內都有 client 請求在敲 mon-01，但它無 quorum、`is_readable`/`is_writeable` 全 false、只能把請求塞成 slow ops。**這就是 quorum 確實失守的鐵證。**
 3. **偵測面全窗盲（對照）**：同時間 Prometheus 上 mgr 匯出的 `count(ceph_mon_quorum_status==1)` **從 baseline 到 window-final 一路讀 3**（`prom-baseline.txt` … `prom-window-final.txt`），`CephMonQuorumLost` 全程沒 fire。這是姊妹頁的主題，本頁只借它反襯「ground truth 是真失守、但既有 metric 說謊」。
 
 <Callout type="warning" title="讀這頁時記得的一件事">
@@ -222,7 +225,7 @@ client ─ RADOS op ──▶ OSD ─ replicate ─▶ OSD ─ ack ─▶ client
 | randread 4k | 2847 / 36134 iops | 8766 / 38702 iops | 照跑，讀甚至更快 |
 | randwrite 4k | 10 / 13 iops | 9 / 19 iops | 照跑（個位數 iops 是慢碟本色，非 quorum） |
 | read seq 1M | 172 / 1380 iops | 343 / 1376 iops | 照跑，1t 讀更快 |
-| write seq 1M | 1 / 3 iops | 2 / 2 iops | 照跑（極慢是碟慢） |
+| write seq 1M | 1 / 3 iops | 2 / 2 iops | 照跑（極慢是碟慢；4t 的 3→2 在個位數 iops 屬雜訊，不是退化訊號） |
 
   讀路徑窗內反而**略快**（randread 1t 2847→8766、seq read 1t 172→343），合理解釋是 quorum 失守後背景 mon/mgr chatter 變少、OSD 少了雜務。但這**不是重點**——重點是**沒有一個 cell 階梯崩落**，rand/seq/單多 thread/讀寫全都穿越整個窗。⇒ H-B1／H-B3／H-B4 全 confirmed：quorum 依賴在「map 分發／建 session」層，不在 data path；OSD 全 up、PG 不 re-peer，既有連線讀寫皆續。
 - **建議**：已在跑的 workload（RBD 已 map/mount）在 quorum 失守窗內**多半無感**，不需緊急疏散——**條件是**在 cephx service ticket 餘額內、且期間不觸發「需要新 map」的事件（見 §6 與 §8 的邊界）。
