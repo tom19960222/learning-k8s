@@ -11,7 +11,7 @@ category: mechanism
 - **版本錨點**：ceph `v19.2.3`（submodule HEAD `c92aebb`）。所有 `File: ... (line N)` 以這個 tag 為準；升級版本前請重驗行號。
 - **閱讀前提（1 個，一句理由）**：
   - [Ceph — mClock OSD I/O scheduler](./mclock-osd-scheduler)：**mClock profile 與三個 scheduler 桶（client / background_recovery / background_best_effort）在那頁**，本頁把 mClock「為什麼要接管 recovery throttle」當已知前提，只拆「它接管的手段」與「這手段對 injectargs 到底做了什麼」。
-- **證據層級**：**T1 ＋ 關鍵主張 T3 真機實證（2026-07-11）**。機制主張全部是 T1（原始碼逐字核對）——CONF_OVERRIDE 層級、injectargs 寫入層、mClock 防寫分支只發 `config rm` + clog warning、`set_mon_vals` 只動 CONF_MON、`_recover_now` 閘門，每條都附行號。兩臂主張皆已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑證實——injectargs 臂（osd.0：值生效、來源層＝`override`、mon db 無寫入、clog warning 誤導）與 `config set` 對照臂（osd.1：mon db 條目 1 秒內被回收、+6s 值還原、同款 warning 這次屬實），逐字輸出貼在文末「在你環境驗證」節。
+- **證據層級**：**原始碼逐字核對 ＋ 關鍵主張真機實證（2026-07-11）**。機制主張全部是原始碼層（逐字核對）——CONF_OVERRIDE 層級、injectargs 寫入層、mClock 防寫分支只發 `config rm` + clog warning、`set_mon_vals` 只動 CONF_MON、`_recover_now` 閘門，每條都附行號。兩臂主張皆已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑證實——injectargs 臂（osd.0：值生效、來源層＝`override`、mon db 無寫入、clog warning 誤導）與 `config set` 對照臂（osd.1：mon db 條目 1 秒內被回收、+6s 值還原、同款 warning 這次屬實），逐字輸出貼在文末「在你環境驗證」節。
 - **本頁取代**：[`recovery-throttle-runtime`](./recovery-throttle-runtime)。取代原因＝該頁的 TL;DR、danger Callout 與 §gate 表宣稱「mClock 會把 injectargs rollback、必須先開 `osd_mclock_override_recovery_settings` 才實際生效」，但逐行查證後這是**對 injectargs 的錯誤詮釋**——injectargs 寫進最高優先的 `CONF_OVERRIDE` 層，mClock 防寫只操作 mon config db（`CONF_MON` 層），動不到它。本頁保留舊頁站得住的主體（`_recover_now` 單向閘門、四層 gate、config set 的真 rollback、兩輪 ping-pong、reserver 差異、自然收斂圖），改寫這條核心因果。
 
 ## 術語表
@@ -432,9 +432,9 @@ t11     2      3   跑到 2 < 3，下一個 op 才可以進來
 | Key | 沒開 override 時（config 值層） | 行為層（throttle 實際上限） |
 |---|---|---|
 | `osd_recovery_max_active*` | injectargs 生效到重啟 / config set 被撤 | `_recover_now` 每次**重讀** `cct->_conf`（`OSD.cc:3695-3703`）→ **值變＝行為變** |
-| `osd_max_backfills` | 同上（值層行為相同；T3 實證的正是這顆 key） | reserver 的上限只在四個點被同步：建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true 分支（`:10189-10190`）、boot-up（`:10262-10263`）——**mClock + override=false 下這四個一個都不會跑** → **cct 值變了、reserver 上限不動、backfill 實際併發不變** |
+| `osd_max_backfills` | 同上（值層行為相同；真機實證的正是這顆 key） | reserver 的上限只在四個點被同步：建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true 分支（`:10189-10190`）、boot-up（`:10262-10263`）——**mClock + override=false 下這四個一個都不會跑** → **cct 值變了、reserver 上限不動、backfill 實際併發不變** |
 
-差別根因：**reserver 是 stateful（要主動同步）**，recovery active count 是純讀取（不用同步）。由此帶出的缺口值得單獨講清楚：mClock + override=false 下 injectargs `osd_max_backfills=7`，`config get` / `config diff` 都會給你 7（**值層**，T3 已證），但 `src/osd/` 下除了上述四個同步點沒有其他 runtime 讀取者——四個點在此情境一個都不執行，backfill 併發上限就停在 reserver 裡的舊值。**所以那條 `did not take effect` warning 對 cct 值是錯的，對 `osd_max_backfills` 的 throttle 行為卻歪打正著。** `osd_recovery_max_active*` 沒有這個缺口：`_recover_now` 直接重讀 cct，值變即行為變，warning 對它的值與行為都是錯的。
+差別根因：**reserver 是 stateful（要主動同步）**，recovery active count 是純讀取（不用同步）。由此帶出的缺口值得單獨講清楚：mClock + override=false 下 injectargs `osd_max_backfills=7`，`config get` / `config diff` 都會給你 7（**值層**，真機已證），但 `src/osd/` 下除了上述四個同步點沒有其他 runtime 讀取者——四個點在此情境一個都不執行，backfill 併發上限就停在 reserver 裡的舊值。**所以那條 `did not take effect` warning 對 cct 值是錯的，對 `osd_max_backfills` 的 throttle 行為卻歪打正著。** `osd_recovery_max_active*` 沒有這個缺口：`_recover_now` 直接重讀 cct，值變即行為變，warning 對它的值與行為都是錯的。
 
 ### 補充：OSD 重啟時 mClock 怎麼把值拉回 default
 
@@ -455,9 +455,9 @@ t11     2      3   跑到 2 < 3，下一個 op 才可以進來
 
 注意 source 註解自己點出：`set_val_default` **蓋不掉更高層的值**。重啟後 injectargs 的 `CONF_OVERRIDE` 早就沒了（ephemeral），config set 的 `CONF_MON` 也被 rollback 撤了，所以 `CONF_DEFAULT` 這份 mClock default 就是最終生效值。這正是 `osd.yaml.in` 那句 `This setting is automatically reset when the mClock scheduler is used`（`osd.yaml.in:1384`）指的——是 **boot-up 重置**，不是 runtime rollback。
 
-## 在你環境驗證（T3 真機實證，2026-07-11）
+## 在你環境驗證（真機實證，2026-07-11）
 
-> **證據等級：T3（真機實證，兩臂完整）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上：injectargs 臂打 osd.0、`config set` 對照臂打乾淨的 osd.1。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。注意本節實證的是 **config 值層**（cct 裡的值與來源層）；`osd_max_backfills` 的**行為層**另受 reserver 同步時機管——mClock + override=false 下值變了、backfill 實際併發不變，見上文「跟 `osd_max_backfills` 的差別」。兩個操作都可逆，你可以在自己環境用同樣指令重跑對照。
+> **證據等級：真機實證（兩臂完整）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上：injectargs 臂打 osd.0、`config set` 對照臂打乾淨的 osd.1。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。注意本節實證的是 **config 值層**（cct 裡的值與來源層）；`osd_max_backfills` 的**行為層**另受 reserver 同步時機管——mClock + override=false 下值變了、backfill 實際併發不變，見上文「跟 `osd_max_backfills` 的差別」。兩個操作都可逆，你可以在自己環境用同樣指令重跑對照。
 
 先確認 scheduler 是 mClock（否則整個防寫分支根本不進）：
 
@@ -540,7 +540,7 @@ ceph tell osd.0 config diff   # 預期同樣出現 "override" 層
 # （在 OSD 本機也可用 admin socket：ceph daemon osd.0 config diff）
 ```
 
-對照組——`config set` 真的被撤（T3 實跑輸出，2026-07-11，osd.1）：
+對照組——`config set` 真的被撤（真機實跑輸出，2026-07-11，osd.1）：
 
 > 為什麼換 osd.1：osd.0 殘留著前一輪實驗的 `override` 層（值雖等於 default，層還在），mon push 落在較低的 `CONF_MON` 層會被它壓住（`config_values.cc:24-26` 的 `SET_NO_EFFECT`），污染「config set 在 OSD 端有沒有生效」的觀測；osd.1 是乾淨的。
 

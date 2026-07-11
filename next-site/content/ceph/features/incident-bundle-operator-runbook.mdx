@@ -10,7 +10,7 @@ category: runbook
 - **文章類型**：runbook（操作手冊）。它跟著 `experiments/ceph-incident-bundle/` 這支工具的實際行為走——工具改了，這頁就要改。所有指令、參數、預設值、輸出結構都逐字對過現行原始碼。
 - **版本錨點**：工具＝`experiments/ceph-incident-bundle/` 現行 HEAD（本頁對照時最後一次改動這支工具的 commit 為 `5673a82`，2026-07-11）。**與 Ceph 版本無關**：這支工具不綁 Ceph 版本，它只是把你 node 上現有的 `ceph` / `cephadm` / `kubectl` 產出的東西原封不動收走，所以 v18 / v19 / Rook 都能用。升級工具後若行為變動請重驗本頁。
 - **本頁可獨立閱讀**：**沒有前置頁**。只要你會 SSH 到 Linux 機器、會編輯一個 shell 檔、會複製一行指令，就能跑完。你**不需要**懂 CRUSH、PG、BlueStore、Paxos、Rook internals——判讀 bundle 是後面那個人的事，你的責任只到「把證據完整帶走」。
-- **證據層級**：指令與參數行為＝T1（逐字對照現行工具原始碼與 tests/ 斷言）；真機驗證證據見姊妹頁 [驗證報告](./incident-bundle-validation-report)。
+- **證據層級**：指令與參數行為＝原始碼層（逐字對照現行工具原始碼與 tests/ 斷言）；真機驗證證據見姊妹頁 [驗證報告](./incident-bundle-validation-report)。
 - **本頁取代**：[`incident-bundle-runbook`](./incident-bundle-runbook)。取代原因＝工具能力大幅演進，舊頁已嚴重落後：舊頁完全沒提 `--mode auto` 能力探測、cephadm runner 三階擇優、Rook `--kube-mode remote|local`、external namespace、`--prom-url` metrics dump、雙層 timeout、`progress`/`--quiet`、`ssh-debug` 這 8 項能力，且有 5 處描述與現行為不符（Rook 層預設已是 remote kubectl、cephadm 不再固定走 `cephadm shell`、超大 log 改收 tail、bsdtar xattr 已修、`environment.txt` 新增欄位）。本頁是重寫的 v3 全能力版。
 
 ## 術語表

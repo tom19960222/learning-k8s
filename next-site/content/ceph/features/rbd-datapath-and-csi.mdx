@@ -14,7 +14,7 @@ category: mechanism
 - **閱讀前提（2 個，各一句理由）**：
   - [Ceph — 架構總覽](./architecture)：先知道 MON / OSD / RADOS 各自的職責，本頁才不用重述「object store 是什麼」。
   - [Ceph — CRUSH 與 placement](./crush-and-placement)：object → PG → OSD set 的定位算式在那頁，本頁只講「切出 object 之後交給誰」，不重畫 CRUSH。
-- **證據層級**：本頁**機制**主張分兩種。凡附 `File: ... (line N)` 的都是 **T1（原始碼逐字核對）**——object prefix、`rbd_default_order`、feature dependency 硬檢查、ceph-csi 預設 mounter、NodeStage / NodePublish 的 volumeMode 分流，每條都有行號。唯一沒有行號的是「kernel krbd 在 kernel 內自行 striping、不呼叫 librbd」——這是**架構事實**（librbd 是 user-space library，沒被 link 進 kernel），不是某一行 source；本頁把它標成推理而非行號斷言。
+- **證據層級**：本頁**機制**主張分兩種。凡附 `File: ... (line N)` 的都是**原始碼逐字核對**——object prefix、`rbd_default_order`、feature dependency 硬檢查、ceph-csi 預設 mounter、NodeStage / NodePublish 的 volumeMode 分流，每條都有行號。唯一沒有行號的是「kernel krbd 在 kernel 內自行 striping、不呼叫 librbd」——這是**架構事實**（librbd 是 user-space library，沒被 link 進 kernel），不是某一行 source；本頁把它標成推理而非行號斷言。
 - **本頁取代**：[`rbd-and-csi`](./rbd-and-csi)。取代原因＝舊頁有兩處被逐字 source 查證推翻的 **data path 混淆**：(1) 它的 IO 流程圖把 kernel `rbd` module 也導進 librbd 的 `librados → Objecter` 漏斗，並把「真正切 object 的地方在 `ImageRequest`」寫成通用敘述——但那段 librbd 碼只在 user-space 路徑執行，且**從未點出 ceph-csi 預設 mounter=krbd**，讀者會誤以為預設部署走的是文章詳解的 librbd 碼；(2) NodePublish「bind-mount `/dev/rbdN` 進 Pod、Pod 看到 mounted filesystem」與 source 的 volumeMode 實際行為不符。本頁保留舊頁站得住的主體（RBD object layout、feature dependency 硬檢查、責任邊界判讀表、rook vs ceph-csi 分工），改寫這兩處。
 
 ## 術語表
