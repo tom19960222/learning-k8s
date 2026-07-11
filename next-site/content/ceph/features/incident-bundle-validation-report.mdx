@@ -14,7 +14,7 @@ category: experiment-report
   - **2026-07-10 Prometheus dump**：`--prom-url` 這個較晚加入的能力，對真 Prometheus 做 103 個 metric 的 dump，逐項 9 條斷言；同一輪順帶把整條 pipeline 在**現行版**複驗一次。
 - **版本錨點（誠實標，各波驗的不是同一個工具版本）**：
   - 工具現行 HEAD＝commit `5673a82`（2026-07-11），也就是把 prom 驗證證據落 git 的那個 commit。
-  - **2026-06-30 multi-fault** 驗的是當時的工具（multi-fault 結果 commit `2c7eac9`、auto smoke `0e3b076`，皆 2026-06-30）。那時**還沒有** `--prom-url`——該能力 2026-07-07 起才進碼（commit `8310fdd` 之後）。所以 multi-fault 的故障注入結論綁在 2026-06-30 的碼，prom 這層它沒測到。
+  - **2026-06-30 multi-fault** 驗的是當時的工具（multi-fault 結果 commit `2c7eac9`、auto smoke `0e3b076`，皆 2026-06-30）。那時**還沒有** `--prom-url`——該能力自 2026-07-07 的 `8310fdd`（helper 函式）起開發、同日 `aa4e5bb` 把旗標接進 `collect.sh`。所以 multi-fault 的故障注入結論綁在 2026-06-30 的碼，prom 這層它沒測到。
   - **2026-07-10 prom dump** 跑的是含 `--prom-url` 的現行版，而且那輪是**完整 6-node 收集**（不是只跑 prom 層），等於把 2026-06-30 那批 happy-path 行為（redaction／verify／node 收集／exit 0）在現行碼上又複驗一次——這是把舊碼結論搬到現行版的橋。
 - **閱讀前提（最多 1 篇）**：[`incident-bundle-operator-runbook`](./incident-bundle-operator-runbook)。**工具怎麼裝 inventory、跑哪條指令、每個參數什麼意思、bundle 裡有什麼，全在那頁**。本頁不重述操作，只放證據；但下方「術語表」仍把承重詞各給一句話，讓本頁能自足讀完。
 - **證據層級**：本頁**以 T3（真機）為主**。`T1`＝pinned 原始碼一定如此（讀碼）；`T2`＝README／官方文件契約；`T3`＝在真 cephadm v19.2.3 6-host lab 上實際跑到。另有一類**單元層**背書＝`tests/` 用 fake `ssh`／`curl` 注入故障、把分支邏輯逐一釘住（不是真叢集，但比讀碼硬——見 [§5](#5-tests-單元層背書真機沒逐一演練的分支在這裡釘住)）。每個證據下方標它屬於哪一層。
@@ -34,6 +34,7 @@ category: experiment-report
 | **seed / runner** | seed＝在哪台 node 跑 cluster-level `ceph`；runner＝在 seed 上怎麼跑（`direct` 直接 `ceph`／`sudo` `sudo -n ceph`／`cephadm` `sudo -n cephadm shell -- ceph`），工具按連線性自動挑。 |
 | **manifest** | `manifest.jsonl`，每個 artifact 一行 JSON：哪台 host、哪條指令、exit code、起訖時間。`CONTENTS.md` 是它的人類可讀版。 |
 | **T3／單元層** | T3＝真機實測；單元層＝`tests/` 用 fake 指令注入故障的行為測試。 |
+| **budget 截斷** | prom dump 的**整體時間預算**（`--prom-timeout`，預設 600s）用完時，dump 停止、已 dump 的 metric 保留，並在 `dump-info.txt`／該 job 的 `index.txt` 標 `TRUNCATED: budget <n>s exceeded`（`lib/collect-prometheus.sh:265-268`）。 |
 
 ## 這份報告怎麼讀
 
@@ -41,7 +42,7 @@ category: experiment-report
 
 **各節導覽**：§1 前提（驗證環境＝真 6-host lab、判準＝exit code 語意＋bundle 內容斷言）→ §2 規劃總覽（三波對帳，含「驗過什麼／沒驗什麼」）→ §3 逐場五欄證據 → §4 發現與邊界（partial failure 仍產 bundle、SKIPPED 路徑、redaction 非 DLP）→ §5 tests/ 單元層背書 → §6 侷限與誠實保留 → §7 開放問題。
 
-**代號**（第一次出現在這裡定義，全文沿用）：`H-1`＝2026-06-29 健康收集；`MF-1…MF-6`＝2026-06-30 multi-fault 六場（對應 review 紀錄的 scenario `12`／`13`／`14`／`15a`／`15b`＋auto smoke）；`PD-1…PD-9`＝2026-07-10 prom dump 的九條逐項斷言。verdict 記號：✅＝斷言成立且有可稽核證據；➖＝本輪未演練（行為由單元層或歷史 bundle 覆蓋，標明出處）。
+**代號**（第一次出現在這裡定義，全文沿用）：`H-1`＝2026-06-29 健康收集；`MF-1…MF-6`＝2026-06-30 multi-fault 六場（對應 review 紀錄的 scenario `12`／`13`／`14`／`15a`／`15b`＋auto smoke）；`PD-1…PD-9`＝2026-07-10 prom dump 的九條逐項斷言。verdict 記號：✅＝斷言成立且有可稽核證據；**歷史背書**＝由較早一輪的本機 bundle 證明、本輪未重新演練（全頁僅 PD-8）；➖＝本輪未演練、僅單元層覆蓋（全頁僅 PD-9）。
 
 ## 1. 前提
 
@@ -79,13 +80,13 @@ category: experiment-report
 | 代號 | 情境 | 驗什麼 | 事前預期 | verdict |
 |---|---|---|---|---|
 | **H-1** | 2026-06-29 健康收集 | happy path 整條 pipeline 跑得完 | 6/6 node 收到、`VERIFY PASS`、`final_status=0` | ✅（歷史，舊頁） |
-| **MF-1** | multi-fault 健康基準（review `#12`） | 健康路徑 ＋ redaction 在真資料上守住 | `VERIFY PASS`、6/6 node、312 行遮蔽、exit 0 | ✅ T3 |
+| **MF-1** | multi-fault 健康基準（review `#12`） | 健康路徑 ＋ redaction 在真資料上守住 | `VERIFY PASS`、6/6 node、redaction 在真 config 上生效、exit 0 | ✅ T3 |
 | **MF-2** | OSD down（review `#13`） | 叢集故障被當**證據**收進 bundle、**不**算收集失敗 | 收到 `OSD_DOWN`（text＋json）、exit **0** | ✅ T3 |
 | **MF-3** | MON down／quorum 在（review `#14`） | 同上，MON 版 | 收到 `MON_DOWN: ...（out of quorum）`、exit **0** | ✅ T3 |
 | **MF-4** | node 不可達（review `#15a`） | 部分失敗仍產 bundle、失敗有紀錄 | 假 host `SKIPPED.txt`、其餘照收、`errors.log` 記 `exited 255`、exit **2** | ✅ T3 |
 | **MF-5** | seed 不可達（review `#15b`） | cluster 層失敗但 node 層照收 | cluster collector 失敗、6 node 仍收、exit **2** | ✅ T3 |
 | **MF-6** | `--mode auto` 真機 smoke | 能力探測＋雙層邏輯在真 ssh 上成立 | probe 走真 ssh、選到 cephadm、rook 層寫 `SKIPPED`、`final_status=0` | ✅ T3 |
-| **PD-1…9** | 2026-07-10 prom dump | `--prom-url` 對真 Prometheus 的九條斷言 | 見 [§3.3](#33-第三波2026-07-10-prometheus-dump九條斷言) | ✅×8 ／ ➖×1 |
+| **PD-1…9** | 2026-07-10 prom dump | `--prom-url` 對真 Prometheus 的九條斷言 | 見 [§3.3](#33-第三波2026-07-10-prometheus-dump九條斷言) | ✅×7＋歷史背書×1＋➖×1 |
 
 ### 2.2 覆蓋對帳：驗過什麼、沒驗什麼（誠實列）
 
@@ -94,12 +95,12 @@ category: experiment-report
 | 行為 | 真機（T3）演練？ | 只有單元層／其他背書？ |
 |---|---|---|
 | exit 0／2 語意（MF-1…MF-5） | ✅ 2026-06-30 逐場 | — |
-| redaction 在真 config 上守住（312 行、`verify_no_secret_content`） | ✅ 2026-06-30／2026-07-10 | 遮蔽變體（PEM 多行、`key = <base64>`、`.gz` 內容）另有 `test-common.sh` 逐一背書 |
+| redaction 在真 config 上守住（312 行、`verify_no_secret_content`＝verify 的內容層檢查：掃檔案內容有無殘留金鑰材料） | ✅ 2026-06-30／2026-07-10 | 遮蔽變體（PEM 多行、`key = <base64>`、`.gz` 內容）另有 `test-common.sh` 逐一背書 |
 | `--prom-url` healthy dump（103 metrics） | ✅ 2026-07-10 | — |
 | prom **budget 截斷**（`TRUNCATED`） | ➖ 健康路徑未觸發 | `test-prom-collector.sh` 的 fake curl 情境（PD-3） |
 | prom **多 job fan-out**（`ceph`＋`node`） | ➖ 本 stack 只有 `ceph` 一個 job | 單元層（PD-2 註） |
-| prom **URL 帳密遮蔽**（`user:***@`） | ➖ 本輪 URL 無帳密 | `lib/collect-prometheus.sh` `prom_mask_url` ＋ `test-prom-collector.sh`（PD-9） |
-| Prometheus 不可達→`SKIPPED.txt`＋不炸整包 | ➖ 本輪 Prometheus 可達 | **歷史 bundle**（2026-07-07，本機）＋單元層（PD-8） |
+| prom **URL 帳密遮蔽**（`user:***@`） | ➖ 本輪 URL 無帳密 | `lib/collect-prometheus.sh` 的 `prom_mask_url`（把 URL 內嵌的 basic-auth 帳密在寫進任何 artifact 前遮蔽的 helper）＋ `test-prom-collector.sh`（PD-9） |
+| Prometheus 不可達→`SKIPPED.txt`＋不炸整包 | 歷史背書（本輪 Prometheus 可達、未重新演練） | **歷史 bundle**（2026-07-07，本機）＋單元層（PD-8） |
 | Rook 層 remote／local kubectl、external namespace | ➖ 本 lab 是純 cephadm、無 kubectl node | `test-rook-collector.sh`（含 external ns、remote ssh、operator lookup 失敗） |
 | verify 檔名黑名單／內容層攔截 | ➖ 靠健康路徑的 `VERIFY PASS` 反證 | `test-verify-bundle.sh`（keyring／`.ssh`／`id_ed25519`／`*.pem`／PRIVATE KEY 內容） |
 | Ctrl-C／SIGTERM 清 workdir、SIGKILL 無法攔 | ➖ | regression test（單元層） |
@@ -128,7 +129,7 @@ category: experiment-report
 | **預期** | `VERIFY PASS`、6/6 node、redaction 在真 config 上生效、exit 0。 |
 | **實際** | `VERIFY PASS`、6/6 node、0 errors、**312 行遮蔽**、`verify_no_secret_content` 在 live config 上通過。 |
 | **證據** | review 紀錄 `#12` 列。**T3**。 |
-| **verdict** | ✅。312 行遮蔽＋內容驗證通過＝沒有 `key = <base64>`／PEM／禁路徑材料survive 進打包的 bundle。 |
+| **verdict** | ✅。312 行遮蔽＋內容驗證通過＝沒有 `key = <base64>`／PEM／禁路徑材料 survive 進打包的 bundle。 |
 
 **MF-2 OSD down（review `#13`）**
 
@@ -189,16 +190,16 @@ category: experiment-report
 | **PD-1** | bundle 內有 `cluster/prometheus/` 層 | tar 清單 109 entry：`dump-info.txt`、`buildinfo.json`、`targets.json`、`ceph/index.txt`、`ceph/<metric>.json.gz` × **103** | tar 清單 | ✅ T3 |
 | **PD-2** | 每個 job 的 metric 逐一 dump 且 gzip | `jobs_seen=ceph`、`jobs_matched=ceph`、`metrics_ok=103`、`metrics_failed=0` | `dump-info.txt` | ✅ T3（多 job fan-out 見 §2.2） |
 | **PD-3** | budget 截斷未觸發（健康路徑） | `truncated=0` | `dump-info.txt`；截斷路徑由 `test-prom-collector.sh` fake curl 覆蓋 | ✅ T3＋單元層 |
-| **PD-4** | step 自動計算 | `since=24h` → `step_seconds=15`（`ceil(86400/10000)`→min 15s） | `dump-info.txt`、`lib/collect-prometheus.sh:43-48` | ✅ T3 |
+| **PD-4** | step 自動計算 | `since=24h` → `step_seconds=15`（`ceil(86400/10000)`→min 15s；除數 10000 是把每 series 點數保守壓在 Prometheus `query_range` 的 11,000 點上限之下，見該檔 `:41-42` 註解） | `dump-info.txt`、`lib/collect-prometheus.sh:43-48` | ✅ T3 |
 | **PD-5** | dump 檔是可解析的真 time series | 抽查 `ceph/ceph_health_status.json.gz`：gunzip→合法 JSON、1 series、有樣本、值 `0`（吻合當時 `HEALTH_OK`） | 該檔 | ✅ T3 |
 | **PD-6** | `environment.txt` 記錄 prom 欄位 | `prom_url=http://127.0.0.1:9790`、`prom_jobs=ceph`；同檔 `ceph_source=ikaros@192.168.18.166`、`ceph_runner=sudo`（三階擇優真機選了 `sudo -n ceph`） | `environment.txt` | ✅ T3 |
 | **PD-7** | metrics `json.gz` 不做 redaction、其餘照常 | `redactions.log` 對 `json.gz` 零項；`dump-info.txt`／`ceph/index.txt`／`targets.json`／`buildinfo.json` 4 個文字檔都進 redaction 清單（各 0 line(s) redacted） | `redactions.log` | ✅ T3 |
-| **PD-8** | Prometheus 不可達 → `SKIPPED.txt`＋不炸整包 | 歷史 bundle `ceph-incident-20260707T090438Z.tar.gz`（本機）的 `cluster/prometheus/SKIPPED.txt`：`SKIPPED: prometheus not reachable: ...（curl exit 6）` | 歷史 bundle | ✅（歷史 bundle） |
+| **PD-8** | Prometheus 不可達 → `SKIPPED.txt`＋不炸整包 | 歷史 bundle `ceph-incident-20260707T090438Z.tar.gz`（本機）的 `cluster/prometheus/SKIPPED.txt`：`SKIPPED: prometheus not reachable: ...（curl exit 6）` | 歷史 bundle | 歷史背書 |
 | **PD-9** | URL 帳密遮蔽（`user:***@`） | 本輪 URL 無帳密、未演練；行為由 `prom_mask_url`＋`test-prom-collector.sh` 覆蓋 | 單元層 | ➖ 本輪未演練 |
 
 ## 4. 發現與邊界
 
-**一句話結論**：這支工具的核心契約——**「叢集有病」≠「我收集失敗」，且部分失敗仍保住現場**——在真 6-host cephadm v19.2.3 lab 上以 exit code 對照（0 vs 2）驗證成立；`--prom-url` 這層對真 Prometheus 的 103-metric dump 也全數過。缺口都是**環境綁定或只有單元層背書**（見 §2.2／§6），沒有機制級失敗。下一步（§7）以「在現行版重跑 multi-fault」與「Rook external 真機演練」優先。
+**一句話結論**：這支工具的核心契約——**「叢集有病」≠「我收集失敗」，且部分失敗仍保住現場**——在真 6-host cephadm v19.2.3 lab 上以 exit code 對照（0 vs 2）驗證成立（multi-fault 波為 2026-06-30 版工具）；`--prom-url` 這層對真 Prometheus 的 103-metric dump 也全數過。缺口都是**環境綁定或只有單元層背書**（見 §2.2／§6），沒有機制級失敗。下一步（§7）以「在現行版重跑 multi-fault」與「Rook external 真機演練」優先。
 
 - **exit code 語意的設計驗證（核心發現）**：MF-2／MF-3 exit **0**、MF-4／MF-5 exit **2**，兩組對照證明工具刻意把「叢集自身故障」（收進 bundle 當證據）與「收集動作失敗」（記進 `errors.log`、rc=2）分開。事故現場最常見的就是某台 node 半死不活；若因它的 `journalctl` 失敗就讓整包不產生，反而損失其他 node 的證據。這個語意是工具最重要的契約，也是本報告花最多篇幅驗的東西。
 - **partial failure 仍產 bundle**：MF-4（node 不可達）、MF-5（seed 不可達）都是 exit 2 但 bundle 照樣產出、失敗寫進 `errors.log`／`summary.txt`——符合 README 契約「先保留現場、把失敗記下來」。
