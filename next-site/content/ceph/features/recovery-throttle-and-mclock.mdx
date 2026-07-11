@@ -100,7 +100,13 @@ ConfigValues::get_value(const std::string_view name, int level) const
     // use highest-priority value available (see CONF_*)
     if (level < 0) {
       return {p->second.rbegin()->second, true};
+    } else if (auto found = p->second.find(level);
+               found != p->second.end()) {
+      return {found->second, true};
     }
+  }
+  return {Option::value_t{}, false};
+}
 ```
 
 所以 `injectargs --osd-recovery-max-active 3` 之後，該 OSD 的 `osd_recovery_max_active` 在 `CONF_OVERRIDE` 層有一份 `3`，而 `get_recovery_max_active()`（讀 `cct->_conf->osd_recovery_max_active`）拿到的就是這個最高層的 `3`。**這一步，值已經生效了。**
@@ -252,7 +258,7 @@ values.rm_val(name, CONF_MON);
 
 | 舊頁的主張 | source 實際 | 正確結論 |
 |---|---|---|
-| TL;DR（line 27）：「Squid 預設 mClock 會把這次 inject rollback…要實際生效必須先 `ceph config set osd osd_mclock_override_recovery_settings true`」 | `maybe_override_options_for_qos` 的 rollback 分支（`OSD.cc:10192-10241`）只發 `config rm`（打 mon db）+ clog warn，**對本機 cct 的 recovery key 零改動**；injectargs 值在 `CONF_OVERRIDE`（`config.cc:851`），mon db 操作只碰 `CONF_MON`（`config.cc:308,334`） | injectargs 的值**在該 OSD 生效直到重啟**，沒有被 rollback；「要先開 override」講的是**持久化**需求，不是「有沒有生效」 |
+| TL;DR（line 27）：「Squid 預設 mClock scheduler 會把這次 inject rollback…要實際生效必須先 `ceph config set osd osd_mclock_override_recovery_settings true`」 | `maybe_override_options_for_qos` 的 rollback 分支（`OSD.cc:10192-10241`）只發 `config rm`（打 mon db）+ clog warn，**對本機 cct 的 recovery key 零改動**；injectargs 值在 `CONF_OVERRIDE`（`config.cc:851`），mon db 操作只碰 `CONF_MON`（`config.cc:308,334`） | injectargs 的值**在該 OSD 生效直到重啟**，沒有被 rollback；「要先開 override」講的是**持久化**需求，不是「有沒有生效」 |
 | gate 表（line 206）：把 injectargs 與 `config set` 都描述成「看似成功但 `did not take effect`、`ceph config dump` 查不到 key」 | `ceph config dump` 讀的是 **mon db**；injectargs 本來就不寫 mon db，dump 查不到是**正常**（不代表沒生效）。真的會被 dump 查不到的是 `config set`（值進 mon db 後被 `config rm` 移除） | 兩條路徑要拆開：injectargs「dump 查不到但 cct 生效」；`config set`「dump 一度有、被撤掉」 |
 | danger Callout（line 338-347）：「injectargs → 下次 OSD 重啟、或別人 query 都會看到舊預設」暗示**當下沒生效** | 當下 `get_recovery_max_active()` 讀 `CONF_OVERRIDE` 拿到新值（`config_values.cc:60-62`）；「重啟看到舊值」對，但那是 ephemeral 的正常結果，不等於「當下沒生效」 | 當下**有**生效；只是不跨重啟。兩件事不能混 |
 | **對照表（line 359）：「`config rm` 對 mon db 是 no-op；cct 端值還在直到 OSD 重啟」** | **這一列 source 查證是對的** | 舊頁**自己在 line 359 就寫對了**，卻與同頁 TL;DR / Callout / §206 互相矛盾——本頁以 line 359 這句為軸心，把整頁對齊到它 |
@@ -272,7 +278,7 @@ values.rm_val(name, CONF_MON);
 | `ceph config dump` 查得到嗎 | 查不到（本來就不寫 mon db）——與有沒有生效無關 | 短暫有、隨即被撤成空 |
 | clog warn 條數 | 1 條 / 命令打到的 OSD | 1 條 / **每一顆**符合 mask 的 OSD（`who=osd` 時 cluster-wide 風暴） |
 | 跨 OSD 重啟存活 | 否（ephemeral） | 否（被 rollback 移除） |
-| **真機實證（2026-07-11）** | osd.0：warning 照發、值=7 生效、10 秒後仍在、存活到重啟 | osd.1：同款 warning、mon db 條目 1 秒內被回收、+6s 值還原回 1 |
+| **真機實證（2026-07-11）** | osd.0：warning 照發、值=7 生效、10 秒後仍在（「存活到重啟」為機制推論——無 runtime 回收路徑，重啟未實測） | osd.1：同款 warning、mon db 條目 1 秒內被回收、+6s 值還原回 1 |
 
 一句話對照：**injectargs 是「悄悄生效、重啟即忘、外加一條假 warning」；config set 是「大張旗鼓寫下去、立刻被自己叫的 OSD 撤掉、還每顆 OSD 各留一條真 warning」。** 在 Squid mClock 預設下，想「臨時止血」反而是 injectargs 更符合直覺（值真的生效），config set 才是那個「自殺式持久化」。
 
@@ -421,14 +427,14 @@ t11     2      3   跑到 2 < 3，下一個 op 才可以進來
 
 ### 跟 `osd_max_backfills` 的差別
 
-同樣被 mClock 保護，但兩個 key 在 `handle_conf_change` 的待遇不同：
+同樣被 mClock 保護，但兩個 key 在 `handle_conf_change` 的待遇不同——而且這裡藏著一個 **config 值層 vs 行為層**的缺口：
 
-| Key | 沒開 override 時 | 值怎麼生效 |
+| Key | 沒開 override 時（config 值層） | 行為層（throttle 實際上限） |
 |---|---|---|
-| `osd_recovery_max_active*` | injectargs 生效到重啟 / config set 被撤 | `_recover_now` 每次**重讀** `cct->_conf`，不需要 sync |
-| `osd_max_backfills` | 同上 | 若開 override，額外呼叫 `reserver.set_max()` 主動同步 reserver（`OSD.cc:10186-10190`） |
+| `osd_recovery_max_active*` | injectargs 生效到重啟 / config set 被撤 | `_recover_now` 每次**重讀** `cct->_conf`（`OSD.cc:3695-3703`）→ **值變＝行為變** |
+| `osd_max_backfills` | 同上（值層行為相同；T3 實證的正是這顆 key） | reserver 的上限只在四個點被同步：建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true 分支（`:10189-10190`）、boot-up（`:10262-10263`）——**mClock + override=false 下這四個一個都不會跑** → **cct 值變了、reserver 上限不動、backfill 實際併發不變** |
 
-差別根因：**reserver 是 stateful（要主動同步）**，recovery active count 是純讀取（不用同步）。這也是為什麼 `handle_conf_change` 對 `osd_max_backfills` 有一段 `set_max()`、對 `osd_recovery_max_active*` 什麼都不用做。
+差別根因：**reserver 是 stateful（要主動同步）**，recovery active count 是純讀取（不用同步）。由此帶出的缺口值得單獨講清楚：mClock + override=false 下 injectargs `osd_max_backfills=7`，`config get` / `config diff` 都會給你 7（**值層**，T3 已證），但 `src/osd/` 下除了上述四個同步點沒有其他 runtime 讀取者——四個點在此情境一個都不執行，backfill 併發上限就停在 reserver 裡的舊值。**所以那條 `did not take effect` warning 對 cct 值是錯的，對 `osd_max_backfills` 的 throttle 行為卻歪打正著。** `osd_recovery_max_active*` 沒有這個缺口：`_recover_now` 直接重讀 cct，值變即行為變，warning 對它的值與行為都是錯的。
 
 ### 補充：OSD 重啟時 mClock 怎麼把值拉回 default
 
@@ -437,16 +443,21 @@ t11     2      3   跑到 2 < 3，下一個 op 才可以進來
 ```cpp
 // File: src/osd/OSD.cc (line 10249)
       for (auto opt : recovery_qos_defaults) {
-        // Note: set_val_default doesn't overwrite an option if it was earlier
-        // set at a config level greater than CONF_DEFAULT.
+        /**
+         * Note: set_val_default doesn't overwrite an option if it was earlier
+         * set at a config level greater than CONF_DEFAULT. It doesn't return
+         * a status. With get_val(), the config subsystem is guaranteed to
+         * either return the overridden value (if any) or the default value.
+         */
         cct->_conf.set_val_default(opt.first, std::to_string(opt.second));
+        // ...
 ```
 
 注意 source 註解自己點出：`set_val_default` **蓋不掉更高層的值**。重啟後 injectargs 的 `CONF_OVERRIDE` 早就沒了（ephemeral），config set 的 `CONF_MON` 也被 rollback 撤了，所以 `CONF_DEFAULT` 這份 mClock default 就是最終生效值。這正是 `osd.yaml.in` 那句 `This setting is automatically reset when the mClock scheduler is used`（`osd.yaml.in:1384`）指的——是 **boot-up 重置**，不是 runtime rollback。
 
 ## 在你環境驗證（T3 真機實證，2026-07-11）
 
-> **證據等級：T3（真機實證，兩臂完整）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上：injectargs 臂打 osd.0、`config set` 對照臂打乾淨的 osd.1。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。兩個操作都可逆，你可以在自己環境用同樣指令重跑對照。
+> **證據等級：T3（真機實證，兩臂完整）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上：injectargs 臂打 osd.0、`config set` 對照臂打乾淨的 osd.1。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。注意本節實證的是 **config 值層**（cct 裡的值與來源層）；`osd_max_backfills` 的**行為層**另受 reserver 同步時機管——mClock + override=false 下值變了、backfill 實際併發不變，見上文「跟 `osd_max_backfills` 的差別」。兩個操作都可逆，你可以在自己環境用同樣指令重跑對照。
 
 先確認 scheduler 是 mClock（否則整個防寫分支根本不進）：
 
@@ -505,7 +516,7 @@ ceph tell osd.0 config get osd_max_backfills
 | cluster log（03:12:05） | `Change to osd_max_backfills on osd.0 did not take effect.` | **錯**（誤導文案） |
 | `config diff`（同分鐘） | `"osd_max_backfills": {"default": 1, "override": 7, "final": 7}` | **對**（值在 `override` 層、`final = 7` 生效中） |
 
-「clog 的 did not take effect 在 injectargs 情境是 source 自身的誤導文案」不再是推論——這是併排的真機事實。
+「clog 的 did not take effect 在 injectargs 情境是 source 自身的誤導文案」不再是推論——這是併排的真機事實。（此併排證的是 config **值層**；`osd_max_backfills` 的**行為層**另受 reserver 同步時機管——override=false 下值=7、backfill 併發上限仍停在 reserver 舊值，見上文「跟 `osd_max_backfills` 的差別」。）
 </Callout>
 
 回退（實跑輸出）＋一個佐證細節：
@@ -564,7 +575,7 @@ ceph tell osd.1 config get osd_max_backfills
 | | osd.0（injectargs，03:12） | osd.1（`config set`，03:18） |
 |---|---|---|
 | clog warning | `did not take effect` | `did not take effect`（同款文案） |
-| 實際結果 | 值 = 7 生效、10 秒後仍在、存活到重啟 | mon db 條目 1 秒內被回收、+6s 值還原回 1 |
+| 實際結果 | 值 = 7 生效、10 秒後仍在；存活到重啟＝機制推論（重啟未實測） | mon db 條目 1 秒內被回收、+6s 值還原回 1 |
 | warning 屬實嗎 | **否**（誤導） | **是** |
 
 這就是全頁對照軸心的完整真機版：**同一段程式碼、同一句 warning，injectargs 臂它在說謊、config set 臂它說的是實話。**
@@ -586,6 +597,7 @@ ceph tell osd.1 config get osd_max_backfills
 | 值即時可見（無快取） | `OSD::get_recovery_max_active`（`OSD.cc:3695-3703`） | 每次重讀 `cct->_conf` |
 | op 完成再 queue | `OSDService::finish_recovery_op`（`OSD.cc:9644-9664`，`_maybe_queue_recovery`） | 自然收斂的驅動點 |
 | observer 入口 | `OSD::handle_conf_change`（`OSD.cc:9918-9933`） | injectargs 與 mon push 共用這條回呼 |
+| `osd_max_backfills` 行為層同步點（僅四處） | reserver 建構子初始化（`OSD.cc:270-273`）、非 mClock fallback（`:9930-9931`）、override=true（`:10189-10190`）、boot-up（`:10262-10263`） | mClock + override=false 下四點皆不執行 → cct 值變、backfill 實際併發不變 |
 | option 定義與 note | `osd.yaml.in:1372-1424`（`This setting is automatically reset when the mClock scheduler is used` 在 `:1384`） | 「automatically reset」＝boot-up 重置，非 runtime rollback |
 
 ## 相關閱讀
