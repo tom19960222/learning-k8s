@@ -20,7 +20,7 @@ category: runbook
 |---|---|
 | **工作機 / 跳板機（jump host）** | 你實際敲 `collect.sh` 的那台機器。它經 SSH 連到每台 Ceph node；自己不必是 cluster 成員。 |
 | **inventory** | 一個 shell 檔，列出要收哪些 node（`alias=host`）、SSH 帳號、seed 等。`collect.sh` 用 `source` 讀它。 |
-| **seed** | 「在哪一台 node 上跑 cluster-level `ceph` 指令」的來源 node。`--mode cephadm` 時可用 `--seed USER@HOST` 或 inventory 的 `SEED_HOST` 釘死；`auto` 會自動挑第一台連得上的。 |
+| **seed** | 「在哪一台 node 上跑 cluster-level `ceph` 指令」的來源 node。`cephadm` 與 `auto` 模式都可用 `--seed USER@HOST` 或 inventory 的 `SEED_HOST` 釘死；沒釘時 `auto` 會自動挑第一台連得上的。 |
 | **runner** | 在 seed 上真正執行 `ceph` 的方式：`direct`（直接 `ceph`）、`sudo`（`sudo -n ceph`）、`cephadm`（`sudo -n cephadm shell -- ceph`）。工具會自動挑最快能連上的那個。 |
 | **bundle** | 最終產物，一個 `ceph-incident-YYYYMMDDTHHMMSSZ.tar.gz`，裝著這次收到的所有證據。 |
 | **workdir** | 打包前的暫存目錄（`results/tmp.<時間>.<pid>/`）。正常情況打包完會刪掉；verify 失敗時會**保留**讓你檢查。 |
@@ -159,7 +159,7 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
 Rook 層的 `kubectl` 跑在哪裡由 `--kube-mode` 決定（`run/collect.sh:331` 預設 `remote`）：
 
 - **`remote`（預設）**：在第一台有 `kubectl` 的 **inventory node** 上、經 SSH 跑 `kubectl`（kubectl/kubeconfig 在 node 上時用這個）。
-- **`local`**：在**你的工作機本機**跑 `kubectl`（kubectl/kubeconfig 在工作機、不在 node 上時用這個）。此時 `environment.txt` 會記 `rook_source=local`（`run/collect.sh:205-207`，`tests/test-collect.sh:522` 背書）。
+- **`local`**：在**你的工作機本機**跑 `kubectl`（kubectl/kubeconfig 在工作機、不在 node 上時用這個）。此時 `environment.txt` 會記 `rook_source=local`（`run/collect.sh:205-207`，`tests/test-collect.sh:531` 斷言背書）。
 
 兩種都可加 `--kube-context CTX` 指定 context（`run/collect.sh:361-368`）。
 
@@ -191,7 +191,7 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
   --mode rook --kube-context my-cluster
 ```
 
-`ROOK_OPERATOR_NAMESPACE` 不填時等於資料 namespace（`run/collect.sh:465`、`lib/collect-cluster-rook.sh:141`）；operator log 就從這個 operator namespace 找。這個「資料 ns 與 operator ns 分離」的組合由 `tests/test-rook-collector.sh:210`（`--namespace rook-ceph-external --operator-namespace rook-ceph`）背書。注意 `--operator-namespace` **不是** `collect.sh` 的 CLI flag，只透過 inventory 的 `ROOK_OPERATOR_NAMESPACE` 設定。
+`ROOK_OPERATOR_NAMESPACE` 不填時預設 `rook-ceph`（`run/collect.sh:465` 寫死字面值）——**不會**自動繼承資料 namespace，所以資料 ns 非 `rook-ceph`、operator 又不在 `rook-ceph` 時，必須明確設 `ROOK_OPERATOR_NAMESPACE`；operator log 就從這個 operator namespace 找。（`lib/collect-cluster-rook.sh:141` 有「不填等於資料 ns」的 collector 內部 fallback，但 `collect.sh` 入口永遠傳非空值，走 `collect.sh` 不會觸發它。）這個「資料 ns 與 operator ns 分離」的組合由 `tests/test-rook-collector.sh:210`（`--namespace rook-ceph-external --operator-namespace rook-ceph`）背書。注意 `--operator-namespace` **不是** `collect.sh` 的 CLI flag，只透過 inventory 的 `ROOK_OPERATOR_NAMESPACE` 設定。
 
 ### 選用：`--prom-url` 把 Prometheus metrics 也 dump 進來
 
@@ -330,7 +330,7 @@ nodes/
 
 每台 node 收（`:351-431`）：基本系統（`hostname`/`uname -a`/`uptime`）、資源（`free -h`、可用時 `iostat -xz 1 3`）、storage（`df -hT`/`lsblk`、可用時 `pvs`/`vgs`/`lvs`）、網路（`ip addr show`）、kernel（`dmesg -T`）、systemd（`systemctl --failed`、`journalctl -u 'ceph*'`）、time sync、container（可用時 `podman ps -a`/`docker ps -a`）、cephadm（可用時 `cephadm ls`）、Ceph log（`/var/log/ceph` listing 與可讀 log）、以及安全列出 `/var/lib/ceph` 並複製設定檔（**排除 keyring/private_key/.ssh**，`:263,291`）。
 
-time sync 把 `systemd-timesyncd` 放在一等公民：若 node 用 timesyncd，會收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，以及 `/etc/systemd/timesyncd.conf` 與 `.conf.d/*.conf`（`:395-407`）。這裡刻意同時收 Ceph 與 Linux——Ceph 的 `HEALTH_WARN` 只告訴你 cluster 覺得哪裡不對，真正原因常在 disk、kernel、time sync、container runtime 或 systemd。
+time sync 把 `systemd-timesyncd` 放在一等公民：若 node 用 timesyncd，會收 `timedatectl status`、`timedatectl show-timesync --all`、`timedatectl timesync-status`、`systemctl status systemd-timesyncd`、`journalctl -u systemd-timesyncd`，以及 `/etc/systemd/timesyncd.conf` 與 `.conf.d/*.conf`（`:395-408`；設定檔複製＝`collect_timesyncd_config`，`:149-182`）。這裡刻意同時收 Ceph 與 Linux——Ceph 的 `HEALTH_WARN` 只告訴你 cluster 覺得哪裡不對，真正原因常在 disk、kernel、time sync、container runtime 或 systemd。
 
 ### Rook cluster-level（`lib/collect-cluster-rook.sh`）
 
