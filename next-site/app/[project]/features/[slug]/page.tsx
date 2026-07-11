@@ -46,6 +46,30 @@ export default async function FeaturePage({ params }: { params: { project: strin
       {/* Main content — flex-1 fills all available space; max-w applied to inner content so ToC is flush right */}
       <article className="flex-1 min-w-0 px-8 py-10">
         <div>
+          {data.archived && (
+            <div className="mb-6 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+              本頁為歷史版本，內容保留當時狀態、不再更新。
+              {(() => {
+                const targets: string[] = Array.isArray(data.supersededBy)
+                  ? data.supersededBy
+                  : data.supersededBy ? [data.supersededBy] : []
+                if (targets.length === 0) return null
+                return (
+                  <>
+                    {' '}現行版本請看：
+                    {targets.map((t, i) => (
+                      <span key={t}>
+                        {i > 0 && '、'}
+                        <Link href={`/${project.id}/features/${t}`} className="underline text-amber-100 hover:text-white">
+                          {t}
+                        </Link>
+                      </span>
+                    ))}
+                  </>
+                )
+              })()}
+            </div>
+          )}
           {data.title && (
             <div className="mb-8">
               {data.category && (
