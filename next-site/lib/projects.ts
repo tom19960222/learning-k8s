@@ -359,7 +359,7 @@ export const PROJECTS: Record<ProjectId, ProjectMeta> = {
         { slug: 'mon-quorum-loss-io-lab', note: 'quorum 失守時 I/O 怎麼受影響（真機實測）' },
         { slug: 'mon-quorum-detection-blind-spot', note: 'mgr metric 凍結盲區與 blackbox 補法' },
         { slug: 'slow-ops-detection-mechanisms', note: 'SLOW_OPS 訊號鏈與三層盲區' },
-        { slug: 'slow-ops-fast-detection-lab', note: 'R1-R4：偵測延遲從 ~120s 壓到 14~60s' },
+        { slug: 'slow-ops-fast-detection-lab', note: '四條快速偵測規則：偵測延遲從 ~120s 壓到 14~60s' },
         { slug: 'ceph-alert-policy-current', note: '現行 29 條 alert rule 與 silence SOP' },
         { slug: 'incident-bundle-operator-runbook', note: '出事第一步：先保留現場再判讀' },
       ],

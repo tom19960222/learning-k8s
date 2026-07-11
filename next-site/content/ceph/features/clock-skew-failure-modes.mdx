@@ -12,7 +12,7 @@ category: mechanism
 - **閱讀前提（2 個，各一句理由）**：
   - [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](./cluster-time-skew-impact)：**毫秒級 pair-by-pair 的刻度在那頁**，本頁只講「跨過門檻之後的機制」，不重畫毫秒矩陣。
   - [Ceph — MON clock 漂移多久後 ceph -s 才變 HEALTH_WARN](./mon-clock-skew-detection)：**50ms `MON_CLOCK_SKEW` 的偵測鏈與延遲在那頁**，本頁把偵測當已知前提，只講「報警之後真正壞的是什麼」。
-- **證據層級**：本頁的**機制**主張全部是 **T1（原始碼逐字核對）**——lease ACK 行為、`need_new_secrets` 邏輯、`exit(1)`、rotation 凍結等，每條都附行號。以下幾點**仍欠 T3（真機驗證）**，本頁明寫為假說、不寫成斷言：
+- **證據層級**：本頁的**機制**主張全部是**原始碼逐字核對**——lease ACK 行為、`need_new_secrets` 邏輯、`exit(1)`、rotation 凍結等，每條都附行號。以下幾點**仍欠真機驗證**，本頁明寫為假說、不寫成斷言：
   1. 「peon 永久不可讀」的**實際 client 端症狀**（讀請求怎麼堆積、`ceph -s` 與 rbd client 實際看到什麼）未在真叢集重現。
   2. 線 2 方向 B「mon 校時跳回會不會產生**任何**在線故障」未在真機驗證；source 只支持「rotation 凍結」，不支持舊頁的「大量掉線」。
   3. election churn 的實際觸發時序（lease 訊息斷流 ≥10s）是從 source 邏輯推導，未實測跳變當下的時間軸。
@@ -345,7 +345,7 @@ if (!keys.get_service_secret(service_id, ticket.secret_id, service_secret)) {
 <Callout type="warning" title="方向 B 的操作性警告：降級為假說，不是斷言">
   舊頁把「對一台時間錯很多的 mon 校時跳回」列為**高風險動作**（會大量掉線）。逐行查證後，這個**故障機制在 source 層不成立**——`need_new_secrets(now)` 讓 mon 跳回後根本不 rotate、未來 key 不被淘汰。
 
-  因此本頁**不保留**「校時跳回 → 大量掉線」這個斷言。source 支持的後果是 **rotation 凍結**；「跳回是否會引發任何在線故障」屬於**未經真機驗證的假說（欠 T3）**。若要把它重新列為操作警告，必須先在真叢集重現出具體故障機制，否則不得寫成事實。方向 A 的 `exit(1)` 才是本線目前唯一 source-confirmed 的硬失敗。
+  因此本頁**不保留**「校時跳回 → 大量掉線」這個斷言。source 支持的後果是 **rotation 凍結**；「跳回是否會引發任何在線故障」屬於**未經真機驗證的假說**。若要把它重新列為操作警告，必須先在真叢集重現出具體故障機制，否則不得寫成事實。方向 A 的 `exit(1)` 才是本線目前唯一 source-confirmed 的硬失敗。
 </Callout>
 
 ## 容易搞混：client ticket 不會因 skew 過期
