@@ -1,0 +1,105 @@
+{
+ "findings": [
+  {
+   "what": "【推翻/大幅修正】BLUESTORE_SLOW_OP_ALERT 的角色被降級：文章把它當「第 1 層」偵測 alert（最容易補的洞、SLOW_OPS 前哨），研究實測後定位為「盤後追查器，不適合 pager」；真正的快速偵測層換成 4 個 Squid slow counter（R1）",
+   "severity": "已推翻（高）——新文章的 alert 建議主軸必須換掉",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:367-369：「### 第 1 層：把 BLUESTORE_SLOW_OP_ALERT 納進來（5s 門檻、最容易補的洞）」「這是直接補缺口 1～3 的一條，門檻 5s、threshold=1，SLOW_OPS 還沒亮它就先亮。因為它黏 24h，適合當 warning 而不是 critical page：」。反證 REPORT-2026-07-09.md:97：「**BLUESTORE_SLOW_OP_ALERT 當盤後追查器**：它 latch 24h，適合「昨晚有沒有發生過」的事後盤點，不適合 pager。要手動清：restart 該 OSD（finale 驗證）。」；取而代之的快訊號 REPORT-2026-07-09.md:11：「**解法是 Squid 才有的 4 個 BlueStore slow counter**（`ceph_bluestore_slow_{aio_wait,committed_kv,read_onode_meta,read_wait_aio}_count`）…以它做的 R1 規則在真機上**卡頓開始後 14 秒可判真**（+ rule eval ≤15s ≈ 30 秒內 fire）。」"
+  },
+  {
+   "what": "【推翻】文章宣稱「唯一的辦法是直接對 latency 設 SLO 式 alert」來抓 5–30s 退化——研究證明存在文章完全沒提的第四條路（4 個 BlueStore slow counter），且它才是唯一不怕採樣漏失的訊號",
+   "severity": "已推翻（高）",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:408：「要抓「5–30s、甚至 1–5s」這種 health check 永遠不亮、但 client 已經有感的退化，唯一的辦法是**直接對 latency 設 SLO 式 alert**。」反證 REPORT-2026-07-09.md:11（同上，4 counter + R1 +14s 判真）；HYPOTHESES.md:282（H-023 Notes）：「R1（counter 累積、事後仍可見）是唯一不怕採樣漏失的訊號。」文章第 3 層列的 counter（op_latency/txc_commit_lat/kv_sync_lat，mdx:410-412）全是 time-avg counter，沒有任何一個是 slow_*_count。"
+  },
+  {
+   "what": "【推翻】文章第 3 層的 latency 均值 alert（rate(sum)/rate(count) > 1s）對暫態卡頓失效：H-007 violated，8s 真卡頓只把均值推到 0.672s，連文章示範的 1s 門檻都過不了；均值被降級為「持續事件的嚴重度分級」輔助",
+   "severity": "已推翻（高）——文章的 CephOSDOpLatencyHigh 規則抓不到它聲稱要補的那一段",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:424-429（規則 `CephOSDOpLatencyHigh` … `) > 1`）與 mdx:437：「門檻（這裡用 1s）要照你自己的 workload SLO 訂——重點是它**遠低於 30s**，補的就是 SLOW_OPS 結構性看不到的那一段。」反證 HYPOTHESES.md:132,136（H-007，Status: violated）：「E-01 低負載 8s 暫態：op_w 均值峰值 0.672s（預測 ≥1s 未達，稀釋比預期重）…修正結論：均值對暫態不可靠、對持續性事件可當嚴重度分級輔助」；REPORT-2026-07-09.md:85：「H-007：op 均值對低負載暫態敏感（≥1s） | 8s 卡頓只推到 0.67s | 均值從「輔助偵測」降級為「持續事件的嚴重度分級」」。另文章用 [5m] 窗，稀釋比實驗的 [1m] 更重。"
+  },
+  {
+   "what": "【推翻】文章第 2 層規則（daemon SLOW_OPS 即時值 + for: 1m + severity warning）的設計被真機證明會整段漏掉真實 slow op 事件：H-023 實測 44.7s 的真 slow op，per-daemon metric 非零樣本數 = 0；且 for > 0 會殺掉偵測能力。新規則改為 max_over_time[1m] + for:0 + keep_firing_for、severity critical，並加 mon 端備援（R4）",
+   "severity": "已推翻（高）——規則設計三要素（表達式、for、severity）全部要改",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:395-401：「- alert: CephDaemonSlowOpsScoped\\n  expr: |\\n    (ceph_daemon_health_metrics{type=\\\"SLOW_OPS\\\"} > 0)\\n      * on (ceph_daemon) group_left(hostname) ceph_osd_metadata\\n  for: 1m\\n  labels:\\n    severity: warning」。反證 HYPOTHESES.md:280（H-023 Evidence）：「`max(ceph_daemon_health_metrics{type=\\\"SLOW_OPS\\\"})` 非零樣本數 = 0。既有 `CephDaemonSlowOps`（吃後者）完全看不到此事件；`CephClientIOBlocked`（吃前者、for:1m）2 個樣本也撐不過 for。**44 秒的真 slow op、兩條現有 alert 全部沉默。**」；REPORT-2026-07-09.md:64：「**for: 0 + keep_firing_for**：事件是單發脈衝…for >0 會直接殺掉偵測能力」；REPORT-2026-07-09.md:58-59（R3 critical「client 已被卡 >30s，立即 page」、R4「R3 的 mon 端備援（H-023：daemon 路徑會漏採）」）。"
+  },
+  {
+   "what": "【大幅修正】文章宣稱 per-daemon SLOW_OPS metric「更可靠、能指出是哪顆 OSD」——H-025 證明它會「怪錯人」：卡的是 osd.0，亮的是別台 node 的 primary osd.4/6/7/8；且 H-023 證明它比 mon 端更容易整段漏採（「更可靠」只在「不吃 summary 字串解析」這個窄義上成立）",
+   "severity": "大幅修正（高）——直接影響 oncall 動線，文章的 annotation 模板會誤導查錯方向",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:385：「`ceph_daemon_health_metrics{type=\\\"SLOW_OPS\\\"}` 帶 `ceph_daemon`，而且不依賴 summary 字串解析，比 cluster 的 `ceph_healthcheck_slow_ops` 更可靠、能指出是哪顆 OSD。」（mdx:403 annotation：「{{ $labels.ceph_daemon }} on {{ $labels.hostname }} 當下有 slow ops」）。反證 REPORT-2026-07-09.md:48：「**H-025——SLOW_OPS 會怪錯人**。E-04 卡住 osd.0（osd-01 上），daemon SLOW_OPS 亮的是 osd.4/6/7/8（別台 node 的 primary）…oncall 看到 SLOW_OPS 亮 osd.4 就去查 osd.4 的碟＝方向錯誤。R1 是 device-local 訊號、直接指向元兇。」；漏採反證 REPORT-2026-07-09.md:46：「**per-daemon metric 整段漏掉**。44 秒的真 slow op、現有兩條 alert 全部沉默。」"
+  },
+  {
+   "what": "【大幅修正】文章「想讓 SLOW_OPS 更早亮」的除錯建議（別動 osd_op_complaint_time、改走 latency alert）被替換：latency alert 對暫態已被證偽（H-007），研究給的新槓桿是 runtime 調低 bluestore_log_op_age（E-06 實證 2s 門檻可抓 3s 卡頓、不需重啟）",
+   "severity": "大幅修正（中）",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:463：「**想讓 SLOW_OPS 更早亮**：可調低 `osd_op_complaint_time`（例如 15s）…通常更推薦走第 3 層的 latency alert，而不是動這個門檻。」反證 REPORT-2026-07-09.md:94：「**想抓 <5s 的卡頓**：`ceph config set osd bluestore_log_op_age 2`（runtime 生效，E-06 驗證）——SAS SSD 正常 op 遠低於 2s，調低門檻可把偵測面推進到 2~5s 的早期徵兆。」；HYPOTHESES.md:217（H-016 confirmed）：「b 段（`ceph config set osd.0 bluestore_log_op_age 2`…）同樣 3s suspend → **+6**；config rm 後讀回 5.0。runtime 生效、不需重啟」。"
+  },
+  {
+   "what": "【數字出入，待核】文章說 log_latency「共 22 處呼叫」，研究枚舉為 29 個 log_latency/log_latency_fn 呼叫點（5 處帶 idx2 + 1 處直接 inc + 23 處只 log；5+1+23=29 內部自洽）。本 worktree 的 ceph submodule 未 checkout，無法獨立重數——新文章改寫時需對 pinned source 重新驗證",
+   "severity": "unverifiable（低）——可能是「只數 log_latency、漏數 log_latency_fn」的口徑差",
+   "evidence": "文章 slow-ops-and-bluestore-alerts.mdx:266：「門檻是 `bluestore_log_op_age`（預設 **5 秒**，共 22 處呼叫）」。研究 HYPOTHESES.md:199（H-014 Evidence）：「2026-07-09 枚舉 `BlueStore.cc` 全部 29 個 log_latency/log_latency_fn 呼叫點：帶 idx2 的僅 5 處（12368/12708/13080=read_onode_meta、12751/13113=read_wait_aio、14471=committed_kv）+ 直接 inc 1 處（14175=aio_wait）；其餘 23 處…只 log + `_add_slow_op_event()`」。git submodule status 顯示 ceph submodule 未初始化（前綴 -），無法本地重數。"
+  },
+  {
+   "what": "【仍正確】SLOW_OPS 兩個 metric 的完整來源鏈（OpTracker + osd_op_complaint_time 30s → DaemonHealthMetric → mgr 累加 → summary 字串解析 / per-daemon dump n1）——研究的 T1 錨點與文章引用的 source 位置一致，可整段沿用",
+   "severity": "仍正確可引用",
+   "evidence": "文章 mdx:19：「這兩個 metric 來自 OSD/MON 的 OpTracker，門檻是 `osd_op_complaint_time`（預設 30 秒），只看「當下還在 in-flight」的 op。」（錨點 OSD.cc:2406/7831/6460、TrackedOp.cc:342/364、DaemonServer.cc:2741、module.py:908）。研究 HYPOTHESES.md:34（preliminary research 表）：「SLOW_OPS health：op 齡 > `osd_op_complaint_time`（預設 **30s**）才計入；OSD 每 tick（~1s）算一次 → `mgrc.update_daemon_health()` | `OSD.cc:7825-7832`、`OSD.cc:6460`、`OSD.cc:2406`」——同一組錨點。"
+  },
+  {
+   "what": "【仍正確且被實證強化】文章的核心盲點 Callout（8 秒完成的 op 對 SLOW_OPS 完全隱形）與缺口表 #1/#2/#3——E-01 真機注入 8s 卡頓，SLOW_OPS 兩路全程 0，逐字驗證了文章的推理",
+   "severity": "仍正確可引用（新文章可升級為「已真機實證」）",
+   "evidence": "文章 mdx:96：「一個跑了 8 秒就完成的 BlueStore 慢操作，從來不會在這個 registry 裡停留到 30 秒——它對 SLOW_OPS 完全隱形。」與 mdx:254 缺口#1：「BlueStore 慢到 5–29 秒（對 client 已經很痛）但每個 op 都在 30s 內完成 → 永遠不亮」。實證 REPORT-2026-07-09.md:10：「真機實證 E-01：注入 8s 卡頓，SLOW_OPS 兩路全程 0」；缺口#2 的取樣推理被 H-023 量化（HYPOTHESES.md:280）。"
+  },
+  {
+   "what": "【仍正確】BLUESTORE_SLOW_OP_ALERT 機制描述（bluestore_log_op_age 5s、warn_threshold=1、lifetime 24h latch、_add_slow_op_event、PGMap 累加、metric 無 host label）——H-008 真機確認 latch 行為；文章的機制段落可沿用，只需改「怎麼用它」的定位",
+   "severity": "仍正確可引用",
+   "evidence": "文章 mdx:356（比較表）：「**黏著**：最後一次 slow op 後維持約 `bluestore_slow_ops_warn_lifetime`（預設 **24h**）」。研究 HYPOTHESES.md:145（H-008 confirmed）：「E-01：latch 於事件後出現且跨場景持續（>1h 不自清）；finale：restart 後 latch 即清。」REPORT-2026-07-09.md:23 亦確認：「超過 `bluestore_slow_ops_warn_threshold`（預設 1）就掛出 `BLUESTORE_SLOW_OP_ALERT` health 警告，保留 `bluestore_slow_ops_warn_lifetime`（預設 **24 小時**，latch 不自動消）」。"
+  },
+  {
+   "what": "【仍正確】文章缺口 #6（mgr failover 時 ceph_healthcheck_slow_ops 消失而非歸零）與第 4 層 absent() 兜底規則——研究未推翻，且 H-018（T1 架構推理）補強：ceph-exporter 的 counter 路徑與 mgr 管線互相獨立，counter 規則天然是 mgr-failover 備援",
+   "severity": "仍正確可引用",
+   "evidence": "文章 mdx:259 缺口#6：「mgr failover、module 沒開、或 summary 格式改變 → metric **消失**（不是 0），`== 1` 的 alert 不會 fire」與 mdx:445-455（CephSlowOpsMetricMissing/absent()）。研究 HYPOTHESES.md:237（H-018 Notes）：「架構層面已可論證：ceph-exporter 直讀各 host admin socket，與 mgr 無關）。報告帶一句「counter 規則同時是 health 規則的 mgr-failover 備援」。」（註：H-018 status=proposed，僅 T1 推理未跑 T3）"
+  },
+  {
+   "what": "【仍正確】其餘未被挑戰的機制細節：n2（oldest blocked 秒數）無人 export、ceph_health_detail 叢集級無 label、per-daemon metric 也涵蓋 mon、osd_enable_op_tracker 可關掉 SLOW_OPS、continuous op/warn_interval_multiplier 豁免、「SLOW_OPS 量 OpRequest 生命週期而非 BlueStore 內部操作」——新文章可直接引用",
+   "severity": "仍正確可引用",
+   "evidence": "文章 mdx:246：「兩個 metric 都**沒有人** export `n2`（oldest blocked 秒數）成乾淨的數值系列」、mdx:260 缺口#7、mdx:256 缺口#3、mdx:258 缺口#5、mdx:257 缺口#4。研究訊號地圖 REPORT-2026-07-09.md:34：「`ceph_health_detail{name=\\\"SLOW_OPS\\\"}` … ❌ 叢集級無 label」與之相容；其餘各點研究未觸及、無反證（源碼錨點文章已附）。"
+  },
+  {
+   "what": "【新發現】三層盲區的完整分類與量化（文章只有第 1 層的推理版）：(1) 暫態盲區 H-001；(2) 持續性 sub-30s 劣化盲區 H-024——150s 持續節流、op_w 均值峰值 15.2s，SLOW_OPS 仍全程 0，「SSD 劣化/firmware 問題最常見的表現形態」整類不可見；(3) 採樣漏失盲區 H-023——44s 真 slow op 兩條現有 alert 全沉默",
+   "severity": "新發現（高）——新文章的骨架",
+   "evidence": "REPORT-2026-07-09.md:44-46：「1. **暫態盲區（H-001）**…2. **持續性 sub-30s 劣化盲區（H-024）**：E-04 v2 注入 150s 持續節流，op_w 均值峰值 15.2s——client 痛了兩分半，SLOW_OPS 仍全程 0，因為**每個 op 都在 30s 內完成**。這正是 SSD 劣化/firmware 問題最常見的表現形態。3. **採樣漏失盲區（H-023）**…實測一個 max latency 44.7s 的真事件：mon 端 `ceph_health_detail` 抓到 2 個樣本（撐不過舊規則的 for:1m），**per-daemon metric 整段漏掉**。」文章對 (2)(3) 只有未量化的推理（mdx:254-255），對 (3) 的「44s 事件兩路全漏」完全沒有。"
+  },
+  {
+   "what": "【新發現】H-025「SLOW_OPS 怪錯人」：daemon label 指向 primary（受害者）而非被卡的 replica device；R1（BlueStore counter）是 device-local 指向元兇，SLOW_OPS 是 client-impact 指向受害者，兩者合看才能定位。文章完全沒有此概念",
+   "severity": "新發現（高）",
+   "evidence": "HYPOTHESES.md:297-300（H-025 confirmed）：「E-04 v4 卡 osd.0（osd-01 上），`ceph_daemon_health_metrics{type=\\\"SLOW_OPS\\\"}` 非零的是 osd.4/6/7/8（osd-02/03 上的 primary）；osd.0 自己全程 0。」Notes：「**R1（BlueStore counter）是 device-local 訊號、指向元兇**；SLOW_OPS 是 client-impact 訊號、指向受害者。兩者一起看：R1 亮 osd.0 + SLOW_OPS 亮一堆別台的 primary = osd.0 的 device 出事、且已波及 client。」"
+  },
+  {
+   "what": "【新發現】R1-R4 四條實測規則與真機偵測延遲數據：R1 CephOSDTransientStall +14s 判真、R2 CephNodeMultiOSDStall（同 node ≥3 OSD＝firmware/RAID 卡指紋）+20s、R3/R4 把 client-blocking slow ops 偵測從 ~120s 壓到 +45~60s；含三個非顯然設計決策（顯式相加避開 __name__ regex 重複 labelset、for:0+keep_firing_for、counter reset 安全）",
+   "severity": "新發現（高）——rules/ceph-slow-ops-fast.yml 是新文章的核心 artifact",
+   "evidence": "REPORT-2026-07-09.md:71-78（偵測延遲表）：「單 OSD 卡 8s（E-01…）| R1 | **+14s**…| 永遠不 fire」「同 node 3 OSD 同秒卡 8s（E-02）| R2（count=3，僅事發 node 達標）| **+20s**」「三路 SLOW_OPS 首度非零 | **+45s** → R3/R4 可 fire ≈ +45~60s | 舊規則（for:1m）≈ +120s；<60s 的事件整段漏」。設計決策 REPORT-2026-07-09.md:63-65；規則本體 rules/ceph-slow-ops-fast.yml:29-93（promtool 測試全綠，REPORT:50）。"
+  },
+  {
+   "what": "【新發現】Squid 版本依賴（H-019）：4 個 slow counter 是 v19.2.0+ 才有（Reef 全系列沒有）；BLUESTORE_SLOW_OP_ALERT 是 v19.2.1+/Reef 18.2.6+；Reef 環境 R1/R2 不可用，fallback 只剩 R3/R4 + node_disk + commit_latency_ms。文章錨在 v19.2.3 但完全沒有版本可用性討論",
+   "severity": "新發現（中高）",
+   "evidence": "REPORT-2026-07-09.md:40：「**版本依賴（H-019 實證，GitHub 原始碼逐版比對）**：4 個 slow counter = **Squid v19.2.0+ 才有**（Reef 全系列沒有）；`BLUESTORE_SLOW_OP_ALERT` = v19.2.1+ / Reef v18.2.6+。生產若還在 Reef，R1/R2 不可用」；HYPOTHESES.md:244（逐版比對證據：「`l_bluestore_slow_aio_wait_count` 在 v19.2.0/v19.2.1 存在、v18.2.7 不存在…」）。"
+  },
+  {
+   "what": "【新發現】counter 只在 op「完成」時記帳（H-011）→ 永久卡死對 R1 隱形、只有 SLOW_OPS 看得到（R1/R3 互補、缺一不可）；且 4 counter 只覆蓋 5+1 個呼叫點，純 omap/scrub 類 slow 事件是 counter 盲區、僅 health alert 可見（H-014）。文章沒有這兩個邊界",
+   "severity": "新發現（中高）",
+   "evidence": "HYPOTHESES.md:172（H-011 Evidence）：「E-01：counter 首升樣本 1783558851 > suspend 結束 1783558844 —— 卡頓期間 counter 全平，完成才記帳」；HYPOTHESES.md:201（H-014 Notes）：「純 omap/scrub 類 slow 事件是 counter 盲區、僅 health alert 可見。」rules/ceph-slow-ops-fast.yml:22-23：「counter 只在 op「完成」時記帳（H-011/H-014）：op 永久卡死不會進 R1，必須保留 SLOW_OPS 路徑」。"
+  },
+  {
+   "what": "【新發現】idle 盲區（H-017/E-03）：無 IO 即無偵測——idle OSD 卡 15s 時全部訊號（counter、SLOW_OPS、R1）靜默；緩解＝低頻 synthetic IO。另 E-01 讀段旁證：資料在 cache、讀不落盤就無讀路徑訊號",
+   "severity": "新發現（中）",
+   "evidence": "REPORT-2026-07-09.md:78：「| idle OSD 卡 15s（E-03） | 全部訊號 | **全靜默**（結構性盲區：無 IO 即無偵測） | 同樣靜默 |」；HYPOTHESES.md:226：「E-03：無負載 suspend osd.0 15s → 4 counter 增量 0、SLOW_OPS 0、R1 0…旁證：E-01 讀段因資料在 cache、讀沒落盤而零訊號」；緩解 REPORT-2026-07-09.md:96：「若在意可加低頻 synthetic IO（如每分鐘一次小寫入的 cron）」。"
+  },
+  {
+   "what": "【新發現】H-015 violated：純負載（無注入的 rados bench）就能讓 9/9 OSD 的 slow counter 全增、max latency 44.7s——R1 定位因此是「症狀偵測」而非硬體定罪，FP 心理預期與分級策略（R2 聚集指紋 + 持續性）是文章沒有的內容",
+   "severity": "新發現（中）",
+   "evidence": "HYPOTHESES.md:208（H-015 Evidence）：「第一次 E-00（16 併發 ×4MB，無注入）：bench max latency 44.7s，全部 9 顆 OSD slow counter 增加（osd.4 +47 … osd.8 +4）…「過載不會產生 >5s 單段延遲」被推翻。」REPORT-2026-07-09.md:93：「**R1 的 FP 心理預期**：過載（recovery、backfill、深佇列）也會觸發（H-015）…真正的分級靠 R2（單 node 聚集 = 硬體）與持續性」。"
+  },
+  {
+   "what": "【新發現】observer 自身故障行為與運維細節：(a) OSD 凍結時 ceph-exporter「掉 series」而非回舊值（H-013 violated，HTTP 200、up=1 全程）；(b) 清 BLUESTORE latch 的 whack-a-mole 風險（restart 引發 peering IO 讓其他 OSD 重新 latch，osd.6 實測中招）；(c) commit_latency_ms 對暫態量級失真（8s 事件只顯示 754ms，H-006）；(d) node_disk 佐證只對「IO 真的卡在 device 內」的事件有效 + RAID write-back cache 會掩護寫延遲、slow_read_wait_aio 是更誠實指標（H-009 violated）",
+   "severity": "新發現（中）",
+   "evidence": "REPORT-2026-07-09.md:106：「**OSD process 凍結時，ceph-exporter 不說謊、它「掉 series」**（H-013 修正）…HTTP 全程 200、Prometheus `up` 全程 1。」REPORT-2026-07-09.md:107：「**restart 清 latch 有 whack-a-mole 風險**（finale 實測）…讓其他 OSD 重新 latch（osd.6 中招一次）」。HYPOTHESES.md:127（H-006）：「E-01：8s 暫態 → gauge 峰值僅 754ms（量級失真、不可依賴）」。REPORT-2026-07-09.md:95：「RAID 卡 write-back cache 可能吸收寫延遲、讓 node_disk 低估——讀路徑訊號（`slow_read_wait_aio_count`）不受 cache 掩護」。"
+  }
+ ],
+ "summary": "新的 slow-ops 文章應以「取代下半、保留並強化上半」的方式改寫舊頁 next-site/content/ceph/features/slow-ops-and-bluestore-alerts.mdx。具體建議：(1) 保留前半機制章節（兩個 SLOW_OPS metric 的來源鏈、30s OpTracker 門檻、BLUESTORE_SLOW_OP_ALERT 機制、七缺口表、兩偵測器比較表）——研究的 T1 錨點與文章一致且 E-01 真機實證了核心 Callout，可把「推理」升級為「已實證」並附 bundle 證據。(2) 整段替換「怎麼改進 alert」四層架構：第 1 層 BLUESTORE_SLOW_OP_ALERT 降級為盤後追查器（不適合 pager，補 restart 清 latch + whack-a-mole 注意事項）；第 2 層 daemon SLOW_OPS 規則改為 R3/R4 雙路（max_over_time[1m] + for:0 + keep_firing_for、critical）——舊寫法（instant + for:1m + warning）被 H-023 證明會整段漏掉 44s 真事件；第 3 層 latency 均值 alert 刪除「唯一辦法」與 1s 門檻示範（H-007 violated：8s 卡頓均值僅 0.672s），降級為持續事件的嚴重度分級；只有第 4 層 absent() 兜底原樣保留。(3) 新的主偵測層改為 4 個 Squid slow counter + R1/R2（rules/ceph-slow-ops-fast.yml，promtool 全綠），並帶真機偵測延遲表（R1 +14s、R2 +20s、R3/R4 +45~60s vs 舊 ~120s）。(4) 新增文章完全沒有的章節：三層盲區（暫態/sub-30s 持續劣化/採樣漏失）、H-025「SLOW_OPS 怪錯人」的 oncall 定位陷阱（R1=元兇、SLOW_OPS=受害者）、Squid/Reef 版本依賴表（H-019）、idle 盲區與 synthetic IO 緩解（H-017）、R1 FP 預期與 R2 firmware 指紋分級（H-015）、bluestore_log_op_age runtime 調低（H-016）、counter「完成才記帳」與 omap 盲區邊界（H-011/H-014）。(5) 改寫時修正一處數字：文章「共 22 處呼叫」vs 研究枚舉 29 個 log_latency/log_latency_fn 呼叫點（本 worktree submodule 未 checkout 無法重數，需對 pinned source 重驗）。(6) 舊頁的除錯建議「更推薦 latency alert 而非調 osd_op_complaint_time」需改為「優先 R1 counter，進階可調 bluestore_log_op_age」。"
+}

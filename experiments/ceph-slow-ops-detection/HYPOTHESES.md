@@ -197,6 +197,7 @@ max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0
 - Origin: negative-space（4 counter vs 全部 log_latency 呼叫點）
 - Prediction: （T1 枚舉即為驗證）
 - Evidence: 2026-07-09 枚舉 `BlueStore.cc` 全部 29 個 log_latency/log_latency_fn 呼叫點：帶 idx2 的僅 5 處（12368/12708/13080=read_onode_meta、12751/13113=read_wait_aio、14471=committed_kv）+ 直接 inc 1 處（14175=aio_wait）；其餘 23 處（omap iterator ×8、read_lat ×2、csum、decompress、clist、kv_flush/kv_commit/kv_sync/kv_final、submit/throttle_transact、compress、allocator、get_onode@readv=13002）只 log + `_add_slow_op_event()`。`_add_slow_op_event()` 在 log_latency 內無條件呼叫（18480）→ health alert 涵蓋全部類別。
+  > 更正 2026-07-11（對 pinned source c92aebb 重數）：log_latency/log_latency_fn 呼叫點總數實為 **31** 處（`grep -cE 'log_latency(_fn)?\('` = 33，扣 18465/18487 兩個函式定義；此前 29 為低估）；帶 idx2 的實為 **6** 處（12368/12708/13080=read_onode_meta、12751/13113=read_wait_aio、14471=committed_kv——上行列了 6 個行號卻誤記為 5 處）；log-only 為 **25** 處。直接 inc 1 處（14175=aio_wait，不經 log_latency 計數）不變。結論（omap/scrub 類是 counter 盲區）不受影響。
 - Artifacts: 報告「訊號地圖」一節
 - Notes: 實務影響：kv_sync 慢（裝置 fsync 卡）不直接進 counter，但只要有 write txc 在飛，txc commit 全程量測（start→committed）會把同一事件記進 `slow_committed_kv_count`；純 omap/scrub 類 slow 事件是 counter 盲區、僅 health alert 可見。
 

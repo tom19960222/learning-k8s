@@ -1,0 +1,100 @@
+{
+ "articles": [
+  {
+   "slug": "clock-skew-magnitude-ladder",
+   "doc_type": "mixed（mechanism 為主體＋一節排查 runbook：「## 排查：看到 skew 怎麼定位」的現象→線→log 對照表）",
+   "self_contained": "否，開頭第一句就假設讀過 sibling 頁並沿用其結論（clock-skew-magnitude-ladder.mdx:9）：「[10ms 到 5s 那一頁](./cluster-time-skew-impact) 把毫秒級的差距攤開過了，結論是「沒有全域的 50ms 規則」。這頁把刻度往上拉」。多處把細節外包給其他頁（:76「拆在 [MON clock skew 偵測那一頁]」、:128「拆在 [mon quorum loss 那一頁]」）。",
+   "staleness": "無日期標記。版本錨點齊全（description:「用 v19.2.3 原始碼回答」，內文大量 file:line 引註）。未發現被後續研究推翻的陳述；timesyncd 研究（experiments/timesyncd/）與本頁互補非矛盾。風險低。",
+   "keep_content": "三條線（MON↔MON / MON↔OSD cephx / OSD↔OSD mono clock）的量級門檻總表與「誰蓋章、誰檢查」心智模型（:34-48）；cephx 方向 A（OSD 快→exit(1)，OSD.cc:4068）與方向 B（mon 先快再跳回→在線 OSD 大量掉線，CephxProtocol.cc:459 查不到 secret_id）的雙向爆法拆解——方向 B 的三步機制與「校時跳回本身是高風險動作」的操作警告（:325-330 Callout）是全站唯一；「client ticket 對 skew 免疫（同機抵消）」的澄清（:364-386）；排查分流表（:390-399）；原始碼路徑一覽表（:401-411）。",
+   "assumed_prereqs": "cluster-time-skew-impact（開頭直接接續其結論）；mon-clock-skew-detection（50ms WARN 偵測延遲被外包過去）；mon-quorum-loss-impact（lease timeout→election 鏈被外包過去）。讀者需已知 mon/Paxos/cephx 基本角色。"
+  },
+  {
+   "slug": "mon-quorum-loss-impact",
+   "doc_type": "mixed（mechanism 為主體：quorum 數學＋Paxos lease 時序＋cephx TTL 原始碼追蹤；附「邊界與除錯」與「想觀察的場景」兩節輕量 runbook/lab 提示）",
+   "self_contained": "是，開頭自帶場景不假設其他頁（mon-quorum-loss-impact.mdx:9）：「你的 cluster 是 3 個 monitor、20 顆 OSD、跑了一台 KubeVirt VM 用 RBD volume。某天機房維護把 mon node 一台一台抽掉」。結尾相關頁面僅為延伸閱讀。",
+   "staleness": "無日期標記，版本錨點齊全（:15「下面從 v19.2.3 原始碼追三個維度」）。兩處與後續真機研究需對帳：(1) 本頁情境 B 表寫「0~1hr 之間 | 新 client、新 PVC、client reconnect…會失敗 / retry」（:215），但 mon-quorum-detection-blind-spot 真機實測是「新 pod 卡在 ContainerCreating（有趣的是新 PVC 反而會 Bound，因為 CSI provisioner 自己是既有連線）」（mon-quorum-detection-blind-spot.mdx:124）——「新 PVC 會失敗」被部分推翻。(2) 本頁「既有 OSD I/O 可能持續」是純 source 推導的保守措辭，盲區頁已有 fio 真機證據（「全部照跑、吞吐約等於 baseline」）可把「可能」升級為實證。",
+   "keep_content": "min_quorum_size 的 N/2+1 原始碼與容錯表（MonMap.h:193，:21-39）；is_writeable/is_readable 兩個 predicate（Paxos.cc:1522/1481）；lease 時序常數鏈（3s renew / 5s expire / 10s timeout → bootstrap → PROBING，:85-156）；掛 1/2/3 台的逐情境時間軸（A1/A2/B/C）；dataplane 不直接依賴 mon 的訊息流拆解（含 MPGStats 走 mgr 不走 mon 的澄清，:290）；「剩 1 mon 救援要走 --extract-monmap/--inject-monmap 離線流程」的邊界標註（:308）。",
+   "assumed_prereqs": "實際上開頭可獨立閱讀；深入時需要 architecture（MON 角色）。cephx ticket 段落與 clock-skew-magnitude-ladder 互相引用但各自可讀。"
+  },
+  {
+   "slug": "osd-ok-to-stop",
+   "doc_type": "mechanism（純原始碼追蹤：命令路由→三條 PG 檢查→回傳碼→cephadm 呼叫端；附不檢查什麼的邊界表）",
+   "self_contained": "是，開頭自帶維護場景（osd-ok-to-stop.mdx:9）：「你要對某個 OSD 做維護：rolling kernel upgrade、抽硬碟換更大顆、把 OSD daemon 停下來看 perf counter。停之前你想確認『把這顆 down 掉，會不會有 PG 變 inactive』」。不假設讀過其他頁。",
+   "staleness": "無日期標記。版本錨點在標題（「在 v19.2.3 原始碼裡檢查了什麼」）。未發現被後續研究推翻的內容；本頁被多篇後續頁（alert-design silence SOP、real-cluster 的 ok-to-stop gating）當作依賴引用，是穩定的地基頁。",
+   "keep_content": "「mgr 接、不是 mon 接」的路由澄清（MgrCommands.h:160，:15-28）；三條 dangerous 條件與分桶（bad_no_pool / bad_already_inactive / bad_become_inactive，DaemonServer.cc:1042，:113-152）；「min_size 不是 size」的判定語意（:152）；回傳碼表 0/-EAGAIN/-EBUSY 與該做什麼（:230-236）；--max 的 CRUSH 樹貪婪擴張（:182-210）；「ok-to-stop 不檢查什麼」邊界表與「不是 safe-to-destroy」的 Callout（:239-257）；cephadm _wait_for_ok_to_stop 的 4 次×15s retry（upgrade.py:524，:259-286）。",
+   "assumed_prereqs": "無硬性前置；pg-health-states（PG state bitmask）與 crush-and-placement（CRUSH 拓樸 API）是延伸而非前提。"
+  },
+  {
+   "slug": "osd-safe-to-destroy",
+   "doc_type": "mechanism（純原始碼追蹤：三條規則→分桶→回傳碼→MON 端最後硬性門→cephadm removal queue）",
+   "self_contained": "否，開頭第一句直接以 ok-to-stop 頁為對照起手（osd-safe-to-destroy.mdx:9）：「`ok-to-stop` 回答的是「現在 stop 這顆 daemon、PG 還活著嗎」。`safe-to-destroy` 回答的是更激烈的問題」——未讀過 ok-to-stop 頁仍大致可讀，但對照表（:188-202）與敘事都預設讀者已知 ok-to-stop 的檢查邏輯。",
+   "staleness": "無日期標記。版本錨點在標題與內文（:200「否（v19.2.3 此版本沒檢查 historical osdmap）」——這種顯式版本界定寫法值得保留）。未發現被後續研究推翻的內容。",
+   "keep_content": "三條規則的逐條拆解：不在 osdmap＝idempotent safe（:88-90）、acting/up_not_acting 任一 >0 即 -EBUSY（PGMap.h:53，:92-113）、cluster 非 active+clean 時 missing_stats(-EAGAIN)/stored_pgs(-EBUSY) 的分桶（:115-141）；「已 down 的 OSD 在 cluster 不健康時不算 safe」的反直覺設計理由（:141）；-EBUSY vs -EAGAIN 對自動化的不同語意（:186）；ok-to-stop vs safe-to-destroy 逐維度對照表（:192-200）；MON 端 destroy-actual 的 --yes-i-really-mean-it 與必須 down 的硬性門（OSDMonitor.cc:12949，:206-231）；EC pool 邊界 Callout（:233-235）；cephadm removal queue 的 is_empty→safe_to_destroy→down→destroy 鏈（osd.py:573/868，:237-278）。",
+   "assumed_prereqs": "osd-ok-to-stop（開頭與全篇以其為對照基準）；pg-health-states（active+clean 語意）。"
+  },
+  {
+   "slug": "prometheus-alert-design",
+   "doc_type": "mixed（decision-guide 為主體：三角色分層＋rule 設計取捨；大段 runbook：「維護時怎麼 silence」三種粒度 SOP＋「發出 alert 時怎麼處理」逐條 response；少量 mechanism：ceph_health_detail 無 host label 的原始碼證明；並內嵌 experiment-report 摘要：F1 promtool bug 與真機 mgr 凍結的長篇 Callout）",
+   "self_contained": "大致是——開頭只假設 upstream 知識、不假設站內其他頁（prometheus-alert-design.mdx:9）：「假設你已經套用 ceph v19.2.3 內建的 `ceph-mixin/prometheus_alerts.yml`——`CephHealthError`…這些預設 rule 都在」。但內文多處把佐證外包給後續頁（:90「完整修訂理由見 [Ceph - 真機故障注入後的 alert 韌性修訂]」、:175「詳見[真機 Tier D 頁]的 S5 對照」），rule 的現行形態已含多輪修訂，單讀本頁看不出哪些是初版哪些是補丁。",
+   "staleness": "無日期標記；版本錨點 v19.2.3 齊全。本頁是 alert 系列中「最新的現行版」：已含 or vector(0) 修正、OSD_FLAGS|OSDMAP_FLAGS 修正（:112、:151，與 experiments/ceph-alert-rules/rules/ceph-stability-first.yml:19/:61 一致）、routing 已含 ceph_external source（:272）。主要風險不是內容過期，而是修訂歷史以巢狀 Callout 疊加（:168-178 的 F1 Callout 內含三層：原 bug、真機盲區、trade-off），與 testing / real-cluster / blind-spot 三頁大量重複同一敘事。",
+   "keep_content": "核心洞見「ceph_health_detail 只有 name/severity、沒有 host label；annotation 不能被 Alertmanager silence matcher 用」（module.py:113，:17-48）——整套設計的地基；三角色分類表（page 主訊號/Slack context/維護可 silence，:82-90）；ceph-stability-first 與 ceph-scoped-availability 完整現行 rule YAML（:96-233）——這是 single source of truth，測試 harness 逐字比對防漂移；scoped 去重的 unless 語意解說（:239）；Alertmanager routing（label 導向，:260-288）；三種維護粒度的 silence SOP 與「這樣蓋得完整嗎」的逐 health-check 對帳 Callout（:344-418）；動態 majority 寫法與 3-mon hard-code 邊界（:522-532）。",
+   "assumed_prereqs": "ceph-mixin 預設 rules 的存在與大意（upstream 知識）；PromQL 基礎。站內：無硬前置，但要理解 rule 為何長這樣需要 prometheus-alert-testing（F1）、prometheus-alert-real-cluster（OSD_FLAGS、mgr 凍結）、prometheus-alert-real-lab-findings（v2 coverage）三頁的來龍去脈。"
+  },
+  {
+   "slug": "prometheus-alert-testing",
+   "doc_type": "mixed（experiment-report 為主體：四層測試方法論＋F1 bug 的完整發現—修正—trade-off 敘事；含 runbook 成分：「怎麼跑」harness 操作段）",
+   "self_contained": "否，開頭第一段就以設計頁為被測對象（prometheus-alert-testing.mdx:9）：「[Ceph — 在 ceph-mixin 預設 rules 之上加一層維護友善的 alert 設計](./prometheus-alert-design) 那頁不是小修小補，它做了幾個**很強的宣稱**」。全篇逐條規則名（CephClientRisk、CephMonQuorumLost…）都假設讀者已從設計頁認識。",
+   "staleness": "三處落後於設計頁現行版（設計頁是它宣稱逐字比對的 single source of truth）：(1) :91/:93 寫「`name!~\"<25 個排除>\"`」「一次餵全部 25 個排除 name」，但設計頁現行排除清單是 26 個（多了 OSD_FLAGS，design:112）；(2) :108 寫「那 5 個低優先 name（HOST_IN_MAINTENANCE / OBJECT_MISPLACED / PG_SLOW_SNAP_TRIMMING / PG_DEGRADED / OSDMAP_FLAGS）」，設計頁現行 CephLowPriorityNotice 有 8 個 name（design:151，含 OSD_FLAGS/POOL_APP_NOT_ENABLED/POOL_NEARFULL）；(3) 旗艦維護情境表（:100、:102）餵的是 `OSDMAP_FLAGS`，而 Tier D 已證實 host 維護實際升 `OSD_FLAGS`（real-cluster「發現一」）——本頁未同步標註 fixture 的這個已知偏差。另有工具版本錨點（alertmanager v0.28.1 下載指令，:220）。無其他日期標記。",
+   "keep_content": "四層 Tier A/B/C/D 分工表與「Tier A 證明的是 IF、不是 ceph 真會這樣」的方法論邊界（:26-68）——這是可複用的驗證哲學，超出 Ceph 本身；三個 PromQL gotcha 白話版（count 空 vector / unless / rule labels 覆蓋，:74-78）；F1 bug 完整故事：直覺版 expr→promtool `got:[]` 證據→or vector(0) 修法→F1b trade-off（absence≠down）→metadata-anchored 動態版對照（:140-200）；「Tier C 不測 for: 時長」等綠燈不可過度解讀的邊界清單（:226-234）；harness 入口與 PASS 判準（:204-224）。",
+   "assumed_prereqs": "prometheus-alert-design（被測對象，必讀）；PromQL 基礎。後接 prometheus-alert-real-cluster（本頁 §6 反覆預告的 Tier D）。"
+  },
+  {
+   "slug": "prometheus-alert-real-lab-findings",
+   "doc_type": "mixed（experiment-report 為主體，但明示是兩個時期疊加：中期 3 場景快照＋收官 22 場景總表＋16 個發現；另含 decision-guide 成分：「我會怎麼更新 alert」的 v2 rule 提案全文）",
+   "self_contained": "否，全篇以設計頁的 rule 名與 v1/v2 演進為前提，且自述是疊加文本（prometheus-alert-real-lab-findings.mdx:9）：「這頁最早只記錄 3 個場景（SLOW_OPS、PG_AVAILABILITY、MON quorum）的真機驗證，是專案中期的快照。專案完成後的最終結果是……」。「所以我的 alert 應該更新成 v2」（:23）預設讀者知道 v1 是什麼。",
+   "staleness": "日期標記多處：`EVIDENCE-SUMMARY-2026-07-04.md`（:27）、activeAt=\"2026-07-04T10:12:42…\"（:31-33）。內嵌 v2 rule 區塊已落後現行版：CephClientRisk 的 name!~ 清單（:114）與 CephLowPriorityNotice（:153）都缺 `OSD_FLAGS`（grep 全文 0 次），而設計頁與 experiments/ceph-alert-rules/rules/ceph-stability-first.yml:19/:61 都已是 OSD_FLAGS|OSDMAP_FLAGS——本頁 YAML 是 Tier D 修正前的快照。S10（:423）寫「設 noout flag 升 OSDMAP_FLAGS」用的是 cluster-wide noout（與 real-cluster 的 subtree OSD_FLAGS 發現並存但易混淆）。:349「還沒有逐條做真機故障注入」與同頁「22/22 全數驗證」（:9）是新舊段落自相矛盾（中期敘述未刪）。版本錨點 v19.2.3 有。",
+   "keep_content": "22 場景總表（S1–S22：場景/類別/alert/注入手法/結果，:412-435）——全站唯一的完整驗收矩陣；16 個真機才抓到的發現（:439-541）——不可替代的 lab 教訓庫，特別是：#02 spiky snapshot gauge 要窗化（max_over_time）、#01 conmon vs ceph-osd PID 與 crash sidecar 缺 keyring、#04 cephadm shell stderr banner 污染 JSON、#08 BlueStore 24h latch 清除法（調 bluestore_slow_ops_warn_lifetime 不 restart）、#13 rados bench 同名 object 覆寫、#16「機制正確但真故障動態讓斷言不可觀察」的模式；「mgr exporter 不是 MON quorum 唯一可靠觀測面」的原始證據（:73-90）；v2 coverage 18 條 rule 全文（:167-347，與 rules/ceph-production-coverage.yml 對應）。",
+   "assumed_prereqs": "prometheus-alert-design（v1 rule）＋prometheus-alert-testing（F1、四層方法論）；理解 S3 需要 mon-quorum 背景。實際上是系列第 3~4 篇。"
+  },
+  {
+   "slug": "prometheus-alert-real-cluster",
+   "doc_type": "experiment-report（Tier D 真機觀測：baseline＋S1–S4＋S5 緩解對照，含兩個發現的機制分析與逐欄對帳表）",
+   "self_contained": "否，開頭即宣告是 dev 四層的續集（prometheus-alert-real-cluster.mdx:9）：「把 [Prometheus alert 設計](./prometheus-alert-design) 那套搬上一個真的 cephadm ceph v19.2.3 叢集（3 mon、9 OSD/3 host）跑完 baseline + 四個情境」；:21-24 直接整段引用測試頁的 IF/THEN 框架：「Tier A/B/C（dev）證明的是『IF 這些 metric / health check 以這些 label 和值存在…』」。",
+   "staleness": "檔案 mtime 6/26，是 12 篇中唯一未被 7/10 批次更新的 alert 系列頁。與後續內容三處重疊/分岔：(1) 發現二＋S5 與 mon-quorum-detection-blind-spot 頁講同一件事，但緩解實作不同名——本頁是 `CephMonQuorumLostExternal`＋自製 `mon-tcp-probe.py`＋`ceph_mon_tcp_up`（:201-214），盲區頁是 `CephMonQuorumLostBlackbox`＋blackbox_exporter＋`probe_success{job=\"mon-tcp\"}`（blind-spot:106-107）——同一緩解兩種版本並存無互相指涉；(2) 本頁的「兩個 bug」框架已被 real-lab-findings 的 16 發現/22 場景收官報告涵蓋並擴充（該頁 S4/S5/S6 即本頁 S1–S3 的重跑）；(3) S4 停的是 mon-03+mon-01 留 mon-02，盲區頁停 mon-02+mon-03 留 mon-01，是兩次不同實驗、細節易被讀者混為一談。環境細節有 fsid 0c9bf37e、host IP 等 lab 錨點（:37-45）。",
+   "keep_content": "Baseline 逐條 label 假設簽收（ceph_osd_up 只帶 ceph_daemon、metadata 帶 hostname、HEALTH_OK 時無 ceph_health_detail series，:52-80）——設計頁假設的真機證據源；發現一 OSD_FLAGS≠OSDMAP_FLAGS 的完整機制（subtree vs cluster-wide noout 對照表，:154-158）與「測試與設計同源就驗不出設計的假設錯誤」的 meta 教訓 Callout（:168-170）；發現二的 F1 vs 架構盲區層級對照表（:181-187）；真機 vs 設計假設逐欄對帳總表（:216-224）；S5 mgr-based vs probe-based 同一 Prometheus 並排對照表（:207-213）。",
+   "assumed_prereqs": "prometheus-alert-design＋prometheus-alert-testing（必讀，開頭直接引用其框架與規則名）；mon-quorum-loss-impact（理解 quorum 失守後果）。"
+  },
+  {
+   "slug": "mon-quorum-detection-blind-spot",
+   "doc_type": "mixed（experiment-report：真機時間軸與 fio 證據；mechanism：mgr 快取凍結的原始碼路徑；decision-guide/runbook：blackbox 解法設定檔＋分層策略＋還原順序）",
+   "self_contained": "否，開頭場景即以設計頁的 rule 為既定事實（mon-quorum-detection-blind-spot.mdx:9）：「你照 [Prometheus alert 補強](./prometheus-alert-design) 設好 `CephMonQuorumLost`，`for: 1m` 的 critical page」；:21 也預設讀者知道 or vector(0) 的來歷：「`or vector(0)` 是先前抓到的修正」。但相較系列其他頁，它把必要背景（expr、修正緣由）都就地重述了，是 alert 系列中最接近可獨立閱讀的一篇。",
+   "staleness": "無日期標記；版本錨點齊全（真 cephadm v19.2.3、harness 在 experiments/ceph-mon-quorum-blind-spot/，:70）。是此主題最新、最完整的一篇——但與 real-cluster S4/S5 及 real-lab-findings 發現11/16 三處講同一盲區，且解法命名不一致（本頁 CephMonQuorumLostBlackbox/probe_success vs real-cluster 的 CephMonQuorumLostExternal/ceph_mon_tcp_up），重構時需擇一為 canonical。無被推翻內容。",
+   "keep_content": "「sensor 跟被測物同生共死」的問題定式與資料流圖（:15-40）；mgr 快取凍結的原始碼路徑（module.py:1018 的 get_quorum_status＋self.get('mon_status') 快取語意，:44-66）；真機時間軸表（mgr count 凍在 3 vs blackbox count=1 vs up=1，:72-83）含 ground truth 佐證（mon-01 748 slow ops）；blackbox_exporter 探 mon:3300 的完整 scrape config＋rule（:91-114）；「blackbox 分母穩定、比 metadata 動態版更耐」的比較（:116）；「已連線無感/新 rbd map 卡」的 fio 真機證據與「新 PVC 反而會 Bound」的反直覺發現（:122-126）；「quorum 失守期間不要 drain node」的操作警告（:126）；「探測的是可達性不是 in-quorum」的誠實邊界（:130）。",
+   "assumed_prereqs": "prometheus-alert-design（CephMonQuorumLost 的設定與 or vector(0) 來歷）；mon-quorum-loss-impact（dataplane/control plane 分界，:122 直接引用）。"
+  },
+  {
+   "slug": "slow-ops-and-bluestore-alerts",
+   "doc_type": "mixed（mechanism 為主體：兩個 metric 的四段來源鏈＋BLUESTORE_SLOW_OP_ALERT 平行路徑；decision-guide：「怎麼改進 alert：三層」的 rule 提案）",
+   "self_contained": "是，開頭自帶場景不假設其他頁（slow-ops-and-bluestore-alerts.mdx:9）：「某天 KubeVirt VM 上的應用變慢，你 ssh 進去看 OSD log，發現一堆：…BlueStore 明明在抱怨慢操作，可是你 Prometheus 上盯著的 `ceph_healthcheck_slow_ops` 卻一直是 0」。僅第 2 層借用設計頁技法（:385「沿用 [alert 設計頁] 的 `group_left` 技法」）。",
+   "staleness": "版本錨點 v19.2.3 齊全、無日期標記，但 alert 建議段已被兩波後續研究部分推翻：(1) 第 2 層建議的 `CephDaemonSlowOpsScoped` 用原始 `ceph_daemon_health_metrics{type=\"SLOW_OPS\"} > 0`＋`for: 1m`（:395-403，全文 grep 無 max_over_time），而 real-lab 發現02 已證實該指標是 spiky snapshot gauge（觀察窗只有 ~28.8% 時間 >0）、`for:` 撐不住，正式 rule 已改窗化 `max_over_time(...[5m]) > 0`（ceph-production-coverage.yml:66）——本頁提案未同步；(2) ceph-slow-ops-detection 收官報告（experiments/ceph-slow-ops-detection/REPORT-2026-07-09.md）推翻本頁「帶 ceph_daemon…能指出是哪顆 OSD」的定位宣稱：H-025「SLOW_OPS 會怪錯人……client op 記在 primary 的 op tracker 上」（REPORT:48）、且暫態事件下該 metric「❌ 全程 0（E-01）」（REPORT:33）；該研究的 R1/R2（Squid-only 4 個 bluestore_slow counter，+14s/+20s 偵測、firmware 指紋）是本頁三層方案之上的更優解，本頁完全未提。",
+   "keep_content": "SLOW_OPS 兩個 metric 的完整來源鏈（OpTracker 30s complaint→DaemonHealthMetric n1/n2→mgr 累加→prometheus 解析 summary 字串，:26-246）——含「summary 字串解析是脆弱耦合」（module.py:885，:212）與「n2 沒人 export」（:246）兩個全站唯一的細節；七缺口表（為什麼 BlueStore 在喊慢 SLOW_OPS 卻不亮，:252-262）；BLUESTORE_SLOW_OP_ALERT 的 5s 門檻/threshold=1/24h latch 機制與兩偵測器對照表（:264-361）；stalled-read 三兄弟 alert 的存在（PGMap.cc:3239，:347）；第 4 層 absent() 兜底的理由（metric 消失≠0，:445-457）。三層 rule 提案本身需依上述後續研究修訂後再保留。",
+   "assumed_prereqs": "prometheus-alert-design（group_left 技法、ceph_health_detail 無 host label 限制）；bluestore-deep-dive（txc/kv 階段語意，延伸非必要）。"
+  },
+  {
+   "slug": "incident-bundle-runbook",
+   "doc_type": "runbook（操作導向：inventory→執行→exit code→bundle 結構→安全界線；附一節 lab 實測記錄作為 experiment-report 成分）",
+   "self_contained": "是，開頭自帶緣起不需其他頁（incident-bundle-runbook.mdx:9）：「Ceph 出問題時，第一個直覺常常是立刻找 repair command…最容易把真正有價值的線索抹掉」。「來龍去脈」一節提及三篇監控頁但定位是背景非前提（:30「前面的 Ceph 監控頁已經拆過三件事」）。目標讀者明示為「只懂基本 Linux 的人」（:77），全篇對此自足。",
+   "staleness": "兩處：(1) 功能落後於工具現況——collect.sh 已有 `--prom-url`（experiments/ceph-incident-bundle/run/collect.sh:42「--prom-url URL optional Prometheus base URL; dump metrics of scrape」，另有 prom_job_regex/prom_step/prom_timeout），但本頁參數表（:130-139）只列到 --skip-logs，完全未提 Prometheus metrics dump 能力（該功能 2026-07-10 已真機驗證落 master）。(2) 日期標記：實測產物檔名 `ceph-incident-20260629T024348Z.tar.gz`（:144、:325）、`created_utc: 2026-06-29T02:49:45Z`（:338）——實測快照會隨工具演進顯得越來越舊。無 ceph 版本錨點問題（工具本身 version-agnostic）。",
+   "keep_content": "「先保留現場，再判讀」的事故第一步定位（:17）；inventory 欄位表與實例（:91-114）；三值 exit code 語意表（0/2/1，含「部分失敗仍產 bundle」的設計理由，:170-178）；bundle 結構與六個入口檔案用途表（manifest.jsonl 回答的三個問題，:184-216）；cephadm/node/Rook 三份收集清單（:220-281）；安全界線五條（read-only、遮蔽非 DLP、forbidden path、人工檢查、--skip-logs trade-off，:283-293）；lab 實測與 summary.txt 樣本（:295-354）。",
+   "assumed_prereqs": "無站內前置（刻意設計給非 Ceph 人）；需會 SSH 與基本 shell。判讀 bundle 內容時才需要其他 Ceph 頁。"
+  },
+  {
+   "slug": "rbd-and-csi",
+   "doc_type": "mixed（mechanism 為主體：RBD object layout→librbd 切分→class extension→feature dependency→ceph-csi/rook 責任邊界；帶舊世代學習頁成分：「整段對齊 lab Day 18」與「收穫檢查」自測題）",
+   "self_contained": "是，開頭自帶場景（rbd-and-csi.mdx:9）：「你 KubeVirt VM 跑著，guest OS 看到一顆 50 GiB 的硬碟，背後是 Ceph 給的 RBD volume。真正出事時，表面錯誤常不是『Ceph 壞了』」。但尾段假設 learning-plan 情境：「整段對齊 lab Day 18」（:364）與跨專案連結 kubevirt 頁，屬第一代 SP-6 批次的寫法。",
+   "staleness": "(1) 版本錨點缺失：全文沒有任何 v19.2.3 字樣（grep 僅 :405 的 docs.ceph.com/en/squid URL 帶 squid），引用的 file:line 沒有版本錨——12 篇中唯一沒版本錨的。(2) 無日期標記。(3) 未被直接推翻，但兩波後續研究它未反映：kubevirt-rbd-tuning SP（experiments/kubevirt-rbd-tuning/ 存在，22 實驗收官）對 krbd/rbd-nbd、CPU limit 等有量化結論，本頁「rbd-nbd…性能略差但兼容性好」（:315-316）仍是無量化的定性句；mon-quorum-detection-blind-spot 發現「新 rbd map 卡、新 PVC 反而 Bound」直接關係本頁的 controller/node plugin 責任邊界（:308），本頁未交叉引用。(4) 「收穫檢查」自測題型與現行「測驗一律放 quiz.json」的站規已不同調（雖非 QuizQuestion 元件、validate 不會抓）。",
+   "keep_content": "RBD 三類 object（rbd_id/rbd_header/rbd_data）與 thin-provision 圖解（rbd_types.h:28，:15-47）；rbd_default_order=22→4MiB chunk 的換算與 CreateRequest 原始碼（:47-84）；header omap 由 cls_rbd 管的機制與「RBD metadata 不在 MON」的澄清（:85-174）；feature dependency 硬檢查（object-map/journaling 需 exclusive-lock，EnableFeaturesRequest.cc:189/204，:192-227）；「PVC create 成功、Pod map 才失敗」的責任邊界與判讀表（:228、:308-328）；controller/node plugin 分工圖與 PVC bind 兩時段流程（:230-306）；rook vs ceph-csi 職責分離與除錯分層（:332-363）；KubeVirt VM 啟動全路徑（:364-383）。",
+   "assumed_prereqs": "crush-and-placement 與 osd-and-bluestore（尾段路徑圖直接指向，:383）；architecture（RADOS/pool 基本概念）；KubeVirt 情境需 kubevirt/virt-handler-and-launcher。lab Day 18 的對齊敘述另假設 learning-plan 上下文。"
+  }
+ ]
+}

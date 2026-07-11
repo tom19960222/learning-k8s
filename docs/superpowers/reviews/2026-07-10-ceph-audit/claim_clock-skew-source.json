@@ -1,0 +1,64 @@
+{
+ "claim_id": "clock-skew-source",
+ "verdict": "confirmed",
+ "evidence": [
+  {
+   "source": "next-site/content/ceph/features/clock-skew-magnitude-ladder.mdx:128",
+   "quote": "`is_lease_valid()` 回 false → `is_writeable()` / `is_readable()` 跟著垮 → peon 的 `lease_timeout` 觸發 → `mon.bootstrap()` → 退出 quorum 重選。**所以 1min / 1hr / 1day 的 MON↔MON skew 做的是同一件事**：那台快超過 5s 的 mon 守不住 lease，反覆 bootstrap、反覆 election。"
+  },
+  {
+   "source": "next-site/content/ceph/features/clock-skew-magnitude-ladder.mdx:22",
+   "quote": "| **1 min** | WARN **＋ lease 崩 → election churn** | 無感（≪ 1hr TTL） | 無門檻 |"
+  },
+  {
+   "source": "ceph/src/mon/Paxos.cc:1123-1125 (handle_lease，收到已過期 lease 只印 log)",
+   "quote": "if (lease_expire < now) {\n      auto diff = now - lease_expire;\n      derr << \"lease_expire from \" << lease->get_source_inst() << \" is \" << diff << \" seconds in the past; mons are probably laggy (or possibly clocks are too skewed)\" << dendl;"
+  },
+  {
+   "source": "ceph/src/mon/Paxos.cc:1129,1135,1143-1144 (之後照樣 ACTIVE、ACK、重設 timeout)",
+   "quote": "state = STATE_ACTIVE;\n... MMonPaxos *ack = new MMonPaxos(mon.get_epoch(), MMonPaxos::OP_LEASE_ACK,\n... // (re)set timeout event.\n  reset_lease_timeout();"
+  },
+  {
+   "source": "ceph/src/mon/Paxos.cc:1206-1207 (lease_timeout 是訊息斷流計時器，2×5s=10s)",
+   "quote": "lease_timeout_event = mon.timer.add_event_after(\n    g_conf()->mon_lease_ack_timeout_factor * g_conf()->mon_lease,"
+  },
+  {
+   "source": "ceph/src/common/options/mon.yaml.in:408-414 (factor 預設 2；mon_lease 預設 5＠386；renew factor 預設 0.6＠401，leader 每 3s renew)",
+   "quote": "- name: mon_lease_ack_timeout_factor\n... default: 2"
+  },
+  {
+   "source": "ceph/src/mon/Paxos.cc:1215-1221 (唯一 bootstrap 路徑＝timer 到期，非 lease_expire 比較)",
+   "quote": "void Paxos::lease_timeout()\n{\n  dout(1) << \"lease_timeout -- calling new election\" << dendl;\n  ceph_assert(mon.is_peon());\n  logger->inc(l_paxos_lease_timeout);\n  lease_timeout_event = 0;\n  mon.bootstrap();"
+  },
+  {
+   "source": "ceph/src/mon/Paxos.cc:1486-1490 (穩態後果＝該 peon 不可讀，非 election)",
+   "quote": "ret =\n      (mon.is_peon() || mon.is_leader()) &&\n      (is_active() || is_updating() || is_writing()) &&\n      last_committed > 0 && is_lease_valid(); // must have a value alone, or have lease"
+  },
+  {
+   "source": "next-site/content/ceph/features/clock-skew-magnitude-ladder.mdx:294",
+   "quote": "**Step 2 — mon 校時跳回，把「未來」那批 secret 擠掉。** mon 時鐘回到正確值後重新 rotate；`add()` 永遠只保留 prev/current/next 三把，舊的直接 erase。新一輪用正確時間蓋的 secret 進來，那批 +1 年的就被擠出視窗："
+  },
+  {
+   "source": "ceph/src/auth/cephx/CephxKeyServer.cc:180-183 (_rotate_secret 的閘：need_new_secrets(now))",
+   "quote": "utime_t now = ceph_clock_now();\n  double ttl = service_id == CEPH_ENTITY_TYPE_AUTH ? cct->_conf->auth_mon_ticket_ttl : cct->_conf->auth_service_ticket_ttl;\n\n  while (r.need_new_secrets(now)) {"
+  },
+  {
+   "source": "ceph/src/auth/Auth.h:324-326 (跳回後 current().expiration 在未來 → false → 不 rotate)",
+   "quote": "bool need_new_secrets(const utime_t& now) const {\n    return secrets.size() < KEY_ROTATE_NUM || current().expiration <= now;\n  }"
+  },
+  {
+   "source": "ceph/src/auth/Auth.h:314-318 (淘汰只在 add() 內發生；不 rotate 就不淘汰)",
+   "quote": "uint64_t add(ExpiringCryptoKey& key) {\n    secrets[++max_ver] = key;\n    while (secrets.size() > KEY_ROTATE_NUM)\n      secrets.erase(secrets.begin());\n    return max_ver;\n  }"
+  },
+  {
+   "source": "ceph/src/auth/cephx/CephxKeyServer.cc:189-193 (即便 rotate，新 key 錨在未來 expiration 上，不是「正確時間」)",
+   "quote": "utime_t next_ttl = now;\n      next_ttl += ttl;\n      ek.expiration = std::max(next_ttl, r.next().expiration);\n    }\n    ek.expiration += ttl;"
+  },
+  {
+   "source": "ceph/src/auth/cephx/CephxKeyServer.cc:383-390 (所有 rotate 都走這條，added==0 直接 return false，無旁路)",
+   "quote": "added += _rotate_secret(CEPH_ENTITY_TYPE_AUTH, pending_data);\n  added += _rotate_secret(CEPH_ENTITY_TYPE_MON, pending_data);\n  added += _rotate_secret(CEPH_ENTITY_TYPE_OSD, pending_data);\n  added += _rotate_secret(CEPH_ENTITY_TYPE_MDS, pending_data);\n  added += _rotate_secret(CEPH_ENTITY_TYPE_MGR, pending_data);\n  if (!added) {\n    return false;\n  }"
+  }
+ ],
+ "implication": "這頁不能原樣保留，需改寫（不是 archive——三線框架、mono/wall clock 心智模型、方向 A、client ticket 免疫等主體仍站得住）。必改兩處：(1) 線 1 的「>5s → lease 崩 → election churn」因果鏈：文章「lease 到手即過期」（Paxos.cc:1118-1126）是對的，但 handle_lease 照樣 ACK 並重設 10s timer（1144, 1206-1207），leader 每 3s renew，穩態 skew 下 lease_timeout 永不觸發；真實後果是該 peon 永久不可讀（is_readable false、讀請求堆積、derr 洗 log），election churn 需要 lease 訊息斷流 ≥10s 或時鐘跳變，不是穩態 skew 的必然結果。表格 1min/1hr/1day 欄、排查表「mon 反覆 flap / election」列、description 都要同步改。(2) 線 2 方向 B 的 Step 2/Step 3、warning Callout、排查表第三列、原始碼路徑一覽的方向 B 列整段重寫：mon 跳回後 need_new_secrets(now) 為 false → 完全不 rotate、未來 key 不被淘汰、secret_id 仍查得到；真實後果是 rotation 凍結長達偏移量的時間（renewal/安全問題），不是「校時那一刻 OSD 大量掉線」。若想保留「校時跳回是高風險動作」的操作性警告，必須先在真機驗證出實際故障機制，否則該警告降級或刪除。諷刺的是文章 line 323 對 OSD 端已正確講了同一個 need_new_secrets 邏輯，可直接沿用到 mon 端改寫。",
+ "notes": "兩條指控皆 confirmed（Codex 對、文章錯），故整體 verdict=confirmed 而非 partial。指控 1：文章主張經逐字核對非稻草人（mdx:22 表格「lease 崩 → election churn」、mdx:128 完整因果鏈、mdx:394 排查表）；文章對「lease 一拿到就等於過期」的描述正確，錯在把 is_lease_valid()==false 接到 lease_timeout → bootstrap——lease_timeout 是訊息到達計時器（2×mon_lease=10s），與 lease_expire 無關；另 is_writeable() 要求 mon.is_leader()（Paxos.cc:1522-1527），「peon 的 is_writeable 垮」本身是類別錯誤。Elector.cc 的 ping 時戳皆同機比較（:470 記錄、:512-514 比較），穩態 skew 相消，無替代 churn 路徑。指控 2：need_new_secrets(now) 的條件方向與文章相反；且 _rotate_secret 新 key expiration = max(now+ttl, next().expiration)+ttl，錨定在既有未來值上只會更未來。連帶注意：方向 B 崩塌後，文章 Step 3 引用的 verify_authorizer/get_service_secret 程式碼本身存在且正確，只是「secret 被擠掉」的前提不成立。驗證基準：ceph submodule HEAD=c92aebb279828e9c3c1f5d24613efca272649e62，git describe=v19.2.3。所有行號以該 tag 為準。"
+}

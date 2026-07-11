@@ -1,0 +1,461 @@
+---
+layout: doc
+title: Ceph — clock skew 的三條故障線：MON lease、cephx rotation、OSD mono clock（因果鏈修正版）
+description: 用 v19.2.3 原始碼逐行回答「node 時鐘差會壞掉什麼」。三條獨立的線：MON↔MON 的 Paxos lease 用 wall clock（skew > mon_lease 讓那個 peon「永久不可讀」，而不是 election churn）；MON↔OSD 的 cephx rotating secret 由 mon 蓋絕對時間戳，雙向都會爆——OSD 快到 1hr 級起不來 exit(1)，mon 先快再校時跳回則讓 rotation 凍結（不是「跳回那一刻大量掉線」）；OSD↔OSD 靠同機比較＋mono delta 免疫。並澄清 client ticket 為何對 skew 免疫。
+category: mechanism
+---
+
+## 本頁定位
+
+- **文章類型**：mechanism（機制拆解）。目標是把「node 之間 wall-clock skew 會壞掉什麼」拆到**每一句因果都指得到行號**，不是操作 runbook。
+- **版本錨點**：ceph `v19.2.3`（submodule HEAD `c92aebb`）。所有 `File: ... (line N)` 以這個 tag 為準；升級版本前請重驗行號。
+- **閱讀前提（2 個，各一句理由）**：
+  - [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](./cluster-time-skew-impact)：**毫秒級 pair-by-pair 的刻度在那頁**，本頁只講「跨過門檻之後的機制」，不重畫毫秒矩陣。
+  - [Ceph — MON clock 漂移多久後 ceph -s 才變 HEALTH_WARN](./mon-clock-skew-detection)：**50ms `MON_CLOCK_SKEW` 的偵測鏈與延遲在那頁**，本頁把偵測當已知前提，只講「報警之後真正壞的是什麼」。
+- **證據層級**：本頁的**機制**主張全部是 **T1（原始碼逐字核對）**——lease ACK 行為、`need_new_secrets` 邏輯、`exit(1)`、rotation 凍結等，每條都附行號。以下幾點**仍欠 T3（真機驗證）**，本頁明寫為假說、不寫成斷言：
+  1. 「peon 永久不可讀」的**實際 client 端症狀**（讀請求怎麼堆積、`ceph -s` 與 rbd client 實際看到什麼）未在真叢集重現。
+  2. 線 2 方向 B「mon 校時跳回會不會產生**任何**在線故障」未在真機驗證；source 只支持「rotation 凍結」，不支持舊頁的「大量掉線」。
+  3. election churn 的實際觸發時序（lease 訊息斷流 ≥10s）是從 source 邏輯推導，未實測跳變當下的時間軸。
+- **本頁取代**：[`clock-skew-magnitude-ladder`](./clock-skew-magnitude-ladder)。取代原因＝該頁兩條核心因果鏈被逐字 source 查證推翻（線 1「>5s → lease 崩 → election churn」、線 2 方向 B「mon 跳回 → 大量掉線」），本頁保留其站得住的主體（三線框架、mono/wall clock 心智模型、方向 A、client ticket 免疫）並改寫這兩條。
+
+## 術語表
+
+先對齊詞彙，後面不再解釋：
+
+| 詞 | 意思 |
+|---|---|
+| **wall clock** | 掛鐘時間（`ceph_clock_now()` / `real_clock`），會被 NTP 校正、會跳。skew 講的就是它。 |
+| **mono clock** | 單調時鐘（`mono_clock`），只會往前、不被 NTP 影響，用來量「過了多久」。 |
+| **lease** | leader 發給 peon 的「你在這個到期點之前可以直接服務讀」的租約。到期要 renew。 |
+| **peon** | quorum 內非 leader 的 mon（follower）。 |
+| **quorum** | mon 之間能達成多數決的集合（3-mon 需要 ≥2）。 |
+| **cephx** | Ceph 的內建認證協定，用 rotating secret / ticket 簽發與驗證身分。 |
+| **rotating secret** | mon 定期重簽、會過期的一組 service key（prev/current/next 三把），供 daemon 互驗。 |
+| **rotation** | mon 產生新一把 rotating secret、擠掉最舊那把的動作。 |
+| **ticket** | client 拿到的、有 TTL 的認證票；跟 daemon rotating secret 是**兩條不同路徑**。 |
+
+## 一張表看完三條線（修正版）
+
+預設值、3-mon cluster，沒手動改 `mon_clock_drift_allowed` / `mon_lease`。**穩態 skew**（固定 offset）下三條線各自的機制與後果：
+
+| 線 | 時鐘來源 | 到期「誰蓋 / 誰檢查」 | 對 skew | 穩態 skew 的**真實**後果 |
+|---|---|---|---|---|
+| **線 1 MON↔MON lease** | `real_clock`（wall） | leader 蓋 `leader_now + 5s`／peon 拿**自己**的 wall clock 比 | 不免疫 | peon 領先 leader 超過 `mon_lease`(5s) → **該 peon 永久不可讀**（不是 election churn） |
+| **線 2 MON↔OSD cephx** | `ceph_clock_now()`（wall） | **mon 蓋絕對 expiration**／OSD 拿自己的 wall clock 比 | 不免疫（雙向） | 方向 A（OSD 快到 1hr 級）→ 起不來 `exit(1)`；方向 B（mon 先快再跳回）→ **rotation 凍結**（不是「跳回那刻大量掉線」） |
+| **線 3 OSD↔OSD** | heartbeat 判死用本機 wall、read lease 換算用 `mono_clock` | heartbeat **同機蓋＋同機檢查**；read lease 走 mono delta | 免疫 | 無（wall skew 不影響 heartbeat / read lease） |
+| （對照）**client ticket** | wall | client **自己蓋** `now + validity`／自己檢查 | 免疫（同機抵消） | 無 |
+
+量級門檻的三個數字，只是「跨過哪一條線的分界」：
+
+- **50ms**（`mon_clock_drift_allowed`）：線 1 的**偵測**門檻 → `MON_CLOCK_SKEW` WARN（偵測延遲見 [mon-clock-skew-detection](./mon-clock-skew-detection)）。
+- **5s**（`mon_lease`）：線 1 的**行為**分界 → 超過就有 peon 守不住 lease。
+- **1hr**（`auth_service_ticket_ttl`）：線 2 的量級分界 → skew 到這個等級 cephx 才出事。
+
+毫秒級 pair-by-pair 的完整矩陣不在這頁，在 [cluster-time-skew-impact](./cluster-time-skew-impact)。
+
+## 心智模型：誰蓋、誰檢查
+
+一條線會不會被 skew 弄爆，只取決於兩個問題：**用哪種時鐘**，以及**到期時間是「誰蓋、誰檢查」**。
+
+- **同一台機器蓋、同一台檢查**（client ticket、線 3 的 heartbeat 同機比較與 mono delta）→ 固定 offset 在減法裡抵消 → **免疫**。
+- **一台蓋、另一台檢查**（線 1 lease、線 2 cephx）→ 兩台時鐘直接比大小 → skew 一到門檻就爆。
+
+線 1 的到期是 `real_clock`（wall clock），不是 monotonic：
+
+```cpp
+// File: ceph/src/mon/Paxos.h (line 405)
+ceph::real_clock::time_point lease_expire;
+```
+
+線 2 最特別：**蓋章的永遠是 mon**（發證方），所以 mon 的時鐘錯誤會污染所有 OSD 手上的票——這就是為什麼線 2 是雙向的。
+
+## 線 1 — MON ↔ MON：lease 到手即過期 →「永久不可讀」，不是 election churn
+
+先講對的部分：**lease 一拿到就等於過期**這個描述是對的。leader 每次 renew 都把「**自己 wall clock 的** now + `mon_lease`」當到期點送出去：
+
+File: `ceph/src/mon/Paxos.cc` (line 979)
+
+```cpp
+lease_expire = ceph::real_clock::now();
+lease_expire += ceph::make_timespan(g_conf()->mon_lease);
+```
+
+`mon_lease` 預設 `5` 秒（`mon.yaml.in:386`）。peon 收到後，在 `handle_lease` 裡把它設進 `lease_expire`，再拿**自己的** wall clock 比：
+
+File: `ceph/src/mon/Paxos.cc` (line 1118)
+
+```cpp
+// extend lease
+if (auto new_expire = lease->lease_timestamp.to_real_time();
+    lease_expire < new_expire) {
+  lease_expire = new_expire;
+
+  auto now = ceph::real_clock::now();
+  if (lease_expire < now) {
+    auto diff = now - lease_expire;
+    derr << "lease_expire from " << lease->get_source_inst() << " is " << diff << " seconds in the past; mons are probably laggy (or possibly clocks are too skewed)" << dendl;
+  }
+}
+```
+
+如果**這個 peon 的 wall clock 領先 leader 超過 5 秒**：lease 訊息帶的是 leader 時間軸上的 `now + 5s`，換算成 peon 自己的時間軸（`peon_now = leader_now + skew`），`lease_expire − peon_now = 5 − skew < 0` → `lease_expire < now` 成立、印 `clocks are too skewed`。lease 一拿到就是過去式。
+
+**但舊頁在這裡接錯了下一步。** 印完 derr，`handle_lease` **照樣往下走**：狀態設回 ACTIVE、送出 ACK、重設 timeout：
+
+File: `ceph/src/mon/Paxos.cc` (line 1129)
+
+```cpp
+state = STATE_ACTIVE;
+// ...
+// ack
+MMonPaxos *ack = new MMonPaxos(mon.get_epoch(), MMonPaxos::OP_LEASE_ACK,
+			       ceph_clock_now());
+// ...
+// (re)set timeout event.
+reset_lease_timeout();
+```
+
+`reset_lease_timeout()` 設的是一個**固定 10 秒的計時器**——`mon_lease_ack_timeout_factor`(2) × `mon_lease`(5) = 10s，而且**跟 `lease_expire` 完全無關**，它只在乎「有沒有收到 lease 訊息」：
+
+File: `ceph/src/mon/Paxos.cc` (line 1206)
+
+```cpp
+lease_timeout_event = mon.timer.add_event_after(
+  g_conf()->mon_lease_ack_timeout_factor * g_conf()->mon_lease,
+  new C_MonContext{&mon, [this](int r) {
+      if (r == -ECANCELED)
+	return;
+      lease_timeout();
+    }});
+```
+
+peon 唯一會因為 lease 而 bootstrap（重選）的路徑，是這個計時器到期——`lease_timeout()`：
+
+File: `ceph/src/mon/Paxos.cc` (line 1215)
+
+```cpp
+void Paxos::lease_timeout()
+{
+  dout(1) << "lease_timeout -- calling new election" << dendl;
+  ceph_assert(mon.is_peon());
+  logger->inc(l_paxos_lease_timeout);
+  lease_timeout_event = 0;
+  mon.bootstrap();
+}
+```
+
+把時間軸拼起來：**leader 每 3 秒 renew 一次**（`mon_lease` × `mon_lease_renew_interval_factor` = 5 × 0.6，`mon.yaml.in:400`；排程在 `Paxos.cc:1012`）。每收到一次 lease 訊息，peon 就 `reset_lease_timeout()` 把那個 10s 計時器重新歸零。**只要 lease 訊息每 3s 準時到（< 10s），`lease_timeout()` 永遠不會觸發** → 沒有 bootstrap、沒有 election churn。穩態 skew 不會讓計時器斷。
+
+那穩態 skew 到底壞了什麼？壞在**讀**。`is_lease_valid()` 只看 `now < lease_expire`：
+
+File: `ceph/src/mon/Paxos.cc` (line 1514)
+
+```cpp
+bool Paxos::is_lease_valid()
+{
+  return ((mon.get_quorum().size() == 1)
+	  || (ceph::real_clock::now() < lease_expire));
+}
+```
+
+對那個領先 5s+ 的 peon，`lease_expire` 恆在它自己的過去 → `is_lease_valid()` **恆 false**。而 peon 服務讀請求要過這一關：
+
+File: `ceph/src/mon/Paxos.cc` (line 1481)
+
+```cpp
+bool Paxos::is_readable(version_t v)
+{
+  // ...
+    ret =
+      (mon.is_peon() || mon.is_leader()) &&
+      (is_active() || is_updating() || is_writing()) &&
+      last_committed > 0 && is_lease_valid(); // must have a value alone, or have lease
+```
+
+結論：**該 peon 永久不可讀**（`is_readable` 恆 false），它服務不了任何讀請求，而且每 3s 收一次 lease 就洗一行 `clocks are too skewed` 的 derr。它沒有 flap、沒有反覆 election——它就只是安靜地當一個「不能讀的副本」。
+
+3-mon cluster 裡只有 1 台這樣時，另外 2 台同步的 mon 仍撐得住 quorum＝2，讀寫都能導到它們身上；cluster 表現是「WARN + 一台 mon 一直洗 log + 少一個可讀副本」，不是 quorum loss。
+
+### 誠實勘誤：舊頁哪裡錯、source 怎麼說
+
+這頁取代的舊頁（`clock-skew-magnitude-ladder`）在線 1 寫了一條逐字可查、但**接錯**的因果鏈。攤開對照：
+
+| 舊頁的主張（line 128 / 表格 line 22） | source 實際 | 正確結論 |
+|---|---|---|
+| 「`is_lease_valid()` 回 false → `is_writeable()` 跟著垮」 | `is_writeable()` 要求 `mon.is_leader()`（`Paxos.cc:1522`），peon **本來就不可寫** | 「peon 的 is_writeable 垮」是**類別錯誤**——peon 從來不負責寫，寫在 leader |
+| 「→ peon 的 `lease_timeout` 觸發 → `mon.bootstrap()` → 退出 quorum 重選」 | `lease_timeout` 是**訊息斷流計時器**（`Paxos.cc:1206`，2×`mon_lease`=10s），只在「10s 沒收到 lease」時觸發，**不比較 `lease_expire`** | 穩態 skew 下 lease 每 3s 到、計時器每次歸零 → `lease_timeout` **永不觸發** |
+| 「1min / 1hr / 1day 的 MON↔MON skew 做同一件事：反覆 bootstrap、反覆 election」 | `handle_lease` 收到過期 lease 照樣 `STATE_ACTIVE` + ACK + `reset_lease_timeout()`（`Paxos.cc:1129-1144`） | 真實後果是**該 peon 永久不可讀**（`is_readable` 恆 false），不是 election churn |
+
+**那 election churn 什麼時候才真的發生？** 需要的是「lease 訊息**斷流** ≥ 10s」（leader 掛了、網路分區、mon 卡住送不出 lease）或「**時鐘跳變**」的瞬間——這些跟「固定 offset 的穩態 skew」是兩回事。穩態 skew 本身沒有替代的 churn 路徑：連 Elector 的存活 ping 都是**同機比較**、skew 相消：
+
+File: `ceph/src/mon/Elector.cc` (line 512)
+
+```cpp
+utime_t now = ceph_clock_now();
+utime_t& acked_ping = peer_acked_ping[peer];
+utime_t& newest_ping = peer_sent_ping[peer];
+if (!acked_ping.is_zero() && acked_ping < now - ping_timeout) {
+```
+
+`acked_ping`（記錄時 `ceph_clock_now()`，`Elector.cc:470`）跟 `now` 都取自同一台的時鐘，相減時 offset 抵消，wall-clock skew 不影響存活判斷。
+
+### 附帶：訊息被戳「在未來」洗 cluster log
+
+只要 skew `> 50ms`，skew mon 每送一個 lease / ack，收方就判定「戳在未來」寫一行 cluster log（同 `mon_clock_drift_allowed` 門檻 + 指數 backoff，`Paxos.cc:1025` `warn_on_future_time()`）。1 天的 skew 印 `stamped 86400s in the future`。這是 cluster log，不是 health check，也不是 election。
+
+## 線 2 — MON ↔ OSD：cephx 到期由 mon 蓋，雙向都會爆
+
+每個 OSD 都持有一份 mon 簽發、會過期、由 mon 定期重簽的 **rotating service key**。它是一組 prev / current / next 三把（`KEY_ROTATE_NUM` = 3，`Auth.h:255`）。mon 產生 key 時用**自己的 wall clock** 蓋一個**絕對** expiration；OSD 收到後拿**自己的 wall clock** 判斷夠不夠新：
+
+File: `ceph/src/auth/Auth.h` (line 324)
+
+```cpp
+bool need_new_secrets(const utime_t& now) const {
+  return secrets.size() < KEY_ROTATE_NUM || current().expiration <= now;
+}
+```
+
+**mon 蓋、OSD 比——兩台時鐘直接對撞。** 差到 TTL(1hr) 等級就出事，而 mon 與 OSD 哪邊快，爆法完全不同。
+
+### 方向 A — OSD 比 mon 快：OSD 起不來 `exit(1)`
+
+OSD 週期檢查 rotating key，`now` 取自己的時鐘，cutoff 再往前抓 30 秒：
+
+File: `ceph/src/mon/MonClient.cc` (line 1103)
+
+```cpp
+utime_t now = ceph_clock_now();
+utime_t cutoff = now;
+cutoff -= std::min(30.0, cct->_conf->auth_service_ticket_ttl / 4.0);
+utime_t issued_at_lower_bound = now;
+issued_at_lower_bound -= cct->_conf->auth_service_ticket_ttl;
+if (!rotating_secrets->need_new_secrets(cutoff)) {
+  // ...
+  return 0;
+}
+```
+
+OSD 領先 mon 到 1hr 等級時，mon 能給的最新 secret 在 OSD 的 `now − 30s` cutoff 下都嫌太舊，`need_new_secrets(cutoff)` 一直回 true，OSD 不停要 renew 卻永遠拿不到夠新的。source 自己標出這個徵兆：
+
+File: `ceph/src/mon/MonClient.cc` (line 1115)
+
+```cpp
+if (!rotating_secrets->need_new_secrets() &&
+    rotating_secrets->need_new_secrets(issued_at_lower_bound)) {
+  // the key has expired before it has been issued?
+  lderr(cct) << __func__ << " possible clock skew, rotating keys expired way too early"
+             << " (before " << issued_at_lower_bound << ")" << dendl;
+}
+```
+
+OSD 啟動時這條直接擋住上線。`wait_auth_rotating` 等不到夠新的 key 就逾時（`rotating_keys_bootstrap_timeout` 30 秒），重試到 `max_rotating_auth_attempts`（預設 10）就 `exit(1)`：
+
+File: `ceph/src/osd/OSD.cc` (line 4068)
+
+```cpp
+while (monc->wait_auth_rotating(rotating_auth_timeout) < 0) {
+  derr << "unable to obtain rotating service keys; retrying" << dendl;
+  ++rotating_auth_attempts;
+  if (rotating_auth_attempts > g_conf()->max_rotating_auth_attempts) {
+      derr << __func__ << " wait_auth_rotating timed out"
+	   <<" -- maybe I have a clock skew against the monitors?" << dendl;
+      exit(1);
+  }
+}
+```
+
+**方向 A 一句話**：OSD node 的 wall clock 比 mon 快「天／時」級 → 啟動時 `exit(1)`，硬失敗。修法不是調 ceph，是把 OSD node 時鐘拉回跟 mon 一致（通常是 RTC 壞、時區設成 localtime、或沒在跑 timesyncd/chrony）。
+
+### 方向 B — mon 先快、再校時跳回：rotation 凍結（不是「那一刻大量掉線」）
+
+這是舊頁改寫最重的一段。舊頁宣稱「mon 校時跳回會擠掉未來的 key → 在線 OSD 大量掉線」。**逐行查證下來，這條不成立**——關鍵卡在 `need_new_secrets(now)` 的條件方向。分三步看。
+
+**Step 1 — mon 時鐘 +offset（例如 +1 年），簽出「未來」的 secret。** mon rotate 時用自己（快了一年的）`ceph_clock_now()` 蓋 expiration，所以每把 secret 的到期都在約一年後：
+
+File: `ceph/src/auth/cephx/CephxKeyServer.cc` (line 180)
+
+```cpp
+utime_t now = ceph_clock_now();
+double ttl = service_id == CEPH_ENTITY_TYPE_AUTH ? cct->_conf->auth_mon_ticket_ttl : cct->_conf->auth_service_ticket_ttl;
+
+while (r.need_new_secrets(now)) {
+  ExpiringCryptoKey ek;
+  generate_secret(ek.key);
+  if (r.empty()) {
+    ek.expiration = now;
+  } else {
+    utime_t next_ttl = now;
+    next_ttl += ttl;
+    ek.expiration = std::max(next_ttl, r.next().expiration);
+  }
+  ek.expiration += ttl;
+```
+
+OSD 收下這批 rotating secret（自己時間是對的），判「夠不夠新、要不要 renew」走的是 `need_new_secrets(cutoff)`（`MonClient.cc:1108`，方向 A 引過的同一段）：secret 的 expiration（+1 年）遠在 cutoff 之後 → 判定「還很新」、不 renew、照常持有使用。所以 mon 時鐘錯的當下 cluster 表面正常，沒人掉線。**這一步舊頁結論是對的。**
+
+**Step 2 — mon 校時跳回。這裡舊頁翻車：mon 根本不會 rotate。** mon 時鐘回到正確值後想 rotate，第一件事就是問 `need_new_secrets(now)`：
+
+```
+need_new_secrets(now) = secrets.size() < 3   ||   current().expiration <= now
+                      = false（有 3 把）      ||   false（current 的 expiration 是 +1 年，> now）
+                      = false
+```
+
+`_rotate_secret` 的 `while (r.need_new_secrets(now))` 條件一開始就是 false → **迴圈一次都不跑、不產生新 secret、不呼叫 `add()`**。而淘汰**只發生在 `add()` 裡**：
+
+File: `ceph/src/auth/Auth.h` (line 314)
+
+```cpp
+uint64_t add(ExpiringCryptoKey& key) {
+  secrets[++max_ver] = key;
+  while (secrets.size() > KEY_ROTATE_NUM)
+    secrets.erase(secrets.begin());
+  return max_ver;
+}
+```
+
+不 rotate 就不進 `add()`，**那批 +1 年的 secret 一把都不會被擠掉**。連 `prepare_rotating_update` 整個彙總都會發現「沒東西可加」而直接放棄、不寫任何更新：
+
+File: `ceph/src/auth/cephx/CephxKeyServer.cc` (line 383)
+
+```cpp
+int added = 0;
+added += _rotate_secret(CEPH_ENTITY_TYPE_AUTH, pending_data);
+added += _rotate_secret(CEPH_ENTITY_TYPE_MON, pending_data);
+added += _rotate_secret(CEPH_ENTITY_TYPE_OSD, pending_data);
+added += _rotate_secret(CEPH_ENTITY_TYPE_MDS, pending_data);
+added += _rotate_secret(CEPH_ENTITY_TYPE_MGR, pending_data);
+if (!added) {
+  return false;
+}
+```
+
+**Step 3 — 沒有 Step 3。** 因為 secret 沒被擠掉，`secret_id` 仍查得到 → OSD 互驗走的 `verify_authorizer → get_service_secret` 照樣成功 → **不會在跳回那一刻大量掉線**。這兩條路徑的程式碼本身存在且正確，只是舊頁「secret 被擠掉」的前提不存在：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 459)
+
+```cpp
+if (!keys.get_service_secret(service_id, ticket.secret_id, service_secret)) {
+  ldout(cct, 0) << "verify_authorizer could not get service secret for service "
+    << ceph_entity_type_name(service_id) << " secret_id=" << ticket.secret_id << dendl;
+```
+
+那真實後果是什麼？**rotation 凍結長達偏移量的時間。** mon 校時跳回後，只要 `current().expiration`（+1 年）還在真實 now 的未來，`need_new_secrets(now)` 就一直是 false，mon 端**完全不 rotate**——直到真實時間追上那個 +1 年的 expiration 為止。這段期間 rotating secret 不換手（renewal / 安全性問題），但不是「大量掉線」。而且**就算**它 rotate，新 key 的 expiration = `max(now+ttl, next().expiration) + ttl`（`CephxKeyServer.cc:189-193`）錨在既有的未來值上，只會**更**未來，永遠生不出一把「正確時間」的 key 去擠掉未來那批。
+
+<Callout type="warning" title="方向 B 的操作性警告：降級為假說，不是斷言">
+  舊頁把「對一台時間錯很多的 mon 校時跳回」列為**高風險動作**（會大量掉線）。逐行查證後，這個**故障機制在 source 層不成立**——`need_new_secrets(now)` 讓 mon 跳回後根本不 rotate、未來 key 不被淘汰。
+
+  因此本頁**不保留**「校時跳回 → 大量掉線」這個斷言。source 支持的後果是 **rotation 凍結**；「跳回是否會引發任何在線故障」屬於**未經真機驗證的假說（欠 T3）**。若要把它重新列為操作警告，必須先在真叢集重現出具體故障機制，否則不得寫成事實。方向 A 的 `exit(1)` 才是本線目前唯一 source-confirmed 的硬失敗。
+</Callout>
+
+## 容易搞混：client ticket 不會因 skew 過期
+
+`auth_service_ticket_ttl`(1hr) 這個數字在 cephx 裡被**兩條不同路徑**用到，skew 對它們的影響相反。線 2 講的是 **daemon rotating secret**（mon 蓋、會被 skew 弄爆）；這裡是另一條 **client service ticket**（client 自己蓋、對 skew 免疫），很容易混。
+
+client（librbd 等 userspace client；kernel client 的 cephx 實作在 Linux kernel `net/ceph/`，不在本頁引用範圍）的 ticket，到期是用**自己一台機器的 wall clock 量的 duration**：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 199)
+
+```cpp
+expires = ceph_clock_now();
+expires += msg_a.validity;
+renew_after = expires;
+renew_after -= ((double)msg_a.validity.sec() / 4);
+```
+
+檢查到期也是同一台 client 的 wall clock：
+
+File: `ceph/src/auth/cephx/CephxProtocol.cc` (line 215)
+
+```cpp
+bool CephXTicketHandler::have_key()
+{
+  if (have_key_flag) {
+    have_key_flag = ceph_clock_now() < expires;
+  }
+
+  return have_key_flag;
+}
+```
+
+`expires` 和檢查它的時鐘在**同一台機器**，固定 skew offset 在減法裡抵消——**client 跟誰差多少，對它自己這張 ticket 的壽命沒有影響**。所以「skew 1 小時讓 *client* I/O 斷」是誤解，但「skew 弄垮 *OSD daemon*」是真的。（`auth_service_ticket_ttl` 在「mon **掛掉**」而非 skew 的情境下讓 client renew 不到而斷，那是另一回事，拆在 [mon quorum loss 那一頁](./mon-quorum-loss-io-lab)。）
+
+| | 誰蓋到期 | 誰檢查 | 對 skew |
+|---|---|---|---|
+| **client service ticket** | client 自己 `now + validity`（相對 duration） | client 自己 | **免疫**（同機抵消） |
+| **daemon rotating secret** | **mon** `now + ttl`（絕對時間點） | OSD | **不免疫**（跨兩台時鐘比） |
+
+## 線 3 — OSD ↔ OSD：同機比較＋mono delta，skew 免疫
+
+OSD 之間跟時間有關的路徑對 wall-clock skew 都免疫，但理由分兩種。
+
+第一種，**heartbeat 判死是同機比較**——它其實用 wall clock，但蓋章與檢查都在本機：`handle_osd_ping` 收到回覆時記下本機的 `ceph_clock_now()`（`OSD.cc:5799` 取 now、`:5914` 記 `last_rx_back = now`），`heartbeat_check()` 再拿本機的 now 去比，固定 offset 在減法裡相消：
+
+File: `ceph/src/osd/OSD.cc` (line 6151)
+
+```cpp
+void OSD::heartbeat_check()
+{
+  ceph_assert(ceph_mutex_is_locked(heartbeat_lock));
+  utime_t now = ceph_clock_now();
+```
+
+第二種，**read lease 的跨機換算走 mono delta**。OSD service 的「現在」用 monotonic clock：
+
+File: `ceph/src/osd/OSD.cc` (line 331)
+
+```cpp
+ceph::signedspan OSDService::get_mnow() const
+{
+  return ceph::mono_clock::now() - osd->startup_time;
+}
+```
+
+跨 OSD 的 read lease 要把對方時間軸換算成自己的，用的是 heartbeat 帶的 **mono timestamp 差（delta）**，不是 wall clock：
+
+File: `ceph/src/osd/PeeringState.h` (line 119)
+
+```cpp
+// we maintain an upper and lower bound on the delta between our local
+// mono_clock time (minus the startup_time) to the peer OSD's mono_clock
+// time (minus its startup_time).
+//
+// delta is (remote_clock_time - local_clock_time), so that
+// local_time + delta -> peer_time, and peer_time - delta -> local_time.
+```
+
+這個 delta 是兩台 OSD mono_clock 起跑點的差，**跟 wall-clock skew 是兩回事**——你把某台 OSD 的 `date` 調快一天，delta 不會跟著變。所以 OSD↔OSD 在 51ms → 1 天的任何刻度，wall-clock skew 都不觸發任何健康或 lease 問題。（OSD↔OSD 真正會 WARN 的是 heartbeat *latency*，那是「訊息來回多久」不是「時鐘差多少」，見 [cluster-time-skew-impact](./cluster-time-skew-impact)。）
+
+## 排查：看到 skew 怎麼定位（修正版）
+
+先 `ceph -s` 確認有沒有 `MON_CLOCK_SKEW`（確認真的有 skew），再依「誰在出事」分流——三條線的徵兆與 log 完全不同：
+
+| 現象 | 是哪條線 | 去哪看 |
+|---|---|---|
+| 一台 mon 一直洗 `clocks are too skewed`、`ceph -s` 少一個可讀 mon，但**沒有**反覆 election | 線 1，某 peon 領先 leader `> mon_lease`(5s) | mon log：`clocks are too skewed`；**不會**看到反覆 `calling new election`（穩態 skew 不 churn） |
+| mon 反覆 flap / `calling new election` | **不是穩態 skew**：lease 訊息斷流 ≥10s 或時鐘跳變 | mon log：`lease_timeout -- calling new election`；查網路分區 / leader 卡住 / NTP 剛跳 |
+| OSD 起不來、一直重啟到 `exit(1)` | 線 2 方向 A，OSD 比 mon 快到 1hr+ | OSD log：`unable to obtain rotating service keys`、`maybe I have a clock skew against the monitors`、`rotating keys expired way too early` |
+| 一台時間錯很多的 mon 校時跳回後，懷疑 OSD 掉線 | 線 2 方向 B（**假說**，source 不支持大量掉線） | 先確認是不是別的原因；source 層預期是 rotation 凍結而非掉線，真要下結論需真機驗證 |
+| OSD 之間 heartbeat 慢、read lease 進 `laggy` | 不是 skew | 這是 latency 不是時鐘差，看 [cluster-time-skew-impact](./cluster-time-skew-impact) |
+
+兩個常見誤判：**（1）** 穩態 MON↔MON skew 造成的是「某 peon 不可讀」，**不是** mon 反覆重選（把 flap 直接歸因 skew 會查錯方向）；**（2）** client I/O 斷掉**通常不是** ticket 因 skew 過期（client ticket 免疫）。
+
+## 原始碼路徑一覽（修正版）
+
+| 線 | 入口 | 門檻 / 效果 |
+|---|---|---|
+| MON-MON 偵測 | `Monitor::timecheck_has_skew()`（`Monitor.h:592`）→ `HealthMonitor` | `skew_bound > 50ms` → `MON_CLOCK_SKEW` WARN，不升 ERR |
+| MON-MON lease（**修正**） | `Paxos::extend_lease()`（`:979`）/ `handle_lease()`（`:1118`）/ `is_lease_valid()`（`:1514`）/ `is_readable()`（`:1481`） | peon 領先 leader `> mon_lease`(5s) → `is_lease_valid` 恆 false → **該 peon 永久不可讀**（非 election churn） |
+| MON-MON election churn | `reset_lease_timeout()`（`:1206`）/ `lease_timeout()`（`:1215`） | 觸發條件＝lease 訊息**斷流 ≥10s**（2×`mon_lease`）或時鐘跳變，**非**穩態 skew |
+| MON-MON log | `Paxos::warn_on_future_time()`（`:1025`） | `> 50ms` 寫 cluster log（非 health check） |
+| MON-OSD 方向 A | `KeyServer::_rotate_secret()` / `MonClient::_check_auth_rotating()`（`:1103`）/ `OSD::init() wait_auth_rotating`（`OSD.cc:4068`） | OSD 比 mon 快到 1hr 級 → secret 太舊 → 啟動重試 10 次 `exit(1)` |
+| MON-OSD 方向 B（**修正**） | `_rotate_secret()`（`CephxKeyServer.cc:180`）/ `need_new_secrets(now)`（`Auth.h:324`）/ `RotatingSecrets::add()`（`Auth.h:314`） | mon 跳回 → `need_new_secrets(now)` false → **不 rotate、不淘汰** → rotation 凍結（非大量掉線；`verify_authorizer` 失敗前提不成立） |
+| OSD-OSD | `heartbeat_check()`（本機 wall 同機比較，`OSD.cc:6151`）/ `OSDService::get_mnow()`（mono，`OSD.cc:331`）/ `HeartbeatStamps` delta（`PeeringState.h:119`） | 無 clock-skew 門檻 |
+| （對照）client ticket | `CephXTicketHandler`（`CephxProtocol.cc:199`/`215`） | 同機蓋、同機檢查 → skew 免疫 |
+
+## 相關閱讀
+
+- [Ceph — 10ms 到 5s 的 clock skew 與 heartbeat latency](./cluster-time-skew-impact) — 毫秒級 pair-by-pair 矩陣、heartbeat *latency* 跟 clock *offset* 的差別
+- [Ceph — MON clock 漂移多久後 ceph -s 才變 HEALTH_WARN](./mon-clock-skew-detection) — 50ms WARN 那條線的偵測延遲（平均 ~2.5 分、最壞 ~5 分）
+- [Ceph — quorum 失守的 I/O 衝擊真機報告](./mon-quorum-loss-io-lab) — lease/quorum 機制底 + fio 實證，以及 1hr cephx ticket TTL 在「mon 掛掉」（非 skew）情境下的角色
+- [systemd-timesyncd — service 重啟對系統時間的影響](/systemd/features/timesyncd-restart-impact) — 是誰在修這些 skew：timesyncd 的 slew / jump 邊界與重啟行為

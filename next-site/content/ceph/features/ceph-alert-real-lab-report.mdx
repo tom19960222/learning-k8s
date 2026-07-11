@@ -1,0 +1,457 @@
+---
+layout: doc
+title: Ceph — alert 規則真機故障注入收官報告（RL-01…RL-22＋Tier D 先導，as-of 2026-07）
+description: 把 Tier D 先導 5 場（2026-06-26）與 real-lab 22 場故障注入（2026-07-04~06）整理成一份給沒參與的人只讀這一頁就懂的報告。在 cephadm v19.2.3 的 6-host lab（3 mon host＋3 OSD host，共 9 OSD）上，22 場均在「其當時最終 rules 版本」下通過並送達正確 receiver（rules 橫跨 3 個 commit，詳見 G-4）——不是一次 snapshot 驗完全部；RL-11 是 PASS*（in-run 只復原到 HEALTH_WARN=BlueStore latch）。含逐場五欄證據（全對 EVIDENCE-INDEX ledger）、16 個只有真機現形的發現、以及 OSD_FLAGS≠OSDMAP_FLAGS 與 mgr 凍結兩個機制級盲區。取代 prometheus-alert-real-lab-findings 與 prometheus-alert-real-cluster 兩篇舊頁。
+category: experiment-report
+---
+
+## 本頁定位
+
+- **文章類型**：experiment-report（研究收官報告）。把「這套 Ceph alert 設計搬上真 cephadm 叢集做故障注入」這批研究的規劃、預測、逐場證據與誠實缺口整理成一份**給沒參與的人只讀這一頁就懂**的報告。
+- **這是日期化快照（as-of 2026-07）**，分兩期，本頁全程標明是哪一期：
+  - **Tier D 先導（2026-06-26，編號 TD-01…TD-05）**：先在真 ceph 上跑 baseline＋5 個維護／故障情境，回答 dev 端答不了的「ceph **實際**升哪些 health check」。這期抓到兩個機制級 bug。
+  - **real-lab 22 場（2026-07-04~06，編號 RL-01…RL-22）**：把 alert 規則集逐條做真實故障注入、驗 firing＋送達 receiver＋復原到 `HEALTH_OK`。
+- **版本錨點**：ceph **v19.2.3**（Squid LTS），同一座 lab（fsid `0c9bf37e`）。拓樸是 **6 個實體 host**——3 個 mon host（`.166`／`.167`／`.164`）＋ 3 個 OSD host（`.169`／`.171`／`.174`，每台 3 顆 OSD＝共 9 OSD），mgr active＋1 standby。**舊頁把它寫成「3-node」是錯的**，別沿用。監控 stack：Prometheus `v3.2.1`＋Alertmanager `v0.28.1`＋`alert-sink` webhook（三路 receiver＝`pager`／`slack`／`watchdog`）。
+- **閱讀前提（最多 2 篇）**：
+  - **必讀 1 篇**：[Ceph — 現行 alert policy](./ceph-alert-policy-current)。**規則本體、每條的 name／severity／routing、排除清單的實際內容都在那頁。本頁刻意不內嵌完整規則 YAML**（理由見 [§6](#6-v1--v2-規則演進最終規則指向-policy-頁)）。
+  - **可選 1 篇**：[Ceph — alert 驗證方法論（四層）](./ceph-alert-validation-methodology)。dev 端 Tier A/B/C 怎麼驗、四層分工的哲學。本頁是它的真機 Tier D＋故障注入延伸，引用不重述。
+- **證據層級**：本頁**以 T3（真機）為主**。`T1`＝pinned 原始碼一定如此；`T2`＝官方文件／GitHub 逐版比對；`T3`＝在真 cephadm v19.2.3 lab 上實際注入量到。逐場證據全部是 T3。
+- **本頁取代兩篇舊頁**：
+  - `prometheus-alert-real-lab-findings`（22 場＋16 發現）：敘事有價值，但**內嵌了一整份會過時的規則 YAML 快照**、且同頁在「27 條驗完」與逐場細節之間自相矛盾。
+  - `prometheus-alert-real-cluster`（Tier D 先導 5 場）：內容健康，但編號 S1–S5 與前者的 S1–S22 撞名、又把叢集稱作「3-node」。
+  - 兩頁的數字與敘事都已對回下方三個 git 內 ledger 逐一核過、搬進本頁，之後將標 archive。
+- **原始數據存放**：每場的 raw evidence（`results/` 下的 `run_capture`、`prometheus-alerts-*.json`、sink log…）**只在本機、被 `.gitignore` 擋掉不進 git**。git 內可查證的三個來源是——`experiments/ceph-alert-real-lab/EVIDENCE-INDEX-2026-07.md`（22 場 machine-readable 總帳，**本頁 22 場數字的唯一來源**）、`experiments/ceph-alert-rules/tests/tierD-realceph/results/observations.md`（Tier D 5 場真機觀測）、`experiments/ceph-alert-real-lab/EVIDENCE-SUMMARY-2026-07-04.md`（最初 3 場 v1）。本頁每個數字都對得回這三檔。
+
+## 這份報告怎麼讀
+
+**趕時間**：直接看 [§2 規劃總覽](#2-規劃總覽)（哪些場、驗哪條 alert、過沒過）＋ [§3 逐場五欄證據](#3-逐場五欄證據每場注入預期實際rollbackverdict)。想知道某場「怎麼證的」再往下讀。
+
+**各節導覽**：§1 前提（緣起、判準、lab 拓樸、rules 版本演進、receiver 鏈）→ §2 規劃總覽（22 場＋Tier D 5 場對帳、ledger 缺口誠實列出、29 條 rule↔場景覆蓋對照）→ §3 逐場五欄證據 → §4 16 個真機才抓到的發現 → §5 兩個機制級盲區（發現一／發現二）→ §6 v1→v2 演進與「為什麼不內嵌 YAML」→ §7 總結 → §8 侷限、事故與開放問題。
+
+**代號與術語**（第一次出現在這裡定義清楚，全文沿用）：
+
+- **RL-01…RL-22**：real-lab 22 場故障注入的**本頁編號**。它與 ledger（`EVIDENCE-INDEX`）的舊編號 **S1–S22 一一對應**（RL-0N＝ledger SN），也對應舊 `prometheus-alert-real-lab-findings` 頁的 S1–S22。
+- **TD-01…TD-05**：Tier D 先導 5 場的**本頁編號**，對應 `observations.md` 與舊 `prometheus-alert-real-cluster` 頁的 S1–S5。
+- **G-1…G-7**：ledger「先講醜話」節裡的 7 條**誠實保留**（缺口／代送／synthetic 驗證…）。**G-4（rules 版本橫跨 3 commit）在 §1 的 rules 演進表展開，其餘六條集中在 §2.3**；本頁另在對應場景如實帶出，不藏。
+- **PASS / PASS***：`PASS`＝該場全部斷言（含復原到 `HEALTH_OK`）在 raw 檔可稽核；`PASS*`＝正向斷言全過但 in-run 沒有 `HEALTH_OK` 復原證據（只有 RL-11，見 G-1）。
+- **receiver**：`alert-sink` 的三條路——`pager`（critical，值班被叫醒）、`slack`（warning／info，非叫醒）、`watchdog`（dead-man switch 心跳）。routing 由 label 決定，規則在 [policy 頁](./ceph-alert-policy-current)。
+- **故障類別 A–F**（沿用舊頁分類，供 §2／§3 分章）：**A** 監控系統自身失明、**B** 硬體（磁碟延遲／容量）、**C** 網路（心跳／抖動／時鐘）、**D** 軟體／daemon（crash／failover／可用性）、**E** 資料完整性、**F** client I/O 生命線＋監控核心。
+- **rule 名**：`CephClientBlocked`（client I/O 被擋）、`CephClientRisk`（catch-all 風險 check）、`CephMonQuorumLost`（quorum 生命線）、`CephMonDownScoped`／`CephOSDDaemonDownScoped`／`CephOSDHostDownScoped`（帶 `hostname`／`ceph_daemon` 的 scoped down）、`CephMetricsAbsent`／`CephExporterAllDown`（監控盲區）、`CephMgrNoStandby`（failover 能力）、`CephLowPriorityNotice`（低優先 slack-only）、`CephOSDSlowHeartbeat`／`CephOSDFlapping`／`CephMonClockSkew`／`CephOSDLatencyOutlier`／`CephDaemonSlowOps`／`CephDaemonRecentCrash`／`CephOSDNearFull`／`CephOSDBackfillFull`／`CephMonDiskLow`／`CephMonDiskCritical`／`CephPoolNearQuota`／`CephCapacityForecast`／`CephDataDamage`／`CephObjectUnfound`／`CephPGUnhealthyStates`、`Watchdog`（恆 firing 心跳）、`CephHealthError`（保留的 upstream 預設）、`CephMonQuorumLostExternal`（out-of-band quorum 探針，TD-05 產出）。每條的完整 expr 與 routing 在 [policy 頁](./ceph-alert-policy-current)。
+- **promtool／amtool**：Prometheus 與 Alertmanager 的官方 CLI。`promtool test rules` 跑規則的單元測試（dev 端 Tier A）；`amtool` 驗 routing 合約與下 silence（Tier B／C）。
+- **F1**：dev 期 promtool 抓到的 bug **代號**——早期 `count(ceph_mon_quorum_status == 1) < 2` 在「全部 mon 都 = 0」時，內層 `==1` 過濾成空 vector、`count(空)` 是「無 sample」而非 0，比較算不出結果、規則靜默。用 `or vector(0)` 修好（見下一條）。§5.2 拿它跟發現二對照層級。
+- **`or vector(0)`／empty-series 路徑**：PromQL 手法——左式評估不出任何 series 時 fallback 成常數 0，讓「series 整個消失」也能參與比較而觸發告警。本頁說某場「走 empty-series 路徑」，指的是 exporter 死掉、series 變空之後靠這個 fallback 讓規則 fire。
+- **inhibit**：Alertmanager 的抑制機制——某條 alert firing 時**壓制**另一條相關 alert 的通知（例：quorum-lost 壓掉個別 mon-down，免得重複吵），被壓的 alert 狀態顯示 `suppressed`。
+- **`predict_linear`**：PromQL 函式，對一段時間窗的序列做線性回歸、外推未來值。RL-18 用它把用量成長斜率外推 72 小時驗容量預測告警。
+- **sentinel object**：測試 pool 裡刻意放的一顆「定位用」object——先查出它的 acting set（負責存它的那組 OSD），故障注入就能精準打中會影響它的那幾顆 OSD（RL-02／RL-19／RL-20 用此法）。
+- **k0s／Rook external**：k0s 是輕量 Kubernetes 發行版；lab 用一台單 node k0s 跑 Rook operator、以 **external 模式**連到這座 cephadm 叢集。Rook 的 `CephCluster` 資源回報 `Connected`＋`HEALTH_OK`，被當成一路獨立的健康 gate。
+
+<Callout type="warning" title="一個必守的讀法：「22/22」不是一次 snapshot 驗完（G-4）">
+  本頁最容易被誤讀的一句就是「22/22 通過」。正確解讀是——**每一場都在「它自己的最終 rules 版本」下通過，而不是拿單一 rules snapshot 一次跑綠全部**。這 22 場橫跨 **3 個 rules commit**（`5a01a77` → `efcf5bb` → `23314bc`，時間軸見 [§1](#rules-集版本演進g-4)）：RL-01 的最終 PASS 用的是 `efcf5bb` 重設計後的 `CephDaemonSlowOps`（前三次即因舊版 spiky gauge 失敗）、RL-19 的 PASS 用的是 `23314bc` 窗化後的 `CephDataDamage`（前兩次失敗）。所以**不要**把它壓縮成「一次驗完 27（或 29）條規則」——那是不實的。另外 **RL-11 是 `PASS*`**：正向斷言全過，但 in-run 只復原到 `HEALTH_WARN`（BlueStore latch），`HEALTH_OK` 是跨 run 的證據（G-1）。
+</Callout>
+
+## 1. 前提
+
+### 緣起：dev 四層證明「規則邏輯對」，真機證明「ceph 的事實對不對得上規則的假設」
+
+這套 alert 設計在 dev 端已用四層測試（promtool／amtool／live／真 ceph 的前三層）逐條驗過（見[驗證方法論頁](./ceph-alert-validation-methodology)）。但 dev 餵給 promtool 的是**手刻的合成 series**——它能精準驗 `for:` 邊界、`count()` 空 vector 語意、`unless` 去重，卻**無法驗「ceph 在那個情境到底會不會升那個 health check、升的是哪個名字、metric 在真故障當下長什麼樣」**。本頁補的就是那一半：
+
+1. **Tier D 先導（TD-01…TD-05）**：先確認 ceph 真的匯出設計假設的 label、維護／故障實際升哪些 health check、scoped silence／去重／monmap 持久化在真機成不成立。
+2. **real-lab 22 場（RL-01…RL-22）**：把每條 alert 用**現實世界會發生的真故障**做出來，驗它 firing、送達正確 receiver、且叢集能乾淨復原。
+
+### 判定標準（先於實驗定案）
+
+real-lab 每場的 PASS 判準由 `scenario_verify` 原始碼定義，**五條全過才算 PASS**（逐場證據見 §3，全部對 `EVIDENCE-INDEX` 的 raw 檔）：
+
+1. 每個目標 alert 在 `prometheus-alerts-<alert>-<label>.json` 有 `state="firing"` 的 row（含 label 匹配）；
+2. 每個目標在 `sink-since-checkpoint.log` 有對應 `receiver`＋`alertname` 的 JSON row；
+3. 每個 negative 斷言（`assert_..._not_firing` / `assert_sink_absent`）的目標在對應 raw 檔中**不存在** firing／row；
+4. 有 ceph 端斷言的場，`health-check-<CHECK>.txt` 存在且含該 check 行；
+5. `recovery/ceph-ready.txt` 回 `HEALTH_OK`、`rook-cephcluster-ready.txt` `Connected`＋`HEALTH_OK`、`prometheus-up-ceph.json` `up{job="ceph"}==1`。
+
+RL-11 卡在第 5 條（in-run 停在 `HEALTH_WARN`）→ 記為 `PASS*`。
+
+**Tier D 的 `for:` 是縮短版（5m→30s）**：Tier D 是為了看「ceph 升哪些 check、規則接不接得上」，不是量 `for:` 邊界（那是 dev promtool 的工作）。為了讓每個 degradation 視窗短、能快速還原，Tier D 把 `for:` 縮成 30s。所以下方 TD 場景寫的「35s firing」是**縮短版**觀測值，讀作「規則確實接上並 fire 了」，**不要**讀成 production 的告警延遲。
+
+### lab 拓樸（讀自各 run 的 `baseline/ceph-s.txt`）
+
+| 角色 | daemon | host（IP） |
+|---|---|---|
+| MON × 3 | mon.ceph-lab-mon-01 / -02 / -03 | ceph-lab-mon-01/02/03（`.166`／`.167`／`.164`）|
+| mgr × 2 | active＋1 standby（mgr 只在 mon host 上）| — |
+| OSD × 9 | osd.0–2 / osd.3–5 / osd.6–8 | ceph-lab-osd-01 / -02 / -03（`.169`／`.171`／`.174`）|
+
+Rook external（單 node k0s）以 `rook-cephcluster.txt` 顯示 `Connected`＋`HEALTH_OK` 當一路健康 gate。監控 stack 部署在 lab k8s namespace `ceph-alert-lab`。
+
+### rules 集版本演進（G-4）
+
+22 場**不是在單一 rules snapshot 下跑完的**——rules 在戰役中被修了兩次。這是「22/22」那句話的最重要 caveat：
+
+| rules commit | UTC 時間 | 改了什麼 | 適用的 run |
+|---|---|---|---|
+| `5a01a77`（＋`cb7b036` coverage v2＝18 條 `ceph-production-coverage` 規則加入）| 2026-07-04 15:35Z | monitoring v2＋inhibit rules | 07-05 17:38Z 起第一批：RL-09/21/13/08/07/04/06/05/14/15，及 RL-01 前三次失敗 |
+| `efcf5bb` | 2026-07-05 22:15Z | `CephDaemonSlowOps` 改 windowed max（spiky gauge 修正）| RL-01 最終 PASS（22:19Z）起至 07-06 09:52Z 前：RL-11/12/02/17/16/18，及 RL-19 第一次失敗 |
+| `23314bc` | 2026-07-06 09:52Z | data-integrity health alerts 窗化（transient mgr export 修正）| 07-06 09:53Z 後：RL-19 兩次 PASS/20/10/03。RL-19 第二次失敗跑在哪一版無法從 raw 斷定 |
+
+raw 硬證據：`rendered/monitoring.yaml`（本機，mtime 07-06 09:53Z）內嵌的四份 rules 檔與 `23314bc` 的現檔**逐字元一致**（已逐一 diff）；更早兩段是由 commit 時間軸推定（raw 沒留每次 redeploy 的 manifest 快照）——此為誠實限制。
+
+### receiver 鏈
+
+`alert-sink` 是一個 python webhook，Alertmanager 依 label routing 把 alert 送到三條 receiver：`pager`（`severity=critical` 的自訂 rule＋upstream `CephHealthError`）、`slack`（warning／info 與 aggregate context）、`watchdog`（只收恆 firing 的 `Watchdog`，餵外部 dead-man switch）。每場的 receiver 證據＝`sink-since-checkpoint.log` 裡的 JSON row（含 `receiver`／`alertname`／`severity`）。完整 routing 樹在 [policy 頁](./ceph-alert-policy-current)。
+
+## 2. 規劃總覽
+
+### 2.1 real-lab 22 場對帳（RL-01…RL-22，按故障類別）
+
+每列：本頁編號（＝ledger `S#`）／場景／類別／驗證的 alert（→receiver）／事前預期／verdict。逐場注入與證據在 [§3](#3-逐場五欄證據每場注入預期實際rollbackverdict)。**全部 PASS，其中 RL-11 為 PASS***（G-1）。
+
+| 編號 | 場景 | 類別 | 驗證的 alert（→receiver） | 事前預期 | verdict |
+|---|---|---|---|---|---|
+| RL-01 | slow-ops | F/B | `CephClientBlocked{SLOW_OPS}`→pager · `CephDaemonSlowOps{osd.4}`→slack | 限速 backing device＋高並發 rados bench 撐滿 op queue → 兩者 firing | ✅ PASS |
+| RL-02 | pg-availability | F/E | `CephClientBlocked{PG_AVAILABILITY}`→pager · `CephPGUnhealthyStates`→pager | 停 acting set 兩顆 OSD → PG 掉到 min_size 下 → 兩者 firing | ✅ PASS |
+| RL-03 | mon-quorum-lost | F | `CephMonQuorumLost`→pager（＋inhibit `CephMonDownScoped`）| 停 2 mon＋active mgr 走 empty-series → firing；inhibit 生效 | ✅ PASS（inhibit＝synthetic，G-2）|
+| RL-04 | osd-daemon-down | D | `CephOSDDaemonDownScoped{osd.0}`→pager | 停單顆 OSD → daemon-scoped firing、host-scoped **不**誤叫 | ✅ PASS |
+| RL-05 | osd-host-down | D | `CephOSDHostDownScoped{ceph-lab-osd-02}`→pager | 停整台 3 顆 → host-scoped firing、3 顆 daemon-scoped **都不**誤叫（驗 `unless` 去重）| ✅ PASS |
+| RL-06 | mon-down-single | D | `CephMonDownScoped{mon-03}`→pager | 停單台 mon → scoped firing、`CephMonQuorumLost` **不**誤叫 | ✅ PASS |
+| RL-07 | exporter-blind | A | `CephMetricsAbsent`＋`CephExporterAllDown`→pager | disable mgr prometheus module → 兩者 firing | ✅ PASS |
+| RL-08 | mgr-failover | D | `CephMgrNoStandby`→slack | `ceph mgr fail`＋停 standby → metrics 不中斷、no-standby firing | ✅ PASS |
+| RL-09 | catch-all-risk | D | `CephClientRisk{OSD_NO_DOWN_OUT_INTERVAL}`→pager | 設危險 config → catch-all firing | ✅ PASS |
+| RL-10 | low-priority-notice | D | `CephLowPriorityNotice{OSDMAP_FLAGS}`→slack | 設 `noout` → info-only firing、**pager 靜默**（走 `for:30m`）| ✅ PASS |
+| RL-11 | latency-outlier | B | `CephOSDLatencyOutlier{osd.7}`→slack | 輕度限速＋長時寫入 → latency outlier firing、pager 靜默 | ✅ PASS*（G-1）|
+| RL-12 | net-slow-heartbeat | C | `CephOSDSlowHeartbeat`→pager | `tc netem delay 1200ms` → slow-heartbeat firing | ✅ PASS |
+| RL-13 | mon-clock-skew | C | `CephMonClockSkew`→pager | 停 chrony＋撥快 2s → clock-skew firing | ✅ PASS |
+| RL-14 | daemon-crash | D | `CephDaemonRecentCrash`→slack | 真 SIGSEGV 打進 ceph-osd → recent-crash firing、pager 靜默 | ✅ PASS（crash 手動代送，G-3）|
+| RL-15 | osd-flapping | C | `CephOSDFlapping{osd.1}`→pager | OSD stop/start ×2（4 次 transition）→ flapping firing | ✅ PASS |
+| RL-16 | capacity-ladder | B/F | `CephOSDNearFull`→slack · `CephOSDBackfillFull`＋`CephClientBlocked{OSD_FULL}`＋`CephHealthError`→pager | 動態調三階 ratio＋爬梯寫入 → 逐階 firing | ✅ PASS |
+| RL-17 | pool-quota | B/F | `CephPoolNearQuota`→slack · `CephClientBlocked{POOL_FULL}`→pager | 寫爆 pool quota → 兩階 firing | ✅ PASS |
+| RL-18 | capacity-forecast | B | `CephCapacityForecast`→slack | 3 條並行連續 bench 拉出成長斜率 → 趨勢預測越 85% firing | ✅ PASS |
+| RL-19 | data-damage | E | `CephDataDamage{OSD_SCRUB_ERRORS,PG_DAMAGED}`→pager | `objectstore-tool set-bytes` 損毀單一 replica → deep-scrub → firing | ✅ PASS |
+| RL-20 | object-unfound | E | `CephObjectUnfound{OBJECT_UNFOUND}`→pager | size=2/min_size=1 誘發 unfound → firing | ✅ PASS |
+| RL-21 | mon-disk-low | B | `CephMonDiskLow`→slack · `CephMonDiskCritical`→pager | 動態推導門檻兩階注入 → 逐階 firing | ✅ PASS |
+| RL-22 | watchdog | A | `Watchdog`→watchdog | 部署後即斷言心跳必達（dead-man switch）| ✅ PASS（G-7）|
+
+### 2.2 Tier D 先導 5 場對帳（TD-01…TD-05）
+
+先導期（`for:` 縮短版）驗的是「ceph 端事實對不對得上規則假設」。**核心機制全部成立、抓到兩個機制級 bug**（發現一／發現二，見 §5）。
+
+| 編號 | 場景 | 驗的假設 | 結果 |
+|---|---|---|---|
+| TD-01 | 單顆 OSD down（停 osd.8）| scoped join 接得上 hostname、單顆不誤觸 host-down | ✅ `CephOSDDaemonDownScoped{osd.8, ceph-lab-osd-03}` 35s firing；host-scoped 不 fire |
+| TD-02 | 整台 OSD node 維護（enter maintenance）| 整台 down 的去重、silence、維護噪音不 page | ✅ host-scoped firing／daemon-scoped 被壓／silence 有效；🔴 **`CephClientRisk{OSD_FLAGS}` firing＝發現一** |
+| TD-03 | 單台 mon 維護（mon-03）| stopped mon 仍在 monmap 匯出 metric、`MON_DOWN` 被正確排除 | ✅ `CephMonDownScoped{mon-03}` firing、`CephMonQuorumLost` 不 fire、metric＋metadata 都在 |
+| TD-04 | 真 quorum loss（停 mon-03＋mon-01）| `CephMonQuorumLost` 是不是 quorum 失守生命線 | 🔴🔴 **mgr metric 凍結 90s、`count==3` 不變、什麼都不 fire＝發現二** |
+| TD-05 | 發現二的緩解（out-of-band 探針）| out-of-band 能否在 mgr 盲掉處 fire | ✅ `CephMonQuorumLostExternal`（探 mon port 3300）在同一刻 35s firing |
+
+### 2.3 ledger 缺口與誠實保留（G-1…G-7）
+
+22 場都找得到完整 run，但以下事項必須誠實標注（G-4＝rules 版本，已在 §1）。這些不是「沒過」，是「過的方式帶保留」：
+
+| 代號 | 場景 | 誠實保留 |
+|---|---|---|
+| G-1 | RL-11 | 唯一沒有 in-run `HEALTH_OK` 復原證據的場。正向斷言全過，但 rollback 後最後一次輪詢仍是 `HEALTH_WARN`（BLUESTORE_SLOW_OP_ALERT 的 24h latch）；`HEALTH_OK` 證據是**跨 run** 的——下一場 RL-12 的 ready gate（`23:14:15Z` 顯示 `HEALTH_OK`）。latch 清除 helper 當時尚未接進本場。故 verdict＝`PASS*`。 |
+| G-2 | RL-03 | inhibit 證據是 **synthetic**。真 quorum lost 時 mgr exporter 凍結，`CephMonDownScoped` 的 expr 無資料可算，兩條 alert 在真故障中永不重疊（`11:35Z` 那次 run 就是這樣 fail 的）。最終 PASS 改用 synthetic POST 直打 Alertmanager 驗 inhibit 設定：`alertmanager-alerts-CephMonDownScoped.json` 顯示 synthetic alert `suppressed`、`inhibitedBy:["c425f3928619a998"]`。驗的是設定本身，不是真 fault 的抑制行為。 |
+| G-3 | RL-14 | crash 上報是**手動代送**。SIGSEGV 真的打在真 ceph-osd process（crash spool 出現新 dir 為證），但這座 lab 的 `ceph-crash` sidecar 壞掉（無 `client.crash` auth），crash meta 由 harness 從 spool 讀出、經 admin shell `ceph crash post` 代送。被替代的只有傳輸層，fault 本身是真的。 |
+| G-5 | RL-03/05/07/08/11/15/18 | `scenario_verify` 原始碼不含 `wait_ceph_health_check`，故 raw 無 `health-check-*.txt`（§3 對應列標「無 health-check 檔」並說明該場 ceph 端證據實際是什麼）。 |
+| G-6 | RL-10/16/18… | sink log 有跨場殘留：Alertmanager 的 resolve／repeat 通知會落到下一場 checkpoint 後（例如 RL-10 的 log 內有前一場 RL-20 的 pager rows）。各場斷言只檢查自己的目標 alert，副作用 rows 如實留在 raw。 |
+| G-7 | RL-22 | 07-04 的舊 baseline 是 v1 harness（無 watchdog sink 斷言）；RL-22 的 PASS 證據取 07-05 的 baseline。 |
+
+多場在最終 PASS 前有失敗重試（RL-01×3、RL-18×9 最難搞、RL-15×2、RL-19×2，另有 RL-03/08/14/16/17 各 1）——全部列在 ledger「逐場明細」的重試史，無一場「找不到完整 run」。（RL-12 不在這份名冊：ledger 記其重試史為「無」、run of record 一次 PASS——發現 09 的 rollback 自斷 SSH 是 **in-run 事件**、非失敗重試，詳見 §4 發現 09。）
+
+### 2.4 現行 29 條 rule ↔ 場景覆蓋對照
+
+反向索引：現行 rule 集（[policy 頁](./ceph-alert-policy-current) 的 29 條）各自被哪些場景驗過。資料對自 policy 頁各 rule 的驗證狀態欄與本頁兩套 ledger。**29 條中有 27 條至少有一個專屬真機場景；2 條沒有**（`CephExporterTargetDown`、`CephMonQuorumLostDynamic`），下表明寫、不含糊。
+
+| 群組（rules 檔） | Rule | 真機場景（本頁編號） |
+|---|---|---|
+| `ceph-stability-first` | `CephClientBlocked` | RL-01（`SLOW_OPS`）、RL-02（`PG_AVAILABILITY`）、RL-16（`OSD_FULL`）、RL-17（`POOL_FULL`）|
+| | `CephClientRisk` | RL-09（`OSD_NO_DOWN_OUT_INTERVAL`）；TD-02／TD-03 驗排除清單（含 `OSD_FLAGS` 修正，§5.1）|
+| | `CephMonQuorumLost` | RL-03（empty-series 路徑 fire）；TD-04（真失守時**盲**——架構盲區，§5.2）|
+| | `CephExporterAllDown` | RL-07 |
+| | `CephExporterTargetDown` | **無專屬注入場景**（RL-07 注入的是 all-down）——Tier A/B 覆蓋，驗證狀態見 policy 頁 |
+| | `CephLowPriorityNotice` | RL-10（`OSDMAP_FLAGS`）；TD-02（`HOST_IN_MAINTENANCE`／`PG_DEGRADED`）|
+| `ceph-scoped-availability` | `CephOSDHostDownScoped` | RL-05；TD-02（silence 真機有效）|
+| | `CephOSDDaemonDownScoped` | RL-04；TD-01 |
+| | `CephMonDownScoped` | RL-06；TD-03；另 RL-03 的 inhibit 端＝synthetic（G-2）|
+| `ceph-production-coverage` | `CephMetricsAbsent` | RL-07；RL-08（negative：failover 中僅 pending 不 firing）|
+| | `Watchdog` | RL-22（baseline 管線驗證）|
+| | `CephOSDSlowHeartbeat` | RL-12 |
+| | `CephOSDFlapping` | RL-15 |
+| | `CephMonClockSkew` | RL-13 |
+| | `CephOSDLatencyOutlier` | RL-11（PASS*，G-1）|
+| | `CephDaemonSlowOps` | RL-01（`efcf5bb` 重設計後）|
+| | `CephDaemonRecentCrash` | RL-14（crash 傳輸層代送，G-3）|
+| | `CephMgrNoStandby` | RL-08 |
+| | `CephOSDNearFull` | RL-16 |
+| | `CephOSDBackfillFull` | RL-16 |
+| | `CephMonDiskLow` | RL-21 |
+| | `CephMonDiskCritical` | RL-21 |
+| | `CephPoolNearQuota` | RL-17 |
+| | `CephCapacityForecast` | RL-18 |
+| | `CephDataDamage` | RL-19（`23314bc` 窗化後）|
+| | `CephObjectUnfound` | RL-20 |
+| | `CephPGUnhealthyStates` | RL-02 |
+| `ceph-mon-quorum-dynamic` | `CephMonQuorumLostDynamic`（非 3-mon cluster 用的動態 majority 變體）| **無真機場景**——3-mon lab 無從注入；promtool 覆蓋，見 policy 頁 |
+| `ceph-mon-external` | `CephMonQuorumLostExternal` | TD-05（mgr-based 規則盲掉的同一刻正確 fire）|
+
+另保留的 upstream 預設 `CephHealthError` 由 RL-16 驗過（`OSD_FULL` 觸發 `HEALTH_ERR` → pager）。
+
+## 3. 逐場五欄證據（每場：注入／預期／實際／rollback／verdict）
+
+每格都對得回 `EVIDENCE-INDEX` 的 22 場總表與逐場明細（raw 檔名一併給出）。「注入」讀自 `run_capture` 的 `# command:` 標頭；activeAt 取自該場 `prometheus-alerts-*.json` 的 firing row。按故障類別分章。
+
+### 3.A 監控系統自身失明（RL-07、RL-22）
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-07** exporter-blind | `ceph mgr module disable prometheus`（`disable-prometheus-module.txt`） | `CephMetricsAbsent`＋`CephExporterAllDown` firing→pager | 無 health-check 檔（G-5，故障點是 metrics 管線、ceph health 本就不變）；`postcheck/mgr-metrics-*.txt` 縮成 229B 錯誤回應。`CephMetricsAbsent`＋`CephExporterAllDown` firing（activeAt `19:03:22Z`），pager 兩者皆到。**副作用**：`CephMonQuorumLost` 也 firing 進 pager——exporter 全滅時 `or vector(0)` 的既知行為（v1 發現在 v2 規則下仍會發生，屬預期告警）。 | `rollback-enable-prometheus-module.txt`；`HEALTH_OK`（`19:08:40Z`）· ✅ PASS |
+| **RL-22** watchdog | 無注入（`Watchdog`＝`vector(1)` 恆 firing 的 dead-man switch，驗整條 Prometheus→Alertmanager→sink 管線）| watchdog receiver 收到 `Watchdog` | `ceph-s.txt` 部署時 `HEALTH_OK`；sink-since 有 `{"receiver":"watchdog","alertname":"Watchdog","severity":"none","source":"ceph_coverage"}`。activeAt 在後續各場的 prometheus json 可見（如 RL-09 檔內 `18:16:12Z`）。 | 無需 rollback（read-only）· ✅ PASS（G-7）|
+
+### 3.B 硬體：磁碟延遲／容量（RL-01、RL-11、RL-16、RL-17、RL-18、RL-21）
+
+RL-01 是整組研究的第一個好消息（`CephClientBlocked` 真的有用），也是 spiky gauge 教訓（發現 02）的來源；RL-11 是唯一的 `PASS*`（G-1）。
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-01** slow-ops | cgroup v2 `io.max` 把 osd.4（`.171`，`/dev/sdc`）限到 rbps/wbps＝262144（`throttle.txt`）＋ `rados bench -p alert-slow-ops 420 write -t 64`（`rados-bench.txt`） | `CephClientBlocked{SLOW_OPS}`→pager · `CephDaemonSlowOps{osd.4}`→slack | `health-check-SLOW_OPS.txt`：`SLOW_OPS: ... osd.4 has slow ops`（同檔另有 BLUESTORE_SLOW_OP_ALERT）。`CephClientBlocked{SLOW_OPS}` firing（activeAt `22:20:07Z`）→pager；`CephDaemonSlowOps{osd.4}` firing→slack。 | 還原 io.max＋殺 bench＋刪 pool＋清 BlueStore latch 6 檔；`HEALTH_OK`（`22:21:41Z`）· ✅ PASS |
+| **RL-11** latency-outlier | cgroup `io.max` 輕度限速 osd.7（`.174`，先 4MiB/s、重試段 1MiB/s）＋ `rados bench 1120 write -t 16` | `CephOSDLatencyOutlier{osd.7}`→slack；pager 靜默 | 無 health-check 檔（G-5）；`postcheck/ceph-health-detail.txt` 存 BlueStore latch 記錄。`CephOSDLatencyOutlier{osd.7}` firing（activeAt `22:44:52Z`）→slack。negative：`sink-absent` 8 個 pager rows 中無 `CephOSDLatencyOutlier`（那些 rows 是限速副作用 SLOW_OPS／BLUESTORE，G-6）。 | 還原限速＋殺 bench＋刪 pool；**in-run 只到 `HEALTH_WARN`**（BlueStore latch），`HEALTH_OK` 在下一場 RL-12 ready gate（`23:14:15Z`，G-1）· ✅ **PASS*** |
+| **RL-16** capacity-ladder | 量測最滿 OSD 使用率後動態設三階 ratio（nearfull 0.00173／backfillfull 0.00202／full 0.00231）＋ `rados bench 60s -t 64` ×8 輪爬梯 | `CephOSDNearFull`→slack · `CephOSDBackfillFull`＋`CephClientBlocked{OSD_FULL}`＋`CephHealthError`→pager | `health-check-OSD_NEARFULL.txt`（8 nearfull）／`health-check-OSD_FULL.txt`（`[ERR] 3 full osd(s)`）。四階 firing：NearFull（activeAt `01:17:37Z`）→slack、BackfillFull（`01:27:52Z`）→pager、`CephClientBlocked{OSD_FULL}`（`01:33:07Z`）→pager、`CephHealthError`（`01:33:06Z`）→pager。negative：NearFull 階段 pager 無 `CephOSDNearFull`（log 內 pager SLOW_OPS 為 bench 副作用，G-6）。 | 三階 ratio 還原 0.85/0.9/0.95＋刪 pool＋清 latch 6 檔；`HEALTH_OK`（`01:39:20Z`）· ✅ PASS |
+| **RL-17** pool-quota | pool `alert-quota` `max_bytes 33554432`（32MiB）；`put-near-quota-1..4` 塞到 81%；`put-past-quota-5..9`（帶 `timeout 30`）打滿 | `CephPoolNearQuota`→slack · `CephClientBlocked{POOL_FULL}`→pager | `health-check-POOL_FULL.txt`：`POOL_FULL: 1 pool(s) full`。`CephPoolNearQuota{alert-quota}` firing（activeAt `00:17:52Z`）→slack；`CephClientBlocked{POOL_FULL}` firing（`00:28:37Z`）→pager。 | 刪 pool＋清暫存檔；`HEALTH_OK`（`00:30:20Z`）· ✅ PASS |
+| **RL-18** capacity-forecast | 3 條並行連續 `rados bench` stream（各 ~301KB 輸出，撐滿整個注入窗）拉出 `ceph_cluster_total_used_bytes` 成長斜率 | `CephCapacityForecast`→slack；pager 靜默 | 無 health-check 檔（G-5；`predict_linear` 預測型 alert 本無對應 ceph check）；證據＝bench stream 輸出＋`postcheck/ceph-health-detail.txt`。`CephCapacityForecast` firing（activeAt `08:56:47Z`，走滿 `for:30m`）→slack。negative：pager 無 `CephCapacityForecast`（log 內 pager rows 為重負載副作用，G-6）。 | 殺 bench＋刪 pool＋清 latch 6 檔；`HEALTH_OK`（`09:32:50Z`）· ✅ PASS |
+| **RL-21** mon-disk-low | 依 mon-01 實測 `Use% 18%` 動態推導門檻（warn＝85、crit＝83）：`config-set-warn.txt`→`config-set-crit.txt` 兩階 | `CephMonDiskLow`→slack · `CephMonDiskCritical`→pager | `health-check-MON_DISK_LOW.txt`／`health-check-MON_DISK_CRIT.txt`（`[ERR] ... very low`）。`CephMonDiskLow` firing（activeAt `18:24:22Z`）→slack；`CephMonDiskCritical` firing（`18:34:37Z`）→pager。negative：Low 階段 pager 無 `CephMonDiskLow`。 | 兩階 config 還原預設；`HEALTH_OK`（`18:36:47Z`）· ✅ PASS |
+
+### 3.C 網路：心跳／抖動／時鐘（RL-12、RL-13、RL-15）
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-12** net-slow-heartbeat | `tc qdisc add dev ens18 root netem delay 1200ms`（`.174`；`armed-revert-liveness.txt` 證明 auto-revert 計時器已武裝）| `CephOSDSlowHeartbeat`→pager | `health-check-OSD_SLOW_PING_TIME.txt`：`OSD_SLOW_PING_TIME_FRONT: ... longest 1130.466ms`。`CephOSDSlowHeartbeat` firing（activeAt `23:15:37Z`）→pager。 | 拆 qdisc＋殺 armed sleeper；`HEALTH_OK`（`23:19:29Z`）· ✅ PASS |
+| **RL-13** mon-clock-skew | 停 mon-03 的 `chrony`（`stop-time-sync.txt`）＋`date -s '+2 seconds'`（`skew-clock-forward.txt`）| `CephMonClockSkew`→pager | `health-check-MON_CLOCK_SKEW.txt`：`clock skew detected on mon.ceph-lab-mon-03`。`CephMonClockSkew` firing（activeAt `18:40:52Z`）→pager。 | 撥回 2s＋重啟 chrony；`HEALTH_OK`（`18:43:51Z`）· ✅ PASS |
+| **RL-15** osd-flapping | osd.1（`.169`）連續 stop/start ×2 輪，每輪以 `osd-tree-poll` 與 `prometheus-osd-up-poll` 確認翻轉被 scrape 到 | `CephOSDFlapping{osd.1}`→pager | 無 health-check 檔（G-5）；證據＝`osd-tree-poll-1..4.json`（up/down 翻轉快照）。`CephOSDFlapping{osd.1}` firing（activeAt `20:42:37Z`）→pager。 | 確保 osd.1 最終 started；`HEALTH_OK`（`20:43:20Z`）· ✅ PASS |
+
+### 3.D 軟體／daemon（RL-04、RL-05、RL-06、RL-08、RL-09、RL-10、RL-14）
+
+這組主打 scoped 去重（RL-04 單顆 vs RL-05 整台）、failover 連續性（RL-08）、catch-all 與低優先分流（RL-09/RL-10）、真 crash（RL-14）。
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-04** osd-daemon-down | `systemctl stop ...@osd.0.service`（`.169`）| `CephOSDDaemonDownScoped{osd.0}`→pager；host-scoped 不叫 | `health-check-OSD_DOWN.txt`：`OSD_DOWN: 1 osds down`。`CephOSDDaemonDownScoped{osd.0}` firing（activeAt `19:09:39Z`）→pager；slack `CephOSDDown`。negative：`CephOSDHostDownScoped` 無 firing row（單顆不觸發 host-down）✔ | 啟 osd.0；`HEALTH_OK`（`19:15:19Z`）· ✅ PASS |
+| **RL-05** osd-host-down | 停 `.171` 整台 3 顆（osd.3/4/5）| `CephOSDHostDownScoped{ceph-lab-osd-02}`→pager；3 顆 daemon 都不叫（驗 `unless` 去重）| 無 health-check 檔（G-5）；證據＝`postcheck/ceph-health-detail.txt`＋prom 端 firing rows。`CephOSDHostDownScoped{ceph-lab-osd-02}` firing（activeAt `19:18:09Z`）→pager。negative：osd.3/4/5 均無 `CephOSDDaemonDownScoped` firing（host-down 時不逐顆叫）✔ | 啟三顆；`HEALTH_OK`（`19:24:26Z`）· ✅ PASS |
+| **RL-06** mon-down-single | 停 mon-03（`.164`，非 active-mgr 所在）| `CephMonDownScoped{mon-03}`→pager；quorum-lost 不叫 | `health-check-MON_DOWN.txt`：`1/3 mons down, quorum ...-01,...-02`。`CephMonDownScoped{mon.ceph-lab-mon-03}` firing（activeAt `19:16:24Z`）→pager。negative：`CephMonQuorumLost` 無 row（單 mon down 不觸發 quorum-lost）✔ | 啟 mon；`HEALTH_OK`（`19:17:20Z`）· ✅ PASS |
+| **RL-08** mgr-failover | `ceph mgr fail` 後停新 standby（`.167`）| metrics 不中斷；`CephMgrNoStandby`→slack | 無 health-check 檔（G-5）；證據＝`mgr-dump-after-fail.json`＋`mgr-failover-continuity.json`。`CephMgrNoStandby` firing（activeAt `18:57:22Z`）→slack。negative：`CephMetricsAbsent` 僅 `pending` 無 firing（failover 中 metrics 不中斷）✔；pager 無 `CephMgrNoStandby` ✔ | 啟 standby mgr；`HEALTH_OK`（`19:02:35Z`）· ✅ PASS |
+| **RL-09** catch-all-risk | `ceph config set mon mon_osd_down_out_interval 0` | `CephClientRisk{OSD_NO_DOWN_OUT_INTERVAL}`→pager | `health-check-OSD_NO_DOWN_OUT_INTERVAL.txt`：`... set to 0`。`CephClientRisk{OSD_NO_DOWN_OUT_INTERVAL}` firing（activeAt `18:17:52Z`）→pager。 | `config rm`；`HEALTH_OK`（`18:23:38Z`）· ✅ PASS |
+| **RL-10** low-priority-notice | `ceph osd set noout` | `CephLowPriorityNotice{OSDMAP_FLAGS}`→slack（info）；pager 靜默 | `health-check-OSDMAP_FLAGS.txt`：`noout flag(s) set`。`CephLowPriorityNotice{OSDMAP_FLAGS}` firing（activeAt `11:04:52Z`，走滿 `for:30m`）→slack（severity info）。negative：pager 無 `CephLowPriorityNotice`（log 中 pager rows 是前場 RL-20 殘留，G-6）✔ | `osd unset noout`；`HEALTH_OK`（`11:35:32Z`）· ✅ PASS |
+| **RL-14** daemon-crash | `kill -SEGV <真 ceph-osd PID>`（經 podman-init 父 PID 解析）；crash spool 出現新 crash；crash meta 手動代送（G-3）| `CephDaemonRecentCrash`→slack；pager 靜默 | `health-check-RECENT_CRASH.txt`：`1 daemons have recently crashed`。`CephDaemonRecentCrash` firing（activeAt `20:03:22Z`）→slack。negative：pager 無 `CephDaemonRecentCrash` ✔ | `ceph crash archive <id>`；`HEALTH_OK`（`20:08:55Z`）· ✅ PASS |
+
+### 3.E 資料完整性（RL-19、RL-20）
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-19** data-damage | 停 osd.0 → `ceph-objectstore-tool --pgid 35.1d victim set-bytes`（65536B urandom 覆寫單一 replica）→ 啟 osd.0 → `ceph pg deep-scrub 35.1d` | `CephDataDamage{OSD_SCRUB_ERRORS,PG_DAMAGED}`→pager | `health-check-OSD_SCRUB_ERRORS.txt`：`[ERR] 2 scrub errors`。`CephDataDamage{OSD_SCRUB_ERRORS}` 與 `{PG_DAMAGED}` 皆 firing（activeAt `10:57:52Z`）→pager 各一。 | `ceph pg repair 35.1d`＋等修復＋刪 pool；`HEALTH_OK`（`11:00:00Z`）· ✅ PASS |
+| **RL-20** object-unfound | size=2/min_size=1 pool 6 步：停 osd.2 → 改寫 victim → 設 `norecover` → 啟 osd.2 → 停 osd.5 → 解 `norecover` | `CephObjectUnfound{OBJECT_UNFOUND}`→pager | `health-check-OBJECT_UNFOUND.txt`：`1/5 objects unfound (20.000%)`。`CephObjectUnfound{OBJECT_UNFOUND}` firing（activeAt `11:01:37Z`）→pager。 | 啟兩顆 OSD＋等 unfound 找回＋確認 `norecover` 已解＋刪 pool；`HEALTH_OK`（`11:04:02Z`）· ✅ PASS |
+
+### 3.F client I/O 生命線＋監控核心（RL-02、RL-03）
+
+RL-02 是第二個好消息（PG 掉到 min_size 下 → client-blocked 真的 fire）；RL-03 是壞消息的濃縮（真 quorum loss 的 inhibit 只能 synthetic 驗，G-2；機制根因見 §5.2）。
+
+| 場景 | 注入 | 預期 | 實際（ceph 端 · Prometheus/receiver） | rollback → HEALTH_OK · verdict |
+|---|---|---|---|---|
+| **RL-02** pg-availability | 停 sentinel object acting set 兩顆 OSD（osd.7@`.174`、osd.5@`.171`）| `CephClientBlocked{PG_AVAILABILITY}`＋`CephPGUnhealthyStates`→pager | `health-check-PG_AVAILABILITY.txt`：`Reduced data availability: 3 pgs inactive, 3 pgs peering`。`CephClientBlocked{PG_AVAILABILITY}` firing（activeAt `23:35:07Z`）；`CephPGUnhealthyStates{alert-pg-availability}` firing（`23:33:52Z`）；pager 兩者皆有。 | 重啟兩顆 OSD＋刪 pool；`HEALTH_OK`（`23:37:39Z`）· ✅ PASS |
+| **RL-03** mon-quorum-lost | 停 mon-01（`.166`）與 mon-03（`.164`），再停 active mgr 走 empty-series 路徑 | `CephMonQuorumLost`→pager；inhibit `CephMonDownScoped` | 無 health-check 檔（G-5）；證據＝`stopped-mons.txt`／`stopped-mgr.txt`＋`prometheus-ceph-mon-quorum-lost-expr.json`（rule expr 評值 `"0"`）。`CephMonQuorumLost` firing（activeAt `12:12:07Z`）→pager。inhibit：`alertmanager-alerts-CephMonDownScoped.json` synthetic alert `suppressed`、`inhibitedBy:["c425f3928619a998"]`（**synthetic，G-2**）。 | 重啟兩顆 mon＋mgr；`HEALTH_OK`（`12:14:22Z`）· ✅ PASS |
+
+## 4. 16 個真機才抓到的發現（as-of 2026-07-06，保留原敘事）
+
+這 16 個問題，fake 測試（`promtool`、unit test）**全部綠燈**，只有接上真硬體、真 mgr、真 cephadm shell 才會現形。它們幾乎都發生在 **rule 邏輯本身沒寫錯**的前提下——這正是「每條 alert 都要真機驗證」這條鐵律的價值：fake 測試測「expr 邏輯對不對」，真機測「這條 expr 接到的資料源在真故障當下長什麼樣子」，兩者是不同的驗證面。發現編號沿用舊頁（發現 01…16），括號內是對應的本頁場景。
+
+<Callout type="info" title="這 16 個發現與 §2.3 ledger 缺口的對應">
+  發現 01（crash 打錯行程＋sidecar 壞）對應 **G-3**；發現 02（spiky gauge）與發現 14（data-integrity 窗化）是 **G-4** 兩次 rules 修正的起因；發現 08（BlueStore 24h latch）是 RL-11 只到 `HEALTH_WARN`（**G-1**）的根因；發現 11／16（mgr 凍結、inhibit 不可觀察）對應 **G-2** 並在 [§5.2 發現二](#52-發現二cephmonquorumlost-對真-quorum-loss-是盲的架構級規則層修不了) 有機制級展開。
+</Callout>
+
+**01 · daemon crash 打錯行程，而且這個 lab 的 crash sidecar 本身是壞的（RL-14）**
+- 症狀：`kill -SEGV` 打 systemd `MainPID`，OSD 乾淨重啟但沒產生 crash report，`RECENT_CRASH` 永遠不出現。
+- 根因：`MainPID` 是 `conmon`（容器監控器）不是 ceph-osd；容器內 PID 1 是 `podman-init`、不轉發 `SIGSEGV`。更深一層：這個 lab 的 `ceph-crash` sidecar 根本沒有 keyring（`client.crash` auth 不存在），物理上 post 不了 crash。
+- 修法：對 host 上 ceph-osd 真實 PID 送 `SIGSEGV` 讓真 crash meta 寫進 spool，再經 seed 節點 admin 執行 `ceph crash post`（真 crash 資料，只繞過壞掉的傳輸 daemon，G-3）。`RECENT_CRASH` 真的亮、alert 真 fire。
+
+**02 · `CephDaemonSlowOps` 的指標太 spiky，`for:` 永遠湊不滿（RL-01 · rule 重設計）**
+- 症狀：製造了真實且持續的 slow-ops，cluster 級 `CephClientBlocked` 正常 fire，但 per-daemon `CephDaemonSlowOps` 逾時不 fire。
+- 根因：對照 TSDB 發現 `ceph_daemon_health_metrics{type="SLOW_OPS"}` 峰值 30、min 0，整個視窗只有約 28.8% 時間 &gt;0——它是「當下超過 complaint-time 的 op 數」snapshot gauge，本質 spiky。原本 `for:` 要求連續多分鐘為真，在這種指標上永遠不可能滿足。
+- 修法：改用 `max_over_time(...[5m]) &gt; 0` 搭配較短 `for:`——語意變成「該 daemon 近 5 分鐘內有過 slow op」。這是 `efcf5bb`（**G-4** 第二段）的內容，RL-01 前三次即因舊版失敗。
+
+**03 · 節流太硬會讓 OSD 直接 flap；要「持續」的 slow-ops 得靠並發（RL-01）**
+- 症狀：同樣的限速參數，一次讓 `SLOW_OPS` 穩定持續，一次卻爆發式高變異。
+- 根因：把節流調更硬，被限速的 OSD 連 housekeeping I/O（心跳、metadata）都被卡住，直接 flap down——調硬換不到「持續」，只換到 OSD 掉線。
+- 修法：保持 flap-safe 的節流強度，改用高並發寫入把 op queue 持續撐滿——queue 不排空，`SLOW_OPS` 就連續，也不增加 flap 風險。
+
+**04 · cephadm shell 的 stderr banner 污染 JSON，`jq` 直接 parse error（RL-15 · RL-19 · RL-20）**
+- 症狀：osd-flapping 的 down/up 輪詢永遠逾時。
+- 根因：擷取指令用 `2>&1` 把 cephadm banner（`Inferring fsid…`）併進要被 `jq` 解析的 JSON，這幾行不以 `#` 開頭、既有過濾濾不掉，`jq` 回 `Invalid numeric literal`。fake 測試回乾淨 JSON，測不到。
+- 修法：JSON 解析改純 stdout 重導（banner 走 stderr 到旁路 log）。同一修正一次補掉尚未真機跑的 RL-19、RL-20 同款問題。
+
+**05 · flapping 太快，5 秒 scrape 抓不到中間狀態，`changes()` 只數到 2（RL-15）**
+- 症狀：`ceph osd tree` 確認 4 次 up/down transition 都完成，但 `CephOSDFlapping` 不 fire。
+- 根因：`ceph osd tree`（mon 視角）比 mgr exporter 快；某個 up 只維持 4 秒，5 秒 scrape 沒把它記成獨立樣本，`changes()` 只數到 2。
+- 修法：每次 transition 改成等 Prometheus 的 `ceph_osd_up` 真的反映該值之後再前進，確保 4 個狀態各被 scrape 成獨立樣本。
+
+**06 · pool 超過 quota 要「持續的寫入壓力」才會升 `POOL_FULL`（RL-17）**
+- 症狀：`CephPoolNearQuota` 正常 fire，但寫過 quota 後 `POOL_FULL` 超過 6 分鐘不出現。
+- 根因：pool 超過 `max_bytes` 確實會升 `POOL_FULL`，但只有 client 持續嘗試寫入（寫到被 block）時 mon 才 flag；腳本原本剛超過就停手。
+- 修法：過 quota 後改用 `timeout 30 rados put`（bounded，逾時 exit code 當「pool 已滿」訊號），持續寫並輪詢 `POOL_FULL`。
+
+**07 · 想寫滿容量太慢；改用動態 ratio 貼合真實使用率（RL-16）**
+- 症狀：想把某顆 OSD 寫到特定水位才調閾值，跑多輪只累積很小的量。
+- 根因：叢集幾乎全空、低並發短時 bench 太慢；固定 ratio 對這麼低使用率本來就不會 trip。
+- 修法：改成高並發寫到「最滿 OSD 到達某使用率」，再動態量測該使用率、把 nearfull/backfillfull/full 三級 ratio 設成它的某比例——自動保證低於實際使用率且三級有序。
+
+**08 · BlueStore slow-op 是 24 小時的 latch，用 restart OSD 清除會弄壞 cephadm 的 inventory（RL-01 · RL-11 · RL-16）**
+- 症狀：限速類場景結束後留下 `BLUESTORE_SLOW_OP_ALERT`（多顆 OSD）卡住收尾要求的 `HEALTH_OK` gate；舊清理方式靠 restart OSD，卻讓 cephadm 把 daemon 狀態標成 `unknown`。
+- 根因：這警告有 24 小時 latch；rolling restart 太粗暴、還讓 orchestrator 追蹤狀態不同步。
+- 修法：暫時把 `bluestore_slow_ops_warn_lifetime` 調很短，讓警告在幾十秒內老化清除後再還原，不 restart 任何 OSD。抽成共用 helper。**注意 RL-11 是這個 helper 補進去之前跑的**——所以它 in-run 停在 `HEALTH_WARN`（G-1）。
+
+**09 · rollback 移除網路延遲時，自己把自己那條 SSH 連線弄斷（RL-12）**
+- 症狀：`CephOSDSlowHeartbeat` 正常 fire、`netem` 也確認移除、叢集回 `HEALTH_OK`，但腳本回報失敗。
+- 根因：rollback 移除延遲的指令，是透過那條「正被延遲 1200ms 的介面」下 SSH 執行；delete 那一刻的網路變化擾亂了當下這條 SSH，連線異常斷開回傳非零，儘管 host 端已成功清除。
+- 修法：rollback 的成功判斷改成事後用一條全新 SSH 連線輪詢「延遲確實不見了」，而不是相信會自我擾亂的刪除指令退出碼。
+
+**10 · mgr failover 之後，standby 要幾十秒才重新註冊（RL-08）**
+- 症狀：`ceph mgr fail` 後立刻查 mgr 狀態，standby 欄位是空的，判定失敗。
+- 根因：被降級的 mgr 需要數秒到數十秒才重新以 standby 身分註冊；腳本只查一次沒重試。
+- 修法：改用有時間預算的輪詢，反覆檢查 standby 清單直到非空。順帶真機驗證 multi-mgr scrape——failover 過程 metrics 沒有中斷。
+
+**11 · 真 quorum loss 時，mgr exporter 的遙測會「凍結」在舊世界（RL-03 · 早期發現）**
+- 症狀：真實停掉多台 mon 後，`ceph quorum_status` 已無法完成，但 Prometheus 查到的 `ceph_mon_quorum_status` 加總仍是原本數字。
+- 根因：不是 PromQL 寫錯，而是**監控資料源還在回報舊世界**——單一 mgr exporter 視角在 quorum 崩潰時 stale。`CephMonQuorumLost` 最後靠 `or vector(0)` 的 empty-series path（exporter 也死、series 變空）才觸發。
+- 修法：這正是後來補 `CephMetricsAbsent` 與 multi-mgr scrape 的理由。**Tier D 的 TD-04 把這個機制看得更清楚，完整展開在 [§5.2](#52-發現二cephmonquorumlost-對真-quorum-loss-是盲的架構級規則層修不了)。**
+
+**12 · 部署腳本只改 configmap，Prometheus 不會自動重載 rule（harness gap）**
+- 症狀：改完 rule 的 expr、重新部署監控，Prometheus 卻還在跑舊 expr。
+- 根因：套用設定變更在 Deployment spec 沒變時不會重啟 pod；configmap 改了，運行中的 Prometheus 不會自動重讀掛載的 rule 檔。
+- 修法：任何 rule 變更後手動重啟 Prometheus deployment；已記入待辦，準備把部署腳本硬化成 apply 後自動 reload。
+
+**13 · capacity-forecast 六輪纏鬥：真正的兇手是 `rados bench` 覆寫同名 object（RL-18）**
+- 症狀：`CephCapacityForecast` 連續五輪不 fire——`predict_linear` 趨勢預測始終爬不到 85% 門檻。
+- 層層剝開：表面像「寫入吞吐不夠」，換三個假設（PG 數太少／並發不夠／複寫倍數吃掉成長）都沒解決。
+- 真根因：一次連續跑 10 分鐘的受控測試量到明顯高很多的成長率，但場景原本分輪跑、每輪重來。差別在——**`rados bench` 的分輪迴圈每輪都用固定 run 名稱，第二輪起就覆寫掉前一輪的同名 object**，pool 填滿第一輪後不再成長；連續跑的單一 bench 沒這問題。
+- 修法：改成連續寫入（不分輪、不重複用同一組 run 名稱）。成長率立刻回高位、projection 越門檻、alert 真 fire。這是整輪最耗工的一次除錯（RL-18×9 重試，§2.3），而 rule 本身從頭到尾都對——它正確地拒絕在不夠陡的趨勢上 fire。
+
+**14 · data-damage 三層疊：health_detail 閃爍＋objectstore 的 remove 被 recovery 治好＋`HEALTH_ERR` 也閃爍（RL-19）**
+- 症狀：`CephDataDamage` 連續兩輪不 fire。
+- 第一層（指標閃爍）：`objectstore-tool` 弄壞副本、deep-scrub 也抓到了，但 mgr 匯出的 `ceph_health_detail` 在整個視窗只有極少數 scrape 是 1——跟發現 02 同類 spiky snapshot gauge。**修法**：改窗化 `max_over_time(...[5m]) &gt; 0`（同一修正順便套 `CephObjectUnfound`）。這是 `23314bc`（**G-4** 第三段）。
+- 第二層（recovery race）：窗化後仍不穩，因為用 `remove` 讓副本**缺少** object，OSD 重啟後 PG recovery 自動補回、跟 deep-scrub 形成競態。**修法**：改用 `set-bytes` **損毀內容**而非刪除——內容錯的副本 recovery 不會自動治好，能確定性觸發 scrub mismatch。
+- 第三層（`HEALTH_ERR` 也閃爍）：`CephDataDamage` 終於 fire，但額外斷言的 `CephHealthError` 逾時——scrub-error 的 `HEALTH_ERR` 隨底層指標在 ERR 與 WARN 間跳。而 `CephHealthError` 早被別場（穩定的 `OSD_FULL`，即 RL-16）驗過。**修法**：移除本場重複且不穩定的 `CephHealthError` 斷言。
+
+**15 · `CephObjectUnfound` 預先套用窗化修正，省下一輪失敗（RL-20）**
+- 判斷：修發現 14 時認出 `OBJECT_UNFOUND` 跟 `PG_DAMAGED`／`OSD_SCRUB_ERRORS` 同屬 mgr health_detail 的資料完整性類檢查，判斷同樣會閃爍，於是同一修正裡把 `CephObjectUnfound` 一併窗化。
+- 結果：本場一次通過，省掉原本預期的一輪失敗。這是「把真機發現抽象成一整類問題、而非逐案修」的價值。
+
+**16 · 真 quorum loss 當下，inhibit 觀察不到——exporter 凍結讓兩條 alert 永遠不重疊（RL-03）**
+- 症狀：`CephMonQuorumLost` fire 並送到 pager，但「應該 inhibit `CephMonDownScoped`」的斷言逾時。
+- 根因：這是發現 11 的延伸。真 quorum loss 時 mgr exporter 先凍結、再死掉；`CephMonQuorumLost` 只能靠 exporter 死後的 empty-series path 觸發，但那時 `ceph_mon_quorum_status` 已整個消失、`CephMonDownScoped` 無資料可算，兩條 alert 在真故障中永遠不會時間重疊，inhibit 無從被「觀察」。
+- 修法：inhibit 設定本身沒問題——改成直接送兩筆 synthetic alert 到 Alertmanager，確認 `CephMonDownScoped` 立刻 suppressed、指向 `CephMonQuorumLost`（**G-2**）。把「在真故障中觀察 inhibit」換成「驗證 Alertmanager 設定本身」，主 alert 仍由真 quorum loss 完整驗證。
+
+## 5. 兩個機制級盲區（Tier D 先導揭露）
+
+Tier D 兩個發現跟上面 16 個「量測方法／harness」層級的問題不同——它們是**設計假設 vs ceph 真實行為對不上**的機制級 bug，dev 四層全綠也抓不到。
+
+### 5.1 發現一：OSD_FLAGS ≠ OSDMAP_FLAGS（TD-02，已修）
+
+設計頁 `CephClientRisk` 的排除清單與 `CephLowPriorityNotice` 的 name 清單，當初寫的是 `OSDMAP_FLAGS`。意圖完全正確——「維護時自動設的 `noout` 會升一個 flag check，要排出 pager，否則例行維護吵醒人」。**意圖對，但 check 的名字寫錯了。**
+
+真機分得很清楚（`ceph health detail` 證實）：
+
+| 動作 | 升的 health check |
+|---|---|
+| `maintenance enter` 對 host **subtree** 設 `noout` | **`OSD_FLAGS`**（`host ceph-lab-osd-03 has flags noout`，per-subtree）|
+| cluster-wide `ceph osd set noout` | `OSDMAP_FLAGS`（整個 osdmap 的 flag）|
+
+設計排除的是後者，但 `maintenance enter` 升的是前者。結果：`OSD_FLAGS` 不在排除清單 → `CephClientRisk` 的 `name!~"..."` catch-all 把它接走 → `CephClientRisk{OSD_FLAGS}` 在 TD-02 例行維護中 **firing**——**這套設計唯一要防的失敗模式被觸發了**：維護一台 OSD node 這種最日常的操作照樣 page oncall。
+
+<Callout type="tip" title="這個 miss 的教訓：測試與設計同源，就驗不出設計的假設錯誤">
+  dev 測試的 fixture 是照著設計頁的 health-check 名字手刻的。當設計把名字寫錯（`OSDMAP_FLAGS`），測試也跟著用同一個錯名，於是「測試驗證設計」變成「設計自己跟自己對帳」——名字錯得一致、照樣全綠。這類錯誤**結構上**只有引入一個獨立事實來源（真 ceph，或 ceph 原始碼當 oracle）才抓得到。
+</Callout>
+
+**修法（已套用到設計與 `rules/ceph-stability-first.yml`）**：排除清單與 `CephLowPriorityNotice` 都改成同時列 `OSD_FLAGS|OSDMAP_FLAGS`——subtree noout 升 `OSD_FLAGS`、cluster-wide noout 升 `OSDMAP_FLAGS`，兩種都要排。現行規則見 [policy 頁](./ceph-alert-policy-current)。
+
+### 5.2 發現二：CephMonQuorumLost 對真 quorum loss 是盲的（架構級，規則層修不了）
+
+這個比發現一更深，也比 dev 抓到的 F1 更深。F1 是 dev 用 promtool 發現的**規則層** PromQL bug（`count(空 vector)` 語意，`or vector(0)` 修好）。TD-04 揭露的是更底層的問題：**就算 F1 修對了，`CephMonQuorumLost` 在真 quorum loss 時還是不會 fire——原因不在 PromQL，在 metric 來源。**
+
+機制：`CephMonQuorumLost` 與 `CephMonDownScoped` 讀的 `ceph_mon_quorum_status` 是 **mgr 匯出**的，而 mgr 要先有 mon quorum 才能更新 cluster 視圖。TD-04 停掉 2/3 mon、quorum 一失守，mgr 就**凍結在最後已知狀態**（三台都＝1），但它的 prometheus HTTP endpoint 仍持續吐這份 stale 資料——scrape 還成功（`up{job="ceph"}=1`，連 `CephExporterAllDown` 都不 fire；原始 observations 記錄用的是拆分前的舊名 `CephExporterDown`，v2 拆分後「全 target down」的語意由 `CephExporterAllDown` 承接），`count(...==1)` 永遠是 stale 的 3，`3 < 2` 不成立，整個 90 秒視窗**沒有任何 alert**。
+
+| | F1（dev promtool 抓到）| 發現二（真機 TD-04 抓到）|
+|---|---|---|
+| 觸發最壞情況靜默的原因 | PromQL `count(空 vector)` 語意 | mgr metric 來源凍結 |
+| 屬於哪一層 | 規則層 | 架構層（metric source）|
+| 規則層修得了嗎 | 修得了（`or vector(0)`）| **修不了**——mgr 凍結時 count 仍是 stale 的 3，根本走不到空 vector |
+| 哪一層能抓到 | dev promtool（合成 series）| 只有真 ceph（mgr 真的會凍結）|
+
+也就是說「用叢集自己的 mgr 匯出的 metric 偵測 quorum loss」有**先天盲區**：graceful 的單台下線（TD-03——quorum 還在、mgr 能更新）測得到、scoped silence 也接得上；真正的 quorum 失守（TD-04）測不到，因為偵測者本身依賴它要偵測的東西。real-lab 的 RL-03（發現 11／16）是同一機制的另一面——正因為凍結，inhibit 只能 synthetic 驗（G-2）。
+
+**緩解（TD-05，必須走 out-of-band）**：實作 `CephMonQuorumLostExternal`，讀一支**叢集外**的 TCP 探針（直連每台 mon 的 msgr2 port `3300`，匯出 `ceph_mon_tcp_up`，完全不經 mgr）。把 mgr-based 與 probe-based 兩條規則載進同一個 Prometheus、再跑一次停 2/3 mon：
+
+| quorum 失守後全程 | `CephMonQuorumLost`（mgr 來源）| `CephMonQuorumLostExternal`（探針來源）|
+|---|---|---|
+| count | `3`（凍結）| `1`（正確）|
+| alert | **不 fire**（盲，重現 TD-04）| **firing**（縮短版 `for:30s` 下約 35s 起）|
+
+同一個 Prometheus、同一刻、同一場真 quorum loss——mgr-based 沉默，out-of-band 探針正確 fire。限制要誠實講：探針偵測「mon port 可達」不是「mon 在 quorum」，能抓 mon-down，抓不到「所有 mon 都活著卻網路分區」。這個盲區的完整拆解與其它偵測面（blackbox 探針、metric staleness 告警）在專頁 [Ceph — CephMonQuorumLost 的盲區](./mon-quorum-detection-blind-spot)。
+
+## 6. v1 → v2 規則演進（最終規則指向 policy 頁）
+
+最初這系列只驗了 3 個場景（v1 phase，2026-07-04：`slow-ops`／`pg-availability`／`mon-quorum`，索引在 `EVIDENCE-SUMMARY-2026-07-04.md`）。那批的教訓催出 v2 的幾個結構改動：
+
+- **`CephClientBlocked` 擴大 catch 面**：把 `OSD_FULL`／`POOL_FULL` 併進 client I/O 生命線（RL-16／RL-17 驗過）；`POOL_APP_NOT_ENABLED` 這種測試 pool 易觸發、不代表 client blocked 的 check 降級進 `CephLowPriorityNotice`。
+- **`CephExporterDown` 拆分級**：`CephExporterAllDown`（全 target down 才 page）與 `CephExporterTargetDown`（單 target down 走 slack）。
+- **新增監控盲區與 coverage**：`CephMetricsAbsent`、`Watchdog`、整組 `ceph-production-coverage`（網路／clock skew／容量／資料完整性／failover 能力）。
+- **routing 從 alertname regex 改成 label 導向**：v1 用 alertname regex，新增 rule 時易漏；v2 改成 `severity`＋`source` label 導向，新 rule 自動落到對的 receiver。
+- **MON quorum 補 out-of-band 觀測面**：發現二的緩解（`CephMonQuorumLostExternal`）。
+
+<Callout type="warning" title="為什麼本頁不內嵌完整規則 YAML（一個刻意的設計決定）">
+  舊 `prometheus-alert-real-lab-findings` 頁把一整份 v2 規則 YAML 內嵌在報告裡——這正是它被 archive 的原因之一：規則會隨 `experiments/ceph-alert-rules/rules/` 演進，內嵌快照必然過時、還會跟現況打架。本頁把「現在該部署什麼」交給唯一 single source of truth——[policy 頁](./ceph-alert-policy-current)（規則 YAML 逐字取自 rules 目錄、有防漂移 guard 綁定，現行 29 條）；本頁只負責「這些規則在真機被怎麼驗的」。所以本頁全程只給 rule 名與語意，不貼 expr。
+</Callout>
+
+## 7. 完整總結
+
+**按研究問題收束**：
+
+1. **這套 alert 設計搬上真 ceph，核心機制守不守得住？** 守得住。scoped label join、整台 down 的去重、`amtool` silence 鎖定、stopped mon 的 monmap 持久化（TD-01/02/03），以及 22 場真故障注入的 firing＋receiver 送達＋乾淨復原——都在真 cephadm v19.2.3 上簽收。dev 的「IF…THEN」拿到了真 ceph 的 IF。
+2. **有沒有 dev 抓不到的 bug？** 有兩個機制級的。發現一（`OSD_FLAGS ≠ OSDMAP_FLAGS`，排除清單名字錯 → 例行維護 page）已修；發現二（`CephMonQuorumLost` 依賴 mgr metric、真失守時凍結）是架構級盲區、規則層修不了，只能靠 out-of-band（TD-05 的探針緩解已在真機證明有效）。
+3. **「22/22」該怎麼引用？** 引用時**必帶 G-4**：每場在其最終 rules 版本下通過（rules 橫跨 3 commit），RL-11 是 `PASS*`。**不要**寫成「一次 snapshot 驗完 27／29 條」。
+
+**一句話版本**：同一座 6-host 真 lab 上，Tier D 5 場先簽收「ceph 事實對得上規則假設」（並抓到兩個機制盲區），real-lab 22 場再逐條把 alert 用真故障做 firing——全過，但「全過」的正確讀法是「每場在其最終 rules 版本下過、RL-11 是 PASS*」。
+
+**接下來做什麼（按優先序，每條掛依據）**：
+
+1. **部署規則以 [policy 頁](./ceph-alert-policy-current) 的現行 29 條為準**，不要用任何舊頁內嵌的 YAML 快照（§6）。
+2. **MON quorum 一定要配 out-of-band 生命線**：`CephMonQuorumLostExternal` 或等價的 blackbox／metric-staleness 偵測（發現二／TD-05），因為 mgr-based 規則對真失守盲。
+3. **維護前確認排除清單含 `OSD_FLAGS|OSDMAP_FLAGS` 兩者**（發現一），否則例行 `maintenance enter` 會 page。
+4. **`BLUESTORE_SLOW_OP_ALERT` 當盤後追查、不當 pager**，清 latch＝縮短 `bluestore_slow_ops_warn_lifetime` 或 restart OSD 且叢集沉降後一次一顆（發現 08）。
+
+## 8. 侷限、事故與開放問題
+
+**侷限（機制級 vs 環境綁定）**：
+
+- **發現二是機制級盲區**：mgr-based quorum 偵測對真失守盲，換環境也一樣（架構層）。
+- **Tier D 的 firing 秒數是 `for:` 縮短版**（30s）：「35s firing」讀作「規則接上並 fire」，不是 production 告警延遲（數值級／設定綁定）。
+- **G-1**：RL-11 的 `HEALTH_OK` 是跨 run 證據，非本場 in-run；BlueStore latch 清除 helper 當時尚未接進本場（環境／時序綁定）。
+- **G-2**：RL-03 的 inhibit 是 synthetic 驗設定，不是真 fault 的抑制行為——因為發現二的凍結讓真 fault 永遠做不出兩 alert 重疊。
+- **G-3**：RL-14 的 crash 傳輸層是手動代送（sidecar 壞），fault 本身真實。
+- **rules 版本橫跨 3 commit（G-4）**：更早兩段的 rules↔run 對應是 commit 時間軸推定，無法排除當時 working tree 有未提交差異（誠實限制）。
+
+**研究過程的事故（誠實記錄＋教訓）**：
+
+- **RL-01 三連敗**：spiky gauge（發現 02）讓 `CephDaemonSlowOps` 抓不到，`efcf5bb` 改 windowed max 後一次通過。
+- **RL-18 九次失敗**（本組最難搞）：五個短命 run 在 pool setup 早段中止＋兩次「分輪迴圈覆寫同名 object」（發現 13），改連續 stream 後才過。
+- **RL-15 兩次失敗**：翻轉太快 scrape 抓不到（發現 05），改成等 Prometheus 反映後再前進。
+- **RL-12 rollback 自斷 SSH**（發現 09，in-run 事件、ledger 無失敗重試）：改成事後用新連線輪詢驗延遲已清。
+- **清 latch 的打地鼠風險**（發現 08）：restart 引發的 peering IO 在慢碟上會產生新的 &gt;5s op、讓別的 OSD 重新 latch，要沉降後一次一顆。
+
+**開放問題（超出 scope／待後續）**：
+
+- **out-of-band 探針抓不到網路分區**（TD-05 限制）：探針只驗「mon port 可達」，「所有 mon 活著卻分區」要對每台真跑 `quorum_status`——見 [mon-quorum 盲區專頁](./mon-quorum-detection-blind-spot)。
+- **rules 版本快照未逐次留存**（G-4）：更早兩段 redeploy 沒留 manifest，未來 harness 應每次 redeploy dump 一份 rendered rules 快照。
+- **部署腳本 configmap 改動不自動 reload Prometheus**（發現 12）：已記待辦，尚未硬化成 apply 後自動 reload。
+
+## 相關閱讀
+
+- [Ceph — 現行 alert policy](./ceph-alert-policy-current)：**必讀前提**。現行該部署哪 29 條 rule、每條 severity／routing／silence——本頁只講「怎麼被驗的」，規則本體都在那頁。
+- [Ceph — alert 驗證方法論（四層）](./ceph-alert-validation-methodology)：dev 端 Tier A/B/C 的分工與 IF 哲學、F1 空 vector bug 的來龍去脈；本頁是它的真機 Tier D＋故障注入延伸。
+- [Ceph — CephMonQuorumLost 的盲區](./mon-quorum-detection-blind-spot)：發現二的深入專頁——mgr 依賴 quorum 的架構盲區、out-of-band 偵測面全譜。
+- [Ceph — slow ops 快速偵測實驗（R1–R4）](./slow-ops-fast-detection-lab)：另一組真機收官報告，與本頁 RL-01／發現 02、08 的 BlueStore slow-op 主題互補。
+- [Ceph — quorum 失守的 I/O 衝擊真機報告](./mon-quorum-loss-io-lab)：呼應發現二盲區的底層背景，lease/quorum 機制底 + fio 實證。

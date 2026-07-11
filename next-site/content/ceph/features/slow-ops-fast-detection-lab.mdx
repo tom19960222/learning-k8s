@@ -1,0 +1,383 @@
+---
+layout: doc
+title: Ceph — slow ops 快速偵測實驗（R1–R4 真機研究報告，as-of 2026-07-09）
+description: 把 experiments/ceph-slow-ops-detection 的 2026-07-09 研究收官成果寫成完整報告：25 條 hypothesis（19 confirmed／4 violated／2 只做 T1 推理）、12 個 cephadm v19.2.3 真機 run。核心結論——5~8s 的 BlueStore 暫態卡頓對既有 SLOW_OPS alert 全盲，改用 Squid 才有的 4 個 BlueStore slow counter 做 R1 規則可在卡頓開始 +14s 判真；同 node ≥3 顆 OSD 同窗卡是 firmware／RAID 卡指紋（R2，+20s）；會卡住 client 的 slow ops 用 for:0＋keep_firing_for 把偵測延遲從 ~120s 壓到 45~60s（R3／R4）。含逐實驗五欄、被推翻的 4 條預測與參數建議總表。
+category: experiment-report
+---
+
+## 本頁定位
+
+- **文章類型**：experiment-report（研究收官報告）。這頁把 `experiments/ceph-slow-ops-detection/` 這批研究的規劃、預測、真機結果與參數建議整理成一份**給沒參與的人只讀這一頁就懂**的報告。
+- **這是日期化快照（as-of 2026-07-09）**：報告內容凍結在研究收官那天，之後不改寫歷史。唯一例外是 H-014 的呼叫點計數在 2026-07-11 對 pinned source 重數過一次（下面用更正後的數字並註明），結論不受影響。
+- **版本錨點**：ceph **v19.2.3**（Squid LTS，submodule commit `c92aebb`）、Prometheus **v2.51.0**、cephadm 部署、scrape interval **10s**、ceph-exporter 抓 admin socket 週期 **5s**、mgr prometheus module 自身 cache **15s**。這些常數決定了本頁所有偵測延遲數字，換版本／換 scrape 設定要重新量。
+- **閱讀前提（恰好 1 篇，必讀）**：[SLOW_OPS／BLUESTORE slow op 的偵測機制與三層盲區](./slow-ops-detection-mechanisms)。本頁四條規則（R1–R4）的設計**完全建立在那頁拆解的訊號機制上**——為什麼 5s 門檻的 slow counter 跟 30s 門檻的 SLOW_OPS 量的不是同一件事、為什麼有些事件只有其中一條看得到。不先讀那頁，這頁的規則會像是憑空冒出來的閾值。
+- **證據層級**：本頁**以 T3（真機）為主**。全文用三級標記——`T1` = pinned 原始碼一定如此；`T2` = 官方文件／GitHub 逐版比對；`T3` = 在 cephadm v19.2.3 的 3 mon + 9 OSD lab 上實際注入量到。核心產出（偵測延遲）全部是 T3。
+- **本頁取代**：舊頁 `slow-ops-and-bluestore-alerts` 的**alert 建議部分**（它提出的三層告警架構、`osd_op_complaint_time` 調法等）。舊頁那部分是在真機驗證前寫的、已被本研究推翻，本頁不沿用；舊頁的機制敘述由[機制頁](./slow-ops-detection-mechanisms)接手。舊頁將標 archive。
+- **原始數據存放**：每個 run 的 raw evidence bundle（`results/` 目錄下的 JSON dump）**只在本機、被 `.gitignore` 擋掉不進 git**。git 內可查證的三個來源是 `REPORT-2026-07-09.md`、`EVIDENCE-SUMMARY-2026-07-09.md`（12 個 run 的索引）、`HYPOTHESES.md`（25 條 backlog）。本頁每個數字都對得回這三檔。
+
+## 這份報告怎麼讀
+
+**趕時間**：直接看 §2.1 實驗總覽 ＋ [§6 參數建議總表](#6-參數建議總表)，這兩節就能決定要不要部署、部署哪幾條、閾值設多少。想知道「為什麼」再回頭讀逐實驗。
+
+**各節導覽**：§1 前提（緣起、要回答的問題、判準、lab 拓樸、訊號地圖）→ §2 規劃總覽（7 個實驗 + 25 條 hypothesis 對帳）→ §3 逐實驗五欄詳情 → §4 被推翻的 4 條預測（研究最有價值的部分，獨立醒目）→ §5 R1–R4 規則與真機偵測延遲 → §6 參數建議總表 → §7 總結 → §8 侷限、事故與開放問題。
+
+**術語與代號**（第一次出現在這裡定義清楚，全文沿用）：
+
+- **SLOW_OPS**：ceph 內建 health check，語意是「有 RADOS op 卡在飛行中且齡超過 `osd_op_complaint_time`（預設 **30s**）」。對應兩個 Prometheus metric：`ceph_daemon_health_metrics{type="SLOW_OPS"}`（per-daemon）與 `ceph_health_detail{name="SLOW_OPS"}`（cluster 級）。
+- **op tracker**：OSD／MON 內追蹤「在飛 op」的 registry（`OpTracker`）——SLOW_OPS 就是它每秒數一次「齡 &gt;30s 的在飛 op」的結果，op 一完成就離開 registry。
+- **primary**：每個 PG 的主 OSD。client op 記在 primary 的 op tracker 帳上，所以 replica 慢的時候超齡計數會掛在（可能在別台 node 的）primary 頭上——這是「怪錯人」陷阱的根源。
+- **BlueStore slow op**：BlueStore 內部單一操作超過 `bluestore_log_op_age`（預設 **5s**）時打的 `slow operation observed` log。它跟 SLOW_OPS 是**兩套完全獨立的機制**（門檻不同、量的層不同、時間特性不同）——這正是[機制頁](./slow-ops-detection-mechanisms)的主題。
+- **slow counter**：BlueStore slow op 順帶 inc 的 4 個專用 perf counter：`ceph_bluestore_slow_{aio_wait,committed_kv,read_onode_meta,read_wait_aio}_count`。累積不歸零、5s 門檻、由 ceph-exporter 匯出、帶 `ceph_daemon` label。**是本研究拿來做快速偵測的核心訊號。**
+- **idx2**：原始碼 `log_latency()` 的第二個 perf counter 索引參數——**有傳 idx2 的呼叫點才會 inc slow counter**，沒傳的只打 log＋觸發 health 警告；這個不對稱是 slow counter 一個盲區（H-014）的根源。
+- **latch**：告警亮起後「閂住」、條件消失也不自動熄滅的行為。`BLUESTORE_SLOW_OP_ALERT` 預設閂 **24h**，要 restart 該 OSD 才清。
+- **omap**：object map——RADOS object 附掛的 key-value 資料（存在 RocksDB）；omap 迭代類的慢操作不 inc slow counter，屬 counter 盲區。
+- **scrub**：ceph 背景執行的資料一致性檢查（讀 object 比對 replica）；scrub 類慢操作同樣只打 log、不 inc counter。
+- **FP**（false positive）：誤報——alert 亮了、但不是你想抓的那類事件。
+- **R1–R4**：本研究產出的 4 條候選 Prometheus 規則（`rules/ceph-slow-ops-fast.yml`）。R1 `CephOSDTransientStall`（單 OSD 出現 slow op）、R2 `CephNodeMultiOSDStall`（同 node ≥3 顆同窗卡＝硬體指紋）、R3 `CephDaemonSlowOpsFast`（SLOW_OPS 加速版）、R4 `CephClusterSlowOpsFast`（R3 的 mon 端備援）。詳見 [§5](#5-r1r4-規則與真機偵測延遲)。
+- **E-00 … E-06、seq-finale**：7 個實驗設計 + 1 個收官序列。同一個實驗可能跑了不只一個 run（例如校準沒過要重跑）。
+- **H-001 … H-025**：25 條 hypothesis backlog 的編號。status 有三種：`confirmed`（預測命中）、`violated`（**預測被推翻＝有發現**，不是執行失敗）、`proposed`（只做 T1 推理、不進真機）。
+- **可判真時刻**：某條規則的 PromQL 表達式**第一次為真的那個 scrape 時刻**，相對「卡頓開始」計。實際 alert `fire` 還要再加一個 rule evaluation interval（≤15s）——本頁報「可判真」是為了跟 scrape/exporter 的管線延遲脫鉤，`+ eval` 這段可控且已標明。
+- **keep_firing_for**：Prometheus 2.42+ 的欄位，讓 alert 在條件不再成立後仍多撐一段時間。本研究的事件多是「單發脈衝」，靠它讓 oncall 來得及看到。
+
+**為什麼常看峰值／百分位而不是均值**：本研究的訊號多半是脈衝（一個 op 卡 8s，其餘正常）。區間**均值**會被大量正常 op 稀釋到看不出來（見 §4 的 H-007），所以延遲類訊號一律報**峰值**或第一次越界時刻，不報均值。
+
+## 1. 前提
+
+### 緣起：firmware 事件為什麼在監控上隱形
+
+使用者的生產環境：OSD node 掛 10 顆 SAS SSD 在**同一張 RAID 卡**（無軟體 RAID）。發生過數次「5~8 顆 OSD 在同一秒回報 BlueStore op 卡 5~8 秒」，疑似 SSD firmware。你在 OSD log 看到一排 `slow operation observed`，可是 Prometheus 上盯著的 SLOW_OPS 類 alert 一聲都不響。
+
+機制上這是必然：SLOW_OPS 只計「在飛且齡 &gt;30s」的 op，5~8s 的暫態連 30s 門檻的零頭都不到。（完整推導在[機制頁](./slow-ops-detection-mechanisms)。）本研究要回答的就是——**不靠 log、只靠 Prometheus，能不能主動抓到這類事件，以及要多久才抓得到。**
+
+### 要回答的兩個問題
+
+1. **對 firmware 型暫態卡頓**（5~8 顆 OSD 同秒卡 5~8s）：能不能只用內建可匯出的 metric 做出可主動偵測的規則？
+2. **對會真的卡住 client 的一般 slow ops**：把偵測延遲從既有規則的 ~2 分鐘壓到事發後 30~60 秒內。
+
+兩者都要求**在真機上量出實際偵測延遲**，不接受純推理。
+
+### 判定標準（先於實驗定案）
+
+- **可信度防線**：每個實驗的 prediction 都在跑之前寫死（見 §3 各實驗的「預期」欄），事後對照命中／推翻，避免事後合理化。
+- **噪音帶**：負載校準到 512K/t4 時全叢集 0 slow op（乾淨基線），確保注入後的增量不是負載本身造成。
+- **時鐘**：lab 內 NTP 同步，skew 實測 ≤1s，所以「卡頓開始 +14s」這種秒級相對時刻可信。
+- **規則未真的載入 Prometheus**：偵測延遲以 `query_range`（step 5s）**事後重放**規則表達式求「可判真時刻」，再分析式加上 eval interval 上限（≤15s）得 fire 時刻。這是刻意的——把「訊號何時可見」與「規則多久評估一次」拆開報。
+
+### 受測系統與注入方法
+
+| 面向 | 內容 |
+|---|---|
+| Cluster | cephadm **v19.2.3**，3 mon（`.166`／`.167`／`.164`）+ 9 OSD（`.169`／`.171`／`.174` 各 3 顆） |
+| 監控 stack | Prometheus **v2.51.0** @ mon-01、ceph-exporter ×6（:9926，抓週期 5s）、node-exporter ×6（:9100）；scrape interval **10s**。實驗結束 `ceph orch rm` 回退 |
+| 暫態卡頓注入 | `dmsetup suspend /dev/dm-N` + sleep + `resume`——device 層 IO 全排隊、OSD process／heartbeat／admin socket **全部正常**，最貼近 firmware 卡頓語意 |
+| 持續慢盤注入 | OSD service cgroup（v2）對 data device 設 `io.max` 極低值；OSD 活著、op 排隊變老 |
+| process 凍結注入 | `kill -STOP` 真正的 `ceph-osd` PID（不是 conmon／podman-init） |
+
+<Callout type="warning" title="一個貫穿全文的模擬保真度邊界">
+  `dmsetup suspend` 把 IO 擋在 **device 之上**（bio 排隊、還沒進裝置）。真 firmware 卡頓是 IO 卡在 **device 之內**。兩者對 ceph 上層（BlueStore counter、SLOW_OPS）表現一致，但對 **node_exporter 的 device 層指標**表現相反——見 §4 的 H-009。凡是牽涉 device 層跨層佐證的結論，都要記得「合成注入 device 層看不到，真事件看得到」這條邊界。
+</Callout>
+
+### 訊號地圖：哪個 metric 什麼時候動
+
+這張表是全研究的骨架——把「op 慢」相關的可匯出訊號攤開，看各自對三類事件（5~8s 暫態／持續 sub-30s 慢盤／永久卡死）反應如何、以及能不能定位元兇。（機制推導見[機制頁](./slow-ops-detection-mechanisms)，這裡是它的 T3 驗證版。）
+
+| 訊號 | 門檻 | 對 5~8s 暫態 | 對持續慢盤 | 對永久卡死 | 定位能力 |
+|---|---|---|---|---|---|
+| `ceph_bluestore_slow_*_count` ×4（slow counter） | &gt;5s（runtime 可調） | ✅ E-01：**+14s** 判真 | ✅ 全程連續增量 | ❌ op 完成才記帳 | ✅ **指向元兇 OSD／device** |
+| `ceph_daemon_health_metrics{SLOW_OPS}` | &gt;30s 在飛 | ❌ 全程 0 | ⚠️ +45s；短事件會漏採 | ✅ | ⚠️ **指向 primary、會怪錯人** |
+| `ceph_health_detail{SLOW_OPS}` | &gt;30s 在飛 | ❌ | ⚠️ +45s、亮 ~90s | ✅ | ❌ 叢集級無 label |
+| `ceph_health_detail{BLUESTORE_SLOW_OP_ALERT}` | &gt;5s（同 counter） | ✅ 但 latch 24h | ✅（latch） | ❌ | ⚠️ detail 文字有 OSD 清單、metric label 沒有 |
+| `ceph_osd_commit_latency_ms` | — | ❌ 量級失真（8s 事件只顯示 754ms） | ✅ 15~22s 可見 | ✅ | ✅ per-OSD |
+| `rate(op_w_latency_sum)/rate(count)` | — | ❌ 稀釋（8s 事件峰值 0.67s） | ✅ 32.9s 可見 | ⚠️ | ⚠️ 被 replication 抹平到別台 |
+| `node_disk_io_time_weighted_seconds_total` | — | ⚠️ 只看得到「IO 卡在 device 內」的事件 | 同左 | 同左 | ✅ per-device（配 `ceph_disk_occupation` join） |
+
+一句話讀法：**只有 slow counter 同時滿足「抓得到 5~8s 暫態」＋「指向元兇 device」**；SLOW_OPS 一路對暫態全盲、且會怪錯人；commit_latency／op 均值只對持續事件有用。
+
+## 2. 實驗規劃總覽
+
+### 2.1 七個實驗一次收官（12 個真機 run）
+
+按目的分三類。「參數／注入」欄的預設值以粗體或「預設」標記。「結果」欄 ✅ = 預測命中、❌ = 被推翻（有發現）、➖ = 難分辨。
+
+**A 類——建立偵測能力（R1／R2 的證據）**
+
+| 編號 | 注入／變因 | 為什麼 | 預期 | 結果 |
+|---|---|---|---|---|
+| E-00 | 無注入，純 rados bench（16×4MB／16×1M） | R1 的 FP 負向對照：乾淨負載會不會誤觸？ | 全叢集 slow counter 零增量 | ❌ bench max latency 44.7s、9/9 OSD counter 全增 → R1 改定位「症狀偵測」（H-015） |
+| E-01 | `dmsetup suspend` 單 OSD 8s ×2（寫段＋讀段） | 核心：R1 能否 &lt;30-60s 抓到 8s 卡頓、SLOW_OPS 是否全盲 | counter +N；SLOW_OPS 全程 0；R1 ≤30s 判真 | ✅ counter +6、R1 **+14s** 判真、SLOW_OPS 全程 0（部分子項見 §4） |
+| E-02 | 同 node 3 顆 OSD 同秒 suspend 8s | firmware／RAID 卡指紋：同 node 多 OSD 同窗卡可辨識？ | R2 count==3、instance=osd-01 | ✅ R2 count=3 於 **+20s** 判真、達標 node 恰 1 台 |
+
+**B 類——盲區與定位陷阱（為什麼既有 alert 漏、R3／R4 的證據）**
+
+| 編號 | 注入／變因 | 為什麼 | 預期 | 結果 |
+|---|---|---|---|---|
+| E-03 | suspend 單 OSD 15s、**無負載** | 結構性盲區：無 IO 即無偵測？ | 4 counter 增量 0、SLOW_OPS 0 | ✅ 全訊號靜默（H-017） |
+| E-04 | 持續慢盤：`io.max` wiops=8 150s／dm duty-cycle ~143s | 既有 SLOW_OPS 端到端延遲 baseline、R3/R4 加速多少、持續劣化能否被看見 | SLOW_OPS 首現 ≥+35s、舊規則 fire ≥+95s | ✅ 三路 SLOW_OPS **+45s** 首非零、R3/R4 ≈ +45~60s vs 舊 ~120s（兩處預測推翻見 §4） |
+
+**C 類——訊號可靠度與可調性**
+
+| 編號 | 注入／變因 | 為什麼 | 預期 | 結果 |
+|---|---|---|---|---|
+| E-05 | `SIGSTOP` ceph-osd 15s | observer 自身故障：exporter 對凍結 daemon 說謊還是缺值？ | 凍結期間持續回舊值（stale）、up=1 | ❌ 短暫整體 stale → **per-daemon 掉 series**（H-013，見 §4） |
+| E-06 | suspend 3s ×2（a：預設 **5s**；b：`bluestore_log_op_age`=2） | 想抓 &lt;5s 卡頓：門檻能否 runtime 調低不重啟？ | a：counter +0；b：counter ≥1 | ✅ a：+0；b：runtime 調 2 → **+6**（H-016） |
+| seq-finale | restart osd.0/1/2 + 善後 | counter reset 會不會讓 `increase()` 假陽性、latch 怎麼清、回基線 | reset 後 R1 不真、latch 清 | ✅ 4 分鐘窗 R1 max=0、restart 即清 latch、最終 HEALTH_OK 無豁免（H-008／H-020） |
+
+**12 個真機 run 索引**（詳表見 `EVIDENCE-SUMMARY-2026-07-09.md`；另有 1 個 io.max EINVAL 的空跑作廢 run 不計入 12）：
+
+| run | 實驗 | Verdict | 一句話 |
+|---|---|---|---|
+| 0 | E-00 第一次（4MB） | 中止＋意外窗 | pgrep 自匹配中止；但意外抓到 9/9 counter 全增（H-015）＋採樣漏失（H-023） |
+| 1 | E-00 negative-control（1M） | violated | 1M 全速仍 +52，H-015 蓋棺；抓到 R1 regex 重複 labelset 錯誤 |
+| 2 | E-01 single-osd | violated（2 子項） | 核心全過（+6／R1 +14s／SLOW_OPS 0）；op 均值 0.67s、讀段 cache 零增量 |
+| 3 | E-01b cold-read | confirmed | 清 cache 冷讀 + suspend → `slow_read_*` +3（H-010） |
+| 4 | E-02 第一次 | violated | R2 訊號成立但 first-true 被前場景殘留污染 → 加 wait_quiet gate |
+| 5 | E-02 multi-osd | confirmed | quiet gate 後 R2 count=3、+20s、達標 node 恰 1 台 |
+| 6 | E-03 idle | confirmed | 全訊號靜默 |
+| 7 | E-04 v2 | violated | op_w 均值 15.2s 而 SLOW_OPS 全程 0 → 持續 sub-30s 劣化盲區（H-024） |
+| 8 | E-04 v3 | void | kernel 6.8 io.max 數值寫入 EINVAL，空跑作廢（踩雷） |
+| 9 | E-04 v4 | violated（預測錯 daemon） | 三路 SLOW_OPS +45s；SLOW_OPS 亮別台 primary（H-025）；node_disk 合成注入不可見 |
+| 10 | E-05 exporter-freeze | violated | 短暫整體 stale → per-daemon 掉 series（H-013） |
+| 11 | E-06 threshold-tuning | confirmed | a：+0（5s 對 3s 盲）；b：runtime 調 2 → +6 |
+| 12 | seq-finale | confirmed | latch restart 即清、counter reset 無假陽性、最終 HEALTH_OK |
+
+### 2.2 25 條 hypothesis 對帳
+
+最終盤點 **19 confirmed／4 violated／2 只做 T1 推理**。`violated` 是預測被推翻＝有發現，不是失敗（詳見 §4）。
+
+**既有 SLOW_OPS 的盲區與偏差**
+
+| 編號 | 命題（一句話） | status | Tier | 錨點 |
+|---|---|---|---|---|
+| H-001 | 5~8s 卡頓永遠不產生 SLOW_OPS（op 齡 &lt;30s） | confirmed | T1+T3 | E-01 兩路全程 0 |
+| H-024 | 「每個 op 都慢但都 &lt;30s」的持續劣化對 op-tracker 全盲 | confirmed | T3 | E-04 v2 op_w 15.2s／SLOW_OPS 0 |
+| H-023 | per-daemon SLOW_OPS 快照式採樣會整段漏掉短事件 | confirmed | T3 | 44.7s 事件 daemon metric 0 樣本 |
+| H-025 | SLOW_OPS 指向 primary 而非元兇 device（怪錯人） | confirmed | T3 | E-04 v4 亮 osd.4/6/7/8、osd.0=0 |
+| H-005 | 既有 SLOW_OPS 端到端延遲 ≥2 分鐘 | confirmed | T3 | E-04 舊規則 ≈ +120s |
+
+**slow counter 作為快訊號（R1／R2）**
+
+| 編號 | 命題（一句話） | status | Tier | 錨點 |
+|---|---|---|---|---|
+| H-002 | 4 個 slow counter lab exporter 預設匯出、&gt;5s 卡頓會 +1 | confirmed | T3 | E-01 osd.0 counter +6 |
+| H-003 | R1 從卡頓開始到可判真 ≤40s（目標 &lt;30-60s） | confirmed | T3 | E-01 **+14s** |
+| H-004 | 同 node ≥3 顆同窗卡＝firmware／RAID 卡指紋，單 OSD 不觸發 R2 | confirmed | T3 | E-02 count=3、E-01 峰值 1 |
+| H-022 | 1~2m 窗聚合足以區分「單 node 聚集」vs「跨 node 變慢」 | confirmed | T3 | E-02 達標 instance 恰 1 |
+| H-010 | 讀路徑靠 `slow_read_*`、寫路徑靠 `slow_committed_kv/aio_wait`，規則需同看 4 個 | confirmed | T1+T3 | E-01 寫 +6、E-01b 讀 +3 |
+| H-011 | op 永久卡死時 4 counter 全不動（完成才記帳），只有 SLOW_OPS 看得到 | confirmed | T1+T3 | E-01 counter 首升晚於 suspend 結束 |
+| H-014 | 多數 `log_latency` 呼叫點無 idx2 → omap／scrub 類是 counter 盲區 | confirmed | T1 | 31 呼叫點、6 帶 idx2、25 log-only（見下方註） |
+
+<Callout type="info" title="H-014 的呼叫點計數（2026-07-11 對 pinned source c92aebb 重數）">
+  `BlueStore.cc` 的 `log_latency`／`log_latency_fn` 呼叫點總數為 **31**（`grep -cE 'log_latency(_fn)?\(' BlueStore.cc` 得 33，扣掉 line 18465／18487 兩個函式定義本身）；帶 idx2 的為 **6** 處（`12368`／`12708`／`13080`=read_onode_meta、`12751`／`13113`=read_wait_aio、`14471`=committed_kv），加上不經 log_latency 直接 inc 的 1 處（`14175`=aio_wait）；純 log-only 為 **25** 處。（收官當天報告曾記為 29／5，此為當時低估，已更正。）結論不變：omap iterator、scrub、kv_sync 等 25 個呼叫點只 log ＋觸發 `BLUESTORE_SLOW_OP_ALERT`、不 inc counter，是 slow counter 的盲區。
+</Callout>
+
+**輔助訊號、跨層與可調性**
+
+| 編號 | 命題（一句話） | status | Tier | 錨點 |
+|---|---|---|---|---|
+| H-006 | `commit_latency_ms`/`apply_latency_ms` 只對持續事件可靠 | confirmed | T1+T3 | E-01 754ms vs E-04 15196ms |
+| H-021 | `ceph_disk_occupation` 可 join OSD 到 node device series | confirmed | T3 | E-04 join 成立 |
+| H-008 | `BLUESTORE_SLOW_OP_ALERT` 24h latch，適合盤後追查非 pager | confirmed | T3 | latch &gt;1h、restart 才清 |
+| H-017 | idle OSD（無 IO）上卡頓 counter 與 op-tracker 都無訊號 | confirmed | T1+T3 | E-03 全靜默 |
+| H-016 | `bluestore_log_op_age` runtime 可調低提高靈敏度、不需重啟 | confirmed | T1+T3 | E-06 調 2 → 3s 卡頓 +6 |
+| H-019 | 4 counter 是 Squid v19.2.0+；`BLUESTORE_SLOW_OP_ALERT` v19.2.1+/Reef 18.2.6+ | confirmed | T2 | GitHub 逐版比對 |
+| H-020 | OSD 重啟 counter reset 不讓 `increase()` 假陽性；`keep_firing_for` 撐窗 | confirmed | T3 | finale 4 分鐘窗 R1 max=0 |
+
+**被推翻的 4 條預測（violated，詳見 §4）**
+
+| 編號 | 預測（被推翻） | status | Tier |
+|---|---|---|---|
+| H-015 | 乾淨負載不會產生 &gt;5s op | violated | T3+T2 |
+| H-007 | op 區間均值對低負載暫態敏感（≥1s） | violated | T3 |
+| H-009 | node_disk 對注入卡頓 ≥5× | violated | T3+T2 |
+| H-013 | exporter 對凍結 OSD 持續回舊值（stale） | violated | T3 |
+
+### 2.3 裁定不執行的 2 條（只做 T1 推理）
+
+Gate 1 backlog triage 時判定這 2 條的 demo 價值低、架構層已可論證，不占用真機序列。
+
+| 編號 | 原計畫 | 不做 T3 的理由 | 推理結論 |
+|---|---|---|---|
+| H-012 | 注入「slow 事件後 ~15s 內 OSD 就 crash」，驗 counter 增量來不及被 scrape | 時序競態 demo 價值低；以管線時間常數（exporter 5s + scrape 10s）即可推 | 此情境訊號丟失，由既有 **OSD down alert** 覆蓋 |
+| H-018 | 事件當下觸發 active mgr failover，驗 health 路徑空窗 | mgr failover 對 lab 序列干擾大；架構層可論證 | ceph-exporter 直讀各 host admin socket、與 mgr 無關，所以 **counter 規則（R1/R2）天然是 health 規則的 mgr-failover 備援** |
+
+## 3. 逐實驗詳情
+
+每個實驗五欄：調了什麼／為什麼測／事前預期／結果（前→後數字＋倍率）／建議。被推翻的預測在這裡只點名、細節集中在 §4。
+
+### 3.A 建立偵測能力（R1／R2）
+
+#### E-00 — 乾淨負載的 FP 負向對照（run 0／1）
+
+- **注入什麼**：無故障注入。變因是**負載本身**：run 0 用 16 併發 ×4MB rados bench（write 90s + seq read 60s）、run 1 用 16 併發 ×1M。
+- **為什麼測**：pre-mortem 擔心 R1 誤觸（pager fatigue → 被靜音 → 真事件漏掉）。要先確認「乾淨負載不會製造 &gt;5s op」，R1 才站得住。
+- **預期**：全叢集 `increase(slow_*_count[5m]) == 0`（lab 虛擬碟全速負載不產生 &gt;5s 單段延遲）。
+- **結果（推翻，見 §4 H-015）**：run 0 bench max latency **44.7s**、9 顆 OSD 的 slow counter **全部增加**（osd.4 +47 … osd.8 +4）、`BLUESTORE_SLOW_OP_ALERT` latch。run 1 換 1M 全速仍 **+52**。「過載不會產生 &gt;5s 單段延遲」被徹底推翻。同一觀察窗還意外揭露 H-023（採樣漏失）與 R1 用 `__name__` regex 會產生重複 labelset 的真 Prometheus 錯誤。
+- **建議**：(a) R1 的定位從「硬體故障證明」改為「症狀偵測」——它亮代表「這顆 OSD 有 op 超過 5s」，過載時 client 一樣痛、仍值得知道，但不是硬體定罪。(b) R1 的 4 counter 必須**顯式相加**、不能用 `__name__` regex + `increase()`（regex 選出的多 counter 經 increase 丟掉 `__name__` 後同 OSD 變重複 labelset，真 Prometheus 直接回錯）。
+
+#### E-01 — 單 OSD 暫態卡頓（run 2 寫段＋讀段、run 3 冷讀）
+
+- **注入什麼**：`dmsetup suspend` osd.0 的 data device 8s，共兩次（一次配寫負載、一次配讀負載）。run 3（e01b）先 `fill → restart osd.0 清 cache → 冷讀` 再 suspend，確保讀真的落盤。校準負載 512K/t4。
+- **為什麼測**：整份研究的核心——slow counter 能不能在 &lt;30-60s 內抓到 8s 暫態、SLOW_OPS 是不是真的全盲、順帶盤點一批「看似可用其實不行」的輔助訊號。
+- **預期**：osd.0 的 4 counter 合計 ≥1；SLOW_OPS 兩路全窗 0；R1 表達式在卡頓結束後 ≤30s 可判真；`commit_latency_ms` &lt;5000；`op_w` 區間均值峰值 ≥1s。
+- **結果**：核心全部命中——counter **+6**；R1 在卡頓**開始 +14s／suspend 結束 +6s** 判真（機制上限 exporter 5s + scrape 10s，實測遠優於 ≤30s 預期）；SLOW_OPS 兩路**全程 0**；counter 首升樣本晚於 suspend 結束，證明「op 完成才記帳」（H-011）；run 3 冷讀段 `slow_read_*` **+3**（H-010，讀路徑覆蓋成立）。兩個子項推翻（見 §4）：`op_w` 均值峰值僅 **0.67s**（&lt;1s，稀釋比預期重，H-007）；`commit_latency_ms` 對 8s 事件只顯示 **754ms**（量級失真，H-006）。註：run 2 原讀段零增量＝資料全在 BlueStore cache、讀沒落盤，這是 idle 盲區的另一面。
+- **建議**：R1（slow counter increase）作為暫態偵測主力；`commit_latency_ms` 與 `op_w` 區間均值**不要**當暫態主偵測，只能當持續事件的嚴重度分級輔助。
+
+#### E-02 — 同 node 3 顆 OSD 同秒卡（run 4／5）
+
+- **注入什麼**：同一 node 上 osd.0/1/2 的 device **同一秒** `suspend` 8s。
+- **為什麼測**：使用者事件的核心形態就是「同秒多 OSD」。要驗證「同 node ≥3 顆同窗卡」能作為 RAID 卡／firmware 層級事件的指紋，且單 OSD 事件（E-01）不會誤觸這條升級規則。
+- **預期**：R2 在注入後 ≤130s 內為真且 `count == 3`、label `instance="osd-01"`；E-01 全程 R2 不為真。
+- **結果**：run 5（加了 wait_quiet gate 後）R2 `count=3` 於**注入開始 +20s** 判真，達標 `instance` **恰 1 台**（osd-01），三顆 OSD 各自有增量；另一台只有零星 `count=2`、低於門檻；E-01 單 OSD 時 R2 峰值僅 1。方法修正：run 4 的 first-true 被前一場景（e01b）的 fill 殘留污染——`[2m]` lookback 會吃到前場景增量，必須先過 quiet gate（事故記在 §8）。
+- **建議**：R2 門檻設 `>=3` per node；使用者環境一台 10 顆 OSD，維持 3 綽綽有餘（5~8 顆同卡上同時卡，3 抓得到；設太高反而漏掉部分受影響事件）。`keep_firing_for: 15m` 讓指紋撐夠久供人歸因。
+
+### 3.B 盲區與定位陷阱（R3／R4）
+
+#### E-03 — idle OSD 的結構性盲區（run 6）
+
+- **注入什麼**：`suspend` osd.0 15s，且**叢集無 client 負載**。
+- **為什麼測**：要把「無 IO 即無偵測」這條結構性盲區實證出來——device 卡住但當下沒 IO 經過時，什麼訊號都沒有。
+- **預期**：觀察窗內 4 counter 增量 == 0 且 SLOW_OPS == 0。
+- **結果（確認）**：4 counter 增量 **0**、SLOW_OPS **0**、R1 **0**，全訊號靜默（H-017）。
+- **建議**：低流量時段的 firmware 事件會漏。若在意，緩解是加低頻 synthetic IO（例如每分鐘一次小寫入的 cron），但這超出「只用 Prometheus」的 scope，列為建議不進規則。
+
+#### E-04 — 持續慢盤：既有 SLOW_OPS 的 baseline 與加速（run 7／9，run 8 作廢）
+
+- **注入什麼**：run 7（v2）cgroup `io.max` wiops=8 對 osd.0 節流 150s；run 9（v4）改用 `dmsetup` duty-cycle（suspend 8s／resume 0.4s ×17，~143s）配 t32 負載。run 8（v3）因 kernel 6.8 io.max 數值寫入 EINVAL 空跑作廢。
+- **為什麼測**：量既有 SLOW_OPS 鏈路的**端到端延遲 baseline**、驗 R3/R4（for:0）能加速多少、以及「持續但每個 op 都 &lt;30s」的劣化能不能被任何 SLOW_OPS 路徑看見。
+- **預期**：`ceph_daemon_health_metrics{SLOW_OPS,osd.0}` 第一次非零 ≥ 注入 +35s；加 `for:1m` + eval，舊 `CephDaemonSlowOps` 可 fire ≥ +95s；R3（for:0）≈ SLOW_OPS 出現 +15s 內。
+- **結果**：run 9（op_w 均值峰值 32.9s、op 齡破 30s）三路 SLOW_OPS 都在 **t_inj+45s** 首度非零 → R3/R4（for:0）可 fire ≈ **+45~60s**；舊規則（for:1m）≈ **+120s**，且 &lt;60s 的事件會整段漏掉（H-005）。run 7（v2，op 齡沒破 30s）`op_w` 均值峰值 **15.2s**、`commit_latency_ms` **15196ms**，client 痛了兩分半，但 SLOW_OPS **全程 0**——持續 sub-30s 劣化盲區（H-024）。兩處預測被推翻（見 §4）：SLOW_OPS 亮的是別台的 primary 而非被卡的 osd.0（H-025）；node_disk 對合成注入不可見（H-009）。附帶確認 `ceph_disk_occupation` join 可用（H-021）。
+- **建議**：部署 R3（daemon 路徑）＋R4（mon 端備援）**兩路取 OR**——H-023 證明 daemon metric 對短事件會整段漏採，單靠一路不夠。oncall 動線：SLOW_OPS 指向受害者 primary，元兇要看 R1（device-local）。sub-30s 持續劣化只有 R1（5s 門檻）看得到。
+
+### 3.C 訊號可靠度與可調性
+
+#### E-05 — observer 自身故障：exporter 凍結行為（run 10）
+
+- **注入什麼**：`kill -STOP` osd.0 的真 `ceph-osd` PID 15s，配輕負載。
+- **為什麼測**：規則的可信度取決於 observer 誠不誠實。要知道 ceph-exporter 遇到凍結的 OSD 是「持續回舊值（stale，會騙人）」還是「缺值（好偵測）」。
+- **預期**：凍結期間 `.169:9926/metrics` 仍 200、osd.0 series 仍在且值不變（stale）；`up` 全程 1；SIGCONT 後 10s 內恢復。
+- **結果（部分推翻，見 §4 H-013）**：凍結 +6s 時**兩顆** OSD 都短暫回舊值（收集迴圈整體卡住），+12s 時 osd.0 series **從 /metrics 消失**、osd.1 恢復更新；HTTP 全程 200、`up` 全程 1；SIGCONT 後恢復。預測的「持續回舊值」被推翻，真實行為是「短暫整體 stale → per-daemon 掉 series」。
+- **建議**：掉 series 比回舊值好偵測（可用 `absent` 型規則補）；且 &gt;20s 凍結會被 peer 標 down、既有 `OSDDown` 接手。要知道 R1 對「凍結中」的 OSD 偵測會延後到解凍後（與「完成才記帳」語意一致）。
+
+#### E-06 — 偵測門檻的線上可調性（run 11）
+
+- **調了什麼**：`bluestore_log_op_age`（預設 **5s**）。a 段維持預設、b 段 `ceph config set osd.0 bluestore_log_op_age 2`。兩段都注入 `suspend` **3s**（故意小於預設門檻）。
+- **為什麼測**：想把偵測面推進到 2~5s 的早期徵兆——這個門檻能不能 runtime 調低、不重啟 OSD 就生效。
+- **預期**：a 段（預設 5s、3s 卡頓）counter 零增量；b 段（門檻 2）counter ≥1。
+- **結果（確認）**：a 段 counter **+0**（5s 門檻對 3s 卡頓盲）；b 段 `ceph config set` 後 `ceph tell` 確認 daemon 收到、同樣 3s 卡頓 → **+6**；`config rm` 後讀回 5.0。**runtime 生效、不需重啟**（H-016）。
+- **建議**：生產可把門檻調到貼近 SSD 預期延遲（如 1~2s）做更早偵測；代價是 log 量與 FP 上升，建議先在一台 node 試。
+
+#### seq-finale — reset 安全性與回基線（run 12）
+
+- **調了什麼**：`restart` osd.0/1/2，然後清 latch、刪 bench pool、驗回基線。
+- **為什麼測**：R1 用 `increase()`，OSD 重啟 counter 歸零時 `increase()` 會不會產生假陽性？順便驗 `BLUESTORE_SLOW_OP_ALERT` latch 的清除法，並確認叢集乾淨收官。
+- **預期**：restart 後 counter 從 &gt;0 歸 0，重啟後 5 分鐘窗 R1 表達式不為真；latch 5 分鐘內清。
+- **結果（確認）**：restart → counter 歸 0、restart 後 **4 分鐘窗 R1 max=0**（`increase()` 對 reset 不產生假陽性，H-020，promtool reset case 亦綠）；latch **restart 即清**（H-008）；最終 **HEALTH_OK 無豁免**。附加事故：restart 引發的 peering IO 在慢碟上會產生新的 &gt;5s op，讓其他 OSD **重新 latch**（osd.6 中招一次）——清 latch 要在叢集完全沉降（active+clean、無 recovery）後做，一次一顆。
+- **建議**：清 `BLUESTORE_SLOW_OP_ALERT` latch = restart 該 OSD，且務必在叢集沉降後一次一顆，否則會玩打地鼠。
+
+## 4. 被推翻的預測（誠實帳）
+
+**這是本研究最有價值的部分。** 每一條被推翻的預測都直接改了規則設計或研究方法。先把帳對清楚：**正式 hypothesis 帳上的 4 條 violated 是 H-015／H-007／H-009／H-013**（與 §2.2 一致）。本節下表則改按「**對規則設計的影響**」呈現——所以多收了 E-04 的兩輪實驗設計反轉（它是注入手段的預測翻車、不是 hypothesis 帳上的一條），而 H-013（observer 凍結行為，影響較小）獨立放在表後一段。兩邊都是「4 條」，但集合不同，口徑在此對齊。
+
+| 預測（跑之前寫死的） | 實測 | 對設計的影響 |
+|---|---|---|
+| **H-015**：乾淨負載不會產生 &gt;5s op | 16 併發 ×4MB 純 bench（無注入）→ bench max latency 44.7s、9/9 OSD counter 全增 | R1 定位改為「症狀偵測」，不是硬體定罪；硬體歸因交給 R2 的聚集指紋＋持續性 |
+| **H-007**：op 區間均值對低負載暫態敏感（≥1s） | 8s 卡頓只把均值推到 0.67s（被大量正常 op 稀釋） | op 均值從「輔助偵測」降級為「持續事件的嚴重度分級」，不進暫態規則 |
+| **H-009**：node_disk 對注入卡頓 ≥5× | `dm suspend` 期間 dm-3 的 `io_time_weighted` rate 反而**下降**（0.71 vs pre 0.89）；自然過載（E-00）才升到 ~2-5× | 跨層佐證只對「IO 真的卡在 device 內」的事件有效（真 firmware 卡頓屬此類）；合成注入不可驗，**倍率門檻不設** |
+| **E-04 兩輪設計**：io.max 能穩定製造「持續卡但 op 破 30s」 | wiops=8 讓每個 op ~15s 完成 → 永不過 30s 門檻（意外揭露 H-024）；io.max 數值寫入在 kernel 6.8 EINVAL（v3 作廢） | 「sub-30s 持續劣化盲區」成為報告主發現之一；注入手段改用 dm duty-cycle |
+
+**另一條被推翻的預測（observer 行為，H-013）**：預測 exporter 對凍結 OSD 會「持續回舊值（stale）」；實測是「凍結 +6s 兩顆短暫整體 stale → +12s 該 OSD series 從 `/metrics` 消失」。差別很關鍵——**掉 series 比回舊值好偵測**（`absent` 型規則可補），代表這個失敗模式沒有想像中危險。細節見 §3.C 的 E-05。
+
+## 5. R1–R4 規則與真機偵測延遲
+
+四條規則與既有 27 條 alert **並存、不取代**：R1 補暫態／持續劣化盲區、R2 做硬體歸因升級、R3/R4 加速既有 SLOW_OPS 路徑。完整 YAML 在 `rules/ceph-slow-ops-fast.yml`（promtool 測試全綠）。
+
+| 規則 | 表達式核心 | severity | 語意 |
+|---|---|---|---|
+| R1 `CephOSDTransientStall` | 4 counter 的 `increase[1m]` **顯式相加** &gt;0，`for:0`，`keep_firing_for:10m` | warning | 「這顆 OSD 剛有 op 超過 5s」——症狀偵測 |
+| R2 `CephNodeMultiOSDStall` | `count by (instance)`(per-OSD increase[2m]&gt;0) ≥3，`keep_firing_for:15m` | critical | firmware／RAID 卡指紋：單碟壞不會同時打中多顆 |
+| R3 `CephDaemonSlowOpsFast` | `max_over_time(daemon_health_metrics{SLOW_OPS}[1m])&gt;0`，`for:0`，`keep_firing_for:10m` | critical | client 已被卡 &gt;30s，立即 page（不等舊規則 for:1m） |
+| R4 `CephClusterSlowOpsFast` | `max_over_time(health_detail{SLOW_OPS}[1m])&gt;0`，`for:0`，`keep_firing_for:10m` | critical | R3 的 mon 端備援（H-023：daemon 路徑會漏採） |
+
+**三個非顯然的設計決策（都來自真機翻車）**：
+
+1. **4 counter 顯式相加、不用 `__name__` regex**：regex 選出的多 counter 經 `increase()` 丟掉 `__name__` 後、同一 OSD 變重複 labelset，真 Prometheus 直接回 `vector cannot contain metrics with the same labelset`（E-00 實測；promtool 測試因每 OSD 只給一個 counter 恰好避開，已補「4 counter 齊備」的真實形態 case）。
+2. **`for: 0` + `keep_firing_for`**：事件是單發脈衝（`increase` 只在一個窗內 &gt;0），`for > 0` 會直接殺掉偵測能力；`keep_firing_for`（Prometheus 2.42+）讓 oncall 來得及看到。
+3. **counter reset 安全**：OSD 重啟 counter 歸零不會讓 `increase()` 產生假陽性（promtool case + finale 真機雙驗，H-020）。
+
+**真機偵測延遲（本研究的核心產出，T3）**。「可判真時刻」相對卡頓開始計；實際 fire 另加 rule eval interval（≤15s）。
+
+| 事件 | 訊號 | 可判真時刻 | 舊規則對照 |
+|---|---|---|---|
+| 單 OSD 卡 8s（E-01，寫負載） | R1 | **+14s**（suspend 結束 +6s） | 永遠不 fire |
+| 單 OSD 卡 8s（E-01） | SLOW_OPS 兩路 | 永遠 0 | 永遠不 fire |
+| 同 node 3 OSD 同秒卡 8s（E-02） | R2（count=3，僅事發 node 達標） | **+20s** | 永遠不 fire |
+| 持續慢盤 ~143s（E-04，op 齡破 30s） | R1 | 全程連續增量（首增 ≤+20s） | — |
+| 持續慢盤 ~143s（E-04） | 三路 SLOW_OPS 首度非零 | **+45s** → R3/R4 fire ≈ +45~60s | 舊規則（for:1m）≈ +120s；&lt;60s 事件整段漏 |
+| idle OSD 卡 15s（E-03） | 全部訊號 | **全靜默**（結構性盲區） | 同樣靜默 |
+
+## 6. 參數建議總表
+
+每條建議自帶適用條件與變更方式。「可調性」欄的 runtime = `ceph config set` 即時生效、reload = Prometheus 規則熱載入。
+
+| 層 | 參數／規則 | 建議 | 適用條件 | 依據 | 可調性 |
+|---|---|---|---|---|---|
+| ceph | `bluestore_log_op_age` | 預設 **5s** 保留；想抓 2~5s 早期徵兆可調 **2**（先一台試） | SAS SSD 正常 op 遠低於 2s；代價是 log 量＋FP 上升 | E-06：3s 卡頓從 +0 → **+6** | **runtime**（`ceph config set osd.N ...`，不需重啟） |
+| ceph | `osd_op_complaint_time` | 預設 **30s** 一般不動 | 只有在無法部署 R1（Reef 沒 slow counter）時，才考慮調低以縮短 SLOW_OPS 門檻 | H-024（sub-30s 盲區成因） | runtime |
+| Prometheus | **R1** `CephOSDTransientStall` | 部署，`for:0`＋`keep_firing_for:10m`，warning | 對「這顆 OSD 有 op &gt;5s」的症狀偵測；FP 心理預期見下 | E-00／E-01：卡頓開始 **+14s** 判真 | **reload**（rules 熱載入） |
+| Prometheus | **R2** `CephNodeMultiOSDStall` | 部署，門檻 `>=3` per node，`keep_firing_for:15m`，critical | 門檻是 per-node OSD 數的函數；一台 10 顆維持 3 | E-02：同 node 3 顆 **+20s** 判真、達標 node 恰 1 | reload |
+| Prometheus | **R3** `CephDaemonSlowOpsFast` | 部署，`for:0`＋`keep_firing_for:10m`，critical | client 已被卡 &gt;30s 立即 page | E-04：**+45~60s** vs 舊規則 ~120s | reload |
+| Prometheus | **R4** `CephClusterSlowOpsFast` | 部署，`for:0`＋`keep_firing_for:10m`，critical，**與 R3 取 OR** | 補 daemon 路徑的採樣漏失 | H-023：44.7s 真事件 daemon metric 0 樣本 | reload |
+| 部署前 | 版本 gate | 先 `curl -s exporter:9926/metrics \| grep bluestore_slow` 有東西才用 R1/R2 | R1/R2 需 Squid v19.2.0+；Reef fallback＝op 均值＋node_disk＋R3/R4 | H-019（逐版比對） | — |
+
+<Callout type="warning" title="R1 的 FP 心理預期（部署前務必先建立）">
+  R1 亮 **≠ 硬體壞**。純過載（recovery、backfill、深佇列）也會把單段 op 推過 5s——lab 上 16 併發純 bench（無注入）就讓 9/9 OSD 全亮（H-015）。R1 的語意是「有 op &gt;5s」的**事實**，這在 SAS SSD 上本來就不該發生、過載到這程度本身值得看。真正的硬體分級靠 **R2 的單 node 聚集指紋**與**持續性**（`keep_firing_for` 窗內反覆＝劣化中），不要指望 R1 單條就定罪硬體。
+</Callout>
+
+## 7. 完整總結
+
+**按兩個研究問題收束**：
+
+1. **firmware 型暫態卡頓能不能只靠 Prometheus 偵測？** 能，但既有 SLOW_OPS 類 alert 對它零覆蓋（30s 門檻＋即時快照的機制必然）。解法是 Squid 才有的 4 個 BlueStore slow counter：R1 在**卡頓開始 +14s** 可判真，R2 用「同 node ≥3 顆同窗卡」在 **+20s** 給出 firmware／RAID 卡層級的歸因——**前提是事件當下該 device 有 IO 經過**（idle 盲區 E-03 是結構性的），且**前提是叢集在 Squid v19.2.0+**（Reef 沒這些 counter）。
+2. **會卡住 client 的一般 slow ops 能不能把延遲壓到 30~60s？** 能。R3/R4 用 `for:0` + `keep_firing_for` 把偵測延遲從舊規則的 ~120s 壓到 **45~60s**，且必須兩路（daemon + mon）取 OR 才不會被採樣漏失整段漏掉——**前提是 op 真的破了 30s**；「每個 op 都慢但都 &lt;30s」的持續劣化（H-024）只有 R1 的 5s 門檻看得到。
+
+**一句話版本**：5~8s 的 BlueStore 卡頓對既有告警是機制性隱形；改吃 4 個 slow counter 能在卡頓開始 +14s 判真、同 node 聚集 +20s 歸因硬體，前提是有 IO、且在 Squid。
+
+**接下來做什麼（按優先序，每條掛依據）**：
+
+1. **先版本 gate 再部署 R1–R4**：`grep bluestore_slow` 確認匯出面 → 上四條規則、既有規則不動（H-019／§5）。
+2. **R2 門檻對齊你的 per-node OSD 數**：10 顆維持 3（H-004／H-022）。
+3. **考慮低頻 synthetic IO** 補 idle 盲區（E-03／H-017）——超出 Prometheus scope，但低流量時段的 firmware 事件否則會漏。
+4. **把 `BLUESTORE_SLOW_OP_ALERT` 當盤後追查器**、不當 pager；清 latch = restart OSD、叢集沉降後一次一顆（H-008／finale）。
+5. **若想抓 2~5s 早期徵兆**，先在一台 node 試 `bluestore_log_op_age=2`（E-06），觀察 log 量與 FP 再決定是否推廣。
+
+## 8. 侷限、事故與開放問題
+
+**侷限（數值級 vs 機制級的邊界）**：
+
+- **idle 盲區是結構性的**（E-03）：無 IO 即無偵測，機制級、換環境也一樣。
+- **完成才記帳**（H-011）：op 永久卡死時 4 counter 全不動，只有 SLOW_OPS 看得到——R1 與 R3 互補、缺一不可，機制級。
+- **omap／scrub 盲區**（H-014）：25 個無 idx2 的 `log_latency` 呼叫點只 log、不 inc counter，純 omap／scrub 類 slow 只有 `BLUESTORE_SLOW_OP_ALERT` 看得到，機制級。
+- **合成注入的 device 層保真度**（H-009）：`dm suspend` 擋在 device 之上，node_exporter device 指標看不到；真 firmware 卡頓卡在 device 內、看得到。凡跨 node_disk 佐證的結論都受此邊界限制（數值級／環境綁定）。
+- **RAID 卡 write-back cache** 行為只能 T1/T2 論證，lab 無真卡——它可能吸收寫延遲讓 node_disk 低估，讀路徑訊號（`slow_read_wait_aio_count`）不受 cache 掩護、是更誠實的 device 指標（環境綁定）。
+- **偵測延遲數字綁定 scrape 10s／exporter 5s／mgr cache 15s**：換 scrape 設定要重新量（數值級）。
+
+**研究過程的事故（誠實記錄＋教訓）**：
+
+- **E-00 第一次 pgrep 自匹配**中止 run——但意外開的觀察窗反而抓到 H-015 與 H-023。
+- **E-02 第一次被前場景 fill 殘留污染**：`[2m]` lookback 會吃前一場景的增量，`wait_quiet` gate 必開，否則 first-true 時刻不可信。
+- **E-04 v3 io.max 數值寫入 kernel 6.8 EINVAL**（開機初期有效、之後全 device 失效）——成因未查明，僅影響實驗手段、不影響結論，注入改用 dm duty-cycle。
+- **清 latch 的打地鼠風險**（finale）：restart 引發的 peering IO 在慢碟上產生新 &gt;5s op、讓別的 OSD 重新 latch（osd.6 中招），要沉降後一次一顆。
+
+**開放問題（超出 scope／待後續）**：
+
+- **事件後 ~15s 內 OSD 就 crash**（H-012，只做 T1 推理）：counter 增量來不及被 scrape，此情境靠既有 OSD down alert 覆蓋——未在真機驗。
+- **事件當下 active mgr failover**（H-018，只做 T1 推理）：ceph-exporter 路徑不受影響、counter 規則天然是 health 規則的 mgr-failover 備援——架構層論證，未真機驗。
+- **kernel 6.8 cgroup io.max 數值寫入 EINVAL 的成因**未查明（僅實驗手段，記入踩雷）。
+- **生產 RAID 卡 write-back cache 對 node_disk 佐證的真實影響**：lab 無真卡，只能 T1/T2 論證。
+
+## 相關閱讀
+
+- [Ceph — SLOW_OPS／BLUESTORE slow op 的偵測機制與三層盲區](./slow-ops-detection-mechanisms)：本頁的**必讀前提**。三條訊號路徑的原始碼拆解、三層盲區與「怪錯人」的機制根源——本頁所有規則的設計理由都在那頁。
+- [Ceph — PG health states](./pg-health-states)：`SLOW_OPS` 與其他 health check 在體系裡如何對應 client 風險。
+- [Ceph — BlueStore deep dive](./bluestore-deep-dive)：`txc_commit_lat`／`kv_sync_lat` 背後的 TransContext 狀態機，幫你看懂 log 裡那行 slow op 慢在哪個階段。
+- [Ceph — CephMonQuorumLost 的盲區](./mon-quorum-detection-blind-spot)：另一個「sensor 與被測物同生共死」的偵測盲區研究，方法論同源。

@@ -5,8 +5,8 @@
 set -uo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-DESIGN_PAGE="$ROOT/next-site/content/ceph/features/prometheus-alert-design.mdx"
-FINDINGS_PAGE="$ROOT/next-site/content/ceph/features/prometheus-alert-real-lab-findings.mdx"
+DESIGN_PAGE="$ROOT/next-site/content/ceph/features/ceph-alert-policy-current.mdx"
+FINDINGS_PAGE="$ROOT/next-site/content/ceph/features/ceph-alert-policy-current.mdx"
 RULES_DIR="$ROOT/experiments/ceph-alert-rules/rules"
 
 [ -f "$DESIGN_PAGE" ] || { echo "FATAL: page not found: $DESIGN_PAGE"; exit 2; }

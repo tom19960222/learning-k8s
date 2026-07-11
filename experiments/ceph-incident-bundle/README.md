@@ -139,8 +139,8 @@ bash experiments/ceph-incident-bundle/run/collect.sh \
   （單行大 JSON 逐行 redact 極慢，且 regex 誤中會讓整檔變 `[REDACTED]`）；
   `dump-info.txt`、`index.txt`、`buildinfo.json`、`targets.json` 照常 redact。
   URL 內嵌的 `user:pass@` 寫進任何 artifact 前會遮蔽為 `user:***@`。
-- 尚未對真 Prometheus 驗證（lab 機器備妥後補跑）；目前行為以測試 + Prometheus
-  HTTP API 官方文件交叉驗證。
+- 已對真 Prometheus 驗證（2026-07-10，真 cephadm lab + 本機 Prometheus v3.12.0，
+  103 metrics 全數 dump 成功）：逐項斷言見 `PROM-VALIDATION-2026-07.md`。
 
 ## auto 的限制（已知）
 

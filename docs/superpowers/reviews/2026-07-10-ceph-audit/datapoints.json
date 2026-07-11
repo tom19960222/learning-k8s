@@ -1,0 +1,41 @@
+{
+ "results": [
+  {
+   "datapoint": "1. OSD flapping 情境開 noout 後 p999 延遲從 1146ms 降到 335ms（約 -71%）",
+   "verdict": "confirmed",
+   "source": "experiments/kubevirt-rbd-tuning/REPORT.md:242 —「flapping 使 qd1 讀 mean ×12、p999 至 1146ms；**noout 後 mean −43%、p999 −71%（→335ms）**」；同見 EVIDENCE-SUMMARY-2026-07-08.md:171「p999 **−71%（1146→335ms）**」與 STATE.md:137（E-34）",
+   "actual_value": "E-34（flapping）：qd1 讀 p999 1146ms → noout 後 335ms，p999 −71%、mean −43%。附註脈絡：noout 不能歸零，peering 尖峰仍到 335ms——與敘述一致。"
+  },
+  {
+   "datapoint": "2. 單一 OSD host 注入 50ms gray latency：寫入延遲約 ×40，但 ceph health 全程 HEALTH_OK",
+   "verdict": "confirmed",
+   "source": "experiments/kubevirt-rbd-tuning/REPORT.md:226 —「**寫入 mean ×40（1.73→69.6ms）、讀 ×19，`ceph -s` 全程 HEALTH_OK、零告警、無 OSD 被標 down**」；REPORT.md:80（E-32 表格行「一台 OSD host 網路 +50ms（gray failure，OSD 沒死）…寫 ×40、讀 ×19，`ceph health` 全程 OK 零告警」）；HYPOTHESES.md:118（confirmed，host 級 tc netem 50ms）",
+   "actual_value": "E-32：host +50ms（tc netem）→ 寫 mean ×40（1.73→69.6ms）、讀 ×19；ceph health 全程 HEALTH_OK、零告警。"
+  },
+  {
+   "datapoint": "3. 調 osd_op_num_shards 的收益不可分辨；但 rolling restart 曾讓 client p99 升到 1360ms",
+   "verdict": "confirmed",
+   "source": "experiments/kubevirt-rbd-tuning/EVIDENCE-SUMMARY-2026-07-08.md:240 —「E-22 osd_op_num_shards 8 vs 16 — done（效果 indistinguishable…）」；REPORT.md:72 —「✅ 效果帶內（8 已足）；**rolling restart 9 OSD 期間 client 讀 p99 → 1360ms**」；EVIDENCE-SUMMARY-2026-07-08.md:244 —「`to16` 輪 mean **39ms（×39）**、p99 **1360ms**、max 2553ms」",
+   "actual_value": "E-22：shards 8 vs 16 效果 indistinguishable；rolling restart 9 顆 OSD 期間 client qd1 讀 p99 = 1360ms（to16 輪；max 2553ms、基線 ~1ms）。也已寫入 next-site/content/vm-storage-perf/features/rbd-io-production-tuning.mdx:175。"
+  },
+  {
+   "datapoint": "4. NVMe 有 headroom 時 mClock balanced vs high_client_ops A/B 無可辨識差異",
+   "verdict": "confirmed",
+   "source": "experiments/kubevirt-rbd-tuning/EVIDENCE-SUMMARY-2026-07-08.md:98 —「backfill 窗 client latency：balanced rw 2.39ms/rr 1.31ms vs high_client_ops rw 2.36ms/rr 1.31ms——**帶內無差**；recovery 速率 467 vs 617 MB/s（NVMe headroom 大到兩個 profile 都沒讓 client 等）」；REPORT.md:87 —「❌ **兩個 profile 無差**（headroom 下沒有爭用可仲裁）」",
+   "actual_value": "E-39（backfill 進行中 A/B）：balanced rw 2.39ms/rr 1.31ms vs high_client_ops rw 2.36ms/rr 1.31ms，帶內無差；prediction 為 violated（原預期 high_client_ops 減半惡化）。MDX 版見 rbd-io-production-tuning.mdx:177「**indistinguishable**（本環境）」。"
+  },
+  {
+   "datapoint": "5. MON quorum loss 時新 PVC 仍可 Bound；卡住的是 node 上新的 kernel rbd map",
+   "verdict": "confirmed",
+   "source": "experiments/ceph-mon-quorum-blind-spot/REPORT.md:128-129 —「新 PVC `qio-newclient` 窗內竟 **Bound**（RBD image 建出來了）——因為 CSI **provisioner 本身也是個已連線的 rados client**」＋「但新 pod 卡在 **ContainerCreating**：node 上的 `rbd map` 是**全新 kernel client**，要向 mon 取 map ⇒ 阻塞」；MDX 版：next-site/content/ceph/features/mon-quorum-detection-blind-spot.mdx:124 —「實驗中新 pod 卡在 `ContainerCreating`（有趣的是新 PVC 反而會 Bound，因為 CSI provisioner 自己是既有連線）」",
+   "actual_value": "H-B2 修正版 confirmed：quorum loss 窗內新 PVC qio-newclient 成功 Bound（CSI provisioner 走既有連線）；阻塞點是 node 端全新 kernel rbd map（pod 停在 SuccessfulAttachVolume 之後、mount 之前）。"
+  },
+  {
+   "datapoint": "6. slow-ops 研究：12 個真機 run、19 confirmed / 4 violated hypotheses",
+   "verdict": "confirmed",
+   "source": "experiments/ceph-slow-ops-detection/REPORT-2026-07-09.md:4-5 —「完整 hypothesis backlog（25 條：**19 confirmed / 4 violated / 2 僅 T1 推理**…）」＋「12 個真機實驗 run 的索引見 `EVIDENCE-SUMMARY-2026-07-09.md`」；EVIDENCE-SUMMARY-2026-07-09.md:22 —「最終盤點：**19 confirmed / 4 violated / 2 proposed（H-012、H-018＝Gate 1 triage 為 T1 推理，不跑 T3）**」",
+   "actual_value": "12 個真機 run（EVIDENCE-SUMMARY 索引表編號至 12，末行為 seq-finale）；25 條 hypotheses = 19 confirmed / 4 violated / 2 proposed（T1 推理）。HYPOTHESES.md 內 grep 實數吻合：`Status: confirmed`=19、`Status: violated`=4。"
+  }
+ ],
+ "notes": "全部 6 個數據點皆 confirmed。查證基準：worktree（branch claude/ceph-content-restructure-dfa625，HEAD e9e0399）git status clean，所有引用檔案均為 git-tracked（git ls-files 驗過），故屬「已 commit」內容。補充脈絡：(1) 數據點 1 的 noout 是 E-34 flapping 情境，335ms 為 noout 後殘餘 peering 尖峰的 p999；(2) 數據點 4 的無差是在「backfill 進行中」的 A/B 窗，且該實驗 prediction 標為 violated（預期減半未發生），但「無可辨識差異」的敘述本身正確；(3) 數據點 6 的 hypotheses 總數是 25 條（19+4+2 proposed），敘述只提 19/4 未提 2 條 T1-only，不影響正確性。"
+}

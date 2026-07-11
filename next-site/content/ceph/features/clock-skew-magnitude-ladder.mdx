@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — node 間時間差 51ms / 401ms / 1s / 1min / 1hr / 1day 分別壞掉什麼
+archived: true
+supersededBy: clock-skew-failure-modes
 description: 用 v19.2.3 原始碼回答「node 時鐘差 N 會發生什麼」。三條獨立的線：MON↔MON 在 50ms 報 MON_CLOCK_SKEW、5s（mon_lease）lease 崩 election churn；MON↔OSD 的 cephx 到期是 mon 蓋的絕對時間戳，所以雙向都會爆——OSD 比 mon 快會起不來 exit(1)，mon 先快再 NTP 跳回會讓在線 OSD 大量掉線；OSD↔OSD 走 mono_clock 免疫。並澄清 client ticket 為何不會因 skew 過期。
 ---
 

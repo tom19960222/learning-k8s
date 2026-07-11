@@ -1,6 +1,8 @@
 ---
 layout: doc
 title: Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響
+archived: true
+supersededBy: mon-quorum-loss-io-lab
 description: ceph 的 quorum 是 N/2+1，3 mon 容忍 1 死。掛 1 台仍可重新 election；掛 2 台剩下的 mon 會卡在 probing、不能讀寫 map。既有 I/O 不會立刻因 mon 失 quorum 全斷，但新連線、reconnect、auth renew、OSD failure 與 map refresh 會逐步把 dataplane 拉進風險區。
 ---
 

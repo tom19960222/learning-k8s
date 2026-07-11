@@ -1,0 +1,304 @@
+---
+layout: doc
+title: Ceph — quorum 失守時的 I/O 衝擊：真機實驗報告（as-of 2026-07-08）
+description: 把 experiments/ceph-mon-quorum-blind-spot 的 IO 矩陣真機結果寫成完整報告。停 2/3 mon（quorum 失守）後，已 map/mount 的 RBD volume single/multi thread × random/seq × 讀寫全部照跑、吞吐約等於 baseline（cached osdmap 直打 OSD、不經 mon）；真正卡的是任何要新建 mon 連線的動作——node 端 kernel rbd map 讓新 pod 卡在 ContainerCreating。頭牌翻案：新 PVC 反而 Bound（CSI provisioner 走既有連線），推翻舊頁「新 PVC 會失敗」的推測。含 T1 機制底（quorum 數學／Paxos lease／dataplane 分界，對 v19.2.3 pinned source 重驗）、逐實驗五欄、被推翻預測與建議。取代純 T1 推演版 mon-quorum-loss-impact。
+category: experiment-report
+---
+
+## 本頁定位
+
+- **文章類型**：experiment-report（研究收官報告）。這頁把 `experiments/ceph-mon-quorum-blind-spot/` 那批研究裡的 **I/O 衝擊面**（Thread B）整理成一份**給沒參與的人只讀這一頁就懂**的報告：停 2/3 mon 時 client I/O 到底受什麼影響、哪些照跑、哪些卡住、為什麼。
+- **這是日期化快照（as-of 2026-07-08）**：內容凍結在注入實驗那天（run `mon-quorum-2down-20260708T154019Z`），之後不改寫歷史。
+- **版本錨點**：ceph **v19.2.3**（Squid LTS，submodule commit `c92aebb`）；真機拓樸＝cephadm 3 mon（`.166`／`.167`／`.164`）+ 9 OSD 的儲存叢集，client 端是 **k0s 單節點 + Rook external**（`.155`，CSI 連到外部 ceph 叢集）。這些常數決定本頁的時序與吞吐數字，換版本／換拓樸要重量。
+- **閱讀前提（恰好 1 篇，建議先讀）**：[Ceph 整體架構](./architecture)。你只要先知道 **MON 是 cluster map 的 source of truth、用 Paxos quorum 維持一致**、以及 **OSD 才是真正存資料的地方**這兩件事，本頁的「為什麼 data path 不經 mon」就會很順。其餘 Paxos／cephx 細節本頁 §2 自帶。
+- **證據層級**：本頁**同時吃兩級證據**。全文用 `T1` = pinned 原始碼一定如此、`T3` = 在真機 lab 實際注入量到，兩種標記。§2 的機制（為什麼會這樣）是 **T1**；§4／§5 的 I/O 結果（實際發生什麼）是 **T3**。
+- **本頁取代**：舊頁 [`mon-quorum-loss-impact`](./mon-quorum-loss-impact)。舊頁是一篇純 **T1 推演**——quorum 數學、Paxos lease 時序、cephx TTL 都對，本頁 §2 直接沿用（並對 pinned source 重驗過）。但舊頁兩處**推測**已被真機修正：(1)「掛 2 台 mon 時新 PVC 會 retry／失敗」——實測**新 PVC 反而 Bound**（見 §5，頭牌翻案）；(2)「既有 OSD I/O 可能持續」的保守措辭——已升級為 **fio 實證**（見 §4）。舊頁不動、之後標 archive。
+- **與姊妹頁的分工（重要）**：[`mon-quorum-detection-blind-spot`](./mon-quorum-detection-blind-spot) 講的是**偵測面**——為什麼 `CephMonQuorumLost` 這條 alert 在 quorum 失守時**不會 fire**（mgr metric 凍結），以及怎麼用 blackbox_exporter 補一條不經 mgr 的訊號。**那頁保留 active、不被本頁取代。** 本頁只講**I/O 衝擊面**：同一個注入窗裡，client 的讀寫實際遭遇什麼。兩頁共用同一場真機注入，各切一半。
+- **原始數據存放**：這個實驗的 raw evidence bundle **在 git 內、逐檔可稽核**（是 8 個 experiments 目錄中證據鏈最完整的一個）。本頁每個數字都對得回 `experiments/ceph-mon-quorum-blind-spot/results/` 底下的具體檔案——baseline 在 `results/baseline/`、注入窗在 `results/mon-quorum-2down-20260708T154019Z/`（14 檔）。下文引用時直接寫檔名。
+
+## 這份報告怎麼讀
+
+**趕時間**：直接看 [§3 規劃總覽](#3-實驗規劃總覽)（一張表看完測了什麼、預測命中沒）＋ [§6 建議總表](#6-建議總表)（quorum 失守期間該做什麼、別做什麼）。想知道「為什麼」再回頭讀 §2 機制與 §4／§5 逐實驗。
+
+**各節導覽**：§1 前提（緣起、要回答的問題、判準、lab 拓樸、fio 矩陣定義、可信度防線）→ §2 T1 機制底（為什麼 data path 不依賴 mon——這是所有預測的來源）→ §3 規劃總覽（H-A／H-B 全對帳）→ §4 逐實驗五欄（含 ground truth、已連線 fio 矩陣）→ §5 被推翻的預測（**新 PVC Bound**，本頁頭牌）→ §6 建議總表 → §7 總結 → §8 侷限與開放問題。
+
+**術語與縮寫**（第一次出現在這裡定義清楚，全文沿用）：
+
+- **quorum**：Paxos 要能運作，必須有超過半數的 mon 彼此同意；能同意的那群 mon 叫 quorum。**沒有 quorum，mon 就不能讀也不能寫 cluster map。**
+- **`min_quorum_size`**：形成 quorum 的最小 mon 數，公式 `N/2 + 1`（見 §2）。3 mon → 需要 2；停掉 2 顆只剩 1 &lt; 2，**quorum 失守**——這就是本實驗注入的狀態。
+- **Paxos lease**：leader mon 定期發給其他 mon 的「你在這段時間內可以回答 read」的租約。lease 過期又收不到新租約，mon 就發起重新選舉。read／write cluster map 都要先確認 lease 有效（見 §2）。
+- **dataplane vs control plane**：**dataplane** = 實際讀寫資料的 RADOS op path（client ⇄ OSD）；**control plane** = 改 cluster 狀態／map 的管理操作（建 pool、標 OSD down、發新 map…，這些要經 mon）。本頁的核心分界：quorum 失守**先倒 control plane，dataplane 只在需要 mon 時才被拖下水**。
+- **cached osdmap**：client／OSD 手上快取的那份「object 該去哪顆 OSD」的地圖。**只要地圖沒過期、也不需要更新，讀寫就能直接算出目標 OSD、直打，不必問 mon。**
+- **cephx ticket**：ceph 的認證票。**mon ticket**（連 mon 用，預設 TTL 72hr）與 **service ticket**（連 OSD 用，預設 TTL 1hr）。票沒到期就不必回 mon 換票。
+- **fio**：Linux 上的 I/O 壓測工具。本實驗用它在 RBD volume 上跑固定 pattern 量吞吐。
+- **fio pattern**：I/O 存取型態。本實驗四種——`randread`（隨機讀）／`randwrite`（隨機寫）／`read`（順序讀，seq）／`write`（順序寫，seq）。隨機用 4k block、順序用 1M block。
+- **qd（queue depth）**：fio 的 `iodepth`，一次在飛的 I/O 數。**本實驗全程固定 qd=1**（`direct=1 iodepth=1`），變因只有 pattern 與 thread 數。
+- **thread（1t／4t）**：fio 的併發 job 數（`numjobs`）。1t = 單 thread、4t = 4 個並行 thread。
+- **rc=0**：指令的 return code 為 0＝成功完成。本頁用它當「照跑」的判準——fio cell rc=0 表示該組讀寫完整跑完、無 stall／timeout。
+- **iops**：每秒完成的 I/O 次數（I/O operations per second），本頁效果量表的單位。
+- **PG（placement group）**：RADOS 把 object 分組放到 OSD 的單位；client 讀寫先算 object 落在哪個 PG、再由 PG 對到一組 OSD。「PG 不 re-peer」（成員組合不變、不需重新協商）是本頁多個結論的機制支點。
+- **krbd（kernel rbd map）**：Linux kernel 內建的 RBD client。k8s node 要把一顆 RBD image 掛成 block device 給 pod 用時，就在 node 上做 `rbd map`——這是一個**全新的 rados client**，開機要先向 mon 取 map。**這是本實驗唯一會卡住的動作。**
+- **CSI provisioner**：ceph-csi 裡負責「建 RBD image／回應 PVC」的 controller 元件。它是一個**長駐、早就連上 mon 的 rados client**——這個身份是 §5 頭牌翻案的關鍵。
+- **PVC `Bound`**：PersistentVolumeClaim 已成功綁到一顆 PV（底層 RBD image 已備妥）。是 control-plane 動作的結果。
+- **pod `ContainerCreating`**：pod 已排程、volume 也 attach 了，但 container 還沒起來——本實驗中卡在這裡的原因就是 node 端 krbd map 掛不上（見 §4.C）。
+- **msgr port 3300**：mon 的 v2 messenger 埠。姊妹頁的 blackbox 偵測探的就是它；本頁只在 ground truth 提一次。
+- **slow ops**：ceph 內建健康檢查，語意是「有請求卡在飛行中、齡超過門檻還沒完成」。本實驗用它當 **ground truth**——mon-01 在窗內冒出 slow ops，反證 quorum 真的失守（見 §4.A）。
+
+**為什麼這份報告的重點是「沒有變化」**：I/O 實驗常見的收穫是「注入後延遲飆高幾倍」。本實驗的頭條結果**相反**——已連線 client 的吞吐**幾乎沒動**（甚至略快）。這個「null result」本身就是結論：它精確地劃出「quorum 依賴在哪一層、不在哪一層」。所以下文報數字時，重點不是倍率，而是**有沒有從 baseline 階梯式崩落／stall**（答案是沒有）。
+
+## 1. 前提
+
+### 緣起：直覺說「掛 2 台就完了」，但完的是哪一半？
+
+3-mon cluster 容錯 1 台是常識。真正含糊的是**掛 2 台（quorum 失守）之後，正在跑的 workload 會怎樣**？是瞬間全斷、還是撐一陣子、還是根本沒事？舊頁 [`mon-quorum-loss-impact`](./mon-quorum-loss-impact) 用 v19.2.3 原始碼推導出「dataplane 不直接依賴 mon、既有 I/O **可能**持續」，但那是純推理、措辭保守，且對「新 PVC 會不會失敗」給了一個**後來被真機推翻**的答案。這份研究就是把那些推理**拉到真機上量**。
+
+### 要回答的問題
+
+1. **已連線 client**（注入前已 map/mount 並在 I/O 的 RBD volume）在 quorum 失守窗內，讀寫吞吐是照跑、退化、還是全斷？是否因 I/O pattern（random／seq）或併發度（1t／4t）而有質性差異？
+2. **新連線 client**（窗內才要新掛 volume 的 pod／PVC）卡在哪個環節、卡多死？
+3. 舊頁「新 PVC 會 retry／失敗」的推測，真機是否成立？
+
+### 判定標準（先於實驗定案）
+
+- **null 也算結果**：對已連線 client，判準是「窗內吞吐是否**階梯式崩落**或出現 **stall／timeout**」，而非「有沒有一點抖動」。lab 用小碟、size=3、慢寫是常態，所以看的是 **baseline vs window 的相對變化**，不是絕對值。
+- **prediction 先行**：每條 hypothesis 的預測都在跑之前寫死在 `HYPOTHESES.md`，事後對照命中／推翻，避免事後合理化。
+- **ground truth 獨立佐證**：不靠「fio 沒崩」去反推「quorum 真的失守了」——用 mon systemd 狀態 + `ceph -s` 的 slow ops 獨立確認注入確實造成 quorum loss（見 §4.A），否則「沒事」可能只是根本沒注入成功。
+
+### 受測系統與注入方法
+
+| 面向 | 內容 |
+|---|---|
+| Storage 叢集 | cephadm **v19.2.3**，3 mon（`.166`／`.167`／`.164`）+ 9 OSD；2 pool、33 pg、`active+clean`（見 `precheck-ceph-s.txt`） |
+| Client 拓樸 | **k0s 單節點 + Rook external**（`.155`）：k8s 內的 ceph-csi 連到上面那個外部 ceph 叢集，PVC 走 `ceph-rbd` StorageClass |
+| 注入手法 | `systemctl stop` **mon-02 + mon-03** 的 mon daemon（保留 mon-01，它跑 active mgr）→ 剩 1/3 mon &lt; `min_quorum_size`=2 ⇒ quorum 失守。可逆、idempotent、注入前 pre-check `ok-to-stop`／quorum |
+| 觀察窗 | 注入 `2026-07-08T15:40:22Z`（`inject-time.txt`）→ 收尾 `15:42:58Z`，約 **2.5 分鐘** |
+| 還原 | trap 保證 `systemctl start` 兩顆 mon → assert 3-mon quorum 回 `HEALTH_OK` 才進下一步 |
+
+### fio 矩陣定義（Thread B 的負載）
+
+- **固定**：`direct=1`、**qd=1**（`iodepth=1`）。變因只有 pattern × thread。
+- **8 個 cell**：4 pattern（`randread` 4k／`randwrite` 4k／`read` seq 1M／`write` seq 1M）× 2 併發（1t／4t）。
+- **兩次量測**：注入**前** healthy 3-mon 跑一次當 baseline（`baseline/fio-matrix-baseline.txt`）；注入窗內同一顆已 warm 的 pod 再跑一次（`fio-window.txt`）。逐 cell 比 baseline vs window。
+- **新連線探針**：窗內另外 `kubectl apply` 一組全新 PVC + fio pod（`qio-newclient`），看它卡不卡（`newclient-status.txt`）。
+
+### 可信度防線
+
+- **已連線 pod 注入前先 warm**：確保它手上已有 cached osdmap／service ticket，量的才是「既有連線」的行為。
+- **窗夠長**：~2.5min 足夠讓「若會崩」的崩落發生（Paxos lease 秒級、election 十秒級都遠短於窗）。但**也僅 2.5min**——所以任何「既有 I/O 不受影響」的結論都只在此窗內成立，cephx service ticket（預設 1hr）耗盡後的行為**不在本實驗觀察範圍**（見 §8）。
+- **raw 在 git**：每個 cell 的 rc、每個時刻的 Prometheus 讀值都留檔可稽核。
+
+## 2. 機制底（T1：為什麼 data path 不依賴 mon）
+
+這一節是所有預測的來源，全部對 pinned source `c92aebb` 重驗過。它回答「**為什麼我們事前就預期已連線 client 會沒事**」。
+
+### quorum 是 `N/2 + 1`，不是「過半」
+
+數字硬寫在 MonMap：
+
+File: `ceph/src/mon/MonMap.h` (line 193)
+
+```cpp
+unsigned min_quorum_size(unsigned total_mons=0) const {
+  if (total_mons == 0) {
+    total_mons = size();
+  }
+  return total_mons / 2 + 1;
+}
+```
+
+| total_mons | min_quorum_size | 可掉幾台 |
+|---|---|---|
+| 3 | 2 | 1 |
+| 5 | 3 | 2 |
+
+3 mon 就是「最多掉 1 台」。本實驗停 2 台 → 剩 1 &lt; 2 → quorum 無法形成。剩下那顆 mon 進 `bootstrap()` 後卡在 `STATE_PROBING`，反覆對其他 mon 發 probe、永遠收不到回應，`outside_quorum` 湊不到 `min_quorum_size` 就永遠不呼 `start_election()`：
+
+File: `ceph/src/mon/Monitor.cc` (line 2147)
+
+```cpp
+unsigned need = monmap->min_quorum_size();
+if (outside_quorum.size() >= need) {
+  ...
+  start_election();
+} else {
+  dout(10) << " that's not yet enough for a new quorum, waiting" << dendl;
+}
+```
+
+### 兩個閘門：`is_writeable` / `is_readable`
+
+mon 上任何 osdmap／monmap／authmap 的**讀或改**都要先過這兩個 predicate。沒有 quorum 就沒有 lease，兩個都會回 false：
+
+File: `ceph/src/mon/Paxos.cc` (line 1522)
+
+```cpp
+bool Paxos::is_writeable()
+{
+  return
+    mon.is_leader() &&
+    is_active() &&
+    is_lease_valid();
+}
+```
+
+File: `ceph/src/mon/Paxos.cc` (line 1481)
+
+```cpp
+bool Paxos::is_readable(version_t v)
+{
+  ...
+  ret =
+    (mon.is_peon() || mon.is_leader()) &&
+    (is_active() || is_updating() || is_writing()) &&
+    last_committed > 0 && is_lease_valid(); // must have a value alone, or have lease
+  ...
+```
+
+所以 quorum 失守後，**任何要經 mon 的 control-plane 動作都停擺**（`ceph -s`、發新 map、標 OSD down、簽發新 cephx ticket…）。lease 的時序常數鏈是 3s renew（`mon_lease` 5 × `mon_lease_renew_interval_factor` 0.6）/ 5s expire（`mon_lease`）/ 10s timeout（5 × `mon_lease_ack_timeout_factor` 2），全部在 `mon.yaml.in` 有預設值——換句話說 mon 端在十幾秒內就確定進入了「無 lease」狀態，遠短於我們 2.5min 的窗。
+
+### 關鍵分界：dataplane 為什麼能不經 mon
+
+ceph 的設計是：**client 從 mon 拿到 osdmap + cephx service ticket 之後，後續 RADOS read/write 全部直接打 OSD**。OSD 對 mon 的依賴是 outbound（送 failure report、beacon 心跳、pg 通知），這些不消化不影響它服務既有 client。
+
+```
+client ─ RADOS op ──▶ OSD ─ replicate ─▶ OSD ─ ack ─▶ client
+   │
+   └── (背景) ─ 定期向 mon subscribe 新 osdmap、refresh cephx service ticket
+```
+
+只要 client 手上**還有有效的 cached osdmap、可用的 authorizer、既有的 connection 沒斷**，I/O 就能繼續——不需要 mon 參與。這正是我們預期「已連線 client 在窗內照跑」的機制根據。兩個會把 dataplane 重新拉回 mon 依賴的邊界，本實驗的 2.5min 窗都**沒踩到**：cephx service ticket 預設 1hr 才需 renew（`auth_service_ticket_ttl`，`global.yaml.in`），且窗內 9 顆 OSD 全 up、PG 不需 re-peer（不需要新 map）。
+
+<Callout type="info" title="這一節的角色">
+  §2 全是 T1（原始碼一定如此）。它給的是**預測**，不是結果。真機到底照不照這個劇本走，是 §4／§5 的 T3 工作——而其中一條（新 PVC）就沒照舊頁的推理走。
+</Callout>
+
+## 3. 實驗規劃總覽
+
+整批研究規劃了 **11 條 hypothesis**：Thread A 偵測 6 條（H-A1…A6）+ Thread B I/O 5 條（H-B1…B5）。**本頁只負責 I/O**，所以下表 Thread A 只列狀態、細節指向[偵測盲區頁](./mon-quorum-detection-blind-spot)；Thread B 是本頁主體，逐條在 §4／§5 展開。
+
+對帳：**11 條 = 8 confirmed（A1–A4、B1–B4）+ 2 設計論證未部署（A5／A6）+ 1 未直接觀察（B5）**。
+
+**Thread A — 偵測（細節在姊妹頁，這裡只交代對帳）**
+
+| 編號 | 命題（一句話） | status | 本頁用途 |
+|---|---|---|---|
+| H-A1 | 現行 `CephMonQuorumLost`（mgr metric）在 2/3 down 時盲、全窗 stale=3 | confirmed | ground truth：mgr metric 全窗讀 3（§4.A） |
+| H-A2 | mgr 續 serve（up=1）但值凍結，非缺席 | confirmed | 偵測面，見姊妹頁 |
+| H-A3 | blackbox 探 mon:3300 可偵測 | confirmed | 偵測面，見姊妹頁 |
+| H-A4 | 純 `up{ceph}` 偵測不到 | confirmed | 偵測面，見姊妹頁 |
+| H-A5 | node_exporter systemd 看 mon 進程 | 設計論證（未部署） | — |
+| H-A6 | per-host ceph-exporter 多源去 stale | 設計論證（未部署） | — |
+
+**Thread B — I/O 衝擊（本頁主體）**
+
+| 編號 | 命題（一句話） | 預期 | 結果 |
+|---|---|---|---|
+| H-B1 | 已連線 client（cached osdmap）續跑 | 窗內 fio 非零、無 stall | ✅ 8 cell 全 rc=0、吞吐≈baseline（§4.B） |
+| H-B2 | 新連線 client 阻塞 | 新 PVC + pod 卡 Pending／ContainerCreating、0 IOPS，quorum 回才 Bound | ❌ **修正版**：新 PVC 反而 **Bound**；卡的是新 pod 的 krbd map（§5 頭牌） |
+| H-B3 | rand/seq × 1t/4t 對「已連線續跑」無質性差異 | 各 cell 皆完成、吞吐≈baseline、非階梯崩落 | ✅ 8 cell 皆續、無崩落（§4.B） |
+| H-B4 | 讀寫皆續（PG 不 re-peer） | randwrite/randread 皆維持非零吞吐 | ✅ 寫也照跑（慢是碟慢、非 quorum，§4.B） |
+| H-B5 | 還原後被卡的新 client 有界恢復 | `systemctl start` 後數十秒內 Bound/Running | ➖ **未直接觀察**（cleanup 提早刪 pod，§8） |
+
+## 4. 逐實驗詳情
+
+### 4.A ground truth — 確認 quorum 真的失守了
+
+在講 I/O 之前，先證明注入有效（否則「fio 沒崩」毫無意義）。三條獨立證據：
+
+1. **mon daemon 真的停了**：`mon-isactive.txt` 記錄 `mon-02: inactive`、`mon-03: inactive`。
+2. **mon-01 收到 client 的 mon 請求卻處理不了**：還原後 `postcheck-ceph-s.txt` 冒出 `748 slow ops, oldest one blocked for 153 sec, mon.ceph-lab-mon-01 has slow ops`。oldest op 齡 153s 與 ~156s 的觀察窗（注入 15:40:22Z → 收尾 15:42:58Z）量級吻合——slow op 起算晚於注入瞬間，差 3 秒合理——表示整個窗內都有 client 請求在敲 mon-01，但它無 quorum、`is_readable`/`is_writeable` 全 false、只能把請求塞成 slow ops。**這就是 quorum 確實失守的鐵證。**
+3. **偵測面全窗盲（對照）**：同時間 Prometheus 上 mgr 匯出的 `count(ceph_mon_quorum_status==1)` **從 baseline 到 window-final 一路讀 3**（`prom-baseline.txt` … `prom-window-final.txt`），`CephMonQuorumLost` 全程沒 fire。這是姊妹頁的主題，本頁只借它反襯「ground truth 是真失守、但既有 metric 說謊」。
+
+<Callout type="warning" title="讀這頁時記得的一件事">
+  quorum 已經真的失守（mon-01 塞了 748 slow ops），可是——如下 §4.B——已連線的 fio **完全沒感覺**。「系統壞了」與「你的 workload 有感」是兩件事，這正是為什麼一定要有主動的 quorum pager（見姊妹頁），不能等 workload 自己叫。
+</Callout>
+
+### 4.B 已連線 client：single/multi × random/seq 全部照跑（H-B1／B3／B4）
+
+- **注入什麼**：停 mon-02+mon-03（quorum 失守）。被測物＝注入前已 map/mount 且 warm 的 fio pod，窗內重跑 8-cell 矩陣。
+- **為什麼測**：驗 §2 的 T1 預測——已連線 client 持 cached osdmap 直打 OSD，quorum 失守不該影響 data path；且不因 pattern／併發度而有質性差異。
+- **預期**（跑前寫死）：8 cell 全部完成（rc=0）、無 stall／timeout、窗內吞吐與 baseline 差異落在雜訊帶內、**非階梯式崩落**。
+- **結果（確認）**：8 cell **全 rc=0**，窗內吞吐 ≈ baseline，**沒有任何 cell 崩到 0 或 stall**。原始值（`baseline/fio-matrix-baseline.txt` vs `fio-window.txt`）：
+
+| pattern | baseline 1t / 4t | window 1t / 4t | 判讀 |
+|---|---|---|---|
+| randread 4k | 2847 / 36134 iops | 8766 / 38702 iops | 照跑，讀甚至更快 |
+| randwrite 4k | 10 / 13 iops | 9 / 19 iops | 照跑（個位數 iops 是慢碟本色，非 quorum） |
+| read seq 1M | 172 / 1380 iops | 343 / 1376 iops | 照跑，1t 讀更快 |
+| write seq 1M | 1 / 3 iops | 2 / 2 iops | 照跑（極慢是碟慢；4t 的 3→2 在個位數 iops 屬雜訊，不是退化訊號） |
+
+  讀路徑窗內反而**略快**（randread 1t 2847→8766、seq read 1t 172→343），合理解釋是 quorum 失守後背景 mon/mgr chatter 變少、OSD 少了雜務。但這**不是重點**——重點是**沒有一個 cell 階梯崩落**，rand/seq/單多 thread/讀寫全都穿越整個窗。⇒ H-B1／H-B3／H-B4 全 confirmed：quorum 依賴在「map 分發／建 session」層，不在 data path；OSD 全 up、PG 不 re-peer，既有連線讀寫皆續。
+- **建議**：已在跑的 workload（RBD 已 map/mount）在 quorum 失守窗內**多半無感**，不需緊急疏散——**條件是**在 cephx service ticket 餘額內、且期間不觸發「需要新 map」的事件（見 §6 與 §8 的邊界）。
+
+### 4.C 新連線 client：卡在 node 端 krbd map
+
+- **注入什麼**：同一個窗內 `kubectl apply` 一組**全新** PVC + fio pod（`qio-newclient`）。
+- **為什麼測**：驗 H-B2——新連線需要向 mon 取 map，預期會卡。
+- **預期**（跑前寫死）：新 PVC 卡 Pending、新 pod 卡 ContainerCreating、0 IOPS，quorum 回才 Bound/Running。
+- **結果（修正版 confirmed，細節見 §5）**：`newclient-status.txt` 顯示——新 **PVC 竟然 `Bound`**（105s 內就綁好了 `pvc-b4d2a61e…`），只有**新 pod 卡在 `ContainerCreating`**。pod events 停在 `SuccessfulAttachVolume` **之後、mount 之前**：node 上的 `rbd map` 是全新 kernel client，要向 mon 取 map ⇒ 阻塞。
+- **建議**：quorum 失守窗內**不要**做任何會觸發「node 端新掛 volume」的事——這涵蓋新部署、pod 重啟、node 重開機、drain 後重排、HPA 擴容。詳見 §5 與 §6。
+
+## 5. 被推翻的預測：新 PVC 反而 Bound（本頁頭牌）
+
+**這是本頁最有價值的一段。** 舊頁 [`mon-quorum-loss-impact`](./mon-quorum-loss-impact) 的情境 B 表寫著「`0~1hr 之間 | 新 client、新 PVC、client reconnect… 會失敗 / retry`」；本研究的 H-B2 也照這個直覺預測「新 PVC 卡 Pending」。真機把它**部分推翻**：
+
+| 預測（跑前寫死） | 實測（`newclient-status.txt`） | 修正後的機制 |
+|---|---|---|
+| 窗內新 PVC 卡 Pending、quorum 回才 Bound | 新 PVC **105s 內 Bound**（RBD image 建出來了）；只有新 **pod** 卡 ContainerCreating | 阻塞的精確位置是「**任何要新建 mon 連線的動作**」，不是「建 PVC」這件事本身 |
+
+為什麼 PVC 會成功？因為 **CSI provisioner 本身就是一個早已連上 mon 的長駐 rados client**。建 RBD image 這個 control-plane 動作，是 provisioner **騎在既有連線上**發出的——等於 §2 的「已連線 client 照跑」延伸到了控制面。真正需要**全新** mon 連線的，是 node 上的 kernel `rbd map`（krbd）：它是一個從零開始的 client，開機第一件事就是向 mon 取 monmap/osdmap，quorum 失守就卡死在這裡。所以 pod 事件停在 `SuccessfulAttachVolume`（attach 是 controller 動作、成功）之後、mount（node 端 krbd map、失敗）之前。
+
+**這個翻案改了兩個東西**：
+
+1. **判斷 workload 風險的維度變了**：不能用「control plane vs data plane」一刀切說「所有 control-plane 動作都卡」。更精確的分界是「**這個動作是騎既有 mon 連線、還是要新建 mon 連線**」。CSI provisioner（既有連線）→ 過；krbd map（新連線）→ 卡。
+2. **舊頁那一格 stale 了**：「新 PVC 會失敗」在這個拓樸（ceph-csi + 既有 provisioner）下不成立，本頁不沿用。
+
+<Callout type="info" title="翻案的邊界">
+  這是**在 ceph-csi + 既有 provisioner 拓樸下**的結果。若你的環境是每次都新起一個 rados client 去建 image（不是長駐 provisioner），那「建 image」也會卡——結論仍收斂到同一句：**卡的是新建 mon 連線，不是動作的名字**。
+</Callout>
+
+## 6. 建議總表
+
+每條自帶適用條件與依據。這頁是 I/O 面，建議都圍繞「quorum 失守窗內該／不該做什麼」。偵測（怎麼知道 quorum 失守了）請看[姊妹頁](./mon-quorum-detection-blind-spot)。
+
+| 對象 | 建議 | 適用條件 | 依據 |
+|---|---|---|---|
+| 已在跑的 workload | quorum 失守當下**不必緊急疏散**已 map/mount 的 volume | 在 cephx service ticket 餘額內（預設 1hr）、且期間不觸發需要新 map 的事件（OSD 故障、reconnect） | §4.B：8 cell 全 rc=0、吞吐≈baseline |
+| node 維運 | quorum 失守期間**不要 drain node / 重排 pod / 觸發 HPA 擴容** | 只要會讓 node 端新做 krbd map 就適用 | §4.C／§5：新 pod 卡 ContainerCreating |
+| 事故判斷 | 看到「新 pod 卡 ContainerCreating 但 PVC 已 Bound」＋既有 workload 沒事 → **優先懷疑 mon quorum**，別誤判成 CSI/storage 壞 | ceph-csi + 既有 provisioner 拓樸 | §5 翻案 |
+| 監控 | **必須有主動的 quorum pager**——不能等 workload 自己叫 | 存量 workload 在窗內無感（§4.A Callout） | 訊號設計見姊妹頁的 blackbox 方案 |
+| 復原 | 先起**一台**已知健康的 mon 回 quorum，不要同時重啟多台；quorum 一回，卡住的新 mount 隨即續成 | 確認網路/時間/磁碟正常後 | 姊妹頁「還原順序」；本實驗 trap 還原後 quorum 秒回 |
+
+## 7. 完整總結
+
+**按兩個研究問題收束**：
+
+1. **已連線 client 在 quorum 失守窗內怎樣？** 照跑，且不因 pattern／併發度而有質性差異。已 map/mount 的 RBD volume 在 ~2.5min 窗內 single/multi × random/seq × 讀寫 8 種組合**全部 rc=0、吞吐約等於 baseline**（讀甚至略快）——**條件是**在此窗內、service ticket 未耗盡、且不需要新 map。這把舊頁「既有 I/O 可能持續」的保守推理升級成 fio 實證。
+2. **新連線 client 卡在哪？** 卡在「任何要新建 mon 連線」的動作——k8s 上就是 node 端 kernel `rbd map`，新 pod 停在 `ContainerCreating`。但**新 PVC 反而 Bound**（CSI provisioner 走既有連線），推翻了「新 PVC 會失敗」的直覺。
+
+**一句話版本**：quorum 失守下「已連線者無感、新建 mon 連線者阻塞」；分界不是 control/data plane，而是「騎既有連線 vs 開新連線」——所以既有 workload 不會替你發現問題，一定要有主動 pager，且窗內別 drain node。
+
+**接下來做什麼（按優先序）**：
+
+1. **先讀[偵測盲區頁](./mon-quorum-detection-blind-spot)並部署 blackbox quorum pager**——本頁證明存量 workload 不會自己叫，pager 是唯一主動訊號。
+2. **把「quorum 失守窗內不 drain node / 不重排 pod」寫進 runbook**（§4.C／§6）。
+3. **事故分流加一條**：「新 pod 卡 ContainerCreating + PVC 已 Bound + 既有 workload 正常」→ 先查 mon quorum（§5）。
+
+## 8. 侷限與開放問題
+
+**侷限（數值級 vs 機制級的邊界）**：
+
+- **只測到 ~2.5min 窗**：「已連線 I/O 不受影響」只在此窗內成立。**cephx service ticket 預設 1hr、mon ticket 72hr**（`auth_service_ticket_ttl`／`auth_mon_ticket_ttl`，`global.yaml.in`）；若 quorum 失守超過 ticket 餘額、client 需要 renew 時，dataplane 仍會回到 mon 依賴而回錯／hang。這條是 **T1 邊界、本實驗未觀察**——不要把本頁結論外推成「既有 I/O 永遠不受影響」。
+- **拓樸綁定**：§5 的「新 PVC Bound」綁定 ceph-csi + 長駐 provisioner。換成每次新起 rados client 建 image 的拓樸，結論會回到「建 image 也卡」——但機制層（卡的是新建 mon 連線）不變。
+- **窗內 9 OSD 全 up、PG 不 re-peer**：本實驗沒疊加「OSD 故障」。若 quorum 失守期間又有 OSD 掛掉，mon 無法 mark it down／改 acting set，該 PG 上的 I/O 會卡——這是舊頁 T1 推導、本實驗未注入的更嚴重情境。
+
+**開放問題**：
+
+- **H-B5（還原後有界恢復）未直接觀察**：cleanup 在 `systemctl start` 兩顆 mon 後即刪除 `qio-newclient` pod，所以「被卡的新 pod 在 quorum 回來後多久 Running」沒量到確切數字。依 §4.B 已證的 data path 健康 + Ceph 既有行為，quorum 一回 krbd map 會續成、pod 轉 Running，屬預期但**未量測**。要補這格，重跑時把 cleanup 延後到 pod Running 之後即可。
+
+## 相關閱讀
+
+- [Ceph — CephMonQuorumLost 的盲區：quorum 失守時 mgr metric 凍結](./mon-quorum-detection-blind-spot)：**姊妹頁、偵測面**。同一場真機注入的另一半——為什麼這條 alert 不會 fire、怎麼用 blackbox_exporter 探 mon:3300 補一條不經 mgr 的訊號。本頁的「一定要有 quorum pager」在那頁有完整方案。
+- [Ceph — 3-mon cluster 掛 1/2/3 台時 I/O 怎麼受影響](./mon-quorum-loss-impact)：**被本頁取代的純 T1 推演版**（將 archive）。quorum 數學、Paxos lease 時序、cephx TTL 的完整原始碼追蹤都在那頁；本頁 §2 是它的濃縮＋真機修正版。
+- [Ceph — 現行 alert 政策總表](./ceph-alert-policy-current)：本頁建議的 quorum pager 在整體告警體系裡的位置。
+- [Ceph — 整體架構](./architecture)：MON／OSD／MGR 的角色分工，本頁「data path 為什麼不經 mon」的背景。
