@@ -1,0 +1,427 @@
+---
+layout: doc
+title: Ceph — RBD 兩條 data path 與 ceph-csi：krbd 是預設、librbd 不在預設路徑上（修正版）
+description: 一顆 50 GiB RBD image 在 RADOS 是一組 rbd_id / rbd_header / rbd_data object，這點兩條路徑都一樣。但把 block IO 切成 object op 的「程式碼」有兩份：librbd（rbd-nbd / QEMU，走 ImageRequest → Striper → Objecter）與 kernel krbd（rbd map → /dev/rbdX，striping 在 kernel 內）。ceph-csi 預設 mounter=krbd，所以預設部署下文章常詳解的 librbd 碼根本不在 data path 上。並用 v3.14.0 source 把 volumeMode（Filesystem vs Block）在 NodeStage / NodePublish 各做什麼講清楚。
+category: mechanism
+---
+
+## 本頁定位
+
+- **文章類型**：mechanism（機制拆解）。目標是把「RBD image 的 block IO 怎麼變成 RADOS object op」與「ceph-csi 怎麼把它接成 PVC」拆到**每一句因果都指得到行號**，不是操作 runbook。
+- **版本錨點（雙錨）**：
+  - Ceph `v19.2.3`（submodule HEAD `c92aebb`）——所有 `File: ceph/...` 行號以此為準。
+  - ceph-csi `v3.14.0`（submodule HEAD `0d0e1f8`）——所有 `File: ceph-csi/...` 行號以此為準。升級任一邊前請重驗行號。
+- **閱讀前提（2 個，各一句理由）**：
+  - [Ceph — 架構總覽](./architecture)：先知道 MON / OSD / RADOS 各自的職責，本頁才不用重述「object store 是什麼」。
+  - [Ceph — CRUSH 與 placement](./crush-and-placement)：object → PG → OSD set 的定位算式在那頁，本頁只講「切出 object 之後交給誰」，不重畫 CRUSH。
+- **證據層級**：本頁**機制**主張分兩種。凡附 `File: ... (line N)` 的都是 **T1（原始碼逐字核對）**——object prefix、`rbd_default_order`、feature dependency 硬檢查、ceph-csi 預設 mounter、NodeStage / NodePublish 的 volumeMode 分流，每條都有行號。唯一沒有行號的是「kernel krbd 在 kernel 內自行 striping、不呼叫 librbd」——這是**架構事實**（librbd 是 user-space library，沒被 link 進 kernel），不是某一行 source；本頁把它標成推理而非行號斷言。
+- **本頁取代**：[`rbd-and-csi`](./rbd-and-csi)。取代原因＝舊頁有兩處被逐字 source 查證推翻的 **data path 混淆**：(1) 它的 IO 流程圖把 kernel `rbd` module 也導進 librbd 的 `librados → Objecter` 漏斗，並把「真正切 object 的地方在 `ImageRequest`」寫成通用敘述——但那段 librbd 碼只在 user-space 路徑執行，且**從未點出 ceph-csi 預設 mounter=krbd**，讀者會誤以為預設部署走的是文章詳解的 librbd 碼；(2) NodePublish「bind-mount `/dev/rbdN` 進 Pod、Pod 看到 mounted filesystem」與 source 的 volumeMode 實際行為不符。本頁保留舊頁站得住的主體（RBD object layout、feature dependency 硬檢查、責任邊界判讀表、rook vs ceph-csi 分工），改寫這兩處。
+
+## 術語表
+
+先對齊詞彙，後面不再解釋：
+
+| 詞 | 意思 |
+|---|---|
+| **RBD** | RADOS Block Device。把一顆 block volume 映射成一組 RADOS object，不是預先配置的連續磁區。 |
+| **librbd** | user-space C++ library，提供「對某個 RBD image 做 block read/write」的 API。QEMU、`rbd-nbd`、`rbd` CLI 都 link 它。 |
+| **krbd** | Linux kernel 內建的 RBD client（kernel `rbd` module）。`rbd map` 後產生 `/dev/rbdX`，object mapping 在 kernel 內完成，**不經過 librbd**。 |
+| **rbd-nbd** | user-space daemon：內部用 librbd，對外用 NBD 介面掛成 `/dev/nbdX`。用來繞過 krbd 不支援的 feature。 |
+| **mounter** | ceph-csi node plugin 把 image 掛成 block device 的方式。取值 `rbd`（=krbd，預設）或 `rbd-nbd`。 |
+| **stagingPath** | ceph-csi NodeStage 階段掛載的 per-volume 路徑（每個 volume 一份），是 NodePublish 的來源。 |
+| **volumeMode** | Kubernetes PVC 的 `Filesystem`（預設，Pod 看到 filesystem）或 `Block`（Pod 看到 raw device）。 |
+| **order** | image 的 object 大小指數，`object_size = 2^order`；預設 `rbd_default_order=22` → 4 MiB。 |
+
+## RBD 在 RADOS 裡到底是什麼（兩條路徑共用的底層）
+
+RBD 不是真的預先配置一整段連續 block device，而是把 block volume 映射成一組 RADOS object。對一個 format 2 image，最重要的是三類 object：`rbd_id.<name>` 幫 image name 找 image id、`rbd_header.<image_id>` 存 metadata、`rbd_data.<image_id>.<object_no>` 存真正的資料 chunk。
+
+```
+你看到的 RBD image                         RADOS pool 內存的東西
+┌─────────────────────┐                   ┌───────────────────────────────┐
+│  /dev/rbd0 (50 GiB) │                   │  rbd_id.<name>                │  ← name → image_id
+│  block 0  ─────────┼──────────────────>│                               │
+│  block 1            │                   │  rbd_header.<image_id>        │  ← metadata (omap)
+│  ...                │                   │  └─ size, order, features,    │
+│  chunk 12,799       │                   │     snap_seq, object_prefix   │
+└─────────────────────┘                   │                               │
+                                          │  rbd_data.<image_id>.0000     │  ← data chunk 0 (4 MiB)
+                                          │  rbd_data.<image_id>.0001     │  ← data chunk 1
+                                          │  ...                          │
+                                          │  rbd_data.<image_id>.31ff     │  ← chunk 12799
+                                          │                               │
+                                          │  thin provision：只有寫過的   │
+                                          │  chunk 才真的有 object         │
+                                          └───────────────────────────────┘
+```
+
+這些 prefix 在 source 是常數。這也是你 `rados -p <pool> ls` 看到的名字不是 PVC 名稱、而是一串 `rbd_data...` 的原因：
+
+File: ceph/src/include/rbd_types.h (line 28)
+
+```cpp
+#define RBD_HEADER_PREFIX      "rbd_header."
+#define RBD_OBJECT_MAP_PREFIX  "rbd_object_map."
+#define RBD_DATA_PREFIX        "rbd_data."
+#define RBD_ID_PREFIX          "rbd_id."
+```
+
+chunk 大小來自 `rbd_default_order = 22`，也就是 `2^22 = 4 MiB`。所以 50 GiB image 邏輯上有 `50 * 1024 / 4 = 12800` 個 chunk，最後一個 object number 是 `12799`（十六進位 `31ff`）。「邏輯上」很重要：RBD 是 thin-provisioned，只有寫過的 chunk 才會真的落 object，raw space 再乘 pool 的 replication 或 EC overhead 才是實際占用。
+
+File: ceph/src/common/options/rbd.yaml.in (line 481)
+
+```yaml
+- name: rbd_default_order
+  type: uint
+  level: advanced
+  desc: default order (data block object size) for new images
+  long_desc: This configures the default object size for new images. The value is used as a
+    power of two, meaning ``default_object_size = 2 ^ rbd_default_order``. Configure a value
+    between 12 and 25 (inclusive), translating to 4KiB lower and 32MiB upper limit.
+  default: 22
+```
+
+建立 image 時，`CreateRequest` 先把 `order` 轉成 `object_size`，再組出 data object prefix。若沒指定 data pool，prefix 就是 `rbd_data.<image_id>`；若有 data pool，還會把 pool id 塞進 prefix，避免不同 pool 的 data object 名稱碰撞。
+
+File: ceph/src/librbd/image/CreateRequest.cc (line 177)
+
+```cpp
+if (get_image_option(image_options, RBD_IMAGE_OPTION_ORDER, &m_order) != 0 ||
+    m_order == 0) {
+  m_order = config.get_val<uint64_t>("rbd_default_order");
+}
+```
+
+File: ceph/src/librbd/image/CreateRequest.cc (line 197)
+
+```cpp
+m_layout.object_size = 1ull << m_order;
+```
+
+File: ceph/src/librbd/image/CreateRequest.cc (line 434)
+
+```cpp
+std::ostringstream oss;
+oss << RBD_DATA_PREFIX;
+if (m_data_pool_id != -1) {
+  oss << stringify(m_io_ctx.get_id()) << ".";
+}
+oss << m_image_id;
+```
+
+`rbd_header.<image_id>` 不是普通說明檔，而是由 RBD class extension 管的 omap metadata。`create` method 把 size、order、features、object_prefix、snap_seq、timestamp 存進 header object；之後 open image、snapshot、resize、clone 都回來讀這些欄位。
+
+File: ceph/src/cls/rbd/cls_rbd.cc (line 814)
+
+```cpp
+encode(size, sizebl);
+encode(order, orderbl);
+encode(features, featuresbl);
+encode(object_prefix, object_prefixbl);
+encode(snap_seq, snap_seqbl);
+encode(timestamp, timestampbl);
+
+map<string, bufferlist> omap_vals;
+omap_vals["size"] = sizebl;
+omap_vals["order"] = orderbl;
+omap_vals["features"] = featuresbl;
+omap_vals["object_prefix"] = object_prefixbl;
+```
+
+**這一整節兩條 data path 共用**：不管等下是 librbd 還是 krbd 在讀寫，image 的 layout（prefix、order、feature bit）都存在同一份 header omap，兩邊算出來的 `rbd_data.<id>.<objno>` 名稱完全一致。差別只在**誰來算**——這正是下一節的重點。
+
+## 兩條 data path：切 object 的「程式碼」有兩份
+
+一個 block write 要變成 RADOS object op，中間那段「offset → object extents」的 striping 邏輯，有**兩份獨立實作**，走哪一份取決於這顆 image 是被誰掛起來的。
+
+### 路徑 A — user-space：librbd（rbd-nbd / QEMU）
+
+QEMU 的 rbd block driver、`rbd-nbd` daemon、`rbd` CLI 都 link librbd。IO 進 librbd 後由 `ImageRequest` 把 image-level extents 丟給 `area_to_object_extents()`，後者呼叫 generic `Striper::file_to_extents()`：
+
+```
+app write @ offset 100 MiB, len 8 KiB      （來源：rbd-nbd 或 QEMU 直接連 librbd）
+        │
+        ▼
+librbd (user-space C++)
+  ImageRequest::send()                       ceph/src/librbd/io/ImageRequest.cc:438
+   └─ area_to_object_extents()               ceph/src/librbd/io/Utils.cc:202
+        └─ Striper::file_to_extents()        切成 rbd_data.<id>.<objno> 的 object extents
+        │
+        ▼
+librados → Objecter → CRUSH 算 primary OSD → OSD → BlueStore
+```
+
+File: ceph/src/librbd/io/ImageRequest.cc (line 438)
+
+```cpp
+uint64_t clip_len = 0;
+LightweightObjectExtents object_extents;
+for (auto &extent : this->m_image_extents) {
+  if (extent.second == 0) {
+    continue;
+  }
+
+  // map to object extents
+  io::util::area_to_object_extents(&image_ctx, extent.first, extent.second,
+                                   this->m_image_area, clip_len,
+                                   &object_extents);
+  clip_len += extent.second;
+}
+```
+
+File: ceph/src/librbd/io/Utils.cc (line 202)
+
+```cpp
+void area_to_object_extents(I* image_ctx, uint64_t offset, uint64_t length,
+                            ImageArea area, uint64_t buffer_offset,
+                            striper::LightweightObjectExtents* object_extents) {
+  offset = area_to_raw_offset(*image_ctx, offset, area);
+  Striper::file_to_extents(image_ctx->cct, &image_ctx->layout, offset, length,
+                           0, buffer_offset, object_extents);
+}
+```
+
+所以跨 4 MiB 邊界的 8 KiB write，不是「塞進同一個大 object」，而是被拆成兩個 object extents，各自走 librados / Objecter / CRUSH / primary OSD。**這段 C++ 只在 librbd 進程裡跑。**
+
+### 路徑 B — kernel：krbd（`rbd map` → `/dev/rbdX`）
+
+`rbd map` 把 image 掛成 kernel block device `/dev/rbdX`。這時 object mapping 由 **Linux kernel 內的 `rbd` module（`drivers/block/rbd.c`）**完成，它讀同一份 header、用同樣的 `order`，在 kernel 內把 offset 切成同樣的 `rbd_data.<id>.<objno>`——但**完全不呼叫 librbd 的 `ImageRequest` / `Striper`**（librbd 是 user-space library，沒 link 進 kernel）：
+
+```
+node 上 `rbd map`（ceph-csi 預設就走這條）      → 產生 /dev/rbdX
+        │
+        ▼
+app write @ /dev/rbdX
+        │
+        ▼
+Linux kernel rbd module (drivers/block/rbd.c)
+   └─ 在 kernel 內把 offset 切成同樣的 rbd_data.<id>.<objno>
+      （讀同一份 header omap、同樣 order=22 → 4 MiB；不進 librbd 的 ImageRequest/Striper）
+        │
+        ▼
+kernel libceph → CRUSH 算 primary OSD → OSD → BlueStore
+```
+
+兩條路徑產出的 RADOS object **一模一樣**（同 prefix、同 4 MiB 邊界），因為 layout 由 header omap 決定，不由哪份程式碼決定。差別只有一個：**striping code 跑在哪**——user-space librbd，還是 kernel `rbd` module。這個差別看似無關痛癢，卻直接決定了「你在文章裡看到的 librbd 碼，到底是不是你叢集的真實 data path」。答案由 ceph-csi 的預設值決定。
+
+## ceph-csi 預設 mounter=krbd：預設部署走的是 kernel 路徑
+
+ceph-csi 不在 Ceph 本 repo，在 [github.com/ceph/ceph-csi](https://github.com/ceph/ceph-csi)。它 node plugin 的 mounter 有一個常數預設值 `rbd`：
+
+File: ceph-csi/internal/rbd/rbd_util.go (line 54)
+
+```go
+rbdDefaultMounter        = "rbd"
+rbdNbdMounter            = "rbd-nbd"
+```
+
+NodeStage 準備 volume 時，如果 StorageClass 的 `volumeContext` 沒帶 `mounter`，就套這個預設：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 213)
+
+```go
+if rv.Mounter, ok = req.GetVolumeContext()["mounter"]; !ok {
+    rv.Mounter = rbdDefaultMounter
+}
+```
+
+而 `rbdDefaultMounter = "rbd"` 對應的 map 動作，就是 `rbd map --device-type krbd`：
+
+File: ceph-csi/internal/rbd/rbd_attach.go (line 399)
+
+```go
+cmdArgs = append(cmdArgs, "--device-type", accessTypeKRbd, "--options", "noudev")
+```
+
+（`accessTypeKRbd = "krbd"`，`rbd_attach.go:41`。）
+
+**這就是舊頁最關鍵的錯**：在**沒有顯式指定 `mounter: rbd-nbd` 的預設部署**下，ceph-csi 走的是**路徑 B（kernel krbd）**。上一節那段 librbd `ImageRequest` / `Striper` 的 C++ 碼——也就是舊頁花最多篇幅詳解的部分——**根本不在預設 data path 上**。要讓它上場，你得在 StorageClass 明寫 `mounter: rbd-nbd`（或觸發下面的 fallback）。
+
+### krbd 不支援某個 feature 時：預設報錯，不自動 fallback
+
+很多人以為 krbd 掛不動就會自動改用 rbd-nbd。**不會。** krbd 若不支援 image 開的某個 feature，預設是**直接報錯**；只有顯式設 `tryOtherMounters:true` 才 fallback 到 rbd-nbd：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 253)
+
+```go
+if rv.Mounter == rbdDefaultMounter && !isFeatureExist {
+    if !parseBoolOption(ctx, req.GetVolumeContext(), tryOtherMounters, false) {
+        log.ErrorLog(ctx, "unsupported krbd Feature, set `tryOtherMounters:true` or fix krbd driver")
+        err = errors.New("unsupported krbd Feature")
+
+        return nil, status.Error(codes.Internal, err.Error())
+    }
+    // fallback to rbd-nbd,
+    rv.Mounter = rbdNbdMounter
+}
+```
+
+所以「StorageClass 開了 host kernel 不支援的 feature → PVC create 成功、Pod 到 node 上 map 時才 `FailedMount`」這個經典地雷，在 ceph-csi 是**明確 by design**：預設 mounter 是 krbd，krbd 能力不足時預設讓你失敗、逼你要嘛換 kernel、要嘛顯式 opt-in rbd-nbd。
+
+## volumeMode：Filesystem 與 Block 在 NodeStage / NodePublish 各做什麼
+
+舊頁把 NodeStage / NodePublish 寫成「NodeStage map 成 `/dev/rbdN`、NodePublish bind-mount `/dev/rbdN` 進 Pod、Pod 看到 filesystem」。這對兩種 volumeMode 都不精確。實際上 map 成 device 之後，**mkfs 與 mount 發生在 NodeStage，不是 NodePublish**，而且 Filesystem / Block 走的是不同分支。
+
+只有非 Block volume 才 mkfs：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 800)
+
+```go
+if existingFormat == "" && !staticVol && !readOnly && !isBlock {
+    args := ns.getMkfsArgs(fsType)
+```
+
+接著在 NodeStage 掛到 `stagingPath`——Block 是 bind 整個 device 檔，Filesystem 是 `FormatAndMount` 把 filesystem 掛上去：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 840)
+
+```go
+if isBlock {
+    opt = append(opt, "bind")
+    err = diskMounter.MountSensitiveWithoutSystemd(devicePath, stagingPath, fsType, opt, nil)
+} else {
+    err = diskMounter.FormatAndMount(devicePath, stagingPath, fsType, opt)
+}
+```
+
+到 NodePublish，兩種 mode 都是把 `stagingPath` bind 到 Pod 的 `targetPath`——**來源是 `stagingPath`，不是 `/dev/rbdN`**：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 875)
+
+```go
+if err := util.Mount(ns.Mounter, stagingPath, targetPath, fsType, mountOptions); err != nil {
+    return status.Error(codes.Internal, err.Error())
+}
+```
+
+連 target path 本身都分流：Filesystem 建**目錄**，Block 建**檔案**：
+
+File: ceph-csi/internal/rbd/nodeserver.go (line 896)
+
+```go
+// filesystem volume needs a directory
+if !isBlock {
+    // Create a mountpath directory
+    if err = util.CreateMountPoint(mountPath); err != nil {
+        return false, fmt.Errorf("failed to create mount path %q: %w", mountPath, err)
+    }
+
+    return false, nil
+}
+
+// block volume checks
+```
+
+兩欄對照：
+
+| 階段 | `volumeMode: Filesystem`（預設） | `volumeMode: Block` |
+|---|---|---|
+| NodeStage：map | krbd `rbd map` → `/dev/rbdX`（預設 mounter） | 同左 |
+| NodeStage：mkfs | 若未格式化 → `mkfs`（`nodeserver.go:800`） | **不 mkfs** |
+| NodeStage：掛到 stagingPath | `FormatAndMount` 掛 filesystem 到 stagingPath 目錄（`:844`） | bind `/dev/rbdX` 到 stagingPath **檔案**（`:841`） |
+| NodePublish：target 準備 | 建**目錄**（`:897`） | 建**檔案**（`:908`） |
+| NodePublish：bind | bind stagingPath（filesystem）→ Pod（`:875`） | bind stagingPath（device）→ Pod（`:875`） |
+| Pod 最終看到 | mounted filesystem | **raw block device** |
+
+**KubeVirt VM disk 走的就是 Block mode 這一欄**：Pod（virt-launcher）拿到的是 raw device，交給 QEMU 當磁碟。也就是說預設情境下，一顆 KubeVirt VM 磁碟 = krbd map 出的 `/dev/rbdX`、以 Block mode bind 進 Pod、由 QEMU 使用——全程**不經過 librbd 的 `ImageRequest` 那段碼**。
+
+## feature dependency：不是建議，是 enable 時的硬檢查
+
+RBD feature 之間不是任意組合。`object-map` 綁 `fast-diff`、且都需要 `exclusive-lock`；`journaling` 也需要 `exclusive-lock`。這不是 docs 的建議，而是 enable operation 的硬檢查。預設 feature set：
+
+File: ceph/src/include/rbd/features.h (line 20)
+
+```cpp
+#define RBD_FEATURES_DEFAULT             (RBD_FEATURE_LAYERING | \
+                                         RBD_FEATURE_EXCLUSIVE_LOCK | \
+                                         RBD_FEATURE_OBJECT_MAP | \
+                                         RBD_FEATURE_FAST_DIFF | \
+                                         RBD_FEATURE_DEEP_FLATTEN)
+```
+
+enable 時若少了前置 feature 直接回 `-EINVAL`：
+
+File: ceph/src/librbd/operation/EnableFeaturesRequest.cc (line 189)
+
+```cpp
+if ((m_features & RBD_FEATURE_OBJECT_MAP) != 0) {
+  if ((m_new_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
+    lderr(cct) << "cannot enable object-map. exclusive-lock must be "
+                    "enabled before enabling object-map." << dendl;
+    *result = -EINVAL;
+    break;
+  }
+```
+
+File: ceph/src/librbd/operation/EnableFeaturesRequest.cc (line 204)
+
+```cpp
+if ((m_features & RBD_FEATURE_JOURNALING) != 0) {
+  if ((m_new_features & RBD_FEATURE_EXCLUSIVE_LOCK) == 0) {
+    lderr(cct) << "cannot enable journaling. exclusive-lock must be "
+                    "enabled before enabling journaling." << dendl;
+    *result = -EINVAL;
+    break;
+  }
+```
+
+把這個硬檢查接回上面的 mounter 討論就完整了：**feature 是 Ceph 層的能力，但能不能被掛起來取決於 mapping client**。你在 StorageClass 只看到一行 `imageFeatures: layering`，背後其實是在替「所有可能掛這顆 PVC 的 node 的 krbd」選一個共同支援的 feature set。開了 krbd 不支援的 feature（例如舊 kernel 的 `object-map` / `journaling`），預設就會在 NodeStage 撞上 `nodeserver.go:253` 的報錯——除非你 opt-in `tryOtherMounters` 換 rbd-nbd（librbd 路徑，支援度較廣）。
+
+## 責任邊界：controller / node plugin、ceph-csi vs rook
+
+ceph-csi 做兩件事，切在不同時段、不同 Pod：
+
+```
+┌──────────── ceph-csi ─────────────────────────────┐
+│  controller plugin (Deployment)                    │
+│   ├─ CreateVolume   → 對 Ceph 建 RBD image         │
+│   ├─ DeleteVolume   → 對 Ceph 砍 RBD image         │
+│   ├─ CreateSnapshot → cls_rbd snap_create          │
+│   └─ ControllerExpandVolume → 改 image size        │
+│                                                    │
+│  node plugin (DaemonSet, 每 node 一個)             │
+│   ├─ NodeStageVolume   → krbd map + (mkfs) + mount │
+│   │                      到 stagingPath            │
+│   ├─ NodePublishVolume → bind stagingPath 給 Pod   │
+│   ├─ NodeUnpublishVolume                           │
+│   └─ NodeUnstageVolume → unmap                     │
+└────────────────────────────────────────────────────┘
+```
+
+責任邊界判讀表（舊頁保留、對 v3.14.0 更新分層）：
+
+| 現象 | 優先看哪裡 | 對應原理 |
+|---|---|---|
+| PVC 長不出 PV | ceph-csi **controller** log、Ceph auth caps、pool / secret | controller plugin 還沒成功 `CreateVolume` → `rbd create` |
+| PV 已 bind，Pod 卡 `FailedMount` | ceph-csi **node** plugin log、host kernel krbd、`mounter` | image 已存在，但 node 上 krbd map 不動 |
+| 開了 `object-map` / `journaling` 後某些 node map 失敗 | `imageFeatures` 與 host krbd 支援、`tryOtherMounters` | krbd 不支援該 feature → 預設報錯（`nodeserver.go:253`），要換 kernel 或 opt-in rbd-nbd |
+| VM live migration / RWX block 不如預期 | KubeVirt access mode、ceph-csi feature matrix、RBD feature | image feature 與 k8s access mode 是兩層契約 |
+
+rook 也不在 Ceph 本 repo，在 [github.com/rook/rook](https://github.com/rook/rook)。它是 operator，把 Ceph cluster 生命週期收進 CRD（`CephCluster` 起 MON/OSD、`CephBlockPool` 建 pool…）。它跟 ceph-csi 是**兩個獨立 component**：rook 起 Ceph daemon 為 Pod、ceph-csi 提供 PVC backend、用 `StorageClass` 把兩者串起來。除錯時分層：
+
+- `CephCluster` / MON / OSD Pod 起不來 → rook 或 Ceph daemon 層。
+- PVC create / delete / expand 出錯 → ceph-csi **controller** plugin + Ceph auth/pool 層。
+- Pod mount / unmount 出錯 → ceph-csi **node** plugin + host krbd（或 rbd-nbd）層。
+- VM guest I/O 慢 → KubeVirt / QEMU / krbd / OSD queue / BlueStore 多層一起看（量化調教見文末連結，不在本頁重寫）。
+
+## 誠實勘誤：舊頁哪裡錯、source 怎麼說
+
+本頁取代的舊頁（`rbd-and-csi`）的 RBD object layout、feature dependency、責任邊界主體都站得住，但 data path 與 CSI 流程有兩處逐字可查的錯。攤開對照：
+
+| 舊頁的主張 | source 實際 | 正確結論 |
+|---|---|---|
+| IO 流程圖把「kernel rbd module 或 rbd-nbd + librbd」一起導進 `librados → Objecter` 漏斗（`rbd-and-csi.mdx:112-121`） | krbd 走 kernel `rbd` module 自行 striping；ceph-csi 預設就是 `--device-type krbd`（`rbd_attach.go:399`） | 只有 user-space（librbd）路徑經過 `librados/Objecter`；kernel 路徑在 kernel 內算 object，不進 librbd |
+| 「真正切 object 的地方在 `ImageRequest`」寫成通用敘述（`rbd-and-csi.mdx:127`） | `ImageRequest::send()` 只在 librbd 進程執行（`ImageRequest.cc:438`） | 這句只對 rbd-nbd / QEMU-librbd 成立；krbd 路徑不碰它 |
+| 從未提 ceph-csi 預設 mounter | 沒指定 `mounter` 就 = `rbdDefaultMounter="rbd"`=krbd（`nodeserver.go:213`、`rbd_util.go:54`） | 預設部署下文章詳解的 librbd 碼**根本不在 data path 上** |
+| NodePublish「bind-mount `/dev/rbdN` 進 Pod」+「Pod 看到 mounted filesystem」（`rbd-and-csi.mdx:301-305`） | Filesystem 在 **NodeStage** 就 `FormatAndMount` 到 stagingPath（`nodeserver.go:844`）；NodePublish bind 的是 **stagingPath**（`:875`） | Filesystem：NodePublish bind stagingPath 上的 filesystem；Block：NodeStage bind device 檔（`:841`），Pod 看到 **raw device** |
+| 全篇無版本錨（24 篇唯一一頁） | — | 本頁雙錨：ceph `v19.2.3` `c92aebb` + ceph-csi `v3.14.0` `0d0e1f8` |
+
+一句話總結修正方向：**「librbd 怎麼切 object」是真的、也重要，但它是 user-space（rbd-nbd / QEMU）路徑的故事；ceph-csi 預設把 image 交給 kernel krbd，所以要判斷「我的叢集實際走哪條」，先看 StorageClass 有沒有 `mounter: rbd-nbd`。**
+
+## 相關閱讀
+
+- [Ceph — 架構總覽](./architecture) — MON / OSD / RADOS 職責與 object store 底層
+- [Ceph — CRUSH 與 placement](./crush-and-placement) — object → PG → OSD set 的定位算式（本頁「交給 CRUSH」那一步的細節）
+- [Ceph — quorum 失守時的 I/O 衝擊：真機實驗報告](./mon-quorum-loss-io-lab) — 真機翻案：quorum 失守時**新 PVC 反而 Bound**（CSI provisioner 走既有連線），真正卡的是 node 端 **krbd map** 讓新 Pod 卡 `ContainerCreating`——正好對應本頁「controller 建 image / node krbd map」的責任分層
+- [VM IO — RBD IO 生產調教](/vm-storage-perf/features/rbd-io-production-tuning) — 量化結論在這頁：krbd map options（`queue_depth`、`osd_request_timeout`…）在 **PV 建立時就凍結**、事後改 StorageClass 對存量磁碟無效；本頁不重寫這些數字
+- [VM IO — RBD IO 完整 datapath](/vm-storage-perf/features/rbd-io-datapath) — 一個 4K write 從 guest virtio 穿到 OSD 的逐跳路徑（krbd → libceph → TCP → OSD）
