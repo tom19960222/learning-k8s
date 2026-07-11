@@ -11,7 +11,7 @@ category: mechanism
 - **版本錨點**：ceph `v19.2.3`（submodule HEAD `c92aebb`）。所有 `File: ... (line N)` 以這個 tag 為準；升級版本前請重驗行號。
 - **閱讀前提（1 個，一句理由）**：
   - [Ceph — mClock OSD I/O scheduler](./mclock-osd-scheduler)：**mClock profile 與三個 scheduler 桶（client / background_recovery / background_best_effort）在那頁**，本頁把 mClock「為什麼要接管 recovery throttle」當已知前提，只拆「它接管的手段」與「這手段對 injectargs 到底做了什麼」。
-- **證據層級**：**T1 ＋ 關鍵主張 T3 真機實證（2026-07-11）**。機制主張全部是 T1（原始碼逐字核對）——CONF_OVERRIDE 層級、injectargs 寫入層、mClock 防寫分支只發 `config rm` + clog warning、`set_mon_vals` 只動 CONF_MON、`_recover_now` 閘門，每條都附行號。頭牌主張（injectargs 值生效、來源層＝`override`、mon db 無寫入、clog warning 誤導）已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑證實，逐字輸出貼在文末「在你環境驗證」節；僅 `config set` 對照組仍標「在你環境跑後對照」。
+- **證據層級**：**T1 ＋ 關鍵主張 T3 真機實證（2026-07-11）**。機制主張全部是 T1（原始碼逐字核對）——CONF_OVERRIDE 層級、injectargs 寫入層、mClock 防寫分支只發 `config rm` + clog warning、`set_mon_vals` 只動 CONF_MON、`_recover_now` 閘門，每條都附行號。兩臂主張皆已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑證實——injectargs 臂（osd.0：值生效、來源層＝`override`、mon db 無寫入、clog warning 誤導）與 `config set` 對照臂（osd.1：mon db 條目 1 秒內被回收、+6s 值還原、同款 warning 這次屬實），逐字輸出貼在文末「在你環境驗證」節。
 - **本頁取代**：[`recovery-throttle-runtime`](./recovery-throttle-runtime)。取代原因＝該頁的 TL;DR、danger Callout 與 §gate 表宣稱「mClock 會把 injectargs rollback、必須先開 `osd_mclock_override_recovery_settings` 才實際生效」，但逐行查證後這是**對 injectargs 的錯誤詮釋**——injectargs 寫進最高優先的 `CONF_OVERRIDE` 層，mClock 防寫只操作 mon config db（`CONF_MON` 層），動不到它。本頁保留舊頁站得住的主體（`_recover_now` 單向閘門、四層 gate、config set 的真 rollback、兩輪 ping-pong、reserver 差異、自然收斂圖），改寫這條核心因果。
 
 ## 術語表
@@ -270,8 +270,9 @@ values.rm_val(name, CONF_MON);
 | mClock 沒開 override 時 | `config rm` 打 mon db（那裡沒值）＝**no-op**；`CONF_OVERRIDE` 值不動 → **在該 OSD 生效到重啟** | `config rm` 真的移除 mon db 的 `CONF_MON` 值；mon 回推 → `set_mon_vals` 清該 OSD 的 `CONF_MON` → **值被真的還原** |
 | `did not take effect` warning | **誤導**（值其實生效了） | **準確**（值真的被撤） |
 | `ceph config dump` 查得到嗎 | 查不到（本來就不寫 mon db）——與有沒有生效無關 | 短暫有、隨即被撤成空 |
-| clog warn 條數 | 1 條 / 命令打到的 OSD | 1 條 / **每一顆** OSD（cluster-wide 風暴） |
+| clog warn 條數 | 1 條 / 命令打到的 OSD | 1 條 / **每一顆**符合 mask 的 OSD（`who=osd` 時 cluster-wide 風暴） |
 | 跨 OSD 重啟存活 | 否（ephemeral） | 否（被 rollback 移除） |
+| **真機實證（2026-07-11）** | osd.0：warning 照發、值=7 生效、10 秒後仍在、存活到重啟 | osd.1：同款 warning、mon db 條目 1 秒內被回收、+6s 值還原回 1 |
 
 一句話對照：**injectargs 是「悄悄生效、重啟即忘、外加一條假 warning」；config set 是「大張旗鼓寫下去、立刻被自己叫的 OSD 撤掉、還每顆 OSD 各留一條真 warning」。** 在 Squid mClock 預設下，想「臨時止血」反而是 injectargs 更符合直覺（值真的生效），config set 才是那個「自殺式持久化」。
 
@@ -445,7 +446,7 @@ t11     2      3   跑到 2 < 3，下一個 op 才可以進來
 
 ## 在你環境驗證（T3 真機實證，2026-07-11）
 
-> **證據等級：T3（真機實證）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。`injectargs` 是可逆的 ephemeral 操作，你可以在自己環境用同樣指令重跑對照。
+> **證據等級：T3（真機實證，兩臂完整）。** 以下流程已於 2026-07-11 在 cephadm v19.2.3 真叢集實跑（前置：`HEALTH_OK`、`osd_mclock_override_recovery_settings` = `false`），輸出逐字貼上：injectargs 臂打 osd.0、`config set` 對照臂打乾淨的 osd.1。實驗 key 用 `osd_max_backfills`——它與 `osd_recovery_max_active*` 走**同一條**防寫分支（key 選擇的 if/else 鏈 `OSD.cc:10197-10204` 涵蓋四個 key），機制結論互通。兩個操作都可逆，你可以在自己環境用同樣指令重跑對照。
 
 先確認 scheduler 是 mClock（否則整個防寫分支根本不進）：
 
@@ -518,7 +519,7 @@ ceph tell osd.0 config diff
 # 叢集回到 HEALTH_OK
 ```
 
-注意回退後 `override` 層**仍殘留**（只是值恰好等於 default）——injectargs 沒有「刪掉這一層」的辦法，注回 default 走的還是同一個 `CONF_OVERRIDE` 層，這一層要到 OSD 重啟才消失。這本身就是「injectargs 的值存活到重啟」的又一佐證。
+注意回退後 `override` 層**仍殘留**（只是值恰好等於 default）——injectargs 沒有「刪掉這一層」的辦法，注回 default 走的還是同一個 `CONF_OVERRIDE` 層，這一層要到 OSD 重啟才消失。這本身就是「injectargs 的值存活到重啟」的又一佐證；也正因為這個殘留，下方的 `config set` 對照組改打乾淨的 osd.1。
 
 同一分支的另外三個 key（`osd_recovery_max_active{,_hdd,_ssd}`）指令相同、未逐一實跑，預期行為一致：
 
@@ -528,15 +529,47 @@ ceph tell osd.0 config diff   # 預期同樣出現 "override" 層
 # （在 OSD 本機也可用 admin socket：ceph daemon osd.0 config diff）
 ```
 
-對照組——`config set` 才會被撤（此組**未實跑**，屬「在你環境跑後對照」）：
+對照組——`config set` 真的被撤（T3 實跑輸出，2026-07-11，osd.1）：
+
+> 為什麼換 osd.1：osd.0 殘留著前一輪實驗的 `override` 層（值雖等於 default，層還在），mon push 落在較低的 `CONF_MON` 層會被它壓住（`config_values.cc:24-26` 的 `SET_NO_EFFECT`），污染「config set 在 OSD 端有沒有生效」的觀測；osd.1 是乾淨的。
 
 ```bash
-# 未開 override 直接 set（會被自己叫的 OSD rollback）
-ceph config set osd osd_recovery_max_active 1
-sleep 2
-ceph config dump | grep osd_recovery_max_active   # 預期：空（被撤了）
-ceph log last 200 cluster | grep "did not take effect"  # 預期：每顆 OSD 各一條
+# 前置：osd.1 乾淨、mon db 無條目
+ceph tell osd.1 config get osd_max_backfills
+# {"osd_max_backfills": "1"}
+ceph config dump | grep -i max_backfills
+# （空）
+
+# 未開 override 直接 set（per-OSD mask）
+sudo ceph config set osd.1 osd_max_backfills 5
+# （成功返回）
+
+# <1 秒後查 mon db：已經空了。config rm 回收快到輪詢沒捕捉到條目的中間態
+# ── 誠實寫法：set 成功、條目曾寫入 mon db，但第一次 dump 已看不到；+6s 再確認持續為空
+ceph config dump | grep -i max_backfills
+# （空）
+
+# +6 秒：OSD 端值已被還原 ── config set 真的被 rollback
+ceph tell osd.1 config get osd_max_backfills
+# {"osd_max_backfills": "1"}
+
+# clog（逐字）：
+# 2026-07-11T03:18:12.337246+0000 osd.1 (osd.1) 15 : cluster [WRN] Change to osd_max_backfills on osd.1 did not take effect. Enable osd_mclock_override_recovery_settings before setting this option.
+
+# 叢集維持 HEALTH_OK
 ```
+
+兩臂並置——同一天、同一叢集、同一句 warning 文案，結局完全相反：
+
+| | osd.0（injectargs，03:12） | osd.1（`config set`，03:18） |
+|---|---|---|
+| clog warning | `did not take effect` | `did not take effect`（同款文案） |
+| 實際結果 | 值 = 7 生效、10 秒後仍在、存活到重啟 | mon db 條目 1 秒內被回收、+6s 值還原回 1 |
+| warning 屬實嗎 | **否**（誤導） | **是** |
+
+這就是全頁對照軸心的完整真機版：**同一段程式碼、同一句 warning，injectargs 臂它在說謊、config set 臂它說的是實話。**
+
+補充：本次對照用 per-OSD mask（`osd.1`），所以 clog 只有 osd.1 一條 warn；若用 `who=osd`（全體 mask），mon push 會觸發**每顆** OSD 各發一條——那就是前面 ping-pong 節描述的 cluster-wide 風暴（該情境未實跑，屬「在你環境跑後對照」）。
 
 ## 原始碼路徑一覽（v19.2.3, commit c92aebb）
 
