@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-qd256, namespace: vmtest}
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Block
+  storageClassName: rbd-qd256
+  resources: {requests: {storage: 16Gi}}

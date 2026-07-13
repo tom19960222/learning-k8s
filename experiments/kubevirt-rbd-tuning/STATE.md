@@ -176,3 +176,34 @@
   HYPOTHESES.md 34 條全數 triage（confirmed 11、violated 8＋部分 violated 2、indistinguishable 1、synthesized 7、not-run 4、open 1；proposed 歸零）；
   頁面補「最終結論」段 + 回填 E-16/E-17/E-18/E-20 列；vm-storage-perf/quiz.json 出 10 題（全部錨實驗證據）。
   開放題留 backlog：H-034（osd_request_timeout PG inactive 不觸發機制）、H-033 閉環變體、H-030 完整決策樹。研究收官。
+
+## 世代 2 重跑（2026-07-13）— clean 6-OSD 環境
+
+> 使用者要求：舊環境（L8s_v3 單 NVMe 切 3 OSD 共媒體）污染的實驗在 clean 拓樸重跑。
+> 新環境 = cyshih-kubevirt-ceph-lab **redeploy 為 L16s_v3、每台 2 顆實體 NVMe 各 1 OSD = 6 OSD**（每 OSD 獨占媒體）。
+> 連線變數改用 `tools/env-gen2.sh`（新 public IP / FSID `fbae2fb0-...` / pool kubevirt / SC ceph-rbd=plain ceph-csi 非 Rook）。
+> 重跑清單：E-02（host ceiling）、E-19（queue_depth）、E-22（shards）、E-30（單 OSD down backfill）。band.json 需重取（新世代）。
+
+- 2026-07-13 E-00 done `results/E-00/<ts>/snapshot.txt` — 6 OSD HEALTH_OK、各 OSD 1 顆 1.74T NVMe（**共媒體污染消除**）、
+  osd_memory_target 已 4G（無 autotune 汙染）、ceph 19.2.4 / kubevirt v1.5.0 / kernel 6.8。
+  **⚠ 新發現：mclock 自動校準 `osd_mclock_max_capacity_iops_ssd` 在同型 NVMe 上嚴重不均**——
+  osd.0/1/3/5≈6.5k，但 osd.2=31.9k、osd.4=68.2k（同硬體 5–10× 差）。屬 cephadm OSD 建立時 bench 的 cold-cache fluke，
+  記為環境 caveat；delivered 數字（單 client modest QD）以 E-02 實測為準。
+- 2026-07-13 tools/env-gen2.sh + gen2 manifests（ceph-csi 版）+ e19/e22/e30-gen2.sh（IP/FSID/OSD 範圍 0-5 修正）建立。
+- 2026-07-13 E-02 host ceiling 點火（worker k8s-1 裝 ceph-common 17.2.9+fio 3.28、map kubevirt/ioperf-host、
+  nohup 3 輪矩陣）。**prefill 16G 僅 58s（≈283MB/s）vs 舊環境 17.7MB/s → 寫側天花板初步 16× 提升，證實舊瓶頸=共媒體消費級 SSD。**
+- 2026-07-13 baseline VM 建立：ns vmtest、PVC data-baseline RWX Block 16Gi Bound、VMI Running @k8s-1（10.244.1.224）、
+  cloud-init done、fio 就緒（vdb=16G）。
+
+- 2026-07-13 **世代 2 四實驗全部完成**（clean 6-OSD，每 OSD 獨占 NVMe）：
+  - `E-02 done results/E-02/<ts>/` — host ceiling 刷新：rr-qd32 37.1k、rw-qd32 20.9k IOPS、sw 1168 MB/s；虛擬化稅集中高並行讀 −22.2%（機制維持）。
+  - `E-01 done results/E-01/<ts>/` — band.json（世代2）產出，CoV 0.1–0.7%（gen1 band 存 band-2026-07-08-gen1.json）。
+  - `E-19 done results/E-19/<ts>/` — queue_depth：qd256 高並行寫 **+28%**、讀 +9%，p99 改善，qd1 零代價（confirmed 且比 gen1 放大＝共媒體反證）。
+  - `E-22 done results/E-22/<ts>/` — shards 8→16 全帶內（「8 已足」非共媒體假象）；rolling 6 OSD client 讀峰值 1.2–1.9s。
+  - `E-30 done results/E-30/<ts>/` — **頭牌污染塌陷**：backfill 相 client 讀 median 0.90ms ×1.0（gen1 ×24），只剩單發 ~1s 尖峰。外部 watchdog 併走、叢集回 HEALTH_OK。
+  - REPORT.md §9 + EVIDENCE-SUMMARY-2026-07-13.md 完成；band.json/scripts/manifests 全 git 追蹤。
+  - **殘留資源（待使用者裁示）**：ns vmtest + baseline VM + data-baseline PVC 仍在（供後續測試）；worker k8s-1 裝了 ceph-common+fio；
+    ioperf-host image/auth 已刪、變體 SC/PVC 已刪、叢集 HEALTH_OK。要清就 `kubectl delete ns vmtest` 或直接 `make stop`。
+  - Deviation：(1) mclock cap 不均（osd.2/4 outlier）以 realistic default 保留、記為 E-00 caveat；
+    (2) E-19 host config_info 生效驗證因 NSG 擋 internal IP 未跑，改行為級 A/B 證明；
+    (3) e30 dg.json 收尾 pkill 部分寫、client p99 改用 lat log 時序。
