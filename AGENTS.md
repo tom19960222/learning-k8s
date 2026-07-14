@@ -21,6 +21,20 @@
 
 子計畫的 spec / plan 都在 `docs/superpowers/{specs,plans}/`。
 
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs for this repo live as GitHub issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo. See `docs/agents/domain.md`.
+
 ## 內容語言（強制）
 
 - 所有 zh 內容**必須是繁體中文，且使用台灣用語**
