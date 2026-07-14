@@ -41,9 +41,11 @@
 | sr-1m | — | 13,129 | **3,111** |
 | sw-1m | — | 42,555 | **1,168** |
 
-- **關鍵**：讀 qd32 = 37.1k ≈ aggregate mclock 天花板（6×6.5k）；seqwrite 1,168 MB/s、seqread 3,111 MB/s——
-  clean 專用 NVMe 的寫側完全不是世代 1「共媒體」時的瓶頸樣貌。
-- 虛擬化稅（host vs guest baseline E-01）：**待填**。
+- **關鍵**：讀 qd32 = 37.1k ≈ aggregate mclock 天花板（6×6.5k）。
+- **與世代 1 對照（重要）**：world-1 host rr-qd32 = 36,602（= 聚合天花板 9×6000=54k 的 **68%**；guest 26,771 = **50%**，單 VM qd32 打不滿聚合）→ world-2 host = 37,107（= 聚合 6×6,500≈39k 的 **95%，近乎打滿**；guest 28,859 = 74%）。
+  交付數字 **+1.4% 幾乎沒變、但成因不同**：world-1 是 client 並行度用不完（68%）、world-2 是被真天花板卡住（95%）。**E-02 是四實驗裡受拓樸影響最小者**——穩態單 client 讀不製造「多來源搶同碟」的爭用，共媒體懲罰無從現形（要 backfill/多 VM 齊發才咬人）。
+  （先前拿「17.7 MB/s→1,168 MB/s」佐證有誤：17.7 來自更早 PVE 消費級 SSD 研究、非本系列世代 1，撤回。）
+- 虛擬化稅（host vs guest baseline E-01）：集中 rr-qd32（host +28.6% / guest −22.2%）、sr-1m −16.9%；寫/低 QD −5～+3%（機制與世代 1 一致）。
 
 ## E-01 noise band — done
 
@@ -62,8 +64,9 @@ rr-qd1=985、rr-qd8=9,218、rr-qd32=28,859、rw-qd1=605、rw-qd8=5,945、rw-qd32
 | rr-qd32x4 | 49,799 | 54,304 | **+9.0%**（p99 4708→3992 改善） |
 | rw-qd32x4 | 28,759 | 36,817 | **+28.0%**（p99 8454→5953 改善） |
 
-- **高並行 queue_depth=256 純加分（讀 +9%、寫 +28%，p99 同步改善）；qd1 零代價。**
-- 世代 1（共媒體）僅 +10~21%；clean 每 OSD 獨占 NVMe 下寫側放大到 +28%——**共媒體污染壓低了 queue_depth 效果的直接反證**。
+- **高並行 queue_depth=256 純加分（讀 +9.0%、寫 +28.0%，p99 同步改善）；qd1 零代價。**
+- **與世代 1 對照**：讀 rr-qd32×4 世代 1 +10.3% → 世代 2 +9.0%（**幾乎相同**）；寫 rw-qd32×4 世代 1 19,798→23,914（+20.8%）→ 世代 2 28,759→36,817（**+28.0%**，絕對 IOPS 也墊高）。
+  → **「共媒體壓低 queue_depth 效果」只成立在寫側**（高並行寫要填滿獨立媒體佇列）；讀側新舊無差。
 - caveat：生效驗證（host config_info）因 NSG 擋 worker internal IP 未能跑，改以行為級 A/B 差異證明生效；
   qd256 寫 36.8k 部分受 osd.2/4 mclock outlier 額外配額，絕對倍率含環境噪音。
 
@@ -88,13 +91,15 @@ rr-qd1=985、rr-qd8=9,218、rr-qd32=28,859、rw-qd1=605、rw-qd8=5,945、rw-qd32
 | auto-out/backfill 600–751s | **0.90 ms** | 13 | **1007 ms** |
 | post-recover | 0.93 ms | 1.58 | 75 ms |
 
-- **世代 1：auto-out 後 backfill 使隨機讀 ×24（持續性劣化）**（recovery 讀與 client 讀擠同一顆實體碟）。
-- **clean 每 OSD 獨占 NVMe：backfill 相 client 讀 median 完全不動（×1.0），只剩單發 ~1s 尖峰。**
-  → **×24 持續懲罰是共媒體病理，clean 拓樸塌成偶發亞秒尖峰。這是本次重跑最重要的修正。**
-- caveat：本環境每 OSD 資料量小（~8G），backfill 快、尖峰窗短；生產 TB 級 backfill 歷時久→尖峰機會更多，
-  但「dedicated media → recovery 不與 client 搶同碟 → median 不受污染」的機制可移植。
+- **世代 1（共媒體）**：backfill 階段 rr-qd1 **mean 22.73ms（×24 vs 0.96ms）、max 1,011ms，「整秒窗」持續性劣化**。
+- **世代 2（clean 獨占）**：backfill 階段 rr-qd1 **mean 13.04ms（×14 vs 0.92ms）、max 1,007ms，但 median 仍 0.90ms（×1.0）**。
+  → **精確講：不是歸零，是「持續變零星」**——均值懲罰約砍半（×24→×14）、最大尖峰兩代都 ~1s，但 median 不動代表典型請求正常、只有約 4/149 秒被單發尖峰拉高。這是拓樸影響最大的一條。
+- 成立條件：本環境每 OSD 實資料 ~8G、backfill 窗僅約 150s；生產 TB 級/OSD backfill 歷時更久 → 尖峰**次數**更多，
+  唯「dedicated media → recovery 不與 client 搶同碟 → median 不受持續污染」的機制可移植。
 
 ## 一句話總結（世代 2）
-clean 每 OSD 獨占 NVMe 重跑四個「共媒體污染」實驗：**E-02 機制維持（天花板刷新為真 NVMe 量級）、E-19 queue_depth 效果放大（+28%）、
-E-22「8 已足」是真結論、E-30 頭牌的 backfill ×24 塌成偶發亞秒尖峰**。核心教訓：**共媒體會系統性放大「recovery 搶 client」類的倍率；
-分離媒體後這些倍率大幅縮小或消失，而機制級排序（queue_depth 有用、shards 8 已足、writeback 危險…）不變。**
+clean 每 OSD 獨占 NVMe 重跑四個「共媒體污染」實驗，**拓樸影響分三級**：
+(1) **大＝E-30 backfill**（rr-qd1 mean ×24→×14、median ×1.0，持續→零星）；
+(2) **中＝E-19 寫側**（+20.8%→+28.0%、絕對 24k→37k）；
+(3) **幾乎無＝E-19 讀側/E-22/E-02**（讀 +10.3%→+9.0%、shards 兩代帶內、讀天花板 36.6k→37.1k）。
+核心教訓：**共媒體只在「有人跟 client 搶同碟」（backfill/recovery、高並行寫）時放大倍率；穩態單 VM 天花板與不缺並行的參數換不換媒體都差不多。機制級排序（queue_depth 有用、shards 8 已足、writeback 危險…）不變。**
