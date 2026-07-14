@@ -1,0 +1,660 @@
+# OSD latency 變高時，如何更快偵測、也更準確找到原因
+
+> 從 SSD 暫態卡頓、IO 過載、BlueStore slow operation，到 client 已受影響的 slow ops
+>
+> 報告日期：2026-07-15
+> 版本錨點：Ceph v19.2.3（slow-ops lab）／v19.2.4（Azure 世代 2）、Prometheus v2.51.0（slow-ops lab）
+> 證據來源：Ceph 原始碼、四個真機部署（含 Azure 兩個世代）、既有 alert rules 與保留下來的 evidence ledger
+
+## 0. 給主管的兩分鐘版本
+
+我們現在面對的不是「有沒有 slow ops alert」而已，而是兩個不同問題：
+
+1. **能不能在 5～8 秒事件結束後數十秒內留下可行動訊號，而不是等到 30 秒級 `SLOW_OPS`？**
+2. **看到 latency 變壞後，能不能分辨是單顆 SSD、同 node 共用硬體、IO 過載、BlueStore 內部卡頓，還是網路 gray failure？**
+
+既有的 Ceph `SLOW_OPS` 只會計算「仍在飛、而且已超過 `osd_op_complaint_time`」的 op；預設門檻是 30 秒。生產曾出現疑似 SSD／firmware 的 5～8 秒暫態卡頓，事件結束得太快，**在機制上不可能進入這條告警路徑**。真機注入 8 秒卡頓時，兩路 `SLOW_OPS` metric 全程都是 0。
+
+Ceph Squid 新增的四個 BlueStore slow counter 能補上這個洞。實測結果：
+
+| 情境 | 建議訊號 | 真機 series 證據 | 推估 alert firing | receiver 證據 |
+|---|---|---|---|---|
+| 單顆 OSD 卡 8 秒 | R1 BlueStore counter | 離線重放 expression 首真 **+14s** | evaluation 15s 時約 **≤+29s** | **未做** |
+| 同 node 三顆 OSD 同窗卡 8 秒 | R2 同 node 聚集 | 離線重放 expression 首真 **+20s** | 約 **≤+35s** | **未做** |
+| request 真正卡超過 30 秒 | R3 daemon＋R4 mon | expression 首真約 **+45s** | 約 **+45～60s** | **未做** |
+| OSD 持續離群 | `CephOSDLatencyOutlier` | 真機 firing | `for: 10m` 走滿 | Slack 送達已驗 |
+
+但**更快不等於更準**。無故障的重負載也曾讓 9/9 OSD 的 BlueStore counter 增加；因此任何單一 counter 只能說「這裡發生過超過 latency 預算的操作」，不能直接說「SSD 壞了」。正確做法是：
+
+> **先偵測症狀，再用 client、OSD、node、device 的跨層證據歸因；任何單一 alert 都不能證明 SSD 已損壞。**
+
+建議分三個階段落地：
+
+1. **先補整合缺口，再上快訊號**：R1～R4 已有 promtool 測試與真機時序資料重放，但尚未完成 Alertmanager 端到端驗證；先修 routing、R2 過載誤歸因與 telemetry absent，再以 shadow／warning 觀察。
+2. **補準確歸因**：把 client p99、per-OSD commit/apply latency、host RTT、同 node 受影響 OSD 數量與 device 指標放進同一個事件視圖。
+3. **補硬體證據**：incident bundle 目前已有 Prometheus dump 與 `iostat`，但還缺 SMART 與 RAID/HBA event；這是要把「同 node 聚集指紋」升級成「可交給硬體團隊處理的證據」的最後一哩。
+
+閱讀方式：主管先看 §0、§9、§11～§14；負責 Prometheus 與 Ceph 的同事再看 §5～§8 與 §15。本文的數字分成 expression 首真、alert firing、receiver 送達三層；沒有 receiver 證據時不會把它寫成 pager SLA。
+
+---
+
+## 1. 先把四個容易混淆的名詞分開
+
+### 1.1 OSD latency
+
+泛指一顆 OSD 處理 IO 的延遲。`ceph_osd_commit_latency_ms` 與 `ceph_osd_apply_latency_ms` 是 mgr 匯出的 per-OSD 統計，適合找持續離群的 OSD；它們不是每筆 IO 的完整 latency 分布，也會稀釋短暫尖峰。
+
+### 1.2 BlueStore slow operation
+
+BlueStore 內部某個階段超過 `bluestore_log_op_age` 就會被視為 slow operation；Ceph v19.2.3 預設是 **5 秒**。這是一個 storage engine 層的事件，不等於 client request 已卡滿 30 秒。
+
+### 1.3 `SLOW_OPS`
+
+OSD op tracker 檢查「仍在飛、而且已超過 `osd_op_complaint_time`」的 request；預設是 **30 秒**。它回答的是「現在是否已有 request 卡得很嚴重」，不是「剛才是否發生過 5 秒 SSD 暫停」。
+
+### 1.4 client p99
+
+第 99 百分位的端到端 IO latency。這最接近 workload 的實際體感，但只告訴我們「使用者正在痛」，不會直接告訴我們是哪顆 OSD、哪個 node 或哪個 device 造成。
+
+這四者是互補關係：client p99 負責確認影響，BlueStore counter 負責留下 per-OSD storage-path 症狀，OSD commit/apply latency 負責看持續離群，`SLOW_OPS` 負責抓永久或超過 30 秒的嚴重 request。
+
+### 1.5 本文會用到的短詞彙
+
+| 詞彙 | 本文中的意思 |
+|---|---|
+| scrape／evaluation／receiver | Prometheus 抓 metric／計算 alert rule／Alertmanager 實際送通知；三者時間不能混為一談 |
+| gray failure | daemon 還活著、沒有被判 down，但已慢到傷害 workload |
+| replica／acting set | 同一份資料的副本／目前負責某個 PG 的 OSD 集合 |
+| size／min_size | pool 的副本數／仍允許 IO 的最少副本數 |
+| PLP | power-loss protection；掉電時保護尚未落盤資料的 SSD 能力 |
+| HBA | host bus adapter；連接主機與磁碟／背板的儲存介面卡 |
+| CoV | coefficient of variation；用來看多輪量測的相對波動 |
+| T1／T3 | 原始碼層證據／真機實驗證據 |
+| shadow | 載入規則並記錄結果，但先不送 pager |
+| SLO | 團隊對 workload 可接受 latency／availability 的服務目標 |
+
+後文的 AIO、cgroup、PromQL 與 label-set 細節只影響實作者，集中放到 §15，不作主管判斷前提。
+
+---
+
+## 2. 這份報告用了哪些環境，可信到哪裡
+
+### 2.1 Ceph slow-ops 真機 lab：告警時間的主要證據
+
+- Ceph v19.2.3 Squid、cephadm。
+- 3 MON、9 OSD，三個 OSD node 各三顆。
+- Prometheus v2.51.0，scrape interval 10 秒、rule evaluation interval 15 秒。
+- 以 `dmsetup suspend` 模擬 device 暫停，以 duty cycle 模擬持續慢盤。
+- 研究 backlog 共 25 條 hypothesis：19 confirmed、4 violated、2 條停在 T1 推理。
+- `EVIDENCE-SUMMARY-2026-07-09.md` 保留 13 筆 run 記錄：11 筆完成且可判讀、1 筆中止但留下有效意外觀測、1 筆因注入未生效而明確標為 void。
+
+這組環境最適合回答「哪個 metric 先動、expression 何時首真、規則會不會漏採」，不代表生產 RAID 卡或 SSD firmware 已被重現。
+
+### 2.2 Azure 世代 1：gray failure 與共媒體拓樸
+
+- 三個 OSD host，每台一顆 NVMe 以 LVM 切成三個 OSD，共 9 OSD。
+- Ceph size=3/min_size=2，每個 host 一份 replica。
+- E-32 對一台 OSD host 注入 50ms 網路延遲，驗證「OSD 活著但很慢」的 gray failure。
+
+這組環境直接證明 `ceph health` 對 latency gray failure 的盲區；但共媒體會放大 backfill／recovery 爭用，不能把所有倍率直接移植到 dedicated-device 生產環境。
+
+### 2.3 Azure 世代 2：每個 OSD 獨占 NVMe 的交叉驗證
+
+- 三個 OSD host，每台兩顆實體 NVMe，各一顆對一個 OSD，共 6 OSD。
+- Ceph v19.2.4；pool 與 workload 形狀維持可比較。
+- 重跑最可能被「三個 OSD 共用一顆 NVMe」污染的 E-02、E-19、E-22、E-30。
+
+世代 2 **沒有重跑 E-32**，所以不能說 gray failure 的 ×40 已跨世代重現。它在本報告的用途，是校正「IO 過重／backfill 到底有多少是共媒體放大」：
+
+- 世代 1 backfill 隨機讀 mean 約 ×24，且呈現整段持續變慢。
+- 世代 2 mean 約 ×14，但 median 維持 ×1.0；典型 request 正常，只剩少數約 1 秒尖峰。
+- 兩代最大尖峰仍都約 1 秒。
+
+因此可移植的結論不是「dedicated NVMe 就沒有 latency」，而是：**共媒體會把 recovery 與 client 搶同一顆碟的影響從零星尖峰放大成持續劣化。**
+
+### 2.4 homelab PVE：只作低信心 SSD 觀察，不拿來定門檻
+
+PVE 環境有明顯干擾：SSD pool 只有兩顆 OSD、size=min_size=2、public network 是 1G、同 pool 有其他 workload、基線已存在 osd.0 BlueStore warning，部分實驗 CoV 很高。本文**不使用它的效能數字制定 alert threshold，也不拿它證明因果**。
+
+只保留 read-only SMART／inventory 觀察：
+
+- osd.0：Crucial MX300 275GB，消費級、無 PLP。
+- wear 90%、average block erase count 1360／約 1500。
+- power-on 29,154 小時、7 個 reallocated sector。
+- osd.8：OCZ ARC100，同樣是消費級、無 PLP。
+
+這些資料足以支持「硬體狀態值得優先檢查」。改用有 PLP 的資料中心級 SSD 是基於 Ceph durability／flush workload 的 engineering recommendation，不是這組觀察單獨證明的實驗結論；更不能寫成「某次 BlueStore slow operation 已證明由 SSD 老化造成」。
+
+### 2.5 證據分級
+
+| 結論 | 證據等級 | 可否直接採用 |
+|---|---|---|
+| 5～8 秒事件不會進 30 秒 `SLOW_OPS` | 原始碼＋真機 | 機制級，可採用 |
+| BlueStore counter expression 14～20 秒首真 | 真機資料離線重放 | 可作 expression 時序證據；未驗 receiver |
+| 同 node 多 OSD 是共用元件指紋 | 真機合成注入＋拓樸推理 | 可用於升級調查，不能直接定罪 firmware |
+| gray host 可在 health OK 下讓寫入 ×40 | Azure 世代 1 真機 | 機制可採用；×40 是環境數值 |
+| dedicated media 與較少持續 backfill 爭用一致 | Azure 跨世代交叉驗證 | 非單變因 A/B；絕對倍率依資料量、VM 規格與拓樸而變 |
+| PVE SSD 老化就是 slow-op 根因 | 觀察性資料 | 不可當已證因果，只能當風險案例 |
+
+### 2.6 實驗帳目如何對上本文
+
+這是一份跨研究整合報告，不是新開一批實驗；以下對帳可避免只挑漂亮數字：
+
+| 原研究 | 原始帳目 | 本文納入 | 其餘項目如何處理 |
+|---|---|---|---|
+| `ceph-slow-ops-detection` | 25 hypotheses；13 筆 run 記錄 | E-00～E-06、finale 的 latency／observer 結論 | 所有 hypothesis 都留在 backlog；與本題無直接關係的版本史與清理細節只列 §15 索引 |
+| `ceph-alert-real-lab` | 22 個 production alert scenario | S1 slow-ops、S11 latency-outlier | 其餘 20 場是 quorum、容量、crash、data damage 等 coverage，與 OSD latency 歸因無直接關係 |
+| Azure 世代 1 | 規劃 35 個：30 獨立執行、1 併入、4 裁定不做 | E-30、E-32、E-33 | 參數調教、KubeVirt failover 與容量故障留在原報告，不拿來支持本題 |
+| Azure 世代 2 | 重跑 E-02、E-19、E-22、E-30 | E-30 直接進主文；其餘用來界定拓樸 caveat | 不宣稱世代 2 重跑了 E-32／E-33 |
+| homelab PVE | 多組 RBD IO 實驗＋read-only SSD 調查 | 只納入 SMART／inventory | 效能結果受 1G 網路、兩 OSD、共用 workload 與高 CoV 影響，不進門檻或效果量結論 |
+
+slow-ops 的 25 條 hypothesis 不是 25 個獨立 scenario；多條 hypothesis 由同一次注入共同驗證。13 筆 run 中，11 筆完成並有 verdict、1 筆中止但留下有效意外觀測、1 筆因注入未生效標為 void。這些失敗與重試沒有從帳上刪除。
+
+---
+
+## 3. 一筆 IO 在哪裡可能變慢
+
+```text
+workload / VM
+  -> client（krbd / librbd）
+  -> primary OSD
+  -> replica OSD
+  -> BlueStore
+  -> block device
+  -> SSD / RAID / HBA
+```
+
+寫入 size=3 的 pool 時，primary 通常要等 replica 完成必要階段才能回覆 client。這會造成一個很重要的定位陷阱：
+
+- 被卡住的 SSD 可能位於 osd.0。
+- 等待 osd.0 replica ack 的 primary 可能是 osd.4。
+- `SLOW_OPS` 記在 primary 的 op tracker，因此告警顯示 osd.4。
+- BlueStore slow counter 是 per-OSD storage-path 計數，較可能指向真正卡住的 osd.0，但仍未直接定位到實體 SSD。
+
+在持續慢盤實驗裡，被限速的是 osd.0，但 daemon `SLOW_OPS` 出現在 osd.4/6/7/8。若 on-call 只看 `SLOW_OPS` label，就可能查錯磁碟。
+
+所以定位順序應該是：
+
+1. 用 client p99 確認影響。
+2. 用 BlueStore counter 與 commit/apply latency 找 per-OSD storage-path 異常。
+3. 用 `SLOW_OPS` 判斷 request 是否已嚴重卡住，但不單靠它定根因。
+4. 用 node/device 訊號確認 SSD、RAID/HBA、網路或 IO 爭用。
+
+---
+
+## 4. 六種常見的 OSD latency 事件
+
+### 4.1 單顆 SSD 或單一路徑暫態異常
+
+典型形狀是單一 OSD 的 BlueStore counter 增加，同 node 其他 OSD 沒有同窗事件。可能原因包含 SSD firmware GC、media retry、單一 virtual disk、纜線或 device path 暫停。
+
+單顆事件只能先列為「per-OSD storage-path 症狀」；下一步要查 SMART、kernel log、`iostat -xz`、RAID/HBA event 與同 node 對照，不能直接換碟。
+
+### 4.2 同 node 多顆 OSD 在同一時間窗卡頓
+
+若同一台 node 有三顆以上 OSD 在同一兩分鐘窗內出現 BlueStore slow counter，**而其他 node 沒有同樣聚集**，單顆 SSD 獨立故障已不容易解釋這個形狀。優先懷疑：
+
+- 共用 RAID/HBA。
+- 背板或共用 bus。
+- 同型號／同批次 SSD firmware 行為。
+- node memory pressure 或整台 node 的 IO 路徑。
+
+這是一個**同 node 聚集指紋**，不是 firmware 的證明。現行 R2 只計算每個 node 在兩分鐘窗內有幾顆 OSD 出現 counter 增量；它沒有檢查其他 node 是否也成立，也不能證明三顆是在同一秒卡住。E-00 的全 cluster 過載會讓每個 node 都符合 R2，因此 R2 在補上 cluster-wide correlation／抑制前不應直接 page。要完成歸因，仍需 controller log、SMART、kernel 與 workload 時間線。
+
+### 4.3 IO 過重、backfill、recovery 或 scrub
+
+無注入的 16×4MiB `rados bench` 曾讓 9/9 OSD counter 全部增加，max latency 44.7 秒。這推翻了「正常負載絕不會產生 >5 秒 BlueStore op」的預測。
+
+判讀重點不是把它叫 false positive，而是看分布：
+
+- 單顆 OSD：偏向單一路徑問題。
+- 同 node 多顆、其他 node 正常：偏向共用 node/device 元件。
+- 多個 node、大量 OSD 同時出現，且伴隨高 client throughput、backfill、recovery 或深佇列：偏向 cluster-wide IO 壓力。
+
+Azure 兩代也證明媒體拓樸會改變表現：共媒體把 backfill 造成的零星尖峰放大成持續性劣化。告警因此不能只看絕對 latency，還要帶上 recovery 狀態與受影響範圍。
+
+### 4.4 BlueStore 內部 slow operation
+
+Ceph v19.2.3 的 `bluestore_log_op_age` 預設 5 秒。四個可由 ceph-exporter 匯出的 counter 是：
+
+- `ceph_bluestore_slow_aio_wait_count`
+- `ceph_bluestore_slow_committed_kv_count`
+- `ceph_bluestore_slow_read_onode_meta_count`
+- `ceph_bluestore_slow_read_wait_aio_count`
+
+它們涵蓋幾個關鍵 read、AIO wait 與 commit 路徑，但不是每一行 `slow operation observed` log 都有專用 counter。既有研究比對到多個只有 log／health event、沒有上述四個 counter 的呼叫點，因此「四個 counter 都沒動」不能排除所有 BlueStore slow operation。
+
+`BLUESTORE_SLOW_OP_ALERT` 走另一條 health 路徑，預設 lifetime 是 86,400 秒（24 小時）、threshold 是 1。它適合回答「昨晚是否發生過」，不適合即時 pager：事件早已結束，health warning 仍可能留一整天。
+
+### 4.5 host 或網路 gray failure
+
+Azure E-32 對一台 OSD host 增加 50ms 網路延遲；OSD 全部活著、heartbeat 正常，`ceph -s` 全程 `HEALTH_OK`：
+
+- client 寫入 mean：1.73ms -> 69.6ms（**×40**）。
+- client 讀取：約 **×19**。
+- 沒有 OSD down，也沒有 health alert。
+
+size=3 且每 host 一份 replica 時，每一筆寫入都要等慢 host；讀取只在 primary 落到慢 host 的 PG 受影響。這解釋了為什麼「半死」比乾淨 down 更危險：乾淨 down 會觸發既有容錯，gray host 卻持續留在 acting set 裡拖慢所有寫入。
+
+E-33 也推翻一個直覺：同一個低 RTT 環境注入 0.1%／0.5% 隨機丟包，已報的 client latency／throughput 指標最壞效果約 1.1×；TCP 快速重傳吸收了稀疏丟包。這不是說 packet loss 永遠安全，而是說在該實驗邊界內，**RTT latency 比少量 loss 更值得優先監控**。
+
+### 4.6 永久卡死、process freeze 或 telemetry 失明
+
+BlueStore slow counter 通常要等對應階段完成才記帳；它是事件結束後快速留下痕跡，不保證能在受影響的那筆 client IO 完成前預警。op 永久卡住時，它可能一直不增加。OSD process 被 freeze 時，ceph-exporter 也可能先短暫回舊值，接著只讓該 daemon series 消失；HTTP 仍是 200、Prometheus `up` 仍是 1。
+
+因此快速 counter 不能取代：
+
+- daemon／cluster `SLOW_OPS`。
+- OSD down、flapping、recent crash。
+- per-daemon series absent／freshness。
+- client timeout／stall。
+
+---
+
+## 5. 為什麼既有監控會晚、會漏、甚至會指錯人
+
+### 5.1 30 秒門檻看不到 5～8 秒事件
+
+Ceph 原始碼把 `osd_op_complaint_time` 預設設為 30 秒；OSD health metric 從目前仍在飛的 op 中找超齡 request。5～8 秒事件完成後就離開 tracker，不會留下 `SLOW_OPS` 訊號。
+
+### 5.2 snapshot gauge 可能落在採樣縫隙
+
+真機曾出現 max latency 44.7 秒的 slow op：mon 端 health detail 抓到兩個樣本，但 per-daemon metric 整段漏掉。原因是 daemon gauge 在 op 完成後歸零，可見窗只有「實際 op 齡減 30 秒」；再穿過 mgr cache 與 10 秒 scrape，很容易沒有任何樣本。
+
+這就是為什麼嚴重 slow-request 告警要同時保留 daemon 與 mon 兩路，並用 `max_over_time()` 留住短暫訊號。它證明 OSD tracked request 已超齡；workload 是否已違反 SLO，仍要回到 client p99 確認。
+
+### 5.3 平均值會把暫態卡頓稀釋掉
+
+單 OSD 8 秒暫停實驗中：
+
+- `ceph_osd_commit_latency_ms` 只顯示約 754ms。
+- `rate(op_w_latency_sum)/rate(count)` 峰值只約 0.67 秒。
+
+這兩者並非沒用，而是不適合當暫態事件的唯一快訊號。它們更適合持續劣化的嚴重度與離群比較。
+
+### 5.4 `ceph health` 不負責保證 latency
+
+E-32 已經證明寫入 ×40 時仍可 `HEALTH_OK`。Ceph health 主要描述 quorum、daemon、PG、容量與已知 health check；它不是 workload latency SLO。
+
+### 5.5 既有 latency-outlier 規則是慢而穩，不是快訊號
+
+目前 `CephOSDLatencyOutlier` 的條件是：
+
+- commit latency >100ms。
+- 同時高於全體 OSD 中位數 3 倍。
+- 持續 10 分鐘。
+
+真機 S11 先把 osd.7 限到 4MiB/s，仍不足以撐過 `for:`；收緊到 1MiB/s 後才 firing，且已驗證 Slack receiver 收到、pager 沒收到。它適合抓「持續離群的 OSD」，不應拿來承擔 5～8 秒暫態卡頓。
+
+### 5.6 三種時間證據不能混用
+
+- **expression 首真**：PromQL 對已收集的 series 第一次算出 true。R1 +14s、R2 +20s 屬於這一層，而且是 `query_range` 離線重放。
+- **alert firing**：Prometheus 定期 evaluation 後把 rule 轉成 firing。若 evaluation interval 為 15 秒、`for: 0`，R1 推估不晚於 +29s、R2 不晚於 +35s；這兩個上限尚未在 live rule evaluator 驗證。
+- **receiver 送達**：Alertmanager 完成 routing 後，Slack／pager 真正收到。R1～R4 尚無這層證據；S11 latency-outlier 才有完整 receiver 證據。
+
+因此本文把 R1～R4 定位為「promtool 已過、真機 series 時序已驗、production integration 未完成」，不能把 +14／+20 秒當成 pager SLA。
+
+---
+
+## 6. 實驗總覽：測了什麼、預期什麼、結果如何
+
+`violated` 代表事前 prediction 被推翻，不代表實驗失敗。被推翻的項目反而是這次規則設計最有價值的部分。
+
+### 6.1 負載、時間與重複方式
+
+| 實驗群 | workload／注入矩陣 | 時間與重複 |
+|---|---|---|
+| E-00 | 無故障；先 16×4MiB、再以 16×1MiB `rados bench` 作 negative control | 兩筆獨立 run；第一筆中止但保留意外觀測 |
+| E-01／E-01b／E-02 | 校準負載 512KiB、4 threads；E-01 單 OSD suspend 8s（寫、讀各一段）；E-01b fill＋restart 後冷讀；E-02 同 node 三 OSD suspend 8s | 每個 scenario 一筆 final run；另保留被前場景污染的 E-02 重試史 |
+| E-03 | idle、無 client IO，單 OSD suspend 15s | 一筆 run |
+| E-04 v2 | cgroup `io.max wiops=8` 持續 150s，觀察到每筆 op 約 15.2s | 一筆有效 run；後續一筆因 kernel 拒絕設定標 void |
+| E-04 v4 | 32 threads；suspend 8s／resume 0.4s ×17，總注入約 143s | 一筆 final run |
+| E-05／E-06 | E-05 輕負載下 SIGSTOP osd.0 15s；E-06 suspend 3s ×2，比較 age=5s／2s | 各一筆 final run |
+| S11 | `rados bench` 1120s、16 threads；先 4MiB/s，再於同 run 收緊至 1MiB/s | 一筆長時 run，涵蓋完整 10m `for:` |
+| Azure E-32／E-33 | 4KiB randwrite qd8＋randread qd1 並行，1 秒粒度；分別注入 host RTT +50ms、隨機 loss 0.1%／0.5% | degraded 長窗 scenario；不是 n≥3 的效能 A/B |
+| Azure E-30 | 同一 degraded 負載；停單顆 OSD 並跨 600s auto-out；世代 2 down 751s、backfill 觀察約 150s | 兩個世代各一個長窗；跨世代交叉驗證，不是單變因 A/B |
+| PVE | 本文不使用效能 run，只用 read-only SMART／inventory | 不參與 alert threshold 統計 |
+
+Azure 正常態參數實驗使用 n≥3 與 noise band；本文引用的 degraded fault scenario 則是可回退的固定長窗。它們可回答機制與事件內效果量，不能被當成大量獨立事件的統計分布。
+
+### 6.2 逐實驗結果
+
+| 編號 | 為什麼測 | 注入／調整 | 事前預期 | 實測結果 | 對監控的影響 |
+|---|---|---|---|---|---|
+| E-00 | 驗 false positive | 無注入高負載 | counter 應保持 0 | ❌ 9/9 OSD 增加，max 44.7s | counter 定位為症狀，不直接定罪硬體 |
+| E-01 | 重現 5～8s 暫態 | 單 OSD suspend 8s | counter 快、SLOW_OPS 不動 | ✅ expression 離線重放首真 +14s；SLOW_OPS=0 | R1 可補暫態盲區，但未驗 receiver |
+| E-01b | 避免 read cache 掩護 | 冷 cache read＋suspend | read counter 應增加 | ✅ `slow_read_*` +3 | 冷讀路徑可被看見 |
+| E-02 | 驗同 node 聚集 | 三 OSD 同窗 suspend 8s | 只有該 node 聚集 | ✅ count=3，expression 首真 +20s | R2 有聚集能力，但須補全 cluster 過載排除 |
+| E-03 | 找 idle 盲區 | idle OSD suspend 15s | 可能仍有背景訊號 | ❌ 全部靜默 | idle 是結構性盲區 |
+| E-04 v2 | 驗持續 sub-30s 劣化 | `wiops=8`、150s | 應出現 SLOW_OPS | ❌ op 約15.2s、SLOW_OPS=0 | 發現持續劣化盲區 |
+| E-04 v4 | 驗 >30s severe path | suspend/resume duty cycle | 30～60s 內出現嚴重訊號 | ✅ expression 首真約 +45s；推估 firing +45～60s | R3/R4 可省掉舊規則額外 1m，未驗 receiver |
+| E-05 | 驗 observer freeze | SIGSTOP osd.0 15s | exporter 會回 stale | ❌ 後續是 per-daemon series 消失 | 必須另做 absent/freshness rule |
+| E-06 | 驗 2～5s 靈敏度 | 3s stall；age 5s vs 2s | 5s 看不到、2s 看得到 | ✅ +0 -> +6 | 2s 可試點，但要承擔噪音 |
+| S11 | 驗持續離群與 routing | osd.7 長時間限速 | latency outlier 應 firing | ✅ 1MiB/s 段走滿 10m；Slack 到、pager 無 | 適合持續 warning，不適合快報 |
+| Azure E-32 | 驗 health OK gray failure | host RTT +50ms | health OK 但 client 變慢 | ✅ 寫 1.73->69.6ms（×40）、讀 ×19 | client p99＋RTT 是必要訊號 |
+| Azure E-33 | 驗 loss 是否比 latency 更傷 | 低 RTT 下 loss 0.1%／0.5% | p99.9 應 >5× | ❌ 已報 client 指標最壞約 1.1× | 只在此低 RTT／稀疏 loss 邊界下先看 RTT |
+| Azure E-30 G1/G2 | 驗共媒體 caveat | OSD down -> auto-out/backfill | 獨占媒體應減少持續爭用 | ✅ mean ×24 -> ×14；G2 median ×1.0 | 結果與拓樸影響一致，但非單變因因果證明 |
+| PVE SMART | 補實體盤觀察 | read-only 盤點 | 老舊消費 SSD 可能是風險 | 觀察到 90% wear、無 PLP | 只作風險案例，不作因果證明 |
+
+### 6.3 被推翻的預測如何改變設計
+
+1. **高負載也會增加 counter**：R1 改稱「暫態卡頓症狀」，硬體歸因交給 R2 與跨層證據。
+2. **平均 latency 對暫態不敏感**：不再拿平均值當 5～8 秒事件主訊號。
+3. **daemon SLOW_OPS 可能整段漏採**：增加 mon 端 R4 備援。
+4. **SLOW_OPS 可能指向等待 replica 的 primary**：定位優先看 BlueStore counter。
+5. **device suspend 不會讓 node disk busy 必然上升**：bio 可能被擋在 device 之上；`node_disk_*` 只當佐證，不設未驗證的固定倍率。
+6. **注入是否生效是一等證據**：cgroup 限速曾套到空殼 unit；沒有行為級生效證據的陰性結果一律作廢，技術細節見 §15。
+
+---
+
+## 7. 建議的五層偵測架構
+
+### L0：先證明 sensor 活著
+
+目的：避免「沒有告警」其實只是 metric 消失。這一層目前只有需求與 E-05 證據，**repo 尚無可直接部署的 per-daemon absent/freshness rule**，必須列入 P0 實作。
+
+- exporter `up`。
+- 每顆 OSD 應有的 series 是否 absent。
+- sample timestamp／freshness。
+- mgr failover 前後的 metrics continuity。
+
+### L1：client 是否真的受影響
+
+目的：把 storage 內部事件與使用者痛感接起來。
+
+- workload／VM block latency p99、p99.9。
+- timeout、stall、queue depth。
+- 建議以各 workload 自身 7 日同時段 baseline 做倍數比較。
+
+Azure E-32 提出的起手式是 client p99 >自身 baseline 3 倍、持續 5 分鐘；這是**待生產 shadow 驗證的起始值**，不是已完成 alert-lab 驗證的通用門檻。
+
+### L2：快速找 per-OSD storage-path 症狀
+
+目的：在 5～8 秒事件結束後，仍能知道哪顆 OSD 剛才卡過。
+
+- 四個 `ceph_bluestore_slow_*_count` 的 `increase()`。
+- `ceph_osd_commit_latency_ms`／`apply_latency_ms` 相對全體中位數。
+- `ceph_osd_metadata` 將 OSD 對應到 hostname。
+
+### L3：確認是否已有嚴重超齡 request
+
+目的：對已超過 30 秒的 OSD tracked request 立即調查，不再多等一分鐘。這一層本身不證明 workload SLO 已破；是否 page 應結合 L1，或由團隊明確接受「severe request 先 page、再查 client」的政策。
+
+- daemon：`max_over_time(ceph_daemon_health_metrics{type="SLOW_OPS"}[1m]) > 0`。
+- mon 備援：`max_over_time(ceph_health_detail{name="SLOW_OPS"}[1m]) > 0`。
+- 兩者都搭配 `keep_firing_for`，保留短暫訊號供 on-call 看見。
+
+### L4：用受影響範圍與硬體訊號做歸因
+
+目的：分辨「單碟、單 node、全 cluster」。
+
+- 同 node 在兩分鐘窗內受影響的 OSD 數量。
+- OSD host 之間的 public／cluster network RTT 與 network queue；探針路徑需獨立於 Ceph mgr，避免 sensor 與故障共因。
+- `node_disk_io_time_weighted_seconds_total`、`iostat -xz`。
+- SMART wear、media error、reallocated sector。
+- RAID/HBA event、virtual disk／physical disk 狀態。
+- recovery、backfill、scrub、client throughput。
+
+---
+
+## 8. 告警組合與時間預算
+
+研究版規則位於 [`../ceph-slow-ops-detection/rules/ceph-slow-ops-fast.yml`](../ceph-slow-ops-detection/rules/ceph-slow-ops-fast.yml)，持續離群規則位於 [`../ceph-alert-rules/rules/ceph-production-coverage.yml`](../ceph-alert-rules/rules/ceph-production-coverage.yml)。R1～R4 不是可直接複製到 production 就完成的 bundle；下列整合缺口要先修。
+
+| 規則 | 用途 | 現行門檻 | 路由建議 | 重要限制 |
+|---|---|---|---|---|
+| `CephOSDTransientStall`（R1） | 單 OSD 剛發生 >5s BlueStore op | 1m increase >0；keep 10m | warning／事件記錄 | 過載也會觸發 |
+| `CephNodeMultiOSDStall`（R2） | 同 node 聚集候選 | 2m 內 ≥3 OSD；keep 15m | 先 shadow；補過載排除後才考慮 critical | 全 cluster 過載時每個 node 都會成立；2m 同窗不等於同秒 |
+| `CephDaemonSlowOpsFast`（R3） | daemon 端 >30s request | 1m max >0；keep 10m | 先驗 routing；是否 pager 由 SLO 政策決定 | 可能指向等待 replica 的 primary；不證明 client SLO 已破 |
+| `CephClusterSlowOpsFast`（R4） | mon 端漏採備援 | 1m max >0；keep 10m | 與 R3 建共同 incident key | 沒有 per-OSD label；不證明 client SLO 已破 |
+| `CephOSDLatencyOutlier` | 持續 commit latency 離群 | >100ms 且 >median×3，for 10m | warning／Slack | 太慢，不抓暫態 |
+| client p99 | 確認 workload impact | 建議起始值 >7d baseline×3，for 5m | 依 workload SLO | 尚需生產 shadow 校準 |
+| host RTT | 找 gray network | 建議起始值 >baseline×5 | 先 warning | Azure 數值不可直接套用 |
+
+### 8.1 上線前五個硬性 blocker
+
+1. **routing allowlist 不認得新 source**：R1～R4 的 `source=ceph_slow_ops_fast` 不在現行 `alertmanager-route.yml` 的 matcher；critical 會落到預設 Slack receiver，不會進 pager。
+2. **現行 grouping 無法合併 slow-request 通知**：`group_by` 含 `alertname`，R3、R4 與既有 `CephClientBlocked{name="SLOW_OPS"}` 都會成為不同通知。需要共同 `incident_class`、inhibition 或自訂 route，不能只在報告裡說「視為同一事件」。
+3. **既有 catch-all 會繞過新分級**：`CephClientRisk` 沒排除 `BLUESTORE_SLOW_OP_ALERT`，health latch 維持 24 小時時，會在 5 分鐘後以 critical page。若 R1 要當 warning、latch 只作盤後證據，就必須先修 catch-all 並補測試。
+4. **R2 沒排除全 cluster 過載**：E-00 的 9/9 OSD 增量會讓每個 node 都符合 R2。production 版要加入「多 node 同時成立時改判 cluster-wide pressure」的 correlation／抑制，或至少在 routing 前加 recording rule 分類。
+5. **L0 還沒有 deployable rule**：E-05 所需的 per-daemon absent/freshness 目前沒有實作；不能只靠 exporter `up`。
+
+以上五項沒有完成前，R1～R4 只能 shadow，不應開 pager。
+
+### 8.2 事件合併原則
+
+同一事件可能同時出現 R1、R2、R3、R4、latency-outlier 與 client p99。production 設計應先產生共同事件分類，再 routing：
+
+- 同 node R2 候選成立時，把該 node 的多個 R1 當細節；若多個 node 同時成立，改標 cluster-wide pressure，不發多張「硬體」page。
+- R3/R4 代表同一 severe slow-request 類別的兩個 sensor，但要用共同 label 或 Alertmanager inhibition 合併。
+- latency-outlier 維持 warning；是否升 pager 取決於 client SLO breach、severe slow request 或經驗證的單 node 聚集。
+- sensor absent 要獨立呈現，不能被 storage alert 抑制。
+- `increase()[1m]` 通常會跨數次 evaluation 為正；`for: 0` 的理由是不要再壓縮有限事件窗、爭取最低延遲，不是「只會剩一個 evaluation」。
+- `keep_firing_for` 讓通知在訊號消失後仍保留 10～15 分鐘，代表「事件近期發生過」，不代表 storage 仍持續慢；annotation／dashboard 要同時顯示最後一次 counter 增量與目前 client p99。
+
+PromQL regex／label-set 的實作踩雷移到 §15，避免阻斷管理決策主線。
+
+---
+
+## 9. 收到訊號後，怎麼判斷是哪一類問題
+
+| 觀測組合 | 較可能原因 | 不能直接下的結論 | 第一個動作 |
+|---|---|---|---|
+| 單 OSD R1，其他 OSD 正常 | 單一 SSD／device path 暫態 | SSD 已壞 | 查該 device SMART、kernel、iostat |
+| 同 node ≥3 OSD R1，其他 node 正常 | RAID/HBA、背板、firmware、node 資源 | firmware 已確診 | 查共用硬體與 controller event |
+| 多 node、大量 OSD R1＋高 throughput | workload、recovery、backfill、深佇列 | 多顆 SSD 同時壞 | 查 cluster-wide IO 與背景工作 |
+| client p99 高、health OK、單 host RTT 高 | 網路／host gray failure | Ceph 沒問題 | 比對每 host RTT 與 per-OSD latency |
+| R3 指向 A、R1 指向 B | A 可能在等待 B 的 replica ack，也可能是兩個獨立問題 | 只靠時間共現就已完成歸因 | 查 A 的 historic ops、PG acting set，再驗證是否真的包含 B |
+| R3/R4 有、R1 無 | 永久卡死、未覆蓋的 BlueStore 路徑或採樣時序 | 沒有 device 問題 | 查 historic ops、daemon log、absent |
+| commit latency 長期離群、R1 反覆出現 | 持續 device 劣化或長期過載 | 必然是 media failure | 用 SMART／RAID／負載完成歸因 |
+| daemon series 消失、HTTP `up=1` | OSD freeze 或 exporter 讀不到 daemon | 問題已恢復 | 查 OSD process、down、crash 與 freshness |
+
+判讀原則只有兩條：
+
+1. **先看範圍**：單 OSD、單 node、還是全 cluster。
+2. **再看共同時間線**：client p99、BlueStore counter、OSD latency、RTT、device 與 recovery 是否同時變化。
+
+---
+
+## 10. On-call 的前 15 分鐘
+
+### 0～2 分鐘：確認影響與 sensor
+
+1. 看 client p99／timeout，確認是否已有 workload impact。
+2. 看 Prometheus targets、exporter `up` 與 per-daemon series，排除 sensor 失明。
+3. 記錄告警開始時間，不要只看目前 `ceph -s`。
+
+### 2～5 分鐘：縮小到 OSD、node 或 cluster
+
+1. 列出最近兩分鐘有 BlueStore counter 增量的 OSD。
+2. 對應 hostname，判斷是否集中同 node。
+3. 比對 commit/apply latency、host RTT、recovery/backfill 狀態。
+4. 若只有 `SLOW_OPS`，確認它是否只是等待 replica 的 primary。
+
+### 5～10 分鐘：啟動證據收集
+
+先執行 read-only 收集，不要急著 restart OSD。現有工具：
+
+```bash
+bash experiments/ceph-incident-bundle/run/collect.sh \
+  --inventory <inventory.env> \
+  --ssh-key .ssh/id_ed25519 \
+  --since 2h \
+  --prom-url <prometheus-url>
+```
+
+bundle 已包含 cluster 狀態、Prometheus 時序、node 資源、`iostat`、kernel／systemd／Ceph log。**這個階段的目標是五分鐘內啟動，不是保證五分鐘內收完**：工具逐台序列收集，Prometheus dump 與單 node 預設 timeout 都可能超過五分鐘。事故期間可先釘 `--mode cephadm --seed ...` 減少 auto probe，再讓完整收集繼續跑；不要為了等 bundle 阻塞止血判斷。現況缺口是 SMART 與 RAID/HBA event，現場仍要另外收集並與 bundle 使用相同時間戳。
+
+### 10～15 分鐘：依證據選處置
+
+- **cluster-wide IO 壓力**：先確認 backfill/recovery/scrub 與 client 競爭，再評估降載或調整恢復速度。
+- **單 device 持續離群＋SMART／controller 證據**：準備隔離與換碟計畫。
+- **同 node 多 OSD＋controller event**：升級為 host／RAID/HBA 事件，不要逐顆 OSD 各自處理。
+- **gray network**：處理 RTT／介面／交換器路徑；乾淨 down 與 gray slow 的處置不同。
+- **永久卡死**：同時看 `ok-to-stop`、quorum、PG 與 redundancy，再做任何 restart／stop。
+
+一條 alert 不足以授權破壞性動作。停止 OSD 前仍要遵守 `ceph osd ok-to-stop`、確認 quorum、預先寫好 rollback，並在處理後確認 `HEALTH_OK` 或明確列出既存 health baseline。
+
+---
+
+## 11. 落地順序
+
+### P0：先補 production integration（立即）
+
+- R1/R2 需要 Squid v19.2.0+ 的四個 counter。
+- 確認 `/metrics` 能看到四個 `ceph_bluestore_slow_*_count`。
+- 確認 `ceph_daemon` 與 `instance`／hostname 的對應；R2 的 `count by (instance)` 必須真的是 per-node。
+- 確認 Prometheus 支援 `keep_firing_for`（v2.42+）。
+- 實作 per-daemon absent/freshness rule，補 E-05 對應測試。
+- 修 Alertmanager source allowlist 與共同 incident grouping，讓 R3/R4 能去重並送到預期 receiver。
+- 從 `CephClientRisk` catch-all 排除 `BLUESTORE_SLOW_OP_ALERT`，改由明確的 warning／盤後規則負責。
+- 為 R2 增加 cluster-wide overload 分類或抑制；在此之前維持 warning。
+
+責任分工建議：Ceph／SRE owner 負責 rules、routing 與 runbook；platform／workload owner 負責 client p99 與 SLO；hardware owner 負責 SMART、RAID/HBA inventory 與 event collector。三方都沒有 owner 時，不進 pager。
+
+### P1：shadow 至少 14 天
+
+- 載入現成規則，但先不 page。
+- 每次觸發保留 workload、recovery、受影響 OSD 與 node 數量。
+- 觀察窗至少涵蓋一次 recovery/backfill 或 scrub，以及一次 planned maintenance；14 天內沒遇到就延長到 30 天或安排可回退演練。
+- 對照 live evaluator 的 firing 時間與離線 +14／+20 秒重放結果，不能只看 expression。
+- 目標是量出正常尖峰、planned maintenance 與真正 incident 的分布，不是趕第二週開 pager。
+
+### P2：通過 go/no-go gate 才開分級通知
+
+- R1：warning／事件記錄。
+- R2：先區分單 node 聚集與多 node 過載；只有前者才是 critical 候選。
+- R3/R4：severe slow-request 事件；是否直接 pager，或只在 client SLO 同時 breach 時 pager，由團隊政策決定。
+- `CephOSDLatencyOutlier`：保留為持續 warning。
+- client p99 breach：依 workload SLO 決定 pager，不與 storage 內部訊號混成單一門檻。
+
+以下是**建議的上線驗收值，不是既有實驗結果**：
+
+| Gate | 通過條件 | 未通過時 |
+|---|---|---|
+| evaluator 時序 | R1、R2、R3/R4 各三次受控測試都在預算內 firing | 保持 shadow，查 scrape/evaluation |
+| receiver routing | 三次 synthetic／受控 alert 都送達正確 receiver，且錯誤 receiver 為 0 | 回退 route，規則只留 shadow |
+| R2 歸因 | 已知 cluster-wide 壓力不產生單 node 硬體 page | R2 維持 warning，補 correlation |
+| critical 噪音 | shadow 14 天內，R2/R3/R4 誤 critical 不超過每 cluster 每週 1 次 | 延長至 30 天並調整條件 |
+| telemetry absent | 三次 daemon freeze／series absent 都被 L0 rule 看見，exporter `up=1` 不會掩護 | 不開任何「無事件即健康」的自動判斷 |
+| runbook | 值班者只看告警與本文，15 分鐘內正確分類 OSD／node／cluster | 修 dashboard／runbook 後重演 |
+
+這裡的「誤 critical」是事後確認既沒有違反既定 paging policy、也沒有需要立即處置的 storage 事件；正常 recovery 造成可解釋的 warning 不算誤 critical。每週 1 次是建議的初始營運門檻，須由 on-call owner 明確接受。
+
+若任一 gate 失敗，回退方式是移除／停用 notification route，保留 recording、dashboard 與資料；不要為了壓 alert 直接刪除原始 metric。
+
+### P3：補歸因資料（同時進行）
+
+- Grafana 同頁放 client p99、R1/R2、commit/apply latency、RTT、recovery 與 device busy。
+- incident bundle 加入 SMART 與 RAID/HBA event collector；在完成前，runbook 明列手動補收步驟。
+- 建立 OSD -> hostname -> block device -> physical SSD／virtual disk 的 inventory。
+
+### P4：單 node 試點 `bluestore_log_op_age=2`（有 baseline 後）
+
+E-06 證明 3 秒 stall 在預設 5 秒時 +0，改 2 秒後 +6，而且 runtime 生效。但降低門檻會增加 log 與 warning 噪音：
+
+1. 只選一台 node，逐一指定該 node 的 `osd.N`；不要先改全域 `osd` scope。
+2. 先記錄至少一週 5 秒門檻 baseline。
+3. 變更前保存每顆 OSD 的 config source/value；改 2 秒後比較事件率、log 量與 workload。
+4. 若無法把正常高負載與異常分開，依保存的 source/value 還原，不推全 cluster；還原後確認 warning rate 回 baseline。
+
+### P5：演練與驗收
+
+每季至少演練一次單 OSD 暫態、同 node 多 OSD 聚集與 telemetry absent。驗收不是「alert 有 firing」而已，而是：
+
+- live evaluator 是否讓 R1 在 30 秒內、R2 在 35 秒內留下可見訊號。
+- >30 秒 severe request 是否在 60 秒左右 firing，並依 routing 政策送到正確 receiver。
+- on-call 是否能在 15 分鐘內縮小到 OSD、node 或 cluster。
+- critical false positive 是否符合 P2 的每 cluster 每週門檻。
+- sensor 失明是否另有獨立告警。
+
+---
+
+## 12. 給主管的投入建議
+
+| 優先序 | 項目 | 解決的風險 | 現有證據 | 成本判斷 |
+|---|---|---|---|---|
+| P0 | 修 routing/catch-all/R2/L0 後 shadow | 5～8s 暫態、採樣漏失與錯誤 paging | promtool＋真機 series 重放；尚缺 receiver | 中；rules 已有但整合未完成 |
+| P0 | client p99 dashboard／alert | health OK 的 gray failure | Azure E-32 ×40 | 中；需 workload metrics |
+| P0 | OSD-node-device inventory | 告警無法對到實體硬體 | 多 OSD 共用元件判讀需求 | 低至中 |
+| P1 | 同頁呈現 RTT／recovery／device | SSD 與過載誤歸因 | E-00、E-30、E-32 | 中 |
+| P1 | incident bundle 補 SMART／RAID | 只能看到指紋，沒有硬體證據 | PVE SMART 案例＋現有缺口 | 中；依 vendor 工具而定 |
+| P1 | R2 correlation＋分級 routing | 單 node 硬體候選與全 cluster 過載混淆 | 同 node +20s；E-00 9/9 反例 | 中；不是單改 severity |
+| P2 | `bluestore_log_op_age=2` 試點 | 2～5s 早期徵兆 | E-06 +0 -> +6 | 低，但有噪音風險 |
+| P2 | 低頻 synthetic IO 評估 | idle OSD 完全無訊號 | E-03 全靜默 | 中；需評估額外 IO 與誤判 |
+
+最值得先做的是修完 §8.1 的整合 blocker，再把 R1～R4 放進 shadow；client p99 與 OSD-node-device inventory 同步進行。直接採購硬體或把所有 R1 當 pager，都比這個順序更容易造成誤判與疲勞。
+
+---
+
+## 13. 不能誇大的地方
+
+1. **lab 沒有生產使用的真 RAID 卡**：R2 證明的是同 node 多 OSD 聚集可被偵測，不是 firmware 已在 lab 重現。
+2. **Azure E-32 只在世代 1 執行**：gray failure 機制很重要，但 ×40 沒有在世代 2 重跑。
+3. **Azure 世代 2 資料量小且不只改一個變因**：每 OSD 約 8GiB，backfill 約 150 秒；VM 規格、OSD 數與 mClock calibration 也不同，跨世代不是乾淨 A/B。
+4. **PVE 是觀察性案例**：硬體老化、無 PLP、既存 warning 與低寫入能力同時存在，但沒有隔離變因的換碟 A/B，不能宣稱因果已證。
+5. **四個 counter 只涵蓋部分 BlueStore 路徑**：log 有 slow operation，不保證四個 counter 一定增加。
+6. **counter 要等階段完成**：永久卡死仍要靠 `SLOW_OPS`、down、absent 與 client stall。
+7. **idle OSD 沒有 IO 就沒有 latency**：若一定要在 idle 時抓 firmware 暫停，需額外 synthetic IO 或帶外硬體 telemetry。
+8. **絕對門檻不可直接移植**：100ms、20ms、2ms 或倍數都受 SSD 類型、replica、scrape interval 與 workload 影響；先 shadow 建 baseline。
+9. **合成注入有保真度邊界**：`dmsetup suspend` 會把 IO 擋在特定層，`node_disk_*` 不一定重現真 firmware 在 device 內排隊的形狀。
+10. **alert 成功不等於 recovery 證據完美**：S11 的正向 firing 與 routing 斷言通過，但 BlueStore 24h latch 讓同一 run 內沒有 `HEALTH_OK`；健康恢復證據來自下一場 run 的 ready gate。
+
+---
+
+## 14. 一句話結論
+
+**更快**：用 Squid BlueStore slow counter 在 5～8 秒事件結束後數十秒內留下痕跡；用 daemon＋mon 雙路讓 severe request expression 約 +45 秒首真。實際 pager 時間要等 routing blocker 修完後重新驗證。
+
+**更準**：不要讓任何單一 metric 定罪 SSD；用「client 是否受影響、哪顆 OSD、是否同 node 聚集、device／RTT／recovery 是否同時異常」完成歸因。
+
+**真正要避免的失敗**：不是只有 OSD down，而是在 size=3、每 host 一份 replica、慢 host 仍留在 acting set 的條件下，OSD 還活著、`ceph health` 還是 OK，卻持續拖慢所有寫入。
+
+---
+
+## 15. 證據與實作索引
+
+### 快速 slow-ops 研究
+
+- [完整研究報告](../ceph-slow-ops-detection/REPORT-2026-07-09.md)
+- [逐 run evidence summary](../ceph-slow-ops-detection/EVIDENCE-SUMMARY-2026-07-09.md)
+- [Hypothesis backlog](../ceph-slow-ops-detection/HYPOTHESES.md)
+- [R1～R4 規則](../ceph-slow-ops-detection/rules/ceph-slow-ops-fast.yml)
+
+### Production alert 真機驗證
+
+- [22 場 evidence index](../ceph-alert-real-lab/EVIDENCE-INDEX-2026-07.md)
+- [`CephOSDLatencyOutlier` 與既有 coverage rules](../ceph-alert-rules/rules/ceph-production-coverage.yml)
+- [現行 Alertmanager route](../ceph-alert-rules/rules/alertmanager-route.yml)
+- [`CephClientRisk` catch-all](../ceph-alert-rules/rules/ceph-stability-first.yml)
+- [slow-ops scenario](../ceph-alert-real-lab/run/scenario-slow-ops.sh)
+- [latency-outlier scenario](../ceph-alert-real-lab/run/scenario-latency-outlier.sh)
+
+### Azure 世代 1／2
+
+- [KubeVirt RBD 完整研究報告](../kubevirt-rbd-tuning/REPORT.md)
+- [世代 1 evidence summary](../kubevirt-rbd-tuning/EVIDENCE-SUMMARY-2026-07-08.md)
+- [世代 2 evidence summary](../kubevirt-rbd-tuning/EVIDENCE-SUMMARY-2026-07-13.md)
+- [Hypothesis backlog（E-32＝H-011）](../kubevirt-rbd-tuning/HYPOTHESES.md)
+
+### homelab PVE 與 incident bundle
+
+- [PVE preflight／SMART snapshot](../rbd-io-perf/preflight-snapshot-2026-07-07.md)
+- [PVE evidence summary](../rbd-io-perf/EVIDENCE-SUMMARY-2026-07-07.md)
+- [Incident bundle 使用說明](../ceph-incident-bundle/README.md)
+- [Prometheus dump 真機驗證](../ceph-incident-bundle/PROM-VALIDATION-2026-07.md)
+
+### Ceph v19.2.3 原始碼錨點
+
+- `ceph/src/common/options/global.yaml.in`：`osd_op_complaint_time`、`bluestore_log_op_age`、slow-op lifetime／threshold 預設值。
+- `ceph/src/os/bluestore/BlueStore.cc`：四個 slow counter、`_add_slow_op_event()`、`BLUESTORE_SLOW_OP_ALERT`。
+- `ceph/src/os/bluestore/BlueStore.h`：counter enum。
+- `ceph/src/osd/OSD.cc`：`get_health_metrics()` 的 30 秒 slow-op 判定。
+- `ceph/src/pybind/mgr/prometheus/module.py`：OSD apply／commit latency 匯出。
+
+### 實作者注意事項
+
+- `increase()[1m]` 的單發增量通常會跨數次 evaluation 保持為正；`for: 0` 是為了不再增加 debounce、取得最低 latency，不是因為它必然只真一次。
+- 四個 counter 不能以 metric name regex 一次選完後直接 `increase()`：`__name__` 被移除時，同 OSD 可能形成重複 label set。研究版規則使用四個 `increase()` 顯式相加。
+- cephadm／podman 的 OSD process 可能在 systemd unit 下的子 cgroup；故障注入必須用實際 throughput／latency 與 cgroup path 證明生效，否則陰性 run 作廢。
+- S11 的 `HEALTH_OK` 不在同一 run 內：BlueStore latch 使 recovery gate 當時仍是 WARN，下一場 ready gate 才提供健康恢復證據。
