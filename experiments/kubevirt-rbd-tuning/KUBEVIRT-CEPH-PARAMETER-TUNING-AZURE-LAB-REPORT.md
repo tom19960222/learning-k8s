@@ -3,7 +3,29 @@
 > 實驗期間：2026-07-07 至 2026-07-13  
 > 受測版本：KubeVirt v1.5.0、Ceph v19.2.4、Linux kernel 6.8、libvirt v10.10.0、QEMU v9.1.0；第一次 Lab 確認 ceph-csi v3.14.0，第二次 Lab 的 ceph-csi image 版本未留在可取得的證據中  
 > 實驗規模：第一次 Azure Lab 執行 30 項實驗；第二次 Azure Lab 重新量測基準，並重跑 4 項最可能受儲存媒體拓樸影響的實驗  
-> 閱讀方式：若只需要決策，先看「管理摘要」與「參數決策總表」；若要判斷結果能否套用到其他環境，再讀「兩次 Azure Lab」與「限制」
+> 閱讀方式：時間有限請只看「兩分鐘決策摘要」；需要效果量與適用條件再看「管理摘要」與「參數決策總表」
+
+## 兩分鐘決策摘要
+
+**一句話結論：這套 KubeVirt＋Ceph RBD 架構的大多數預設值已經合理；最高回報不是微調 Ceph，而是防止 VM CPU、disk cache 與 guest scheduler 被設錯，再補上 gray failure、容量與 node 失效的維運防線。**
+
+| 決策 | 建議 | 不照做的實測代價 |
+|---|---|---|
+| VM CPU | CPU limit 不得低於 VM 的 vCPU 數 | 在 guest 同時承受 CPU 壓力與 I/O 負載時，4 vCPU VM 的 limit 由 4 降為 2，IOPS 約減半，p99 latency 變成 7.4 倍；p50 幾乎不變，很難從平均值察覺 |
+| Disk cache | KubeVirt disk 的 `cache` 欄位留空，並確認 QEMU 實際使用 direct／none | `writeback` 的 p99.9 由 3.3 ms 增至 71 ms（約 21.5 倍），node 硬斷時遺失約最後 6 秒已確認寫入 |
+| Guest I/O | Virtio block device 的 scheduler 維持 `none` | `none` 相對 `mq-deadline` 的循序讀寫分別高 39.7% 與 30.1%；反過來改成 `mq-deadline`，約等於降低 28% 與 23% |
+| 高並行新 workload | 另建 krbd `queue_depth=256` 的 StorageClass，小範圍驗證後使用；一般 workload 保留預設 128 | 實測 256 相對 64，高並行讀取增加 9%、寫入增加 28%；既有 PVC 無法線上修改，全面改動需要搬資料 |
+| Ceph 進階參數 | 維持 `osd_op_num_shards_ssd=8`、mClock balanced；沒有 cache 壓力證據前不提高 `osd_memory_target` | 受測環境沒有可辨識收益；修改 OSD startup 參數的 rolling restart 反而造成約 1.2～1.9 秒 client 讀取尖峰 |
+| 維運與監控 | 短期維護／OSD flapping 才使用 `noout`；nearfull 必須立即處理；監控 client p99、單一 OSD latency 與 host RTT；部署 NodeHealthCheck | 一台仍在線但增加 50 ms 延遲的 OSD host，讓寫入 latency 變成 40 倍且 `ceph health` 仍為 `HEALTH_OK`；k8s node 硬斷後，VM 曾在失聯 node 上顯示 `Running` 超過 11 分鐘 |
+
+主管需要推動的順序：
+
+1. **立即建立 VM template guardrail**：CPU limit、cache effective state、guest scheduler 三項自動檢查。
+2. **立即補監控與容量處置**：把 client p99、OSD latency、host RTT、`CephOSDNearFull` 與 `CephCapacityForecast` 放進同一套事件視圖。
+3. **下一階段補 VM HA 與維運程序**：部署並演練 NodeHealthCheck；在 runbook 寫清楚 `noout` 的啟用、解除與逾時檢查。
+4. **只對符合條件的新 workload 試行 `queue_depth=256`**：不要全面修改既有 PVC。
+
+解讀限制只有兩點：第二次 Azure Lab 不是只改一個變因，不能把兩次的絕對數字差異全部歸因於 NVMe 配置；它能支持的是決策方向重現。其次，第二次 Lab 觀察到 backfill 由「持續變慢」轉為「典型 request 正常、少量約 1 秒尖峰」；兩次 Lab 另有 OSD 數量、mClock 與 CSI 差異，不能把改善單獨歸因於 NVMe 配置，而且尖峰影響沒有消失。
 
 ## 管理摘要
 
