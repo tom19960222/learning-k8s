@@ -48,7 +48,11 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   `%s%s`（sign + FORMAT_TIMESPAN）timedatectl.c:509-516。awk 對 `+1min` 數值強制轉型 → 1.0。
 
 ### H-002: 若改跑 chrony（cephadm 官方建議之一），`timedatectl timesync-status` 失敗 → 所有 metrics 靜默消失
-- Status: predicted
+- Status: confirmed
+- Evidence: Azure lab 實機（2026-07-23）：osd-2 保持 chrony 時，v2 collector 走 fail-loud
+  路徑（heartbeat + collector_error=1 + timex×3，daemon metrics 全缺席）— chrony 下
+  timesync-status 確實失敗；baseline script 在同條件下只會剩 comment 檔（L1 已證 T-tdctl-fail）。
+  v2 的 fail-loud 設計即本假設的對策，實機行為與設計完全一致
 - Tier: T3
 - Origin: matrix「NTP daemon × partial × observer」
 - Note: 使用者已確認（2026-07-23）生產環境用 systemd-timesyncd → 本假設降為 robustness
@@ -93,7 +97,11 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   新 script 仍需外層 timeout + flock。
 
 ### H-007: timesyncd 啟動後、首次成功對時前，`timesync-status` 無 Offset 值（或 n/a）— script 在最需要回報的窗口反而沒輸出
-- Status: proposed
+- Status: confirmed
+- Evidence: Azure lab 實機（2026-07-23）：k8s-1 剛轉 timesyncd、Packet count=0 時，
+  timesync-status 只印 Server/Poll interval/Packet count 三行 — Offset 整行缺失，
+  與預測一致。baseline → unavailable 分支（全滅）；v2 → collector_error=1 + 部分欄位，
+  首次 poll 成功後自動恢復
 - Tier: T3
 - Origin: negative-space（daemon 生命週期狀態枚舉）
 - Prediction: restart timesyncd 且 udp/123 被擋時，`Offset:` 行缺失或值非數字 → 進 unavailable 分支或寫壞檔。
@@ -295,7 +303,7 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   timex/drift 車道。E-05 驗證 for 設計確實擋住單發 spike。
 
 ### H-037: pinned cephadm（v19.2.3）預設以 `--no-collector.timex` 啟動 node-exporter 且不設定 textfile 目錄 — timex 車道與 textfile 採集都需要顯式設定
-- Status: predicted
+- Status: confirmed
 - Tier: T1（cephadmlib/daemons/monitoring.py:73-77 args 僅 `--no-collector.timex`；
   NodeExporterService 無 textfile flag）→ T3（E-00 對 lab 與生產各驗一次）
 - Origin: codex r2 finding 1
@@ -303,6 +311,13 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   extra_entrypoint_args）；生產環境現有 `node_textfile_mtime_seconds` 輸出證明生產
   有設定 textfile — E-00 抓兩邊實際 argv 對照，v2 部署文件補「啟用兩個 collector」
   步驟（`--collector.timex` 能否蓋掉 `--no-collector.timex` 由 kingpin 語意決定，實測）。
+- Evidence（判決，2026-07-23 Azure lab）：**confirmed** —
+  (1) E-00 證實 lab 的 cephadm 19.2.5 預設完全不佈監控堆疊；
+  (2) `extra_entrypoint_args` 加 `--collector.timex` → 6 台 node-exporter 全掛，
+  container 直接吐 `node_exporter: error: flag 'collector.timex' cannot be repeated`
+  （kingpin 拒絕重複 bool flag）→ **timex collector 在 cephadm 下無法重新啟用**；
+  (3) 對策已實作：v2 script 的 `EMIT_TIMEX=1` 以 glibc adjtimex() 補發同名
+  node_timex_* metrics（textfile fallback），6 台實機驗證輸出正常。
 
 ---
 

@@ -170,6 +170,56 @@ if [[ -n "${packet_count}" ]]; then
     fi
 fi
 
+# ── kernel timex fallback（H-037 實測：cephadm 對 node-exporter 硬帶
+#    --no-collector.timex，且 kingpin 拒絕重複 flag、extra args 無法重新啟用）。
+#    EMIT_TIMEX=1 時由本 script 以 glibc adjtimex() 補發同名 metrics —
+#    單位換算對齊 node_exporter timex.go（offset 依 STA_NANO 選 ns/µs、maxerror µs）。
+#    只准在 node_exporter 的 timex collector 確認停用時開啟，否則同名 series
+#    重複會讓整個 scrape 壞掉。──
+timex_offset_s=""
+timex_maxerror_s=""
+timex_sync=""
+if [[ "${EMIT_TIMEX:-0}" == "1" ]]; then
+    timex_out=$(python3 - <<'PY' 2>/dev/null
+import ctypes, sys
+class Timex(ctypes.Structure):
+    _fields_ = [("modes", ctypes.c_uint),
+                ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+                ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long),
+                ("status", ctypes.c_int),
+                ("constant", ctypes.c_long), ("precision", ctypes.c_long),
+                ("tolerance", ctypes.c_long),
+                ("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_long),
+                ("tick", ctypes.c_long), ("ppsfreq", ctypes.c_long),
+                ("jitter", ctypes.c_long), ("shift", ctypes.c_int),
+                ("stabil", ctypes.c_long), ("jitcnt", ctypes.c_long),
+                ("calcnt", ctypes.c_long), ("errcnt", ctypes.c_long),
+                ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int),
+                ("pad", ctypes.c_int * 11)]
+tx = Timex()
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.adjtimex(ctypes.byref(tx)) < 0:
+        sys.exit(1)
+except (AttributeError, OSError):
+    sys.exit(1)
+STA_NANO = 0x2000
+STA_UNSYNC = 0x0040
+div = 1e9 if tx.status & STA_NANO else 1e6
+print("%.9f %.6f %d" % (tx.offset / div, tx.maxerror / 1e6,
+                        0 if tx.status & STA_UNSYNC else 1))
+PY
+    ) || timex_out=""
+    if [[ "${timex_out}" =~ ^-?[0-9]+\.[0-9]+\ [0-9]+\.[0-9]+\ [01]$ ]]; then
+        timex_offset_s="${timex_out%% *}"
+        rest="${timex_out#* }"
+        timex_maxerror_s="${rest%% *}"
+        timex_sync="${rest#* }"
+    else
+        collector_error=1   # 要求了 timex fallback 卻拿不到 → fail-loud
+    fi
+fi
+
 # ── 輸出：mktemp 唯一暫存（同檔案系統，rename 原子）+ trap 清理 ──
 tmp=$(mktemp "${OUTFILE}.XXXXXX") || exit 1
 trap 'rm -f "${tmp}"' EXIT
@@ -204,6 +254,12 @@ emit node_time_sync_collector_error gauge \
     "Total accumulated error bound to the reference clock in seconds" "${root_distance_s}"
 [[ -n "${poll_s}" ]] && emit node_ntp_poll_interval_seconds gauge \
     "Current timesyncd poll interval in seconds (long = stable, short = struggling)" "${poll_s}"
+[[ -n "${timex_offset_s}" ]] && emit node_timex_offset_seconds gauge \
+    "Kernel PLL remaining correction in seconds (textfile fallback; timex collector disabled by cephadm)" "${timex_offset_s}"
+[[ -n "${timex_maxerror_s}" ]] && emit node_timex_maxerror_seconds gauge \
+    "Kernel clock maximum error bound in seconds (textfile fallback)" "${timex_maxerror_s}"
+[[ -n "${timex_sync}" ]] && emit node_timex_sync_status gauge \
+    "Kernel clock sync status, 1 = STA_UNSYNC clear (textfile fallback)" "${timex_sync}"
 
 # 先 chmod 再原子發布（mktemp 給 0600；cephadm node-exporter 以 UID 65534 讀 —
 # rename 後才 chmod 會有一個不可讀窗口，且 mv 失敗時舊檔被 chmod 造成假成功）

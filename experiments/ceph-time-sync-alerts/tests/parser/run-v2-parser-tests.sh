@@ -173,6 +173,26 @@ sed -i '' 's/ Packet count: 461/ Packet count: 462/' "${CASE_FILE}" 2>/dev/null 
 run_sut
 check "V-age-resets" node_ntp_seconds_since_last_packet "0"
 
+# ── EMIT_TIMEX fallback：macOS 上 adjtimex 不存在 → 要求了拿不到 = fail-loud
+#    （值路徑的正確性由 L2 真機對照 node_exporter timex collector 驗證）──
+write_case "+1.2ms"
+EMIT_TIMEX=1 TDCTL_FAIL=0 TEXTFILE_DIR="${OUT_DIR}" PATH="${FAKE_BIN}:${PATH}" bash "${SUT}" 2>/dev/null
+if [[ "$(uname)" == "Darwin" ]]; then
+    check "V-timex-fail-loud" node_time_sync_collector_error "1"
+    if [[ -z "$(metric node_timex_offset_seconds)" ]]; then
+        echo "ok   V-timex-absent: timex metrics 缺席（macOS 無 adjtimex）" >&2; pass=$((pass + 1))
+    else
+        echo "FAIL V-timex-absent" >&2; fail=$((fail + 1))
+    fi
+else
+    check "V-timex-error0" node_time_sync_collector_error "0"
+    if [[ -n "$(metric node_timex_offset_seconds)" && -n "$(metric node_timex_sync_status)" ]]; then
+        echo "ok   V-timex-present: $(metric node_timex_offset_seconds)" >&2; pass=$((pass + 1))
+    else
+        echo "FAIL V-timex-present" >&2; fail=$((fail + 1))
+    fi
+fi
+
 echo "== v2 parser tests: ${pass} ok, ${fail} fail" >&2
 if [[ ${fail} -eq 0 ]]; then
     echo "PASS"
