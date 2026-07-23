@@ -1,0 +1,84 @@
+# BASELINE — 使用者現行版本，原封不動存檔供 review 與 E-05 使用。勿修改。
+groups:
+  - name: ceph-ntp-alerts
+    rules:
+      - alert: CephNTPClockAbnormal
+        expr: |
+          # (1) Node time spread > 50ms
+          (
+            (
+              max(abs(node_ntp_offset_seconds))
+              -
+              min(abs(node_ntp_offset_seconds))
+            ) > 0.05
+          )
+            or on ()
+          # (2) Any node is not synchronized
+          (
+            count(node_ntp_synchronized == 0) > 0
+          )
+            or on ()
+          # (3) Single node offset > 100ms AND jitter > 50ms
+          (
+            abs(node_ntp_offset_seconds) > 0.1
+            and on(instance)
+            node_ntp_jitter_seconds > 0.05
+          )
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+          description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+
+      - alert: CephNTPNetworkDegraded
+        expr: |
+          # (1) High delay AND high jitter simultaneously
+          (
+            node_ntp_delay_seconds > 0.5
+            and on(instance)
+            node_ntp_jitter_seconds > 0.03
+          )
+            or on ()
+          # (2) Zero NTP packet rate in 5 minutes
+          (
+            rate(node_ntp_packet_count_total[5m]) == 0
+          )
+            or on ()
+          # (3) Poll interval stretched to 128s+ (client deems network unstable)
+          (
+            node_ntp_poll_interval_seconds >= 128
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NTP network connection degraded on {{ $labels.instance }}: high delay/jitter, zero packets, or poll interval stretched"
+          description: "NTP network quality is deteriorating: (1) Round-trip delay > 500ms with jitter > 30ms, (2) Zero NTP packets received in 5 minutes, or (3) Poll interval stretched to 128s+. This is a precursor to time drift – if unresolved, it will likely escalate to a critical clock abnormal alert within minutes."
+
+      - alert: CephNTPServiceMisconfigured
+        expr: |
+          # (1) NTP service not enabled
+          (
+            node_ntp_active == 0
+          )
+            or on ()
+          # (2) RTC configuration inconsistent across nodes
+          (
+            count(
+              count_values("rtc", node_ntp_local_rtc)
+            ) > 1
+          )
+            or on ()
+          # (3) Timezone inconsistent across nodes
+          (
+            count(
+              count_values("tz", node_ntp_timezone_info)
+            ) > 1
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NTP service misconfigured: service disabled, RTC inconsistency, or timezone mismatch across cluster"
+          description: "NTP service configuration issue detected: (1) NTP service is not enabled on one or more nodes, (2) Hardware clock (RTC) configuration is inconsistent across nodes (mix of UTC and local time), or (3) Timezone settings differ across nodes. This may cause log time confusion, cross-datacenter alignment issues, and inconsistent scheduled task execution."
