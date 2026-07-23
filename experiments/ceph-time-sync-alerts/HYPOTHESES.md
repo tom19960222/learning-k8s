@@ -81,7 +81,9 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   持續變舊但無 alert 引用它。
 
 ### H-005: `node_ntp_offset_seconds` 是「上次 poll 時刻」的快照，兩次 poll 之間凍結 — 預設 2048s 時最多過時 34 分鐘；生產參數 256s 時凍結窗 ≤ 4.3 分鐘
-- Status: predicted
+- Status: confirmed
+- Evidence: E-05(d) Azure lab（2026-07-23 05:47–06:15Z）：osd-0 斷 NTP 25 分鐘，
+  daemon offset 凍結在 +26µs 全程不動（EVIDENCE-LOG.md E-05(d) 段）
 - Tier: T3
 - Origin: matrix「script × stale × observer」
 - Prediction: 斷 NTP（iptables drop udp/123）+ 注入 100ppm drift 後，`node_ntp_offset_seconds`
@@ -149,7 +151,9 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 
 ### H-013: 「poll interval ≥ 128s 判為網路不穩」方向完全相反 — NTP client 穩定時才會拉長 poll → 健康 cluster 開機十幾分鐘後此條件永久為真
 - Status: confirmed
-- Evidence: T5 — 健康節點（rate>0）僅因 poll=2048 即永久 warning；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
+- Evidence: T5 — 健康節點（rate>0）僅因 poll=2048 即永久 warning；promtool 3.12.0（2026-07-23）。
+  Live 追加：Azure lab 健康 4 台於規則載入 ~10min 後達 firing（poll=256≥128）—
+  且 05:52 被 osd-0 的 rate==0 分支透過 or-on() 全數瞬間 auto-resolve（EVIDENCE-LOG.md）
 - Tier: T1（timesyncd poll 倍增邏輯；先前 exp4 實測）→ T3
 - Origin: persona（SRE 視角：這條上線第一天就 alert fatigue）
 - Prediction: 若補上 `node_ntp_poll_interval_seconds` metric，健康節點在 sync 穩定後
@@ -214,7 +218,9 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   這是三層防禦中 node 層存在的核心理由，L4 驗證一次即可。
 
 ### H-022: 斷 NTP 後 `node_timex_maxerror_seconds` 穩定累加（500µs/s，linux kernel/time/ntp.c:457）→ 約 8.9 小時觸頂 16s — kernel 層是唯一「持續反映失聯時長」的免費訊號，但它是誤差上界、不是實際 offset
-- Status: predicted
+- Status: confirmed
+- Evidence: E-05(d)：maxerror 0.0465→0.769 / 1456s → 實測斜率 496µs/s（理論 500µs/s）；
+  外插 16s 觸頂 ≈ 8.95h 與 T1 推算一致（EVIDENCE-LOG.md）
 - Tier: T1（kernel source 已證）→ T3（實測累加曲線與 sync_status 翻轉）
 - Origin: negative-space（三層觀測路徑各自的更新頻率枚舉）
 - Prediction: 斷線後 maxerror 以 500µs/s 累加，~8.9 小時觸頂 16s；
@@ -225,7 +231,9 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   兩者都**不是**絕對時間誤差的真值。
 
 ### H-023: 斷 NTP 後 `NTPSynchronized` 約 8.9 小時內維持 yes — script 的 sync flag 對「上游失聯」在頭幾小時完全不敏感
-- Status: predicted
+- Status: confirmed
+- Evidence: E-05(d)：25 分鐘完全失聯，flag 全程 =1（8.9h 全程翻轉點由 maxerror 實測斜率
+  外插；不值得吊 8.9h 機器等它翻）（EVIDENCE-LOG.md）
 - Tier: T1（source 已證）→ T3（實測翻轉時刻）
 - Origin: matrix「timesyncd × stale × observer」
 - Prediction: `NTPSynchronized` 實作是 `adjtimex().maxerror < 16s`，且**刻意忽略
