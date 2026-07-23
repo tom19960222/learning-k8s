@@ -178,7 +178,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   跟 PollIntervalMaxSec 綁定設計，且此路徑只能當粗粒度後備、快速失聯偵測靠 last-sync-age。
 
 ### H-015: 全 cluster 同步漂移（所有 node 跟同一個錯誤 upstream 對時）→ spread=0、sync=1、jitter 低 → 三條 alert 全盲
-- Status: predicted
+- Status: confirmed
+- Evidence: E-06（2026-07-23 06:47–07:05Z）：全 fleet +300s 穩態下 baseline 三條全程綠 — 共模全盲 firing 級證明；HEALTH_OK 全程、零 election（EVIDENCE-LOG.md E-06 段）
 - Tier: T3
 - Origin: matrix「NTP upstream × lying」
 - Prediction: fake upstream 統一撥快 5 分鐘，全部 node 跟上後：現行三條 alert 無一 fire；
@@ -286,7 +287,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   一次性 step 只適合測「transient 偵測」這個獨立問題（見 E-07 重設計）。
 
 ### H-034: 共模錯誤時間下，kernel timex 三訊號（offset/maxerror/sync_status）全部顯示健康 — timex 層對 H-015 無防禦力
-- Status: predicted
+- Status: confirmed
+- Evidence: E-06：共模穩態下 daemon spread ≤0.003s、sync=1、timex 全綠；唯一 firing = Drift 雙車道×5 — 第四路是唯一可見路徑（EVIDENCE-LOG.md E-06 段）
 - Tier: T2 → T3（E-06 同步採樣驗證）
 - Origin: codex cross-review finding 8（timex 語意修正的推論）
 - Prediction: 全 cluster 跟錯誤 upstream 收斂後，node_timex_offset ≈ 0、maxerror 正常
