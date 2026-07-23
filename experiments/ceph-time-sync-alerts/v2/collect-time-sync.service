@@ -1,0 +1,12 @@
+# 部署：cp collect_time_sync.sh /usr/local/bin/ && cp *.service *.timer /etc/systemd/system/
+#       systemctl daemon-reload && systemctl enable --now collect-time-sync.timer
+[Unit]
+Description=Collect time-sync metrics into node_exporter textfile (ceph-time-sync-alerts v2)
+Documentation=https://github.com/tom19960222/learning-k8s/tree/master/experiments/ceph-time-sync-alerts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/collect_time_sync.sh
+# TEXTFILE_DIR 自動偵測 cephadm node-exporter 目錄；非 cephadm 環境在此指定：
+# Environment=TEXTFILE_DIR=/var/lib/node_exporter/textfile
+Nice=10

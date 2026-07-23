@@ -18,8 +18,13 @@ else
     echo "warn: promtool 不存在，跳過規則測試（brew install prometheus）" >&2
 fi
 
-echo "== parser tests" >&2
+echo "== parser tests (baseline)" >&2
 if ! bash parser/run-parser-tests.sh >/dev/null; then
+    status=1
+fi
+
+echo "== parser tests (v2)" >&2
+if ! bash parser/run-v2-parser-tests.sh >/dev/null; then
     status=1
 fi
 

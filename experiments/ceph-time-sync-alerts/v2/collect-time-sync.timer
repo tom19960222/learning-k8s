@@ -1,0 +1,10 @@
+[Unit]
+Description=Run time-sync metrics collection every 30s (ceph-time-sync-alerts v2)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
