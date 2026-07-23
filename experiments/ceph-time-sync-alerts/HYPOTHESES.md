@@ -29,8 +29,12 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 ## A 組 — 採集 script 的行為邊界
 
 ### H-001: offset ≥ 1 分鐘時，parser 把 `+1min 2s` 誤讀成 1.0 秒 — skew 越大、匯報值錯得越離譜
-- Status: predicted
-- Tier: T1（source 已證）→ 待 T3 實測
+- Status: confirmed
+- Evidence: tests/parser/run-parser-tests.sh 11/11 PASS（2026-07-23，baseline script 原封
+  awk 邏輯 + fake timedatectl）：`+1min 2.337s`→1.000000000、`+1h 2min 3s`→1.0、
+  `+1d`→1.0、`n/a`→0.000000000（lying）、Offset 行缺失→unavailable 分支；
+  60s 以下（us/ms/s）全對。真機 timedatectl 輸出格式的端到端覆核留 E-01 L2 段
+- Tier: T1（source 已證）→ L1 已實證，T3 端到端覆核
 - Origin: negative-space（offset 字串格式全空間枚舉）
 - Prediction: fake timedatectl 回 `Offset: +1min 2.337s` 時，`node_ntp_offset_seconds` 輸出 `1.000000000`；
   回 `+1h 2min` 時輸出 `1.000000000`。60 秒以下（dot notation 單 token）則正確。
@@ -54,6 +58,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 
 ### H-003: 三次獨立指令呼叫任一回空值時，`.prom` 出現無值行，node_exporter 拒收**整份檔案**
 - Status: predicted
+- Note: 檔案面已 L1 實證（tests/parser T-empty-packet：Packet count 缺失時確實寫出
+  `node_ntp_packet_count_total ` 無值行）；node_exporter 拒收整檔的行為留 E-02（L2）
 - Tier: T3
 - Origin: pre-mortem（script 靜默失效的路徑回推）
 - Prediction: `packet_count` 為空時寫出 `node_ntp_packet_count_total `（無值）→
@@ -61,7 +67,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   現行 alert 無一盯 `node_textfile_scrape_error` → 靜默。
 
 ### H-004: metric absent 時，`count(node_ntp_synchronized == 0) > 0` 不會 fire — 「採集死亡」與「一切正常」在 alert 眼中同義
-- Status: predicted
+- Status: confirmed
+- Evidence: T9 — stale 後 alert 靜默 auto-resolve 亦證實；textfile→stale 的實機時序留 E-10；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2（PromQL 語意）→ T3 實測
 - Origin: axes.md accumulated class「Observer lying / stale telemetry」
 - Prediction: 停掉 cron 或刪 `.prom` 後，3 條 alert 持續綠燈；`node_textfile_mtime_seconds`
@@ -98,7 +105,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 ## B 組 — Alert 規則邏輯缺陷
 
 ### H-010: 6 個被引用的 metric（jitter/delay/poll_interval/active/local_rtc/timezone_info）script 從未輸出 → 3 條 alert 的 7 個條件中 6 個永遠是 empty vector
-- Status: predicted
+- Status: confirmed
+- Evidence: T3 — Misconfigured 在 6 metric 缺席下 15m 全程沉默；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2（比對 script 輸出與 rule 引用）→ T3 實測
 - Origin: negative-space（rule 引用 vs script 輸出交集）
 - Prediction: `CephNTPServiceMisconfigured` 整條在任何注入下都不可能 fire；
@@ -106,7 +114,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   Prometheus 對 absent metric 不報錯 — 這是靜默的規則腐敗。
 
 ### H-011: spread 用 `max(abs(o)) - min(abs(o))` — 對稱 skew（+40ms / -40ms，實際相差 80ms）算出 spread=0，不 fire
-- Status: predicted
+- Status: confirmed
+- Evidence: T1+T2 — 對稱 ±40ms 沉默；非對稱 70ms 陽性對照有 fire；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2 → T3
 - Origin: pre-mortem（mon 已 MON_CLOCK_SKEW 但我們的 alert 沒叫，回推原因）
 - Prediction: 兩 node 各注入 +40ms / -40ms，真實 inter-node skew 80ms，
@@ -118,7 +127,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   Ceph 接不住的這一塊，這是 node 層 spread 條件存在的獨立理由。
 
 ### H-012: `or on()` 串接讓 alert series 身分在「aggregate 條件 ↔ per-instance 條件」轉換時變動 → `for: 3m` 計時器重置；且 fire 時無法辨識條件與 node
-- Status: predicted
+- Status: confirmed
+- Evidence: T6+T7 — 修正版語意證實：(1)↔(2) 不重置準時 3m fire；(1)→(3) 重置、5m 沉默 7m 才 fire；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2（PromQL `or on()` 語意：LHS 非空時 RHS 同 signature 全丟）→ T3 實測
 - Origin: matrix「alert rule × partial」
 - Prediction:（codex 修正原始版本）條件(1)↔(2) 之間轉換**不會**重置 for — 兩者輸出
@@ -128,7 +138,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   「fire 時分不清哪個條件、哪個 node」的部分維持原判。promtool 單元測試可完整驗證（E-05a）。
 
 ### H-013: 「poll interval ≥ 128s 判為網路不穩」方向完全相反 — NTP client 穩定時才會拉長 poll → 健康 cluster 開機十幾分鐘後此條件永久為真
-- Status: predicted
+- Status: confirmed
+- Evidence: T5 — 健康節點（rate>0）僅因 poll=2048 即永久 warning；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T1（timesyncd poll 倍增邏輯；先前 exp4 實測）→ T3
 - Origin: persona（SRE 視角：這條上線第一天就 alert fatigue）
 - Prediction: 若補上 `node_ntp_poll_interval_seconds` metric，健康節點在 sync 穩定後
@@ -138,7 +149,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   「offset 持續很小」的證明，方向反轉的結論不變且更強。
 
 ### H-014: `rate(packet_count[5m]) == 0` 在 poll interval > 300s 的健康節點上是常態 → 永久性間歇 false positive
-- Status: predicted
+- Status: confirmed
+- Evidence: T4 — counter 34 分鐘 +1 時 rate[5m]==0 → 10m 即誤發；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T3
 - Origin: negative-space（poll interval 值域 32–2048s vs 窗口 5m）
 - Prediction: poll=2048 的健康節點，此條件在每個 poll 週期的大部分時間為真，
@@ -152,7 +164,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   但 RGW S3 signature（AWS SigV4 容忍 ±15min）、cephx ticket、外部系統對時全部處於風險中。
 
 ### H-016: 單 node 大 offset 但網路穩定（jitter 低）→ 條件(3) 的 `and jitter > 0.05` 擋掉 alert
-- Status: predicted
+- Status: confirmed
+- Evidence: T3 — +250ms 絕對偏差全程無任何 alert；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2 → T3
 - Origin: negative-space（offset × jitter 四象限，「大 offset + 低 jitter」象限 UNCOVERED）
 - Prediction: 單 node step +200ms 且網路乾淨時，條件(3) 不成立；只剩條件(1) spread 能救
@@ -225,7 +238,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   降級（可能是別的 `.prom` 壞掉，別讓時鐘監控背鍋）。
 
 ### H-032: 規則的 selector 全域無 scope — 任何非 Ceph 主機的 `node_ntp_*` 都會混進 spread / count 計算
-- Status: predicted
+- Status: confirmed
+- Evidence: T8 — app-42 主機 +200ms 令 Ceph alert 誤 fire；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
 - Tier: T2 → T3
 - Origin: codex cross-review finding 10（persona: 共用 Prometheus 的 fleet 視角）
 - Prediction: 同一個 Prometheus 上若有第二組主機輸出同名 metrics，非 Ceph 主機的

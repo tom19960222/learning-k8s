@@ -1,0 +1,199 @@
+# E-05a — 現行 3 條 ceph-ntp alert 的 promtool 決定性判決（機器到位前執行）
+# 每個 test 對應 HYPOTHESES.md 的 H 條目；預期結果 = 該 H 的 prediction（先寫死）。
+# 判決語意：測試「通過」= prediction confirmed（含「預測它不會 fire」的盲區證明）。
+rule_files:
+  - ../../current/ceph-ntp-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── T1 / H-011：對稱 skew（+40ms / -40ms，實際相差 80ms）→ abs-spread=0 → 不 fire ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0.04x30'
+      - series: 'node_ntp_offset_seconds{instance="mon2"}'
+        values: '-0.04x30'
+      - series: 'node_ntp_offset_seconds{instance="mon3"}'
+        values: '0x30'
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon2"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon3"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPClockAbnormal
+        exp_alerts: []   # H-011 confirmed 的樣子：80ms inter-node skew，規則沉默
+
+  # ── T2 / 陽性對照：非對稱 spread（90ms vs 20ms）→ abs-spread=70ms → 會 fire ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0.09x30'
+      - series: 'node_ntp_offset_seconds{instance="mon2"}'
+        values: '0.02x30'
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon2"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephNTPClockAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+              description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+
+  # ── T3 / H-016 + H-010：單 node 持續 +250ms、網路乾淨（jitter series 不存在）→
+  #    條件(3) 的 and jitter 擋掉、單 node spread=0、sync=1 → 全部沉默 ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0.25x30'
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_packet_count_total{instance="mon1"}'
+        values: '100+1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPClockAbnormal
+        exp_alerts: []   # 250ms 的絕對偏差完全不 page
+      - eval_time: 15m
+        alertname: CephNTPServiceMisconfigured
+        exp_alerts: []   # H-010：6 個 metric 不存在，整條規則死的
+
+  # ── T4 / H-014：健康節點 poll=2048s → packet counter 34 分鐘才 +1 →
+  #    rate[5m]==0 常態為真 → 永久性間歇 false positive ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_packet_count_total{instance="mon1"}'
+        values: '461x34 462x34'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPNetworkDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: mon1   # 健康節點被誤判為 degraded
+            exp_annotations:
+              summary: "NTP network connection degraded on mon1: high delay/jitter, zero packets, or poll interval stretched"
+              description: "NTP network quality is deteriorating: (1) Round-trip delay > 500ms with jitter > 30ms, (2) Zero NTP packets received in 5 minutes, or (3) Poll interval stretched to 128s+. This is a precursor to time drift – if unresolved, it will likely escalate to a critical clock abnormal alert within minutes."
+
+  # ── T5 / H-013：poll interval 拉長 = timesyncd 對穩定的獎勵，規則卻判為網路不穩 →
+  #    健康節點（counter 每分鐘遞增、rate>0）永久 warning ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_poll_interval_seconds{instance="mon1"}'
+        values: '2048x30'
+      - series: 'node_ntp_packet_count_total{instance="mon1"}'
+        values: '461+1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPNetworkDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: mon1   # 完全健康、只因 poll 被拉長而永久告警
+            exp_annotations:
+              summary: "NTP network connection degraded on mon1: high delay/jitter, zero packets, or poll interval stretched"
+              description: "NTP network quality is deteriorating: (1) Round-trip delay > 500ms with jitter > 30ms, (2) Zero NTP packets received in 5 minutes, or (3) Poll interval stretched to 128s+. This is a precursor to time drift – if unresolved, it will likely escalate to a critical clock abnormal alert within minutes."
+
+  # ── T6 / H-012（codex 修正版 a）：條件(1) spread → 條件(2) unsync 轉換，
+  #    兩者同為空 label set → alert 身分不變 → for 計時器「不」重置 → t=3m 準時 fire ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0.09x2 0x27'         # t0-2 spread 條件真，之後解除
+      - series: 'node_ntp_offset_seconds{instance="mon2"}'
+        values: '0x30'
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon2"}'
+        values: '1x2 0x27'            # t3 起 unsync 條件接手
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: CephNTPClockAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: critical      # 條件輪替但身分同為 {} → 連續計時 → 已 firing
+            exp_annotations:
+              summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+              description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+
+  # ── T7 / H-012（codex 修正版 b）：條件(1) {} → 條件(3) {instance} 轉換 →
+  #    身分改變 → for 重置 → t=5m 還不 fire、t=7m 才 fire ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0.09x2 0.15x27'      # t0-2 spread 真；t3 起兩 node 同為 0.15 → spread 假
+      - series: 'node_ntp_offset_seconds{instance="mon2"}'
+        values: '0x2 0.15x27'
+      - series: 'node_ntp_jitter_seconds{instance="mon1"}'
+        values: '0x2 0.06x27'         # t3 起條件(3) 對 mon1 為真
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon2"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephNTPClockAbnormal
+        exp_alerts: []                # 身分轉換 → for 從 t3 重新計時，事故進行中卻沉默
+      - eval_time: 7m
+        alertname: CephNTPClockAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: mon1
+            exp_annotations:
+              summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+              description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+
+  # ── T8 / H-032：selector 無 scope — 非 Ceph 主機的時鐘異常對 Ceph cluster 誤發 page ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0x30'
+      - series: 'node_ntp_offset_seconds{instance="mon2"}'
+        values: '0x30'
+      - series: 'node_ntp_offset_seconds{instance="app-42"}'
+        values: '0.2x30'              # 無關的應用主機
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="mon2"}'
+        values: '1x30'
+      - series: 'node_ntp_synchronized{instance="app-42"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephNTPClockAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: critical      # Ceph node 全部完美，卻因 app-42 而 page
+            exp_annotations:
+              summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+              description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+
+  # ── T9 / H-004：採集死亡（series 轉 stale）→ firing 中的 alert 自動 resolve、
+  #    之後永遠沉默 — 「監控死了」與「一切正常」同義 ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_synchronized{instance="mon1"}'
+        values: '0x10 stale'          # t0-10 真實 unsync（alert 應 fire），之後採集死亡
+      - series: 'node_ntp_offset_seconds{instance="mon1"}'
+        values: '0x10 stale'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CephNTPClockAbnormal
+        exp_alerts:
+          - exp_labels:
+              severity: critical      # 採集還活著時正確 firing
+            exp_annotations:
+              summary: "Ceph cluster clock abnormal: node time spread > 50ms, NTP unsynchronized, or single node offset/jitter exceeded"
+              description: "Multiple clock anomalies detected: (1) Node time spread between max and min offset nodes exceeds 50ms, (2) One or more nodes lost NTP synchronization, or (3) Single node has both offset > 100ms and jitter > 50ms. This may cause Ceph object version conflicts, PG state inconsistency, or OSD map convergence delay."
+      - eval_time: 13m
+        alertname: CephNTPClockAbnormal
+        exp_alerts: []                # 採集死亡 → alert 靜默 auto-resolve（最危險的行為）
