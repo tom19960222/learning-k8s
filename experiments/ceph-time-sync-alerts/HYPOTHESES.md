@@ -63,9 +63,10 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   現行 3 條 alert 全部不 fire。
 
 ### H-003: 三次獨立指令呼叫任一回空值時，`.prom` 出現無值行，node_exporter 拒收**整份檔案**
-- Status: predicted
-- Note: 檔案面已 L1 實證（tests/parser T-empty-packet：Packet count 缺失時確實寫出
-  `node_ntp_packet_count_total ` 無值行）；node_exporter 拒收整檔的行為留 E-02（L2）
+- Status: confirmed
+- Note: 檔案面已 L1 實證（tests/parser T-empty-packet）；node_exporter 側 E-02(a) 實機
+  判決（2026-07-23 06:21Z mon-2）：**拒收 granularity = per-file** — 壞檔自己全滅
+  （含 mtime series 不產生）、其他 .prom 完好、scrape_error=1 為 target 級無從歸因
 - Tier: T3
 - Origin: pre-mortem（script 靜默失效的路徑回推）
 - Prediction: `packet_count` 為空時寫出 `node_ntp_packet_count_total `（無值）→
@@ -326,6 +327,23 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   （kingpin 拒絕重複 bool flag）→ **timex collector 在 cephadm 下無法重新啟用**；
   (3) 對策已實作：v2 script 的 `EMIT_TIMEX=1` 以 glibc adjtimex() 補發同名
   node_timex_* metrics（textfile fallback），6 台實機驗證輸出正常。
+
+### H-038: kernel 對任何 CLOCK_REALTIME step（ADJ_SETOFFSET / settimeofday）執行 ntp_clear() → maxerror 瞬間 16s + STA_UNSYNC — NTPSynchronized 對「本地 step」是即時偵測器
+- Status: confirmed
+- Tier: T3（E-07i 實測）；T1 佐證 = linux kernel timekeeping ntp_clear() 路徑
+- Origin: E-07(i) prediction violation（預測 8.9h 盲 → 實測 3min firing）
+- Evidence: EVIDENCE-LOG.md E-07(i)：step +100ms 後 maxerror 直跳 16、sync_status=0，
+  `CephNodeTimeUnsynchronized` +3min firing。設計含意：Unsynchronized 車道實為
+  「本地 step 即時偵測 + 安靜失聯 8.9h 後衛」雙用途；真正的慢速盲區只剩
+  「上游緩慢帶偏」（Drift 車道專屬領域）
+
+### H-039: 單次 step 會汙染 timesyncd 的頻率估計（誤判為 freq 誤差）→ 修復後 offset 震盪、錯誤 freq 持續多個 poll 週期
+- Status: confirmed
+- Tier: T3（E-07i 回退段實測）
+- Origin: E-07(i) 回退觀測（timesyncd lab exp1 已知行為的生產參數再現）
+- Evidence: freq +14.7ppm → -275.9ppm、offset ±25ms 震盪（EVIDENCE-LOG.md）。
+  設計含意：一次 transient step 的可觀測餘波長達數十分鐘 — keep_firing_for 的
+  存在價值再添一筆；監控端「修好了」不等於「沒事了」
 
 ---
 
