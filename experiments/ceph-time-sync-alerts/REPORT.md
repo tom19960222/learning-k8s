@@ -29,8 +29,8 @@
     +500µs）、`STA_UNSYNC` 旗標。`timedatectl` 的 `NTPSynchronized` 其實就是
     「maxerror < 16 秒」。
 - 本報告的分層與代號約定：
-  - **L1 / 實機**：L1 = 本機離線判決（fake timedatectl、promtool 合成 series）；
-    其餘實驗皆在 Azure lab 實機。
+  - **L1 / L2 / 實機**：L1 = 本機離線判決（fake timedatectl、promtool 合成
+    series）；L2 = 單機真實環境段（如 E-01 的真機格式對照）；其餘皆 Azure lab 實機。
   - **車道（lane）**：一組共用同一訊號來源的規則。v2 共 8 條：A 跨 node spread、
     B 單 node 絕對 offset、C kernel 修正快車道（timex）、D 上游失聯（age + 同步旗）、
     E kernel 誤差上界（maxerror）、F daemon 掙扎（poll 縮短）、G 跨信任域 Drift、
@@ -150,7 +150,7 @@
 - **建議**：heartbeat（`node_time_sync_last_run_timestamp_seconds`）是採集層自保的
   第一訊號，對應規則 `CephNodeTimeSyncDataStale`（>120s / for 3m）。
 
-### 3.3 E-02(a) 壞檔語意 —— 拒收是 per-file；scrape_error 無法歸因
+### 3.3 E-02 壞檔語意 —— 拒收是 per-file；scrape_error 無法歸因
 
 - **調整的參數**：對 mon-2 寫入獨立壞檔 `junk.prom`（無值行 + 壞 label）。
 - **為什麼測**：baseline script 會寫出無值行；node_exporter 的拒收範圍決定
@@ -245,7 +245,7 @@
 - **結果**：
   - ❌ **推翻#1**：`CephNodeTimeUnsynchronized` **T+3min firing** — kernel 對任何
     CLOCK_REALTIME step 執行 `ntp_clear()` → maxerror 瞬間 16s + STA_UNSYNC〔機制〕。
-    `NTPSynchronized` 是雙面訊號：安靜失聯 8.9h 盲（E-05d）／本地 step 秒級翻旗。
+    `NTPSynchronized` 是雙面訊號：安靜失聯 8.9h 盲（E-05 斷線段）／本地 step 秒級翻旗。
     v2 偵測接力實測：**Unsync 3min → KernelErrorBound 6min → Stalled 13min**；
   - Drift 穩定 +105ms（±5ms）— 大幅高於雜訊、低於當時 1s 門檻（→ E-09 定案下修）；
   - timex offset 全程 0（ADJ_SETOFFSET 不經 PLL）→ `CorrectionInProgress` 正確沉默；
