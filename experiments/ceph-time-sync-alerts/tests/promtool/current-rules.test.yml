@@ -83,6 +83,39 @@ tests:
               summary: "NTP network connection degraded on mon1: high delay/jitter, zero packets, or poll interval stretched"
               description: "NTP network quality is deteriorating: (1) Round-trip delay > 500ms with jitter > 30ms, (2) Zero NTP packets received in 5 minutes, or (3) Poll interval stretched to 128s+. This is a precursor to time drift – if unresolved, it will likely escalate to a critical clock abnormal alert within minutes."
 
+  # ── T4b / H-014 修訂（生產參數 PollIntervalMaxSec=256）：counter 每 4 分鐘 +1 →
+  #    任何 5m 窗至少含一次遞增 → rate>0 → 健康態 FP 消失（短暫零窗撐不過 for:5m）──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_packet_count_total{instance="mon1"}'
+        values: '461x3 462x3 463x3 464x3 465x3 466x3 467x3 468x3'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPNetworkDegraded
+        exp_alerts: []   # poll=256 時健康節點不再誤發
+      - eval_time: 20m
+        alertname: CephNTPNetworkDegraded
+        exp_alerts: []
+
+  # ── T5b / H-013（生產參數 256）：poll 恆為 256 ≥ 128 → 健康節點永久 warning，
+  #    在生產參數下這條反向規則 100% 命中每一台健康機器 ──
+  - interval: 1m
+    input_series:
+      - series: 'node_ntp_poll_interval_seconds{instance="mon1"}'
+        values: '256x30'
+      - series: 'node_ntp_packet_count_total{instance="mon1"}'
+        values: '461+1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CephNTPNetworkDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: mon1
+            exp_annotations:
+              summary: "NTP network connection degraded on mon1: high delay/jitter, zero packets, or poll interval stretched"
+              description: "NTP network quality is deteriorating: (1) Round-trip delay > 500ms with jitter > 30ms, (2) Zero NTP packets received in 5 minutes, or (3) Poll interval stretched to 128s+. This is a precursor to time drift – if unresolved, it will likely escalate to a critical clock abnormal alert within minutes."
+
   # ── T5 / H-013：poll interval 拉長 = timesyncd 對穩定的獎勵，規則卻判為網路不穩 →
   #    健康節點（counter 每分鐘遞增、rate>0）永久 warning ──
   - interval: 1m

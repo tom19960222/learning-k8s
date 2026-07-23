@@ -22,6 +22,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 - `mon_timecheck_interval = 5min`（mon.yaml.in:628-634）→ Ceph 自身偵測週期 5 分鐘（leader 執行）
 - 官方 mixin `CephMonClockSkew`：`ceph_health_detail{name="MON_CLOCK_SKEW"} == 1`，for: 1m（prometheus_alerts.yml:74-83）
 - systemd-timesyncd poll interval：成功即倍增，預設最大 `PollIntervalMaxSec=2048s`（≈34 min）
+- **生產 ops 參數（使用者 2026-07-23 確認）**：`PollIntervalMaxSec` 將調整為 **256s**
+  （= timesyncd lab exp4 的建議值）→ 涉及 poll 的預測以 256 為主線、2048 為預設組對照
 - node_exporter timex collector 預設啟用：`node_timex_offset_seconds` / `node_timex_sync_status` / `node_timex_maxerror_seconds`（timex.go:75,85,155,191）
 
 ---
@@ -74,7 +76,7 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 - Prediction: 停掉 cron 或刪 `.prom` 後，3 條 alert 持續綠燈；`node_textfile_mtime_seconds`
   持續變舊但無 alert 引用它。
 
-### H-005: `node_ntp_offset_seconds` 是「上次 poll 時刻」的快照，兩次 poll 之間凍結 — poll 拉到 2048s 時，metric 最多過時 34 分鐘
+### H-005: `node_ntp_offset_seconds` 是「上次 poll 時刻」的快照，兩次 poll 之間凍結 — 預設 2048s 時最多過時 34 分鐘；生產參數 256s 時凍結窗 ≤ 4.3 分鐘
 - Status: predicted
 - Tier: T3
 - Origin: matrix「script × stale × observer」
@@ -143,18 +145,24 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 - Tier: T1（timesyncd poll 倍增邏輯；先前 exp4 實測）→ T3
 - Origin: persona（SRE 視角：這條上線第一天就 alert fatigue）
 - Prediction: 若補上 `node_ntp_poll_interval_seconds` metric，健康節點在 sync 穩定後
-  poll 倍增至 2048，條件(3) 在穩定同步一段時間後永久為真 → 永久 warning。
+  poll 倍增至 max，條件(3) 在穩定同步一段時間後永久為真 → 永久 warning。
+  生產參數 256 下更糟：256 ≥ 128 恆真 → 每一台健康機器 100% 命中（T5b 證實）。
   （codex 細化）倍增條件是 `|offset| < 0.25×NTP_ACCURACY_SEC`；`> 0.75×` 或 spike 減半、
   `> 1×` 直接跌回最小值（timesyncd-manager.c:364-390）— 所以 poll 拉長恰恰是
   「offset 持續很小」的證明，方向反轉的結論不變且更強。
 
-### H-014: `rate(packet_count[5m]) == 0` 在 poll interval > 300s 的健康節點上是常態 → 永久性間歇 false positive
+### H-014: `rate(packet_count[5m]) == 0` 的 FP 與否取決於 poll interval 對 5m 窗的比值 — 預設 2048s 下永久性間歇 FP；生產參數 256s 下健康態 FP 消失、翻轉為「掉 ~3 個 poll 才 fire」的粗粒度失聯偵測
 - Status: confirmed
-- Evidence: T4 — counter 34 分鐘 +1 時 rate[5m]==0 → 10m 即誤發；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）, tests/promtool/current-rules.test.yml
+- Evidence: T4 — poll=2048 型 counter（34 分鐘 +1）10m 即誤發；T4b — 生產參數 256 型
+  counter（4 分鐘 +1）任何 5m 窗必含遞增 → 10m/20m 全程無 alert，短暫零窗撐不過
+  for:5m；promtool 3.12.0, `bash tests/run-tests.sh` → PASS（2026-07-23）
 - Tier: T3
-- Origin: negative-space（poll interval 值域 32–2048s vs 窗口 5m）
-- Prediction: poll=2048 的健康節點，此條件在每個 poll 週期的大部分時間為真，
-  `for: 5m` 擋不住（凍結窗 34 分鐘 >> 5 分鐘）→ `CephNTPNetworkDegraded` 反覆誤發。
+- Origin: negative-space（poll interval 值域 vs 窗口 5m）
+- Prediction: 預設 2048 下健康節點反覆誤發（T4 證實）。生產參數 256 下：counter 最大
+  間隔 4.27m < 5m 窗 → 健康態恆 rate>0（T4b 證實）；失聯時條件為真的時長 ≈ gap−300s，
+  要撐過 for:5m 需 gap ≥ ~600s ≈ 連掉 3 個 poll → 偵測延遲 ~10 分鐘等級（L2/E-03
+  實測 timesyncd 失聯時的實際重試節奏後精算）。設計含意：rate 窗與 for 必須
+  跟 PollIntervalMaxSec 綁定設計，且此路徑只能當粗粒度後備、快速失聯偵測靠 last-sync-age。
 
 ### H-015: 全 cluster 同步漂移（所有 node 跟同一個錯誤 upstream 對時）→ spread=0、sync=1、jitter 低 → 三條 alert 全盲
 - Status: predicted
