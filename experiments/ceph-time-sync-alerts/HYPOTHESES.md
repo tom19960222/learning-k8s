@@ -277,7 +277,8 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   （每 node 一條 missing-series alert，而非全域 absent()）。
 
 ### H-033: 外部注入的一次性 clock step 會觸發 timesyncd 的 clock-change watcher 立即 resync — 注入在被偵測前自癒
-- Status: predicted
+- Status: confirmed
+- Evidence: 純形式實測（k8s-1, 2026-07-23 07:39Z）：NTP 連線下 step +100ms → 12.7s 自癒；E-07 亦證封鎖下不自癒。EVIDENCE-LOG.md
 - Tier: T1（timesyncd-manager.c:206-223：`manager_clock_watch` 對非自身 jump 立即
   `poll_resync=true` + `manager_send_request()`）→ T3
 - Origin: codex cross-review finding 16（實驗設計 confound）

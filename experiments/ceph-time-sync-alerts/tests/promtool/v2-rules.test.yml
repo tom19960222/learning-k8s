@@ -175,6 +175,9 @@ tests:
         alertname: CephNodeTimeMetricsMissing
         exp_alerts: []
       - eval_time: 20m
+        alertname: CephNodeExporterDown
+        exp_alerts: []
+      - eval_time: 20m
         alertname: CephNodeTextfileScrapeError
         exp_alerts: []
 
@@ -278,9 +281,9 @@ tests:
               instance: mon1
               job: ceph-node
             exp_annotations:
-              summary: "Node clock differs from Prometheus server clock by over 10s"
-              description: "A 10s+ wall-clock disagreement across trust domains cannot be scrape noise. Either this node (or the whole cluster, if all nodes alert together) is following wrong time, or the Prometheus host is. S3/RGW request signing tolerates +/-15min; cephx and mon health degrade far earlier. Identify which side is wrong against an external reference before correcting."
-      - eval_time: 6m
+              summary: "Node clock differs from Prometheus server clock by over 500ms"
+              description: "A 500ms+ wall-clock disagreement across trust domains cannot be scrape noise (measured noise floor is +-5ms). Either this node (or the whole cluster, if all nodes alert together) is following wrong time, or the Prometheus host is. S3/RGW request signing tolerates +/-15min; cephx and mon health degrade far earlier. Identify which side is wrong against an external reference before correcting."
+      - eval_time: 4m
         alertname: CephNodeClockVsPrometheusDrift
         exp_alerts:
           - exp_labels:
@@ -289,8 +292,8 @@ tests:
               instance: mon1
               job: ceph-node
             exp_annotations:
-              summary: "Node clock differs from Prometheus server clock by over 1s"
-              description: "Cross-trust-domain check: the node's wall clock disagrees with the Prometheus server's scrape timestamps. This is the only signal that catches the whole cluster following a wrong upstream (all node-local signals look healthy in that case). Includes scrape delay noise; threshold calibrated against measured noise floor. Verify the Prometheus host's own clock before trusting the sign."
+              summary: "Node clock differs from Prometheus server clock by over 50ms"
+              description: "Cross-trust-domain check: the node's wall clock disagrees with the Prometheus server's scrape timestamps by over 50ms (10x the measured +-5ms noise floor). This is the only signal that catches a node — or the whole cluster — following a wrong upstream while every node-local signal looks healthy (proven in E-06/E-09). Detection is a deterministic ~3min bound and does not depend on the mon/mgr pipeline. Verify the Prometheus host's own clock before trusting the sign."
 
   # ── U10: timex 短暫 0.2s 修正（2 分鐘就自癒）→ CorrectionInProgress 以 keep_firing_for 保留 10m ──
   - interval: 1m
@@ -387,4 +390,25 @@ tests:
             exp_annotations:
               summary: "Time-sync collector has not run for over 2 minutes"
               description: "The collector's heartbeat timestamp is frozen: the timer died, the script is stuck, or the node clock is far behind the Prometheus clock (this expression crosses trust domains — a node running slow by minutes also fires it, and in that case the Drift alerts fire too). node_exporter keeps serving the frozen file, so every other time-sync metric for this node is stale — treat their values as historical, not current."
+
+  # ── U15: up==0 → ExporterDown fire、MetricsMissing 正確沉默（其前提是 up==1） ──
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="mon1", job="ceph-node"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: CephNodeExporterDown
+        exp_alerts:
+          - exp_labels:
+              alertgroup: ceph-time-sync
+              severity: warning
+              instance: mon1
+              job: ceph-node
+            exp_annotations:
+              summary: "node_exporter target down — all per-node time-sync lanes blind"
+              description: "Prometheus cannot scrape node_exporter on this node (E-10: nothing else alerts on this out of the box). Every per-node time-sync alert assumes up==1; until this resolves, this node's clock state is unknown, not healthy. Inhibit the per-node time-sync warnings for this instance while this alert fires."
+      - eval_time: 7m
+        alertname: CephNodeTimeMetricsMissing
+        exp_alerts: []
 

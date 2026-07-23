@@ -21,14 +21,15 @@ inhibit_rules:
       - alertname = CephNodeTimeSpreadHigh
     equal: ['cluster']
 
-  # node 整台 down（up==0 的基礎設施 alert，名稱依既有 rule set 調整）時，
-  # 壓掉該 node 的時鐘 warning（避免與 node-down page 疊加）
-  # - source_matchers:
-  #     - alertname = NodeDown
-  #   target_matchers:
-  #     - alertgroup = ceph-time-sync
-  #     - severity = warning
-  #   equal: ['instance']
+  # exporter 整台 down 時壓掉該 node 的其他時鐘 warning（E-10：per-node 車道
+  # 的前提是 up==1，exporter 死掉時它們的沉默是「未知」不是「健康」）
+  - source_matchers:
+      - alertname = CephNodeExporterDown
+    target_matchers:
+      - alertgroup = ceph-time-sync
+      - severity = warning
+      - alertname != CephNodeExporterDown
+    equal: ['instance']
 
 # 分組建議（減少 fanout 的第二道）：
 #   route.group_by: ['alertgroup', 'cluster'] 讓同一次時鐘事故的多條 alert 進同一則通知。

@@ -22,7 +22,7 @@ for line in open(RULES):
         ann[cur][m.group(1)] = m.group(2)
 
 ALL_ALERTS = list(ann)
-assert len(ALL_ALERTS) == 16, f"預期 16 條 rule，抽到 {len(ALL_ALERTS)}"
+assert len(ALL_ALERTS) == 17, f"預期 17 條 rule，抽到 {len(ALL_ALERTS)}"
 
 
 def series(name, labels, values):
@@ -157,7 +157,7 @@ tests.append(block(
     [series("node_time_seconds", n("mon1"), "300+60x30")],
     [("3m", "CephNodeClockVsPrometheusDriftCritical",
       exp("CephNodeClockVsPrometheusDriftCritical", {"severity": "critical", "instance": "mon1", "job": "ceph-node"})),
-     ("6m", "CephNodeClockVsPrometheusDrift",
+     ("4m", "CephNodeClockVsPrometheusDrift",
       exp("CephNodeClockVsPrometheusDrift", {"severity": "warning", "instance": "mon1", "job": "ceph-node"}))]))
 
 # U10 — H-033 對策驗證：transient step 自癒後 keep_firing_for 仍讓人看見
@@ -197,6 +197,14 @@ tests.append(block(
     [("8m", "CephNodeTimeSyncDataStale", None),
      ("17m", "CephNodeTimeSyncDataStale",
       exp("CephNodeTimeSyncDataStale", {"severity": "warning", "instance": "mon1", "job": "ceph-node"}))]))
+
+# U15 — E-10(§6.3)：exporter 整台死 → ExporterDown 接手；MetricsMissing 需 up==1 故不 fire
+tests.append(block(
+    "U15: up==0 → ExporterDown fire、MetricsMissing 正確沉默（其前提是 up==1）",
+    [series("up", n("mon1"), "0x30")],
+    [("7m", "CephNodeExporterDown",
+      exp("CephNodeExporterDown", {"severity": "warning", "instance": "mon1", "job": "ceph-node"})),
+     ("7m", "CephNodeTimeMetricsMissing", None)]))
 
 header = """# v2 規則的 promtool 判決 — 由 gen-v2-rules-test.py 產生，不要手改。
 # 對照組：current-rules.test.yml（舊規則的盲區證明）；本檔斷言 v2 把每個盲區接住

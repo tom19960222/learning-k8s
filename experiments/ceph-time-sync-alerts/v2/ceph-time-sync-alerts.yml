@@ -131,26 +131,29 @@ groups:
       - alert: CephNodeClockVsPrometheusDrift
         expr: |
           abs(node_time_seconds{job="ceph-node"}
-              - timestamp(node_time_seconds{job="ceph-node"})) > 1   # [draft-E06] 雜訊水位
-        for: 5m
+              - timestamp(node_time_seconds{job="ceph-node"})) > 0.05
+          # E-06/E-09 定案：雜訊水位 ±5ms（E-06 實測）→ 10× 裕度；E-09b 實測 T+2.9min
+          # firing、正確指認節點。Drift 是連續量測、無 daemon-snapshot spike 問題 → for 2m
+        for: 2m
         labels:
           alertgroup: ceph-time-sync
           severity: warning
         annotations:
-          summary: "Node clock differs from Prometheus server clock by over 1s"
-          description: "Cross-trust-domain check: the node's wall clock disagrees with the Prometheus server's scrape timestamps. This is the only signal that catches the whole cluster following a wrong upstream (all node-local signals look healthy in that case). Includes scrape delay noise; threshold calibrated against measured noise floor. Verify the Prometheus host's own clock before trusting the sign."
+          summary: "Node clock differs from Prometheus server clock by over 50ms"
+          description: "Cross-trust-domain check: the node's wall clock disagrees with the Prometheus server's scrape timestamps by over 50ms (10x the measured +-5ms noise floor). This is the only signal that catches a node — or the whole cluster — following a wrong upstream while every node-local signal looks healthy (proven in E-06/E-09). Detection is a deterministic ~3min bound and does not depend on the mon/mgr pipeline. Verify the Prometheus host's own clock before trusting the sign."
 
       - alert: CephNodeClockVsPrometheusDriftCritical
         expr: |
           abs(node_time_seconds{job="ceph-node"}
-              - timestamp(node_time_seconds{job="ceph-node"})) > 10
+              - timestamp(node_time_seconds{job="ceph-node"})) > 0.5
+          # E-09 定案：0.5s = 10× mon_clock_drift_allowed；絕對錯誤時間的立即行動線
         for: 1m
         labels:
           alertgroup: ceph-time-sync
           severity: critical
         annotations:
-          summary: "Node clock differs from Prometheus server clock by over 10s"
-          description: "A 10s+ wall-clock disagreement across trust domains cannot be scrape noise. Either this node (or the whole cluster, if all nodes alert together) is following wrong time, or the Prometheus host is. S3/RGW request signing tolerates +/-15min; cephx and mon health degrade far earlier. Identify which side is wrong against an external reference before correcting."
+          summary: "Node clock differs from Prometheus server clock by over 500ms"
+          description: "A 500ms+ wall-clock disagreement across trust domains cannot be scrape noise (measured noise floor is +-5ms). Either this node (or the whole cluster, if all nodes alert together) is following wrong time, or the Prometheus host is. S3/RGW request signing tolerates +/-15min; cephx and mon health degrade far earlier. Identify which side is wrong against an external reference before correcting."
 
       # ── 車道 H：觀測鏈自保（H-004/H-030/H-031 — 監控自己死了必須有人叫）──
       - alert: CephNodeTimeCollectorError
@@ -185,6 +188,16 @@ groups:
         annotations:
           summary: "Time-sync metrics absent while node is up"
           description: "node_exporter answers scrapes but the time-sync textfile series are absent: the file was rejected as malformed, deleted, or written to a directory node_exporter does not read. Note a dead collector timer does NOT trigger this — node_exporter keeps re-reading the old file forever; that case is caught by CephNodeTimeSyncDataStale. All offset-based alerts are blind for this node until fixed."
+
+      - alert: CephNodeExporterDown
+        expr: up{job="ceph-node"} == 0
+        for: 5m
+        labels:
+          alertgroup: ceph-time-sync
+          severity: warning
+        annotations:
+          summary: "node_exporter target down — all per-node time-sync lanes blind"
+          description: "Prometheus cannot scrape node_exporter on this node (E-10: nothing else alerts on this out of the box). Every per-node time-sync alert assumes up==1; until this resolves, this node's clock state is unknown, not healthy. Inhibit the per-node time-sync warnings for this instance while this alert fires."
 
       - alert: CephNodeTextfileScrapeError
         expr: node_textfile_scrape_error{job="ceph-node"} == 1
