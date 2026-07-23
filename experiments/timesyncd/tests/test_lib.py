@@ -55,6 +55,51 @@ class TestClockInjectDryRun(unittest.TestCase):
         self.assertEqual(d["freq"], -(10 << 16))
 
 
+class TestClockInjectCaptureRestore(unittest.TestCase):
+    """codex finding 17（ceph-time-sync-alerts SP）：回退必須還原「注入前捕捉的狀態」，
+    不能硬編碼 tick=10000/freq=0 — L4 真機 mon node 的 tick/freq 可能本來就非預設值。"""
+
+    STATE = {"tick": 10011, "freq": 655360, "status": 0x0001,
+             "maxerror": 2_000_000, "esterror": 1_500_000}
+
+    def _write_state(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(self.STATE, f)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_capture_dry_run_is_pure_query(self):
+        # capture 的讀取呼叫必須 modes=0（純查詢、不改任何欄位）
+        d = json.loads(run_tool("clock_inject.py", "--dry-run", "capture"))
+        self.assertEqual(d["modes"], 0)
+
+    def test_restore_replays_captured_values(self):
+        path = self._write_state()
+        out = run_tool("clock_inject.py", "--dry-run", "restore", "--from", path)
+        calls = [json.loads(line) for line in out.strip().splitlines()]
+        by_mode = {tuple(c["modes_names"]): c for c in calls}
+        self.assertEqual(by_mode[("ADJ_TICK",)]["tick"], 10011)
+        self.assertEqual(by_mode[("ADJ_FREQUENCY",)]["freq"], 655360)
+        self.assertEqual(by_mode[("ADJ_STATUS",)]["status"], 0x0001)
+        self.assertEqual(
+            by_mode[("ADJ_MAXERROR", "ADJ_ESTERROR")]["maxerror"], 2_000_000)
+        self.assertEqual(
+            by_mode[("ADJ_MAXERROR", "ADJ_ESTERROR")]["esterror"], 1_500_000)
+
+    def test_restore_rejects_incomplete_state(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump({"tick": 10000}, f)  # 缺 freq/status/maxerror/esterror
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        p = subprocess.run(
+            [sys.executable, os.path.join(LIB, "clock_inject.py"),
+             "--dry-run", "restore", "--from", f.name],
+            capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("freq", p.stderr)
+
+
 class TestNtpProbeParse(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, LIB)

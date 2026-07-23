@@ -72,6 +72,7 @@ def tx_dump(tx):
         "modes_names": [n for v, n in sorted(MODE_NAMES.items()) if modes & v],
         "offset": tx.offset, "freq": tx.freq, "status": tx.status,
         "tick": tx.tick,
+        "maxerror": tx.maxerror, "esterror": tx.esterror,
         "time_tv_sec": tx.time.tv_sec, "time_tv_usec": tx.time.tv_usec,
     }
 
@@ -137,6 +138,48 @@ def cmd_reset(args):
         print("reset: tick=10000 freq=0 time_offset=0 status=UNSYNC")
 
 
+RESTORE_KEYS = ("tick", "freq", "status", "maxerror", "esterror")
+
+
+def cmd_capture(args):
+    # 注入前呼叫：modes=0 純查詢，把可被實驗改動的欄位存成 JSON（給 restore 用）。
+    # 對應 ceph-time-sync-alerts SP 的 codex finding 17：回退要還原捕捉值，非硬編碼預設。
+    tx = Timex()
+    tx.modes = 0
+    do_call(tx, args.dry_run)
+    if args.dry_run:
+        return
+    state = {k: getattr(tx, k) for k in RESTORE_KEYS}
+    state["freq_ppm"] = tx.freq / 65536  # 人類可讀；restore 不用它
+    payload = json.dumps(state)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(payload + "\n")
+        print(f"capture: {args.out}", file=sys.stderr)
+    else:
+        print(payload)
+
+
+def cmd_restore(args):
+    with open(args.state_file) as f:
+        state = json.load(f)
+    missing = [k for k in RESTORE_KEYS if k not in state]
+    if missing:
+        sys.exit(f"restore: state 檔缺欄位 {missing}（需要 {list(RESTORE_KEYS)}）")
+    seq = []
+    tx = Timex(); tx.modes = ADJ_TICK; tx.tick = state["tick"]; seq.append(tx)
+    tx = Timex(); tx.modes = ADJ_FREQUENCY; tx.freq = state["freq"]; seq.append(tx)
+    tx = Timex(); tx.modes = ADJ_STATUS; tx.status = state["status"]; seq.append(tx)
+    tx = Timex(); tx.modes = ADJ_MAXERROR | ADJ_ESTERROR
+    tx.maxerror = state["maxerror"]; tx.esterror = state["esterror"]; seq.append(tx)
+    for tx in seq:
+        do_call(tx, args.dry_run)
+    if not args.dry_run:
+        print(f"restore: tick={state['tick']} freq={state['freq']} "
+              f"status={state['status']} maxerror={state['maxerror']} "
+              f"esterror={state['esterror']}")
+
+
 def cmd_status(args):
     tx = Timex()
     tx.modes = 0
@@ -157,6 +200,8 @@ def main():
     s = sub.add_parser("set-freq"); s.add_argument("--ppm", type=float, required=True); s.set_defaults(fn=cmd_set_freq)
     s = sub.add_parser("reset"); s.set_defaults(fn=cmd_reset)
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("capture"); s.add_argument("--out", default=None); s.set_defaults(fn=cmd_capture)
+    s = sub.add_parser("restore"); s.add_argument("--from", dest="state_file", required=True); s.set_defaults(fn=cmd_restore)
     args = p.parse_args()
     args.fn(args)
 
