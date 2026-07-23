@@ -19,10 +19,11 @@ groups:
       # ── 車道 A：跨 node 偏差（Ceph mon quorum 最在乎的量）──
       - alert: CephNodeTimeSpreadHigh
         expr: |
-          (max(node_ntp_offset_seconds{job="ceph-node"})
-           - min(node_ntp_offset_seconds{job="ceph-node"})) > 0.05
-        for: 2m
+          (max by (cluster) (node_ntp_offset_seconds{job="ceph-node"})
+           - min by (cluster) (node_ntp_offset_seconds{job="ceph-node"})) > 0.05
+        for: 5m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Ceph nodes NTP offsets spread beyond 50ms"
@@ -30,10 +31,11 @@ groups:
 
       - alert: CephNodeTimeSpreadCritical
         expr: |
-          (max(node_ntp_offset_seconds{job="ceph-node"})
-           - min(node_ntp_offset_seconds{job="ceph-node"})) > 0.15
-        for: 1m
+          (max by (cluster) (node_ntp_offset_seconds{job="ceph-node"})
+           - min by (cluster) (node_ntp_offset_seconds{job="ceph-node"})) > 0.15
+        for: 5m
         labels:
+          alertgroup: ceph-time-sync
           severity: critical
         annotations:
           summary: "Ceph nodes NTP offsets spread beyond 150ms"
@@ -42,37 +44,42 @@ groups:
       # ── 車道 B：單 node 絕對偏差（不依賴 jitter 條件；H-016 修正）──
       - alert: CephNodeTimeOffsetWarning
         expr: abs(node_ntp_offset_seconds{job="ceph-node"}) > 0.05
-        for: 3m
+        for: 10m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Node NTP offset above 50ms"
-          description: "This node's clock disagrees with its NTP upstream by more than 50ms at the last poll and has not recovered for 3 minutes. timesyncd normally corrects this within one or two poll cycles; sustained offset means correction is failing or drift is faster than correction."
+          description: "This node's clock disagrees with its NTP upstream by more than 50ms at the last poll and has not recovered for 10 minutes (beyond spike-sample lifetime at PollIntervalMaxSec=256). timesyncd normally corrects this within one or two poll cycles; sustained offset means correction is failing or drift is faster than correction."
 
       - alert: CephNodeTimeOffsetHigh
         expr: abs(node_ntp_offset_seconds{job="ceph-node"}) > 0.1   # [draft-E07] threshold/for
-        for: 1m
+        for: 5m
         labels:
+          alertgroup: ceph-time-sync
           severity: critical
         annotations:
           summary: "Node NTP offset above 100ms"
-          description: "This node's clock is off by more than 100ms from its NTP upstream — twice the mon clock-skew allowance. If this node is a mon, expect MON_CLOCK_SKEW within the next timecheck round (up to ~5 minutes behind this alert)."
+          description: "This node's clock is off by more than 100ms from its NTP upstream — twice the mon clock-skew allowance — and has stayed there past spike-sample lifetime (a single NTP response rejected as a spike lingers in timesync-status for up to one poll interval). If this node is a mon, expect MON_CLOCK_SKEW around the next timecheck round. Fast detection of large steps is the CorrectionInProgress and Drift lanes' job, not this rule's."
 
       # ── 車道 C：快車道 — kernel 正在修正一個大偏差（接住會自癒的 transient step）──
       - alert: CephNodeClockCorrectionInProgress
         expr: abs(node_timex_offset_seconds{job="ceph-node"}) > 0.05   # [draft-E03/E07]
+        for: 1m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         keep_firing_for: 10m
         annotations:
           summary: "Kernel clock correction larger than 50ms in progress"
-          description: "The kernel PLL is actively correcting a clock error larger than 50ms (node_timex_offset_seconds is the remaining correction, not the absolute error). A step this size was injected into or detected on this node recently; timesyncd may repair it within seconds — keep_firing_for holds this alert so the event is visible even after self-heal. A clock step did happen; check what caused it."
+          description: "The kernel PLL has been correcting a clock error larger than 50ms for over a minute (node_timex_offset_seconds is the remaining correction, not the absolute error). Causes include an injected/host-initiated step, boot-time initial sync, or a large slew after upstream change — timesyncd may finish within seconds; keep_firing_for holds this alert so the event stays visible after self-heal. Correlate with daemon restarts and boot time before treating as an incident. Requires the timex collector (cephadm disables it by default — verify in E-00)."
 
       # ── 車道 D：上游失聯（快速訊號；NTPSynchronized 要 ~8.9h 才翻 no）──
       - alert: CephNodeTimeSyncStalled
         expr: node_ntp_seconds_since_last_packet{job="ceph-node"} > 768   # 3×PollIntervalMaxSec(256)
         for: 1m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "No NTP response for over 3 poll intervals"
@@ -82,6 +89,7 @@ groups:
         expr: node_ntp_seconds_since_last_packet{job="ceph-node"} > 1800   # [draft-E03]
         for: 1m
         labels:
+          alertgroup: ceph-time-sync
           severity: critical
         annotations:
           summary: "No NTP response for over 30 minutes"
@@ -91,6 +99,7 @@ groups:
         expr: node_ntp_synchronized{job="ceph-node"} == 0
         for: 2m
         labels:
+          alertgroup: ceph-time-sync
           severity: critical
         annotations:
           summary: "Kernel reports clock unsynchronized (maxerror exceeded 16s)"
@@ -101,6 +110,7 @@ groups:
         expr: node_timex_maxerror_seconds{job="ceph-node"} > 1   # [draft-E03]
         for: 5m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Kernel clock error bound above 1s"
@@ -111,6 +121,7 @@ groups:
         expr: node_ntp_poll_interval_seconds{job="ceph-node"} < 64   # [draft-E03]
         for: 15m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "timesyncd poll interval stuck at minimum"
@@ -123,6 +134,7 @@ groups:
               - timestamp(node_time_seconds{job="ceph-node"})) > 1   # [draft-E06] 雜訊水位
         for: 5m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Node clock differs from Prometheus server clock by over 1s"
@@ -134,6 +146,7 @@ groups:
               - timestamp(node_time_seconds{job="ceph-node"})) > 10
         for: 1m
         labels:
+          alertgroup: ceph-time-sync
           severity: critical
         annotations:
           summary: "Node clock differs from Prometheus server clock by over 10s"
@@ -144,26 +157,40 @@ groups:
         expr: node_time_sync_collector_error{job="ceph-node"} == 1
         for: 10m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Time-sync collector failing on this node"
           description: "collect_time_sync.sh could not collect or parse at least one core field for 10+ minutes (timedatectl unavailable, chrony took over, or output format changed). Metrics for the failed fields are absent — clock problems on this node are currently invisible to the offset-based alerts."
 
+      - alert: CephNodeTimeSyncDataStale
+        expr: |
+          (time() - node_time_sync_last_run_timestamp_seconds{job="ceph-node"}) > 120
+        for: 3m
+        labels:
+          alertgroup: ceph-time-sync
+          severity: warning
+        annotations:
+          summary: "Time-sync collector has not run for over 2 minutes"
+          description: "The collector's heartbeat timestamp is frozen: the timer died, the script is stuck, or the node clock is far behind the Prometheus clock (this expression crosses trust domains — a node running slow by minutes also fires it, and in that case the Drift alerts fire too). node_exporter keeps serving the frozen file, so every other time-sync metric for this node is stale — treat their values as historical, not current."
+
       - alert: CephNodeTimeMetricsMissing
         expr: |
           up{job="ceph-node"} == 1
-          unless on(instance) node_time_sync_collector_error{job="ceph-node"}
+          unless on(cluster, instance) node_time_sync_collector_error{job="ceph-node"}
         for: 10m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "Time-sync metrics absent while node is up"
-          description: "node_exporter answers scrapes but the time-sync textfile metrics are gone: the collector timer is dead, the textfile was rejected as malformed, or the textfile directory changed. Per-node detection — this fires for exactly the node whose collection died. All offset-based alerts are blind for this node until fixed."
+          description: "node_exporter answers scrapes but the time-sync textfile series are absent: the file was rejected as malformed, deleted, or written to a directory node_exporter does not read. Note a dead collector timer does NOT trigger this — node_exporter keeps re-reading the old file forever; that case is caught by CephNodeTimeSyncDataStale. All offset-based alerts are blind for this node until fixed."
 
       - alert: CephNodeTextfileScrapeError
         expr: node_textfile_scrape_error{job="ceph-node"} == 1
         for: 15m
         labels:
+          alertgroup: ceph-time-sync
           severity: warning
         annotations:
           summary: "node_exporter rejected a textfile on this node"

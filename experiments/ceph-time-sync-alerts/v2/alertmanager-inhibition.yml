@@ -1,0 +1,34 @@
+# Alertmanager inhibition 草稿（codex r2 finding 8：單一 outlier 可能同時滿足
+# spread warning/critical + offset warning/critical + timex + CephMonClockSkew —
+# 沒有整流會一次噴 4+ 個 page）。E-08 在真 Alertmanager + 非 paging receiver 驗證。
+#
+# 併入既有 alertmanager.yml 的 inhibit_rules 段（cephadm 環境用
+# `ceph orch apply alertmanager` 的 spec 或 web config 注入 — E-00 確認機制）。
+inhibit_rules:
+  # 同 lane 的 critical 壓掉 warning（per-node lane：同 instance）
+  - source_matchers:
+      - alertgroup = ceph-time-sync
+      - severity = critical
+    target_matchers:
+      - alertgroup = ceph-time-sync
+      - severity = warning
+    equal: ['instance']
+
+  # aggregate spread critical 壓掉 aggregate spread warning（無 instance label，靠 cluster）
+  - source_matchers:
+      - alertname = CephNodeTimeSpreadCritical
+    target_matchers:
+      - alertname = CephNodeTimeSpreadHigh
+    equal: ['cluster']
+
+  # node 整台 down（up==0 的基礎設施 alert，名稱依既有 rule set 調整）時，
+  # 壓掉該 node 的時鐘 warning（避免與 node-down page 疊加）
+  # - source_matchers:
+  #     - alertname = NodeDown
+  #   target_matchers:
+  #     - alertgroup = ceph-time-sync
+  #     - severity = warning
+  #   equal: ['instance']
+
+# 分組建議（減少 fanout 的第二道）：
+#   route.group_by: ['alertgroup', 'cluster'] 讓同一次時鐘事故的多條 alert 進同一則通知。

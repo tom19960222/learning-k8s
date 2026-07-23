@@ -12,3 +12,4 @@ experiments/timesyncd/.ssh
 .superpowers/
 experiments/kubevirt-rbd-tuning/results/
 .worktrees/
+experiments/ceph-time-sync-alerts/results/

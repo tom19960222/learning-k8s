@@ -227,12 +227,15 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 
 ## D 組 — 觀測鏈自身失效（observer 也是被測系統）
 
-### H-030: textfile 過期無人盯 — `node_textfile_mtime_seconds` 已存在但 0 條 alert 引用；cron 死亡 = 全部時鐘監控靜默死亡
+### H-030: textfile 過期無人盯 — timer 死亡後 series **不會消失**（node_exporter 每次 scrape 重讀舊檔、時間戳永遠新鮮），absent/staleness 類偵測全部失效
 - Status: predicted
 - Tier: T2 → T3
-- Origin: pre-mortem
-- Prediction: `crontab -r`（或 timer 停用）後，所有 `node_ntp_*` 凍結在最後值，
-  `time() - node_textfile_mtime_seconds{file="...ntp_offset.prom"}` 持續增長，無 alert fire。
+- Origin: pre-mortem；機制由 codex r2 finding 2 修正（textfile collector 於 scrape 時讀檔）
+- Prediction: timer 停用後，所有 `node_ntp_*` 凍結在最後值但 series 持續存在且「新鮮」；
+  `up unless collector_error` 類規則不會 fire（U5 的 stale-series 情境是合成的，真實
+  機制走不到）。唯一可靠訊號 = 檔內 heartbeat 時戳凍結（v2 已加
+  `node_time_sync_last_run_timestamp_seconds` + `CephNodeTimeSyncDataStale`）或
+  `node_textfile_mtime_seconds` 變舊。E-10 實機驗證兩者。
 
 ### H-031: `node_textfile_scrape_error == 1`（壞檔）無人盯 — 與 H-003 合併成「採集層需要自己的 meta-alert」
 - Status: predicted
@@ -282,6 +285,25 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
   `.tmp`，可能出現半寫入內容被 rename 或 rename 目標消失；新 script 需
   mktemp 唯一暫存檔（同檔案系統）+ flock + trap cleanup。
 
+### H-036: 被 timesyncd 判為 spike 而拒用的 NTP 樣本，仍會停留在 `timesync-status` 顯示直到下一個 poll — snapshot 車道單一樣本可存活 ≤256s
+- Status: predicted
+- Tier: T1（timesyncd-manager.c:565-575：`if (!spike)` 才 adjust，樣本本身照存）→ T3（E-03/E-05 實測）
+- Origin: codex r2 finding 4
+- Prediction: 對 upstream 注入單發大 offset 回應（fake server 可控），節點時鐘不動、
+  `node_ntp_offset_seconds` 卻顯示 spike 值長達一個 poll 週期（poll 因 spike 減半 →
+  ~128s）。v2 對策：snapshot 車道 `for:` ≥ 5m > spike 樣本壽命；快偵測交給
+  timex/drift 車道。E-05 驗證 for 設計確實擋住單發 spike。
+
+### H-037: pinned cephadm（v19.2.3）預設以 `--no-collector.timex` 啟動 node-exporter 且不設定 textfile 目錄 — timex 車道與 textfile 採集都需要顯式設定
+- Status: predicted
+- Tier: T1（cephadmlib/daemons/monitoring.py:73-77 args 僅 `--no-collector.timex`；
+  NodeExporterService 無 textfile flag）→ T3（E-00 對 lab 與生產各驗一次）
+- Origin: codex r2 finding 1
+- Prediction: lab 的 node-exporter argv 無 textfile 目錄與 timex（除非部署有
+  extra_entrypoint_args）；生產環境現有 `node_textfile_mtime_seconds` 輸出證明生產
+  有設定 textfile — E-00 抓兩邊實際 argv 對照，v2 部署文件補「啟用兩個 collector」
+  步驟（`--collector.timex` 能否蓋掉 `--no-collector.timex` 由 kingpin 語意決定，實測）。
+
 ---
 
 ## Matrix 完備性檢核（enumerating-adversarial-boundaries）
@@ -294,8 +316,13 @@ iptables/tc 注入與 cleanup trap）；`experiments/ceph-alert-rules/`（既有
 | stale | H-005（offset 凍結）、H-004/H-030（textfile 過期）、H-021（mgr 凍結）|
 | lying | H-001（parser 把 1min 讀成 1s、n/a 讀成 0）、H-013（把健康訊號讀成故障）、H-015/H-034（upstream 統一說謊、timex 跟著說謊）、H-023（sync=yes 但失聯 8.9h）、H-033（注入自癒 → 實驗自己騙自己）|
 
-**Cross-review 紀錄**：2026-07-23 codex（gpt-5.6-sol, high reasoning）對抗性 review 產出
-19 條 findings，全數採納；載重反駁（Monitor.cc leader-相對 timecheck、timesyncd
+**Cross-review 紀錄**：
+- Round 2（2026-07-23，機器前交付物）：codex 17 條 findings、NO-GO verdict，全數採納。
+  載重項抽查證實：cephadm `--no-collector.timex`（H-037）、textfile series 永不消失
+  （H-030 機制修正）、spike 樣本存留（H-036）。修正落地：script heartbeat/chmod 順序/
+  age 防倒退/零值 parse、rules 16 條（+DataStale、by(cluster)、alertgroup、snapshot
+  車道 for≥5m）、E-00 硬化重寫、alertmanager-inhibition.yml 草稿、results/ 入 .gitignore。
+- Round 1（2026-07-23，計畫）：codex 19 條 findings，全數採納；載重反駁（Monitor.cc leader-相對 timecheck、timesyncd
 clock-change watcher、BUS_DEFAULT_TIMEOUT、`NTPSynchronized = maxerror < 16s`）已由本
 session 對 pinned source 抽查證實。原始輸出見 session 記錄；修正已回寫至各 H 條目
 （標「codex 修正/補充」）與 README.md（E-05a、E-07/E-09 注入重設計、L4 回退安全）。

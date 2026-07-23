@@ -89,6 +89,43 @@ check "V-us"   node_ntp_offset_seconds "0.000812000"
 write_case "-2d 1h";        run_sut
 check "V-day"  node_ntp_offset_seconds "-176400.000000000"
 
+# ── 真正的零值："0"（systemd 對 0 印純 0、無單位）→ 合法 0，error 維持 0 ──
+write_case "0"
+run_sut
+check "V-zero-offset" node_ntp_offset_seconds        "0.000000000"
+check "V-zero-error"  node_time_sync_collector_error "0"
+
+# ── heartbeat：永遠存在、為合理的 epoch 秒數 ──
+hb=$(metric node_time_sync_last_run_timestamp_seconds)
+now_epoch=$(date +%s)
+if [[ "${hb}" =~ ^[0-9]+$ && $(( now_epoch - hb )) -le 5 ]]; then
+    echo "ok   V-heartbeat: ${hb}" >&2; pass=$((pass + 1))
+else
+    echo "FAIL V-heartbeat: '${hb}'" >&2; fail=$((fail + 1))
+fi
+
+# ── 發布後檔案權限 644（cephadm node-exporter 以 UID 65534 讀）──
+# shellcheck disable=SC2012  # 檔名是測試自己控制的固定路徑；stat 的 flag macOS/Linux 不相容，ls 反而可攜
+perm=$(ls -l "${PROM}" | awk '{print $1}')
+if [[ "${perm}" == "-rw-r--r--"* ]]; then
+    echo "ok   V-perms: ${perm}" >&2; pass=$((pass + 1))
+else
+    echo "FAIL V-perms: ${perm}" >&2; fail=$((fail + 1))
+fi
+
+# ── 時鐘倒退（state 時戳在未來）→ age 不可信：缺席 + error=1，不 clamp 成 0 ──
+write_case "+1.2ms"
+run_sut   # 建立 state（count=461）
+printf '461 %s\n' "$(( $(date +%s) + 1000 ))" > "${OUT_DIR}/.time_sync.state"
+run_sut
+check "V-backstep-error" node_time_sync_collector_error "1"
+if [[ -z "$(metric node_ntp_seconds_since_last_packet)" ]]; then
+    echo "ok   V-backstep-absent: age 缺席（不假裝新鮮）" >&2; pass=$((pass + 1))
+else
+    echo "FAIL V-backstep-absent: age='$(metric node_ntp_seconds_since_last_packet)'" >&2; fail=$((fail + 1))
+fi
+rm -f "${OUT_DIR}/.time_sync.state"
+
 # ── n/a → fail-loud（offset 缺席 + error=1），絕不匯報 0 ──
 write_case "n/a"
 run_sut

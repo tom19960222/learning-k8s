@@ -22,7 +22,7 @@ for line in open(RULES):
         ann[cur][m.group(1)] = m.group(2)
 
 ALL_ALERTS = list(ann)
-assert len(ALL_ALERTS) == 15, f"預期 15 條 rule，抽到 {len(ALL_ALERTS)}"
+assert len(ALL_ALERTS) == 16, f"預期 16 條 rule，抽到 {len(ALL_ALERTS)}"
 
 
 def series(name, labels, values):
@@ -32,6 +32,7 @@ def series(name, labels, values):
 
 def exp(alertname, labels):
     out = "          - exp_labels:\n"
+    labels = {"alertgroup": "ceph-time-sync", **labels}
     for k, v in labels.items():
         out += f"              {k}: {v}\n"
     out += "            exp_annotations:\n"
@@ -65,16 +66,18 @@ tests.append(block(
     [series("node_ntp_offset_seconds", n("mon1"), "0.04x30"),
      series("node_ntp_offset_seconds", n("mon2"), "-0.04x30"),
      series("node_ntp_offset_seconds", n("mon3"), "0x30")],
-    [("4m", "CephNodeTimeSpreadHigh", exp("CephNodeTimeSpreadHigh", {"severity": "warning"})),
-     ("4m", "CephNodeTimeSpreadCritical", None)]))
+    [("7m", "CephNodeTimeSpreadHigh", exp("CephNodeTimeSpreadHigh", {"severity": "warning"})),
+     ("7m", "CephNodeTimeSpreadCritical", None)]))
 
 # U2 — H-016 修正驗證：單 node +250ms、無 jitter 條件 → 雙車道 offset alert
+#      （for=5m/10m 是 H-036 spike 免疫設計：3m 時應該還沒 fire）
 tests.append(block(
-    "U2: 單 node +250ms（舊規則 T3 證實沉默）→ OffsetHigh/Warning 都接住",
+    "U2: 單 node +250ms（舊規則 T3 證實沉默）→ OffsetHigh/Warning 都接住；3m 時未 fire＝spike 免疫",
     [series("node_ntp_offset_seconds", n("mon1"), "0.25x30")],
-    [("3m", "CephNodeTimeOffsetHigh",
+    [("3m", "CephNodeTimeOffsetHigh", None),
+     ("7m", "CephNodeTimeOffsetHigh",
       exp("CephNodeTimeOffsetHigh", {"severity": "critical", "instance": "mon1", "job": "ceph-node"})),
-     ("4m", "CephNodeTimeOffsetWarning",
+     ("12m", "CephNodeTimeOffsetWarning",
       exp("CephNodeTimeOffsetWarning", {"severity": "warning", "instance": "mon1", "job": "ceph-node"}))]))
 
 # U3 — H-032 修正驗證：無關主機不再汙染
@@ -110,6 +113,7 @@ healthy = [
     series("node_timex_maxerror_seconds", n("mon1"), "0.05x30"),
     series("node_time_seconds", n("mon1"), "0+60x30"),
     series("node_textfile_scrape_error", n("mon1"), "0x30"),
+    series("node_time_sync_last_run_timestamp_seconds", n("mon1"), "0+60x30"),
 ]
 tests.append(block(
     "U4: 生產參數健康基線（poll=256）→ 15 條 rule 全程零 alert（零 FP 斷言）",
@@ -184,6 +188,15 @@ tests.append(block(
     [series("node_textfile_scrape_error", n("mon1"), "1x30")],
     [("16m", "CephNodeTextfileScrapeError",
       exp("CephNodeTextfileScrapeError", {"severity": "warning", "instance": "mon1", "job": "ceph-node"}))]))
+
+# U14 — codex r2 finding 2：timer 死掉時 series 不會消失（node_exporter 永久重讀舊檔），
+#       唯一訊號是凍結的 heartbeat 時戳 vs time() 的差距
+tests.append(block(
+    "U14: heartbeat 凍結在 600（timer 已死、檔案仍被重讀）→ DataStale 在 diff>120 持續 3m 後 fire",
+    [series("node_time_sync_last_run_timestamp_seconds", n("mon1"), "600x30")],
+    [("8m", "CephNodeTimeSyncDataStale", None),
+     ("17m", "CephNodeTimeSyncDataStale",
+      exp("CephNodeTimeSyncDataStale", {"severity": "warning", "instance": "mon1", "job": "ceph-node"}))]))
 
 header = """# v2 規則的 promtool 判決 — 由 gen-v2-rules-test.py 產生，不要手改。
 # 對照組：current-rules.test.yml（舊規則的盲區證明）；本檔斷言 v2 把每個盲區接住

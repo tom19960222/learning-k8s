@@ -17,19 +17,20 @@ tests:
       - series: 'node_ntp_offset_seconds{instance="mon3", job="ceph-node"}'
         values: '0x30'
     alert_rule_test:
-      - eval_time: 4m
+      - eval_time: 7m
         alertname: CephNodeTimeSpreadHigh
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
             exp_annotations:
               summary: "Ceph nodes NTP offsets spread beyond 50ms"
               description: "The gap between the highest and lowest NTP offset across Ceph nodes exceeds 50ms (= mon_clock_drift_allowed). Ceph's own MON_CLOCK_SKEW check runs every 5 minutes, measures peers against the leader only and subtracts latency, so it can miss symmetric skew that this rule catches. Note: offsets are last-poll snapshots; cross-check CephNodeTimeSyncStalled before trusting per-node values."
-      - eval_time: 4m
+      - eval_time: 7m
         alertname: CephNodeTimeSpreadCritical
         exp_alerts: []
 
-  # ── U2: 單 node +250ms（舊規則 T3 證實沉默）→ OffsetHigh/Warning 都接住 ──
+  # ── U2: 單 node +250ms（舊規則 T3 證實沉默）→ OffsetHigh/Warning 都接住；3m 時未 fire＝spike 免疫 ──
   - interval: 1m
     input_series:
       - series: 'node_ntp_offset_seconds{instance="mon1", job="ceph-node"}'
@@ -37,24 +38,29 @@ tests:
     alert_rule_test:
       - eval_time: 3m
         alertname: CephNodeTimeOffsetHigh
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: CephNodeTimeOffsetHigh
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: critical
               instance: mon1
               job: ceph-node
             exp_annotations:
               summary: "Node NTP offset above 100ms"
-              description: "This node's clock is off by more than 100ms from its NTP upstream — twice the mon clock-skew allowance. If this node is a mon, expect MON_CLOCK_SKEW within the next timecheck round (up to ~5 minutes behind this alert)."
-      - eval_time: 4m
+              description: "This node's clock is off by more than 100ms from its NTP upstream — twice the mon clock-skew allowance — and has stayed there past spike-sample lifetime (a single NTP response rejected as a spike lingers in timesync-status for up to one poll interval). If this node is a mon, expect MON_CLOCK_SKEW around the next timecheck round. Fast detection of large steps is the CorrectionInProgress and Drift lanes' job, not this rule's."
+      - eval_time: 12m
         alertname: CephNodeTimeOffsetWarning
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
             exp_annotations:
               summary: "Node NTP offset above 50ms"
-              description: "This node's clock disagrees with its NTP upstream by more than 50ms at the last poll and has not recovered for 3 minutes. timesyncd normally corrects this within one or two poll cycles; sustained offset means correction is failing or drift is faster than correction."
+              description: "This node's clock disagrees with its NTP upstream by more than 50ms at the last poll and has not recovered for 10 minutes (beyond spike-sample lifetime at PollIntervalMaxSec=256). timesyncd normally corrects this within one or two poll cycles; sustained offset means correction is failing or drift is faster than correction."
 
   # ── U3: job=other 的主機 +200ms → scope 隔離，Ceph alert 不 fire（舊規則 T8 證實誤發） ──
   - interval: 1m
@@ -120,6 +126,8 @@ tests:
         values: '0+60x30'
       - series: 'node_textfile_scrape_error{instance="mon1", job="ceph-node"}'
         values: '0x30'
+      - series: 'node_time_sync_last_run_timestamp_seconds{instance="mon1", job="ceph-node"}'
+        values: '0+60x30'
     alert_rule_test:
       - eval_time: 20m
         alertname: CephNodeTimeSpreadHigh
@@ -161,6 +169,9 @@ tests:
         alertname: CephNodeTimeCollectorError
         exp_alerts: []
       - eval_time: 20m
+        alertname: CephNodeTimeSyncDataStale
+        exp_alerts: []
+      - eval_time: 20m
         alertname: CephNodeTimeMetricsMissing
         exp_alerts: []
       - eval_time: 20m
@@ -179,12 +190,13 @@ tests:
         alertname: CephNodeTimeMetricsMissing
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
             exp_annotations:
               summary: "Time-sync metrics absent while node is up"
-              description: "node_exporter answers scrapes but the time-sync textfile metrics are gone: the collector timer is dead, the textfile was rejected as malformed, or the textfile directory changed. Per-node detection — this fires for exactly the node whose collection died. All offset-based alerts are blind for this node until fixed."
+              description: "node_exporter answers scrapes but the time-sync textfile series are absent: the file was rejected as malformed, deleted, or written to a directory node_exporter does not read. Note a dead collector timer does NOT trigger this — node_exporter keeps re-reading the old file forever; that case is caught by CephNodeTimeSyncDataStale. All offset-based alerts are blind for this node until fixed."
 
   # ── U6: 上游失聯 age 線性爬升 → Stalled(768s)/StalledCritical(1800s) 依序 fire ──
   - interval: 1m
@@ -196,6 +208,7 @@ tests:
         alertname: CephNodeTimeSyncStalled
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
@@ -206,6 +219,7 @@ tests:
         alertname: CephNodeTimeSyncStalledCritical
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: critical
               instance: mon1
               job: ceph-node
@@ -223,6 +237,7 @@ tests:
         alertname: CephNodeTimeUnsynchronized
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: critical
               instance: mon1
               job: ceph-node
@@ -240,6 +255,7 @@ tests:
         alertname: CephNodeTimeCollectorError
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
@@ -257,6 +273,7 @@ tests:
         alertname: CephNodeClockVsPrometheusDriftCritical
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: critical
               instance: mon1
               job: ceph-node
@@ -267,6 +284,7 @@ tests:
         alertname: CephNodeClockVsPrometheusDrift
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
@@ -284,12 +302,13 @@ tests:
         alertname: CephNodeClockCorrectionInProgress
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
             exp_annotations:
               summary: "Kernel clock correction larger than 50ms in progress"
-              description: "The kernel PLL is actively correcting a clock error larger than 50ms (node_timex_offset_seconds is the remaining correction, not the absolute error). A step this size was injected into or detected on this node recently; timesyncd may repair it within seconds — keep_firing_for holds this alert so the event is visible even after self-heal. A clock step did happen; check what caused it."
+              description: "The kernel PLL has been correcting a clock error larger than 50ms for over a minute (node_timex_offset_seconds is the remaining correction, not the absolute error). Causes include an injected/host-initiated step, boot-time initial sync, or a large slew after upstream change — timesyncd may finish within seconds; keep_firing_for holds this alert so the event stays visible after self-heal. Correlate with daemon restarts and boot time before treating as an incident. Requires the timex collector (cephadm disables it by default — verify in E-00)."
       - eval_time: 13m
         alertname: CephNodeClockCorrectionInProgress
         exp_alerts: []
@@ -304,6 +323,7 @@ tests:
         alertname: CephNodeKernelClockErrorBoundHigh
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
@@ -321,6 +341,7 @@ tests:
         alertname: CephNodeTimeSyncStruggling
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
@@ -338,10 +359,32 @@ tests:
         alertname: CephNodeTextfileScrapeError
         exp_alerts:
           - exp_labels:
+              alertgroup: ceph-time-sync
               severity: warning
               instance: mon1
               job: ceph-node
             exp_annotations:
               summary: "node_exporter rejected a textfile on this node"
               description: "Some .prom file failed to parse — node_exporter drops the whole file and reports only this target-wide flag (no file label). If CephNodeTimeMetricsMissing fires for the same node, the time-sync file is the likely culprit; otherwise another collector's file broke. Attribution requires checking the textfile directory on the node."
+
+  # ── U14: heartbeat 凍結在 600（timer 已死、檔案仍被重讀）→ DataStale 在 diff>120 持續 3m 後 fire ──
+  - interval: 1m
+    input_series:
+      - series: 'node_time_sync_last_run_timestamp_seconds{instance="mon1", job="ceph-node"}'
+        values: '600x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: CephNodeTimeSyncDataStale
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: CephNodeTimeSyncDataStale
+        exp_alerts:
+          - exp_labels:
+              alertgroup: ceph-time-sync
+              severity: warning
+              instance: mon1
+              job: ceph-node
+            exp_annotations:
+              summary: "Time-sync collector has not run for over 2 minutes"
+              description: "The collector's heartbeat timestamp is frozen: the timer died, the script is stuck, or the node clock is far behind the Prometheus clock (this expression crosses trust domains — a node running slow by minutes also fires it, and in that case the Drift alerts fire too). node_exporter keeps serving the frozen file, so every other time-sync metric for this node is stale — treat their values as historical, not current."
 
