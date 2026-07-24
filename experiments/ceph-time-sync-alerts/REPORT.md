@@ -354,8 +354,11 @@
 **問題 2（FP）**：舊規則健康態必然誤報（載入 60 秒全 pending、10 分鐘 firing、每次
 daemon restart 再送一發）；v2 在全部注入（±300s step、100ms skew、freq 汙染震盪）
 中零過渡誤發 — for 時長按「spike 樣本壽命 ≤ 一個 poll」設計是關鍵。
-**注意：零 FP 的實機 soak 閘門尚未關閉**（soak 自 07:39Z 起累積，需收滿多日再複核 —
-§1 判定標準的第三條目前只過了 promtool 半座門）。
+**零 FP soak 閘門已關（07-24 01:28Z 收官）**：乾淨窗 17.8 小時內 v2 全部 per-node
+規則**零 firing、零 pending**（唯一例外 = osd-2 的 MetricsMissing，刻意不裝 collector
+的參考機，by design）；對照組 baseline `Degraded` 同窗在健康 fleet 連續 firing ~18h。
+17.8h 短於原定「多日」（lab 成本因素提前收）— 生產上線首週仍建議接非 paging
+receiver 過渡。
 
 **問題 3（重建後的偵測面）**：8 車道 17 條規則，每種故障型態有明確負責人與實測時序 —
 本地 step：kernel tripwire 3min；上游失聯：age 13/30min 兩級；單 node 錯誤
@@ -366,8 +369,9 @@ Drift 車道獨家（Ceph 的 timecheck 只量 mon 相對差 — 在此架構下
 都掛著一個實驗編號。
 
 **接下來（按優先序）**：
-1. E-08 soak 收滿多日（已於 07:39Z 起跑）→ 零 FP 斷言 + `CorrectionInProgress`
-   門檻複核（E-07 顯示 50ms 對 100ms 級 slew 不敏感）；
+1. ~~E-08 soak~~ 已收官（17.8h 零 firing 零 pending）；`CorrectionInProgress`
+   門檻複核（E-07 顯示 50ms 對 100ms 級 slew 不敏感）留待生產非 paging 過渡期用
+   真實數據定；
 2. 生產部署走 §7 表 + `run/e00-inventory.sh` 盤點 + README §4.6 首小時檢核；
    Alertmanager receiver 級遞送與 inhibition 驗證（本 lab 未接真 receiver）；
 3. 生產 Prometheus 的時鐘來源確認與監控（Drift 車道的架構前提）；
