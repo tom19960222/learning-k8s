@@ -1,6 +1,6 @@
 # Ceph mClock profile 對照實驗（Azure 真機）— 設計（spec）
 
-> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行）
+> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行；rev 4：provisioning 改由 IaC agent 依 PROVISIONING-REQUIREMENTS.md 實作）
 > 方法論：`skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize）
 > 目標版本：**Ceph v19.2.2**（實機部署與原始碼引用皆以 v19.2.2 為準；repo submodule pin 維持 v19.2.3 不動，讀碼用 `git show v19.2.2:<path>`）
 > 產出：`experiments/ceph-mclock-profiles/` 完整實驗報告（`skills/writing-experiment-reports` 五欄格式 + 參數建議總表）
@@ -153,7 +153,8 @@
   2. 第二層：**reboot 相關 VM**（首選 ssh `sudo reboot`；ssh 完全失聯才用最後手段 `az vm restart`——兩者皆不換 host、local NVMe 資料保留）→ 等 OSD rejoin + HEALTH_OK → 從斷點續跑；該 replicate 標記 tainted 重跑。
   3. 第三層（唯一叫使用者的時機）：前兩層循環仍無法恢復（例如 BlueStore 損毀、Azure allocation 層問題）→ 通知使用者裁示。**全程 VM 保持 allocated，嚴禁自動 deallocate**——8 台 OSD 的 NVMe 同時消失 = data plane 報廢，deallocate 只能是使用者親自下的放棄決定。
 - 連續 campaign 期間每 12 小時回報累計花費與進度。
-- **完全自主執行（rev 3，使用者裁示）**：campaign 內的一切——校準、穩態、故障注入（daemon stop / iptables 隔離）、chaos、自救（daemon restart / `sudo reboot`）、收數據——全部 ssh-native，由 AI 自主執行，不依賴 Azure API。Azure 層操作降到最少且集中在 campaign 邊界：provision（開跑前）、teardown（收官）、以及 watchdog 第三層的最後手段（VM ssh 完全失聯時的 `az vm restart`）。使用者手動負責：quota、舊 lab 刪除（我不碰 `CYSHIH-KUBEVIRT-CEPH-LAB`）；provisioning script 為純 az CLI、使用者要親手跑也可以，預設仍由我執行（沿用先前分工裁示）。
+- **完全自主執行（rev 3，使用者裁示）**：campaign 內的一切——校準、穩態、故障注入（daemon stop / iptables 隔離）、chaos、自救（daemon restart / `sudo reboot`）、收數據——全部 ssh-native，由 AI 自主執行，不依賴 Azure API。Azure 層操作降到最少且集中在 campaign 邊界：provision（開跑前）、teardown（收官）、以及 watchdog 第三層的最後手段（VM ssh 完全失聯時的 `az vm restart`）。
+- **Provisioning 分工（rev 4，使用者裁示）**：由**另一個 IaC agent** 依 `experiments/ceph-mclock-profiles/PROVISIONING-REQUIREMENTS.md` 實作（完整需求：規格數量、套件、OS desired state、inventory handoff 契約、acceptance checklist 都在該文件）；harness 開跑前跑 acceptance 驗收，任一不過退回 IaC。teardown 用同一套 IaC 刪整個 RG。使用者手動負責：quota、舊 lab 刪除（我不碰 `CYSHIH-KUBEVIRT-CEPH-LAB`）。
 
 ## 8. Harness 架構
 
@@ -161,10 +162,10 @@
 experiments/ceph-mclock-profiles/
 ├── HYPOTHESES.md            # charter + 假說 backlog（Frame 產出）
 ├── README.md
+├── PROVISIONING-REQUIREMENTS.md  # 給 IaC agent 的完整 provisioning 需求（rev 4）
 ├── azure/
-│   ├── provision.sh         # az CLI：RG/VNet/VM/NSG；原子化 L8s_v3 批次；冪等可重入
-│   ├── teardown.sh          # 整 RG 刪除（S3 收尾）；watchdog 第一層不在此（不 deallocate）
-│   └── inventory.sh         # 產出 IP/host 清單給 lib/ 使用
+│   ├── verify-provision.sh  # acceptance checklist 自動驗收（IaC 交付 gate）
+│   └── inventory.sh         # 讀 IaC 交付的 inventory JSON → 供 lib/ 使用
 ├── lib/
 │   ├── common.sh            # ssh 向量、log→stderr、die、bundle helper + 原子 completion marker
 │   ├── ceph.sh              # cephadm bootstrap/add-host/OSD、profile 切換 + 逐 OSD effective config 驗證、osd out/in、laggy 檢查
