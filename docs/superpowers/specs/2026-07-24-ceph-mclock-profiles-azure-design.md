@@ -1,6 +1,6 @@
 # Ceph mClock profile 對照實驗（Azure 真機）— 設計（spec）
 
-> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 的 21 條 findings，verdict REQUEST_CHANGES → 全數修正）
+> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行）
 > 方法論：`skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize）
 > 目標版本：**Ceph v19.2.2**（實機部署與原始碼引用皆以 v19.2.2 為準；repo submodule pin 維持 v19.2.3 不動，讀碼用 `git show v19.2.2:<path>`）
 > 產出：`experiments/ceph-mclock-profiles/` 完整實驗報告（`skills/writing-experiment-reports` 五欄格式 + 參數建議總表）
@@ -50,12 +50,13 @@
 | OSD node | Standard_L8s_v3（8 vCPU / 64G / 1.92TB local NVMe） | 8 | 64 | 1 OSD/node（不切分 NVMe）；CRUSH：**4 synthetic racks × 2 nodes** |
 | mon/admin | Standard_D4s_v5 | 1 | 4 | mon.a + mgr + prometheus（cephadm 內建 monitoring stack）+ 指揮所 |
 | mon | Standard_D2s_v5 | 2 | 4 | 3-mon quorum；故障實驗不碰 mon |
-| fio client | Standard_D4s_v5 | 4 | 16 | librbd fio；**4 小台取代 2× D8s_v5**：compute 價格相同、aggregate NIC ceiling 較高（rev 2/F19） |
+| fio client | Standard_D4s_v5 | 4 | 16 | **krbd** map + fio（對映生產 KubeVirt/ceph-csi 的 krbd datapath，rev 3）；**4 小台取代 2× D8s_v5**：compute 價格相同、aggregate NIC ceiling 較高（rev 2/F19） |
 | **合計** | | 15 | **88** | |
 
 **Quota 三層 gate（rev 2/F17）**：Azure 同時檢查 Total Regional vCPU 與 per-family quota。需求：Regional 88 / **LSv3 family 64（上限 65，僅餘 1 的緊配）** / DSv5 family 24（上限 65）。前提 = 使用者先刪 `CYSHIH-KUBEVIRT-CEPH-LAB`（釋出 LSv3 24 + DSv5 36 + regional 60）。provision gate 必須：(a) 保存 `az vm list-usage -l japanwest` 證據確認三層 free quota；(b) **原子化建立全部 8 台 L8s_v3**——quota 夠不代表當下有 allocation capacity，任何一台拿不到就整批清理停止。
 
-- SKU 可用性（2026-07-24 實掃）：L8s_v3 僅 japanwest 對本 subscription 開放（eastasia / southeastasia / japaneast 皆 NotAvailableForSubscription，koreacentral 無此 SKU）。
+- **網路設計（rev 3）**：Azure 的頻寬上限是 **per-VM**，加第二張 NIC 不會增加頻寬 → 每台 VM 單 NIC + Accelerated Networking，全部掛同一 VNet/subnet；Ceph `public_network` = `cluster_network` = 該 subnet（在 Azure 上做 public/cluster 分離只是設定形式、無實體隔離效果，報告如實註明與實體機差異）。只有 admin node 掛 public IP（NSG 鎖使用者來源 IP），其餘 VM 純 private、經 admin 跳板。
+- SKU 可用性（2026-07-24 實掃）：L8s_v3 僅 japanwest 對本 subscription 開放（eastasia / southeastasia / japaneast 皆 NotAvailableForSubscription，koreacentral 無此 SKU）。**不用更大台（如 L16s_v3 2×NVMe = 2 OSD/node）**：8 台超出 LSv3 quota（128>65）；4 台則 rack 塌縮成 node（rack 場景消失）且 2 顆 OSD 共享同一條 12.5 Gbps NIC，網路面劣化。
 - replica 3、failure domain = **rack**。4 racks 的理由：失去一個 rack 後仍有未用 rack 可承接第三副本 → 觸發真 backfill；3 racks 拓撲只會卡 degraded。**命名注意（rev 2/F21）**：rack 是人為 CRUSH logical label，場景正名為 **synthetic CRUSH-rack loss**，不可外推為 Azure 實體 rack correlated failure。
 - 資料填充 ~25–30%（讓單 OSD backfill 在 15–30 分鐘量級收斂；實際填充量由 pilot 定案）。
 - on-demand 計價，不用 Spot（Spot 驅逐 = 不受控的故障注入）。
@@ -87,7 +88,7 @@
 
 - **開迴路 vs 閉迴路（rev 2/F10）**：極端組是 closed-loop——latency 惡化時發送率自動下降，其 tail latency **不可**與固定速率組直接比較；極端組主要報 achieved throughput + 該供給下的 latency，跨 profile 比較以「同為極端組」為限。
 - 兩種形態：**4K randrw 70/30**（latency 敏感）與 **1M seq write**（頻寬型、走 cost 換算路徑）。1M seq 的 peak 可能先撞 NIC ceiling（L8s_v3 / D4s_v5 皆 12.5 Gbps，replica 3 放大 cluster traffic）——burn-in 含 network baseline，每組收 NIC tx/rx/drop/retransmit，若 seq 受限於網路則如實標註「NIC-bound 環境下的結果」（rev 2/F19）。
-- **fio job spec 固定化（rev 2/F10）**：ioengine=rbd、direct=1、randseed 固定、runtime 300s + ramp_time 30s、`--log_avg_msec=1000`；4 client 各用獨立 RBD image（大小固定、預先全量寫過 precondition、之後只 overwrite）；randrw iodepth/numjobs 與速率分配在 plan 定死並進 evidence bundle。RBD cache 顯式關閉（librbd 預設 write-back 會污染 4K latency 路徑）。
+- **fio job spec 固定化（rev 2/F10 + rev 3 改 krbd）**：client 用 **krbd**（`rbd map` → fio `ioengine=libaio` 打 `/dev/rbdX`），對映生產 KubeVirt/ceph-csi 的 kernel RBD datapath；direct=1（繞過 page cache）、randseed 固定、runtime 300s + ramp_time 30s、`--log_avg_msec=1000`；4 client 各用獨立 RBD image（大小固定、預先全量寫過 precondition、之後只 overwrite）；randrw iodepth/numjobs 與速率分配在 plan 定死並進 evidence bundle。client kernel 版本（Ubuntu 24.04 LTS）與 krbd map options 記入 environment snapshot；client 端 IO scheduler=none、readahead 固定。
 - **capacity 校準（rev 2/F2）**：Phase 0 逐 OSD 收 `osd_mclock_max_capacity_iops_ssd`（含 benchmark provenance 與 warning），對照 fio 裸盤數據；確認後**顯式鎖定**該值（避免重啟重測漂移）。`osd_mclock_max_sequential_bandwidth_ssd` 維持預設 1200 MiB/s 並如實記錄——所有結論標註為「Ceph 預設 cost model 下的結果」；若逐 OSD capacity 離散 >20%，先處理再開跑（本身即一條 hypothesis）。
 
 ## 5. 實驗矩陣（63 cells / ~147 executions，rev 2/F9+F12 重構）
@@ -113,14 +114,15 @@
 |---|---|---|---|
 | OSD flapping | 單 OSD daemon stop/start，**以 OSDMap epoch 為邊界**（確認 down epoch → up epoch → active 才算一輪；目標 10 輪） | 不 out（保留預設） | 反覆 peering（mClock bypass 路徑）+ log-based recovery 對 client latency 的衝擊 |
 | OSD down | stop 單 OSD daemon | down 後立即手動 `ceph osd out`（= **managed-out backfill**） | backfill 速度 vs client IO 分配 |
-| node down（變體） | `az vm stop --skip-shutdown`（abrupt；power state 必須 = **Stopped/Allocated**，嚴禁 Deallocated） | 手動 out ×1 OSD | 同 OSD down 但故障路徑不同（VM/network/boot） |
-| synthetic CRUSH-rack loss | `az vm stop --skip-shutdown` 同 rack 2 台 | 手動 out ×2 OSD | 最大規模 backfill（~1/4 資料）下的 QoS 行為 |
+| node down（變體） | **網路隔離**（iptables drop 該 node 全部 Ceph 流量、保留 bastion ssh）——ssh-native、可維持任意 down 時長、免 Azure API（rev 3） | 手動 out ×1 OSD | 同 OSD down 但故障路徑不同（heartbeat 逾時 + 整機消失視角） |
+| synthetic CRUSH-rack loss | 同上 ×2 台（同 rack） | 手動 out ×2 OSD | 最大規模 backfill（~1/4 資料）下的 QoS 行為 |
 
 - **flapping 的 adaptive grace（rev 2/F5）**：Squid 預設 `mon_osd_adjust_heartbeat_grace=true`，重複 down/up 會累積 `laggy_probability`，固定 sleep 不保證每輪真的判 down → 逐輪以 OSDMap 事件驗證，未達 down 即用 `ceph osd down` 顯式標記並記錄；flapping replicate 結束後執行 cooldown + laggy 狀態檢查（必要時 restart 目標 OSD daemon 清 laggy 記錄），防跨 cell 污染。
 - **managed-out 語意（rev 2/F6）**：手動 out ≠「生產再加 600s」——(a) auto-out 是「至少」600s 再疊 adaptive grace；(b) **rack down 預設 `mon_osd_down_out_subtree_limit=rack` 會一直不 auto-out**，生產上需 operator 手動介入；(c) 立即 out 消除了 down-but-in 期間的 write debt（repo 既有 E-39 已觀察到差異）。報告以「managed-out backfill」定位所有故障 cell，生產語意差異獨立成節。S3 時間允許時加 2 組 auto-out 確認組（OSD down × 中壓 × balanced/high_client_ops，等真 600s+grace）。
-- **Azure power-off canary（rev 2/F18）**：Phase 0 對 1 台 OSD node 做 stop(--skip-shutdown)/start canary——記錄 NVMe namespace/serial 與 OSD FSID，start 後驗證原 BlueStore 可讀、OSD 正常 rejoin，**確認 Stopped/Allocated 確實保留 local NVMe 資料**後才把 node down / rack loss 排入佇列（官方文件對此措辭不一致，必須實證）。
+- **node 級故障改用網路隔離的理由（rev 3，取代 rev 2/F18 的 az stop 方案）**：(a) 從叢集視角語意等價（heartbeat 全滅 → node 判 down），而 mClock QoS 行為正是本實驗的觀測對象；(b) ssh-native → 免 Azure API、夜間全自主、down 時長任意可控；(c) 完全避開「stop 是否保留 local NVMe」的文件不一致風險。與真實斷電的差異（OSD process 仍存活、恢復時無 journal replay）在報告如實註明。**reboot canary（Phase 0）**：對 1 台 OSD node `sudo reboot`（planned reboot 不換 host、NVMe 保留），驗證 BlueStore 可讀 + OSD rejoin——這是 watchdog 第二層自救的前提驗證。
+- **選配（S3，時間允許）**：gray network failure——`tc netem` 對單一 OSD node 注入 1–5% packet loss/延遲抖動（對應生產「ping 掉兩個封包」的灰色故障情境），觀察 heartbeat 未斷但效能劣化下三 profile 的 client latency 差異；進 HYPOTHESES.md backlog。
 - 每個故障 replicate 結束：回歸 → `ceph osd in` → 等回填收斂 → `HEALTH_OK` + baseline latency 復測通過 → 下一個。
-- chaos：固定 seed 隨機故障序列（隨機 OSD kill/restart、隨機 node abrupt stop、隨機間隔，20–30 分鐘），三 profile 重播同一序列；定位 showcase，不做嚴格歸因。
+- chaos：固定 seed 隨機故障序列（隨機 OSD kill/restart、隨機 node 隔離/解除、隨機間隔，20–30 分鐘），三 profile 重播同一序列；定位 showcase，不做嚴格歸因。
 
 ## 6. 量測與判準
 
@@ -128,7 +130,9 @@
 - **recovery 面**：`ceph pg dump` / `ceph -s` 差分——recovering objects/s、bytes/s、degraded% 曲線、time-to-clean；peering 區間與 recovery 區間分開統計（rev 2/F4）。
 - **叢集面**：cephadm 內建 prometheus（OSD op latency、SLOW_OPS、mclock/queue perf counters、NIC 指標、per-shard queue）。
 - **生效驗證（rev 2/F3）**：profile 切換後**逐 OSD** `ceph config show osd.N`（daemon effective 值）驗證 profile 名 + 九個衍生參數 + capacity + recovery 併發，全部一致並經固定 settle window 才開始量測；`ceph config dump` 不可作為依據（profile 衍生值不進 mon store）。違者作廢該 replicate。
-- **判準（rev 2/F11）**：prediction 先行。primary endpoints 預先指定：**client p99 degradation ratio（故障中 vs 同壓力穩態）**、**recovery bytes/s**、**time-to-clean**；其餘指標為 secondary/exploratory。equivalence margin 由 pilot CoV 建立（穩態 n=3 起步）；故障 n=2 標 **exploratory**，噪音超標（CoV > margin）自動升 n（上限 5，時間預算允許時）。三態 verdict `confirmed / violated / indistinguishable`，`indistinguishable` 必須引 margin。
+- **stall/brownout 視角（rev 3，使用者標準：關鍵生產系統，IO delay 幾秒即事故）**：從 fio 逐秒 log 導出——**IO stall**（該秒完成數 = 0）與 **brownout**（該秒 p99 > 1s）的最長連續時長與總秒數，per replicate 報告；同步收 SLOW_OPS 事件時間軸對齊。故障實驗的頭號問題是「client 到底黑掉幾秒」，不只是平均劣化幅度。
+- **網路觀測面（rev 3）**：全 node 間 1s 間隔 ping mesh 全程記錄（對齊故障注入時間軸，也用於辨識 Azure 自身的網路抖動輪）。
+- **判準（rev 2/F11）**：prediction 先行。primary endpoints 預先指定：**client p99 degradation ratio（故障中 vs 同壓力穩態）**、**max IO stall duration**、**recovery bytes/s**、**time-to-clean**；其餘指標為 secondary/exploratory。equivalence margin 由 pilot CoV 建立（穩態 n=3 起步）；故障 n=2 標 **exploratory**，噪音超標（CoV > margin）自動升 n（上限 5，時間預算允許時）。三態 verdict `confirmed / violated / indistinguishable`，`indistinguishable` 必須引 margin。
 - **timeout ≠ skip（rev 2/F14）**：recovery 逾時記為 **right-censored 有效資料**（`time-to-clean > cap`）納入 verdict——慢 profile 的最差結果正是研究對象；只有量測工具故障才作廢。bundle 完成以原子 marker 判定，不以目錄存在判定。
 
 ## 7. 執行模式（單一連續 campaign，rev 2/F13 時程重算）
@@ -146,10 +150,10 @@
 - 全自動 run queue：組間零人工等待；pilot 通過後整批放行（每型首組人工檢查）。
 - **watchdog 分層自救（rev 2/F16 + 使用者裁示：無解先重開機、真的解不了才叫人）**：
   1. 第一層：停止 fio 與故障注入、暫停佇列，嘗試自動修復（daemon restart、`ceph osd in/out` 校正、重跑該 replicate）。
-  2. 第二層：**reboot 相關 VM**（`az vm restart` 不換 host、local NVMe 資料保留）→ 等 OSD rejoin + HEALTH_OK → 從斷點續跑；該 replicate 標記 tainted 重跑。
+  2. 第二層：**reboot 相關 VM**（首選 ssh `sudo reboot`；ssh 完全失聯才用最後手段 `az vm restart`——兩者皆不換 host、local NVMe 資料保留）→ 等 OSD rejoin + HEALTH_OK → 從斷點續跑；該 replicate 標記 tainted 重跑。
   3. 第三層（唯一叫使用者的時機）：前兩層循環仍無法恢復（例如 BlueStore 損毀、Azure allocation 層問題）→ 通知使用者裁示。**全程 VM 保持 allocated，嚴禁自動 deallocate**——8 台 OSD 的 NVMe 同時消失 = data plane 報廢，deallocate 只能是使用者親自下的放棄決定。
-- 夜間 Azure API 操作內建 retry；連續 campaign 期間每 12 小時回報累計花費與進度。
-- 分工：az CLI provisioning script 我寫我跑；實驗我從 bastion ssh 執行；**quota 調升與舊 lab 刪除由使用者親手**，我不碰 `CYSHIH-KUBEVIRT-CEPH-LAB`。
+- 連續 campaign 期間每 12 小時回報累計花費與進度。
+- **完全自主執行（rev 3，使用者裁示）**：campaign 內的一切——校準、穩態、故障注入（daemon stop / iptables 隔離）、chaos、自救（daemon restart / `sudo reboot`）、收數據——全部 ssh-native，由 AI 自主執行，不依賴 Azure API。Azure 層操作降到最少且集中在 campaign 邊界：provision（開跑前）、teardown（收官）、以及 watchdog 第三層的最後手段（VM ssh 完全失聯時的 `az vm restart`）。使用者手動負責：quota、舊 lab 刪除（我不碰 `CYSHIH-KUBEVIRT-CEPH-LAB`）；provisioning script 為純 az CLI、使用者要親手跑也可以，預設仍由我執行（沿用先前分工裁示）。
 
 ## 8. Harness 架構
 
@@ -164,7 +168,7 @@ experiments/ceph-mclock-profiles/
 ├── lib/
 │   ├── common.sh            # ssh 向量、log→stderr、die、bundle helper + 原子 completion marker
 │   ├── ceph.sh              # cephadm bootstrap/add-host/OSD、profile 切換 + 逐 OSD effective config 驗證、osd out/in、laggy 檢查
-│   ├── inject.sh            # 故障注入（OSDMap epoch 邊界）+ az vm stop --skip-shutdown + chaos 序列（固定 seed）+ 回退
+│   ├── inject.sh            # 故障注入（OSDMap epoch 邊界）：daemon stop/start、iptables 隔離/解除、chaos 序列（固定 seed）+ 回退；全 ssh-native
 │   ├── fio.sh               # 校準 sweep、固定 job spec render、Latin square 排序、n 輪執行
 │   ├── collect.sh           # fio JSON、pg dump 差分、prometheus 快照、effective config、NIC 指標
 │   └── verdict.py           # 三態比對 + equivalence margin + right-censored 處理（bastion python3）
