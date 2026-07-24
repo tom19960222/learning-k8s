@@ -71,7 +71,7 @@
 | **compute 合計** | | | **$8.03/hr** |
 
 - 另計 OS managed disks / public IP / egress（估 +5–10%）。
-- 時程目標 72h、上限 96h（§7）→ compute **$578–771**，含雜項估 **$620–850**；天花板 US$1000（超過 84h 需回報使用者裁示是否續跑）。
+- 時程目標 72h（§7）→ compute **$578–771**，含雜項估 **$620–850**；天花板 US$1000。**跨過 96h 時通知使用者一聲，但不停機器、繼續跑到完**（使用者裁示）。
 - provision 前以實際 subscription rate 重算一次。
 
 ## 4. 壓力等級定義（共同基準校準，rev 2/F8）
@@ -133,7 +133,7 @@
 
 ## 7. 執行模式（單一連續 campaign，rev 2/F13 時程重算）
 
-使用者裁示：開機後一路跑到完、不落地；只在卡死時停損。時程以 **72h 為目標、96h 為上限**（147 executions 的誠實估算：穩態 ~9h、故障 cycles ~48h、chaos+校準+provision+gates ~12h、buffer ~8h）。
+使用者裁示：開機後一路跑到完、不落地、**不設硬性時間上限**（跨 96h 通知一聲即可，繼續跑到完）。時程估算以 72h 為目標（147 executions：穩態 ~9h、故障 cycles ~48h、chaos+校準+provision+gates ~12h、buffer ~8h）。
 
 | Stage | 內容 | 累計 wall-clock |
 |---|---|---|
@@ -142,9 +142,12 @@
 | S2 | **每型故障先跑 n=1 pilot（4 組）→ 以實測 P50/P95 recovery 時間重算 S2 排程** → 故障 72 cycles | ~63–70h |
 | S3 | chaos 3 → auto-out 確認組（選配）→ 補跑 → 資料齊收 → **刪除整個 RG** | ~72–80h |
 
-- **descope 階梯**（超時觸發，順序執行）：① 故障低壓 cells 降 n=1（標 exploratory）② 砍 auto-out 確認組 ③ seq-contention 只留極端壓 ④ 回報使用者裁示。
+- **descope 階梯**：時間無硬上限（使用者裁示跑到完），predefined descope（① 故障低壓降 n=1 ② 砍 auto-out 確認組 ③ seq-contention 只留極端壓）只在成本逼近 $1000 天花板或病態緩慢（單 cycle 超估算 3 倍以上反覆發生）時啟用，啟用前通知使用者。
 - 全自動 run queue：組間零人工等待；pilot 通過後整批放行（每型首組人工檢查）。
-- **watchdog 分層（rev 2/F16）**：第一層 = 停止 fio 與故障注入、**VM 保持 allocated**、暫停佇列告警（燒 idle 錢但保住 data plane）；**deallocate = 放棄本 campaign**——8 台 OSD 的 NVMe 同時消失即整個 data plane 消失，重建 = 新 campaign epoch（全量重部署、重填資料、重校準，禁止混用舊 peak）。停損決策：暫停超過 2h 無解 → 通知使用者裁示 abandon or continue。
+- **watchdog 分層自救（rev 2/F16 + 使用者裁示：無解先重開機、真的解不了才叫人）**：
+  1. 第一層：停止 fio 與故障注入、暫停佇列，嘗試自動修復（daemon restart、`ceph osd in/out` 校正、重跑該 replicate）。
+  2. 第二層：**reboot 相關 VM**（`az vm restart` 不換 host、local NVMe 資料保留）→ 等 OSD rejoin + HEALTH_OK → 從斷點續跑；該 replicate 標記 tainted 重跑。
+  3. 第三層（唯一叫使用者的時機）：前兩層循環仍無法恢復（例如 BlueStore 損毀、Azure allocation 層問題）→ 通知使用者裁示。**全程 VM 保持 allocated，嚴禁自動 deallocate**——8 台 OSD 的 NVMe 同時消失 = data plane 報廢，deallocate 只能是使用者親自下的放棄決定。
 - 夜間 Azure API 操作內建 retry；連續 campaign 期間每 12 小時回報累計花費與進度。
 - 分工：az CLI provisioning script 我寫我跑；實驗我從 bastion ssh 執行；**quota 調升與舊 lab 刪除由使用者親手**，我不碰 `CYSHIH-KUBEVIRT-CEPH-LAB`。
 
@@ -184,12 +187,12 @@ experiments/ceph-mclock-profiles/
 | 1 Frame | v19.2.2 讀碼補完 §2 機制題 → HYPOTHESES.md（每條附預測） | 假說 backlog 過使用者一眼 |
 | 2 Automate | harness + tests 全綠（純本機，fake 外部指令） | tests + shellcheck + `make validate` 全綠 |
 | 3 S0/S1 | **Gate：使用者確認舊 lab 已刪、三層 quota 證據齊、說 go** → provision → canary/校準 → 穩態 | 校準 + canary + 首組人工檢查通過 |
-| 4 S2/S3 | 故障 pilots → 重算排程 → 故障全佇列 → chaos → 收資料 → 刪 RG | 每型 pilot 人工檢查；watchdog 全程；84h 花費回報點 |
+| 4 S2/S3 | 故障 pilots → 重算排程 → 故障全佇列 → chaos → 收資料 → 刪 RG | 每型 pilot 人工檢查；watchdog 全程；96h 通知（不停機） |
 | 5 Synthesize | 完整報告（五欄 + 參數建議總表 + 主管 persona review）；HYPOTHESES.md 收斂 | 報告過 `writing-experiment-reports` gate |
 
 ## 10. 風險與邊界
 
-- **成本失控**：watchdog 分層 + descope 階梯 + 每 12h 花費回報 + 84h 裁示點 + S3 整 RG 刪除。
+- **成本失控**：watchdog 分層自救 + 每 12h 花費回報 + 96h 通知 + 成本逼近天花板才啟用 descope + S3 整 RG 刪除。
 - **雲端噪音**：Azure 鄰居效應——counterbalance + n≥3（穩態）+ 逐秒 time series + equivalence margin；異常 replicate 進 S3 補跑清單。
 - **capacity 量測失真**：Phase 0 逐 OSD 把關 + 顯式鎖定；seq bandwidth 固定 1200 MiB/s 是 Ceph 預設 cost model 的一部分，如實標註。
 - **LSv3 quota 僅餘 1 vCPU 餘裕**：provision gate 原子化 + 失敗即清理；拿不到 8 台就停，不硬跑殘缺拓撲。
