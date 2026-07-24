@@ -70,7 +70,9 @@ LSv3 quota 上限 65、本次要用 64——**只剩 1 vCPU 餘裕**，8 台 L8s
 
 ## 6. 套件安裝（apt）
 
-**全部 15 台**：`chrony curl jq python3 lvm2`
+**全部 15 台**：`chrony curl jq python3 lvm2 sysstat iperf3 nvme-cli netcat-openbsd fping`（另確認 `iptables` 指令存在——Ubuntu 24.04 預設有，驗收會查）
+
+**osd-1..8 另加**：`fio`（Phase 0 要在 OSD 建立前對 raw NVMe 跑基線量測）
 
 **Ceph 套件——版本必須 pin 19.2.2（squid）**，用 Ceph 官方 apt repo（不要用 Ubuntu distro 的 ceph 版本）：
 
@@ -105,15 +107,29 @@ admin 也要裝 `podman`（mon.a 會跑在 admin 上）。
      "nodes": [
        {"name": "mclock-admin",  "role": "admin",  "private_ip": "10.60.1.10"},
        {"name": "mclock-mon-1",  "role": "mon",    "private_ip": "10.60.1.11"},
-       {"name": "mclock-osd-1",  "role": "osd",    "private_ip": "10.60.1.21", "rack": "rack1"},
+       {"name": "mclock-osd-1",  "role": "osd",    "private_ip": "10.60.1.21", "rack": "rack1",
+      "nvme_device": "/dev/disk/by-id/nvme-..."},
        {"name": "mclock-client-1","role": "client","private_ip": "10.60.1.31"}
      ]
    }
    ```
 
-   osd 條目必須含 `rack` 標籤：osd-1/2=rack1、osd-3/4=rack2、osd-5/6=rack3、osd-7/8=rack4（harness 據此建 CRUSH 拓撲）。
-2. IaC 程式碼與 state 的存放位置（之後 teardown 用同一套刪整個 RG）。
-3. 實際花費率確認：provision 完成後回報各 SKU 的實際 hourly rate（預估 compute $8.03/hr）。
+   osd 條目必須含 `rack` 標籤（osd-1/2=rack1、osd-3/4=rack2、osd-5/6=rack3、osd-7/8=rack4，harness 據此建 CRUSH 拓撲）與 **`nvme_device`**（該台 1.92TB NVMe 的 canonical 路徑，建議 `/dev/disk/by-id/...` 穩定路徑；harness 逐台指定建 OSD，不用 all-available-devices）。
+2. **attestation JSON**（與 inventory 同交付）：ssh 進去驗不到的 Azure 控制面事實由 IaC 出具證明，欄位至少：
+
+   ```json
+   {
+     "accelerated_networking_all": true,
+     "vm_priority_all": "Regular",
+     "auto_shutdown_none": true,
+     "tags_applied": true,
+     "public_ip_only_admin": true,
+     "hourly_rate_usd": {"L8s_v3": 0.0, "D4s_v5": 0.0, "D2s_v5": 0.0}
+   }
+   ```
+
+   另需 `generated_at`（ISO 時戳）與 `subscription_id` 欄位。harness 驗收驗**值**而非僅驗存在：boolean 欄位必須為期望值（true/Regular/…）、費率必須為正數、`generated_at` 距驗收時間 <24h、`subscription_id` 與 bastion `az account show` 相符；缺欄位、未提供、或值不符 → **FAIL**，不會 skip。
+3. IaC 程式碼與 state 的存放位置（之後 teardown 用同一套刪整個 RG）。
 
 ## 9. Acceptance checklist（harness 開跑前逐條驗，任一不過退回）
 
@@ -129,6 +145,9 @@ admin 也要裝 `podman`（mon.a 會跑在 admin 上）。
 - [ ] admin：`cephadm version` 與 `ceph --version` = 19.2.2。
 - [ ] mon/osd/admin：`podman --version` 正常。
 - [ ] client-1..4：`ceph --version` = 19.2.2、`fio --version` 正常、`sudo modprobe rbd` 成功。
+- [ ] osd-1..8：`fio --version` 正常；inventory 的 `nvme_device` 路徑存在且與 lsblk 相符。
+- [ ] 15 台：`iostat -V`（sysstat）、`iperf3 --version`、`sudo iptables -L -n` 皆正常。
+- [ ] attestation JSON 存在且欄位齊全（缺 = FAIL）。
 - [ ] client/osd 任兩台間 `ping` < 1ms 量級（同 subnet 內網通）。
 - [ ] admin 以外的 VM 從 internet 不可達（抽查 1 台 osd 無 public IP）。
 - [ ] Accelerated Networking：15 台 NIC 屬性 `enableAcceleratedNetworking=true`。

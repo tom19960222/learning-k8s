@@ -1,6 +1,6 @@
 # Ceph mClock profile 對照實驗（Azure 真機）— 設計（spec）
 
-> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行；rev 4：provisioning 改由 IaC agent 依 PROVISIONING-REQUIREMENTS.md 實作）
+> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行；rev 4：provisioning 改由 IaC agent 依 PROVISIONING-REQUIREMENTS.md 實作；rev 5：套用 plan review 波及 spec 的修正——clean 判準、capacity 順序+skip_benchmark、fio segment 續跑、adaptive grace 裁決、生效驗證強化、node loss 命名統一；rev 6：兩層 clean 判準（recovery-complete vs final-clean）、故障 replicate 改 workload 先行、fault_t0 絕對時間軸、殘留 HEALTH_OK/power-off 清除；rev 7：degradation ratio 分母改 within-replicate 注入前健康窗、雙軌 margin（noise + production 預註冊門檻）、mon repair vs injection 釐清）
 > 方法論：`skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize）
 > 目標版本：**Ceph v19.2.2**（實機部署與原始碼引用皆以 v19.2.2 為準；repo submodule pin 維持 v19.2.3 不動，讀碼用 `git show v19.2.2:<path>`）
 > 產出：`experiments/ceph-mclock-profiles/` 完整實驗報告（`skills/writing-experiment-reports` 五欄格式 + 參數建議總表）
@@ -12,7 +12,7 @@
 
 1. **參數面**：每個 profile 具體設定了哪些參數？這些參數在 scheduler 機制上各自控制什麼？
 2. **行為面**：在低／中／高／極端四級 IO 壓力下，profile 對 client IO（IOPS、latency 百分位）與 recovery/backfill（速度、time-to-clean）的取捨曲線長什麼樣？
-3. **故障面**：OSD flapping、OSD down、node down（abrupt power-off）、synthetic CRUSH-rack loss 各情境下，profile 差異如何呈現？
+3. **故障面**：OSD flapping、OSD down、node loss（network-isolation）、synthetic CRUSH-rack loss 各情境下，profile 差異如何呈現？
 4. **極限面**：極端壓力 + 連續隨機故障（chaos）下，各 profile 的退化與恢復力差異。
 
 使用者原始關注 = balanced vs high_client_ops；high_recovery_ops 全矩陣同跑，作為光譜另一端錨點。
@@ -77,7 +77,7 @@
 
 ## 4. 壓力等級定義（共同基準校準，rev 2/F8）
 
-**校準只做一次、在共同參考條件下**：`balanced` profile + HEALTH_OK，rate sweep 找出兩種形態的 aggregate throughput ceiling 與 latency knee。**三個 profile 共用同一組絕對速率**（treatment 不得污染 dose）；own-peak-normalized 曲線只作次要分析。
+**校準只做一次、在共同參考條件下**：`balanced` profile + final-clean（§5 判準），rate sweep 找出兩種形態的 aggregate throughput ceiling 與 latency knee。**三個 profile 共用同一組絕對速率**（treatment 不得污染 dose）；own-peak-normalized 曲線只作次要分析。
 
 | 等級 | 定義（相對 balanced-healthy ceiling） | fio 實作 |
 |---|---|---|
@@ -88,8 +88,8 @@
 
 - **開迴路 vs 閉迴路（rev 2/F10）**：極端組是 closed-loop——latency 惡化時發送率自動下降，其 tail latency **不可**與固定速率組直接比較；極端組主要報 achieved throughput + 該供給下的 latency，跨 profile 比較以「同為極端組」為限。
 - 兩種形態：**4K randrw 70/30**（latency 敏感）與 **1M seq write**（頻寬型、走 cost 換算路徑）。1M seq 的 peak 可能先撞 NIC ceiling（L8s_v3 / D4s_v5 皆 12.5 Gbps，replica 3 放大 cluster traffic）——burn-in 含 network baseline，每組收 NIC tx/rx/drop/retransmit，若 seq 受限於網路則如實標註「NIC-bound 環境下的結果」（rev 2/F19）。
-- **fio job spec 固定化（rev 2/F10 + rev 3 改 krbd）**：client 用 **krbd**（`rbd map` → fio `ioengine=libaio` 打 `/dev/rbdX`），對映生產 KubeVirt/ceph-csi 的 kernel RBD datapath；direct=1（繞過 page cache）、randseed 固定、runtime 300s + ramp_time 30s、`--log_avg_msec=1000`；4 client 各用獨立 RBD image（大小固定、預先全量寫過 precondition、之後只 overwrite）；randrw iodepth/numjobs 與速率分配在 plan 定死並進 evidence bundle。client kernel 版本（Ubuntu 24.04 LTS）與 krbd map options 記入 environment snapshot；client 端 IO scheduler=none、readahead 固定。
-- **capacity 校準（rev 2/F2）**：Phase 0 逐 OSD 收 `osd_mclock_max_capacity_iops_ssd`（含 benchmark provenance 與 warning），對照 fio 裸盤數據；確認後**顯式鎖定**該值（避免重啟重測漂移）。`osd_mclock_max_sequential_bandwidth_ssd` 維持預設 1200 MiB/s 並如實記錄——所有結論標註為「Ceph 預設 cost model 下的結果」；若逐 OSD capacity 離散 >20%，先處理再開跑（本身即一條 hypothesis）。
+- **fio job spec 固定化（rev 2/F10 + rev 3 改 krbd）**：client 用 **krbd**（`rbd map` → fio `ioengine=libaio` 打 `/dev/rbdX`），對映生產 KubeVirt/ceph-csi 的 kernel RBD datapath；direct=1（繞過 page cache）、randseed 固定、**穩態組** runtime 300s + ramp_time 30s；**故障/chaos 組改為連續 segment 續跑**（back-to-back 300s segment 直到 clean 或 measurement cap——300s 蓋不住 15–30 分鐘 backfill，後段 recovery 若無 client 競爭即失去研究對象，rev 5/F8）；逐秒 time series 契約 = 1s IOPS log + 1s latency log + 1s histogram log（`log_avg_msec=1000` + `write_iops_log`/`write_lat_log`/`write_hist_log`，stall/brownout 由此重建，rev 5/F12）；4 client 各用獨立 RBD image（大小固定、預先全量寫過 precondition、之後只 overwrite）；randrw iodepth/numjobs 與速率分配在 plan 定死並進 evidence bundle。client kernel 版本（Ubuntu 24.04 LTS）與 krbd map options 記入 environment snapshot；client 端 IO scheduler=none、readahead 固定。
+- **capacity 校準（rev 2/F2 + rev 5 順序修正）**：順序不可逆——(1) **OSD 建立前**逐台跑 raw NVMe fio 4K randwrite 基線（OSD 建立後再碰 raw device 會毀 BlueStore）；(2) cephadm 建 OSD、收 startup bench 結果與 provenance（accepted / rejected-out-of-range / default）；(3) 對照 (1) 的 fio 基線 + 離散 gate（CoV>20% 先處理）；(4) 顯式 `ceph config set osd.N` 鎖定 + **`osd_mclock_skip_benchmark=true`**（v19.2.2 只比對「值是否 ≠ compiled default」決定重跑 bench，不看 config 來源——鎖同值仍會重跑，必須用 skip 旗標，`OSD.cc:10039-10063`）；(5) reboot canary 後重驗值未變。`osd_mclock_max_sequential_bandwidth_ssd` 維持預設 1200 MiB/s 並如實記錄——所有結論標註為「Ceph 預設 cost model 下的結果」。
 
 ## 5. 實驗矩陣（63 cells / ~147 executions，rev 2/F9+F12 重構）
 
@@ -99,13 +99,13 @@
 |---|---|---|---|---|
 | 穩態（**null/control 定位**） | 3 profiles × 4 壓力 × 2 形態 | 24 | 3 | 72 |
 | 故障主軸（4K randrw） | 3 profiles × 3 壓力（低/中/極端） × {flapping, OSD down, rack loss} | 27 | 2 | 54 |
-| 故障：node down 變體 | 3 profiles × 中壓 × abrupt power-off | 3 | 2 | 6 |
+| 故障：node loss 變體 | 3 profiles × 中壓 × network-isolation（整機） | 3 | 2 | 6 |
 | 故障：large-IO contention（rev 2/F9） | 3 profiles × {中, 極端} × OSD down × **1M seq** | 6 | 2 | 12 |
 | chaos 終局 | 3 profiles × 極端壓 × 固定 seed 故障序列 | 3 | 1 | 3 |
 | **合計** | | **63** | | **147** |
 
 - **穩態組定位修正（rev 2/F9）**：三 profile 的 client lim 都是 max，無 recovery 競爭時 client 可借滿 capacity → 穩態組是 **negative control**（預測：profile 間 indistinguishable）；真正的 tradeoff 主戰場在故障區塊。`calc_scaled_cost()` 的 large-IO 路徑由 seq-contention 6 cells 在競爭下驗證。
-- **node down 修正（rev 2/F7）**：1 OSD/node ⇒ node down 只失去 1 顆 OSD，backfill footprint 與 OSD down 幾乎相同；其獨立價值只在故障路徑（VM abrupt power-off vs daemon stop），故降為中壓單點變體。「2 OSD 同時 backfill」由 rack loss（2 nodes）承擔。
+- **node loss 修正（rev 2/F7）**：1 OSD/node ⇒ node loss 只失去 1 顆 OSD，backfill footprint 與 OSD down 幾乎相同；其獨立價值只在故障路徑（整機網路消失 vs 單 daemon stop），故降為中壓單點變體。「2 OSD 同時 backfill」由 rack loss（2 nodes）承擔。
 - **profile 順序 counterbalance（rev 2/F15）**：同一 cell 群組內三個 profile 的執行順序按 Latin square 輪換，避免 Azure 鄰居效應、NVMe GC/溫度、BlueStore compaction 與 profile 共線。狀態鎖定：pg_num 固定 + autoscaler off、balancer off、實驗中 noscrub/nodeep-scrub、RBD image 固定只 overwrite；每個故障 replicate 記錄 target 初始 bytes 與實際 recovery backlog。
 
 ### 故障注入定義
@@ -114,14 +114,18 @@
 |---|---|---|---|
 | OSD flapping | 單 OSD daemon stop/start，**以 OSDMap epoch 為邊界**（確認 down epoch → up epoch → active 才算一輪；目標 10 輪） | 不 out（保留預設） | 反覆 peering（mClock bypass 路徑）+ log-based recovery 對 client latency 的衝擊 |
 | OSD down | stop 單 OSD daemon | down 後立即手動 `ceph osd out`（= **managed-out backfill**） | backfill 速度 vs client IO 分配 |
-| node down（變體） | **網路隔離**（iptables drop 該 node 全部 Ceph 流量、保留 bastion ssh）——ssh-native、可維持任意 down 時長、免 Azure API（rev 3） | 手動 out ×1 OSD | 同 OSD down 但故障路徑不同（heartbeat 逾時 + 整機消失視角） |
+| node loss（變體） | **網路隔離**（iptables drop 該 node 全部 Ceph 流量、保留 bastion ssh）——ssh-native、可維持任意 down 時長、免 Azure API（rev 3） | 手動 out ×1 OSD | 同 OSD down 但故障路徑不同（heartbeat 逾時 + 整機消失視角） |
 | synthetic CRUSH-rack loss | 同上 ×2 台（同 rack） | 手動 out ×2 OSD | 最大規模 backfill（~1/4 資料）下的 QoS 行為 |
 
-- **flapping 的 adaptive grace（rev 2/F5）**：Squid 預設 `mon_osd_adjust_heartbeat_grace=true`，重複 down/up 會累積 `laggy_probability`，固定 sleep 不保證每輪真的判 down → 逐輪以 OSDMap 事件驗證，未達 down 即用 `ceph osd down` 顯式標記並記錄；flapping replicate 結束後執行 cooldown + laggy 狀態檢查（必要時 restart 目標 OSD daemon 清 laggy 記錄），防跨 cell 污染。
+- **flapping 的 adaptive grace（rev 2/F5 + rev 5/F17 裁決）**：Squid 預設 `mon_osd_adjust_heartbeat_grace=true`，重複 down/up 累積 `laggy_probability`；且 **daemon restart 並非可靠的 laggy reset**（`OSDMonitor.cc:3692-3714` 只是更新/衰減，非歸零）→ 跨 cell 污染無法靠 restart 清除。裁決：**campaign 全程設 `mon_osd_adjust_heartbeat_grace=false`**（控制變因，主比較在關閉 adaptive grace 下進行，報告如實標註）；逐輪仍以 OSDMap 事件驗證 down/up，未達 down 即 `ceph osd down` 顯式標記；S3 選配一組 production-default（adaptive grace on）特性化 run。
 - **managed-out 語意（rev 2/F6）**：手動 out ≠「生產再加 600s」——(a) auto-out 是「至少」600s 再疊 adaptive grace；(b) **rack down 預設 `mon_osd_down_out_subtree_limit=rack` 會一直不 auto-out**，生產上需 operator 手動介入；(c) 立即 out 消除了 down-but-in 期間的 write debt（repo 既有 E-39 已觀察到差異）。報告以「managed-out backfill」定位所有故障 cell，生產語意差異獨立成節。S3 時間允許時加 2 組 auto-out 確認組（OSD down × 中壓 × balanced/high_client_ops，等真 600s+grace）。
 - **node 級故障改用網路隔離的理由（rev 3，取代 rev 2/F18 的 az stop 方案）**：(a) 從叢集視角語意等價（heartbeat 全滅 → node 判 down），而 mClock QoS 行為正是本實驗的觀測對象；(b) ssh-native → 免 Azure API、夜間全自主、down 時長任意可控；(c) 完全避開「stop 是否保留 local NVMe」的文件不一致風險。與真實斷電的差異（OSD process 仍存活、恢復時無 journal replay）在報告如實註明。**reboot canary（Phase 0）**：對 1 台 OSD node `sudo reboot`（planned reboot 不換 host、NVMe 保留），驗證 BlueStore 可讀 + OSD rejoin——這是 watchdog 第二層自救的前提驗證。
 - **選配（S3，時間允許）**：gray network failure——`tc netem` 對單一 OSD node 注入 1–5% packet loss/延遲抖動（對應生產「ping 掉兩個封包」的灰色故障情境），觀察 heartbeat 未斷但效能劣化下三 profile 的 client latency 差異；進 HYPOTHESES.md backlog。
-- 每個故障 replicate 結束：回歸 → `ceph osd in` → 等回填收斂 → `HEALTH_OK` + baseline latency 復測通過 → 下一個。
+- **clean 判準（rev 5/F7 + rev 6 兩層定義）**——全文件唯一定義，不可用字面 `HEALTH_OK`（campaign 掛著 noscrub flags 會永久 timeout）：
+  - **recovery-complete（under-fault）**：以**當下 up set** 為準，PG 100% `active+clean`（degraded/misplaced 歸零）——managed-out 的故障中，backfill 完成時 target 仍 down+out，這就是量測終點；fio segment 的 stop-condition 用這層。
+  - **final-clean**：OSD 全部 up+in + PG 100% `active+clean` + health 除 harness 自設 `noscrub`/`nodeep-scrub` 外無其他 warning/error——replicate 收尾、baseline 復測前、watchdog 成功判準用這層。campaign 收尾必須 unset flags（abort path 也要，cleanup stack 對稱註冊）。
+- **故障 replicate 的順序（rev 6 修正——workload 先行）**：qos gate → sampler 啟動 → **fio 先啟動並通過 readiness barrier**（ramp 完成、throughput 穩定）→ 記錄 `fault_t0` → **注入在 workload 進行中發生**（stall/brownout 才量得到故障瞬間）→ fio segment 續跑至 recovery-complete 或 measurement cap → 回歸（heal/start + `osd in`）→ 等 final-clean → baseline 復測 → 下一個。deadline 全部錨定 `fault_t0` 的絕對時間軸（不因 heal 重新起算）。
+- **measurement cap 與 safety gate 分離（rev 5/F9）**：cap 到期記 `time-to-recovery-complete > cap`（right-censored 有效觀測，相對 recovery-complete 而非 final-clean），叢集仍必須等到 final-clean 才進下一 replicate；PG 持續無進展才進 watchdog。
 - chaos：固定 seed 隨機故障序列（隨機 OSD kill/restart、隨機 node 隔離/解除、隨機間隔，20–30 分鐘），三 profile 重播同一序列；定位 showcase，不做嚴格歸因。
 
 ## 6. 量測與判準
@@ -129,10 +133,10 @@
 - **client 面**：fio JSON——IOPS/BW、lat p50/p99/p99.9/max、逐秒 time series。
 - **recovery 面**：`ceph pg dump` / `ceph -s` 差分——recovering objects/s、bytes/s、degraded% 曲線、time-to-clean；peering 區間與 recovery 區間分開統計（rev 2/F4）。
 - **叢集面**：cephadm 內建 prometheus（OSD op latency、SLOW_OPS、mclock/queue perf counters、NIC 指標、per-shard queue）。
-- **生效驗證（rev 2/F3）**：profile 切換後**逐 OSD** `ceph config show osd.N`（daemon effective 值）驗證 profile 名 + 九個衍生參數 + capacity + recovery 併發，全部一致並經固定 settle window 才開始量測；`ceph config dump` 不可作為依據（profile 衍生值不進 mon store）。違者作廢該 replicate。
+- **生效驗證（rev 2/F3 + rev 5/F14 強化）**：每個 replicate **開始前**輪詢八顆 OSD 的 effective config（`ceph tell osd.N config show`）**同時收斂**到預期集合——profile 名、九個衍生參數、鎖定的 IOPS capacity、`osd_mclock_max_sequential_bandwidth_ssd=1200MiB/s`、`osd_max_backfills=1`、recovery active 值、`osd_mclock_override_recovery_settings=false`——全數一致後再過 settle window 才開始量測；結構化驗證結果寫入該 replicate bundle。`ceph config dump` 不可作為依據（profile 衍生值不進 mon store）。違者作廢該 replicate。
 - **stall/brownout 視角（rev 3，使用者標準：關鍵生產系統，IO delay 幾秒即事故）**：從 fio 逐秒 log 導出——**IO stall**（該秒完成數 = 0）與 **brownout**（該秒 p99 > 1s）的最長連續時長與總秒數，per replicate 報告；同步收 SLOW_OPS 事件時間軸對齊。故障實驗的頭號問題是「client 到底黑掉幾秒」，不只是平均劣化幅度。
 - **網路觀測面（rev 3）**：全 node 間 1s 間隔 ping mesh 全程記錄（對齊故障注入時間軸，也用於辨識 Azure 自身的網路抖動輪）。
-- **判準（rev 2/F11）**：prediction 先行。primary endpoints 預先指定：**client p99 degradation ratio（故障中 vs 同壓力穩態）**、**max IO stall duration**、**recovery bytes/s**、**time-to-clean**；其餘指標為 secondary/exploratory。equivalence margin 由 pilot CoV 建立（穩態 n=3 起步）；故障 n=2 標 **exploratory**，噪音超標（CoV > margin）自動升 n（上限 5，時間預算允許時）。三態 verdict `confirmed / violated / indistinguishable`，`indistinguishable` 必須引 margin。
+- **判準（rev 2/F11 + rev 7 修訂）**：prediction 先行。primary endpoints 預先指定：**client p99 degradation ratio（分母 = 同 replicate 的注入前 60s 健康窗；跨日穩態 cell 降為次要對照——防 72h 校準漂移污染）**、**max IO stall duration**、**recovery bytes/s**、**time-to-recovery-complete**；其餘指標為 secondary/exploratory。margin 採**雙軌**：noise margin（觀測 CoV 導出）+ **production margin（HYPOTHESES.md 預註冊的生產有感絕對門檻）**——`indistinguishable` 必須標明是「等效（差異 < 生產門檻）」或「靈敏度不足（噪音 > 生產門檻）」。故障 n=2 標 **exploratory**，噪音超標自動升 n（上限 5；含 censored 觀測的 cell 不走 CoV 升級，改走雙 censored 自救規則——plan §Cap policy）。三態 verdict `confirmed / violated / indistinguishable`。
 - **timeout ≠ skip（rev 2/F14）**：recovery 逾時記為 **right-censored 有效資料**（`time-to-clean > cap`）納入 verdict——慢 profile 的最差結果正是研究對象；只有量測工具故障才作廢。bundle 完成以原子 marker 判定，不以目錄存在判定。
 
 ## 7. 執行模式（單一連續 campaign，rev 2/F13 時程重算）
@@ -141,7 +145,7 @@
 
 | Stage | 內容 | 累計 wall-clock |
 |---|---|---|
-| S0 | provision（原子化 8× L8s_v3）→ cephadm 部署 → burn-in（含 network baseline、power-off canary）→ Phase 0 校準 | ~6–8h |
+| S0 | provision（原子化 8× L8s_v3）→ cephadm 部署 → burn-in（含 network baseline、reboot canary）→ Phase 0 校準 | ~6–8h |
 | S1 | 穩態 72 executions（control） | ~15–17h |
 | S2 | **每型故障先跑 n=1 pilot（4 組）→ 以實測 P50/P95 recovery 時間重算 S2 排程** → 故障 72 cycles | ~63–70h |
 | S3 | chaos 3 → auto-out 確認組（選配）→ 補跑 → 資料齊收 → **刪除整個 RG** | ~72–80h |
@@ -150,7 +154,7 @@
 - 全自動 run queue：組間零人工等待；pilot 通過後整批放行（每型首組人工檢查）。
 - **watchdog 分層自救（rev 2/F16 + 使用者裁示：無解先重開機、真的解不了才叫人）**：
   1. 第一層：停止 fio 與故障注入、暫停佇列，嘗試自動修復（daemon restart、`ceph osd in/out` 校正、重跑該 replicate）。
-  2. 第二層：**reboot 相關 VM**（首選 ssh `sudo reboot`；ssh 完全失聯才用最後手段 `az vm restart`——兩者皆不換 host、local NVMe 資料保留）→ 等 OSD rejoin + HEALTH_OK → 從斷點續跑；該 replicate 標記 tainted 重跑。
+  2. 第二層：**reboot 相關 VM**（首選 ssh `sudo reboot`；ssh 完全失聯才用最後手段 `az vm restart`——兩者皆不換 host、local NVMe 資料保留；az 路徑需 campaign 開跑前 preflight `az account show`/subscription/權限）→ 等 OSD rejoin + **final-clean** → 從斷點續跑；該 replicate 標記 tainted 重跑。
   3. 第三層（唯一叫使用者的時機）：前兩層循環仍無法恢復（例如 BlueStore 損毀、Azure allocation 層問題）→ 通知使用者裁示。**全程 VM 保持 allocated，嚴禁自動 deallocate**——8 台 OSD 的 NVMe 同時消失 = data plane 報廢，deallocate 只能是使用者親自下的放棄決定。
 - 連續 campaign 期間每 12 小時回報累計花費與進度。
 - **完全自主執行（rev 3，使用者裁示）**：campaign 內的一切——校準、穩態、故障注入（daemon stop / iptables 隔離）、chaos、自救（daemon restart / `sudo reboot`）、收數據——全部 ssh-native，由 AI 自主執行，不依賴 Azure API。Azure 層操作降到最少且集中在 campaign 邊界：provision（開跑前）、teardown（收官）、以及 watchdog 第三層的最後手段（VM ssh 完全失聯時的 `az vm restart`）。
@@ -174,7 +178,7 @@ experiments/ceph-mclock-profiles/
 │   ├── collect.sh           # fio JSON、pg dump 差分、prometheus 快照、effective config、NIC 指標
 │   └── verdict.py           # 三態比對 + equivalence margin + right-censored 處理（bastion python3）
 ├── run/
-│   ├── calibrate.sh         # Phase 0（含 capacity 驗證、power-off canary、network baseline）
+│   ├── calibrate.sh         # Phase 0（含 capacity 驗證、reboot canary、network baseline）
 │   ├── steady.sh            # 穩態佇列
 │   ├── faults.sh            # pilot → 故障佇列（回復 gate、watchdog、descope 階梯）
 │   ├── chaos.sh
@@ -202,7 +206,7 @@ experiments/ceph-mclock-profiles/
 - **capacity 量測失真**：Phase 0 逐 OSD 把關 + 顯式鎖定；seq bandwidth 固定 1200 MiB/s 是 Ceph 預設 cost model 的一部分，如實標註。
 - **LSv3 quota 僅餘 1 vCPU 餘裕**：provision gate 原子化 + 失敗即清理；拿不到 8 台就停，不硬跑殘缺拓撲。
 - **絕對數字不可外推**：結論以「同環境內 profile 相對差異」為準；synthetic CRUSH-rack loss 不可外推為實體 rack 故障；NIC-bound 的 seq 結果如實標註。
-- **mon 單薄**：故障實驗不碰 mon node；mon 異常即暫停佇列（watchdog 條件之一）。
+- **mon 單薄**：故障**注入**不碰 mon node；mon 異常即暫停佇列，watchdog 允許的 mon **修復**動作（daemon restart，上限 1 次 → HUMAN-NEEDED）不在此限——repair ≠ fault injection。
 - **版本**：實機 v19.2.2 = 引用基準 v19.2.2，無漂移；與 submodule pin（v19.2.3）差異在報告註記一次。
 
 ## 11. 驗收標準
