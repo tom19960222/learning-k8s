@@ -41,10 +41,17 @@
 - 但 `fio_calibrate` 要求「當下 profile = balanced」且判定方式是 `ceph config get osd osd_mclock_profile`。**校準必須在任何 profile 被 set 之前完成**（calibrate 的步驟順序已保證這點：`calibrate-4k`/`calibrate-seq` 在 `manifest` 之前，而 profile 切換發生在 execution preflight）。
 - 切換後必須等**八顆同時**收斂才算數——這正是既有 `ceph_qos_gate` 的職責，不要另寫一套。
 
-- [ ] Step 1: 測試先行——`ceph_set_profile <profile>`：(a) 三個合法 profile 之外 die；(b) 已經是目標 profile 時不重下指令（冪等）；(c) 下 `ceph config set osd osd_mclock_profile <p>` 的 argv 逐字斷言；(d) pipeline preflight 的**順序斷言**：`ceph_set_profile` 必須在 `ceph_qos_gate` **之前**呼叫，且 gate 仍是唯一的通過判準。
-- [ ] Step 2: 實作 `lib/ceph.sh::ceph_set_profile`，在 `lib/pipeline.sh` 的 preflight 接上（`_PIPE_PROFILE` 已存在）。
-- [ ] Step 3: 決定 campaign 收尾是否要把 `osd_mclock_profile` 從 mon store 移除（對稱回退）。**裁決記入本 plan**：建議由 `ceph_campaign_unflags` 一併 `ceph config rm osd osd_mclock_profile`，理由是 campaign flags 的對稱性原則（設什麼就回退什麼），且 teardown 前的最後一次 `ceph config dump` 乾淨才證得了 cleanup stack 對稱。
-- [ ] Step 4: `tests/gate.sh` 綠 → commit。
+- [x] Step 1: 測試先行——`ceph_set_profile <profile>`：(a) 三個合法 profile 之外 die；(b) 已經是目標 profile 時不重下指令（冪等）；(c) 下 `ceph config set osd osd_mclock_profile <p>` 的 argv 逐字斷言；(d) pipeline preflight 的**順序斷言**：`ceph_set_profile` 必須在 `ceph_qos_gate` **之前**呼叫，且 gate 仍是唯一的通過判準。
+- [x] Step 2: 實作 `lib/ceph.sh::ceph_set_profile`，在 `lib/pipeline.sh` 的 preflight 接上（`_PIPE_PROFILE` 已存在）。
+- [x] Step 3: 決定 campaign 收尾是否要把 `osd_mclock_profile` 從 mon store 移除（對稱回退）。**裁決記入本 plan**：建議由 `ceph_campaign_unflags` 一併 `ceph config rm osd osd_mclock_profile`，理由是 campaign flags 的對稱性原則（設什麼就回退什麼），且 teardown 前的最後一次 `ceph config dump` 乾淨才證得了 cleanup stack 對稱。
+
+  **裁決（2026-07-26，採納建議）**：`ceph_campaign_unflags` 新增 `_ceph_config_rm_osd osd_mclock_profile`，與其餘五項回退同列（任一失敗即 rc=1、記 log 要人工確認）。三點理由：
+  1. **對稱性**：profile 是 campaign 期間唯一「持續存在於 mon store」的 treatment 設定，設了不收就違反「設什麼就回退什麼」。
+  2. **回退層級要對齊設定層級**：profile 由每個 execution 的 preflight 設定，但它是 campaign 級的持續狀態（不是單一 execution 的注入），所以**不註冊 per-execution cleanup**（那會在每個 execution 出口把 profile 拆掉、下一個 cell 又重設，徒增 mon store churn 與 gate 抖動），而掛在 campaign 收尾。
+  3. **可證性**：teardown 前最後一次 `ceph config dump` 乾淨，才證得了 cleanup stack 對稱——這是 §8 收尾 checklist 的判準之一。
+
+  副作用（已一併處理）：`tests/test-ceph-deploy.sh` 的 `script_unflags` 多一筆 `config rm osd osd_mclock_profile` 期望，並加了反向斷言「campaign flags 階段**不得**自己設 profile」（校準必須在編譯預設 `balanced` 下完成，H-018/§4.9）。
+- [x] Step 4: `tests/gate.sh` 綠（commit 待使用者裁示）。
 
 ### Task 0.2: descope 的佇列端效果
 
@@ -52,12 +59,19 @@
 
 **問題**：`results/descope.json` 只被 `verdict.py audit` 讀，`manifest.py next` / `view` 不吃它。目前只能靠 `needs-human` amend 擋佇列（README §7.3 的兩步操作），語意錯配（descope 是成本決策，不是「需要人處理」）。
 
-- [ ] Step 1: 測試先行——`descope.json` 列出的 cell 在 `view` 的 status 標 `descoped`（與 `needs-human` 分開的第五種狀態）、`next` 跳過、`counts` 有獨立欄位。
-- [ ] Step 2: 實作（`descope.json` 讀取集中在 `expand_schedule`，與 amendments 同一個 merge 視圖）。
-- [ ] Step 3: 更新 README §7.3 的操作步驟為單步。
-- [ ] Step 4: gate 綠 → commit。
+- [x] Step 1: 測試先行——`descope.json` 列出的 cell 在 `view` 的 status 標 `descoped`（與 `needs-human` 分開的第五種狀態）、`next` 跳過、`counts` 有獨立欄位。
+- [x] Step 2: 實作（`descope.json` 讀取集中在 `expand_schedule`，與 amendments 同一個 merge 視圖）。
 
-> 若時間壓力大，此 task 可降為「維持兩步操作 + README 已寫清楚」，但**必須在 Phase 3 開跑前明確裁決**（做或不做），不得懸而未決。
+  **實作位置的偏離（有意）**：讀取放在 `merged_view()` 而非 `expand_schedule()`。`expand_schedule` 只負責「展開出哪些 executions」（base + extra/rescue amendments），descope 不新增也不刪除 execution、只改 status；status 判定與 counts 全在 `merged_view`。`merged_view` 就是 `schedule` / `view` / `next` / audit 共用的**單一 merge 點**，所以「與 amendments 同一個 merge 視圖」的意圖有滿足。
+- [x] Step 3: 更新 README §7.3 的操作步驟為單步（同時更新 §1.7 與 §11 產物地圖）。
+- [x] Step 4: gate 綠（commit 待使用者裁示）。
+
+> 若時間壓力大，此 task 可降為「維持兩步操作 + README 已寫清楚」，但**必須在 Phase 3 開跑前明確裁決**（做或不做），不得懸而未決。→ **裁決：做**（2026-07-26 完成）。
+
+**額外決策（測試已固定）**：
+- `descoped` **優先於** `needs-human`（cell 級成本決策是終局裁決，人不必再看），兩者不重複計數。
+- 已完成的 replicate 保持 `done`：descope 是「不再跑」，不是抹掉既有證據。
+- `descope.json` 壞檔 / 指向不存在的 cell / 缺 `reason` 一律讓 `view` / `next` **die**——成本決策靜默失效等於佇列照跑（省不到錢）或帳目出現「不知道為什麼少」的缺件。
 
 ### Task 0.3: `halted` 的解除路徑
 
@@ -65,9 +79,11 @@
 
 **問題**：`results/watchdog-state.json` 的 `halted:true` 只寫不清。人工排除問題後只能手改 JSON（README §4.7）。72h campaign 期間預期會用到不只一次，手改 JSON 容易漏掉 `drift_streak` / `counts`。
 
-- [ ] Step 1: 測試先行——`_pipeline_py state <path> unhalt <reason>`：清 `halted`/`halt_reason`、**保留** trigger counts（除非明示 `--clear-counts`）、寫 `unhalted_at` + 理由（留痕，不可無聲清除）；`watchdog_halted` 隨之回 false。
-- [ ] Step 2: 實作，並提供 `run/` 層的薄入口或在 README 給定案指令。
-- [ ] Step 3: gate 綠 → commit。
+- [x] Step 1: 測試先行——`_pipeline_py state <path> unhalt <reason>`：清 `halted`/`halt_reason`、**保留** trigger counts（除非明示 `--clear-counts`）、寫 `unhalted_at` + 理由（留痕，不可無聲清除）；`watchdog_halted` 隨之回 false。
+- [x] Step 2: 實作，並提供 `run/` 層的薄入口或在 README 給定案指令。→ 兩者都做：`run/unhalt.sh "<理由>" [--clear-counts]`（薄入口，只改本機狀態檔、不碰叢集）＋ README §4.7 步驟 4 改寫成單步指令、§4.6 drift 段補「重新校準後要帶 `--clear-counts`」。
+
+  **額外決策（測試已固定）**：`--clear-counts` 同時歸零 `counts` 與 `drift_streak`（兩者都是「累積到就停佇列」的計數器，分開清會讓 drift 停佇列後立刻再停）；留痕是 **append-only 的 `unhalt_log` 陣列**（72h 內預期會 unhalt 不只一次，單一 `unhalted_at` 欄位會被覆蓋掉前一次），另存最新一次到 `unhalted_at` / `unhalt_reason` 方便速查；佇列本來就沒停時回 `unhalt: NOOP` 且不寫留痕。
+- [x] Step 3: gate 綠（commit 待使用者裁示）。
 
 ### Task 0.4: 開跑前的最後檢查
 

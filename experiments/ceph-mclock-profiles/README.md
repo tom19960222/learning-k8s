@@ -86,15 +86,15 @@ bash experiments/ceph-mclock-profiles/tests/gate.sh
 # gate: PASS  = run-tests + shellcheck（含 info 級）+ make validate 三段全綠
 ```
 
-### 1.7 已知未實作項（真機首跑前必須補）
+### 1.7 Phase 1–2 掃出的三個缺口（Task 0 已補）
 
-Phase 1–2 收官時掃出三個「測試綠但真機會擋路」的缺口。**它們在 Phase 3–5 plan 的 Task 0，開跑前補完**：
+收官時掃出三個「單元測試綠但真機會擋路」的缺口，已在 Phase 3–5 plan 的 Task 0 補完：
 
-| 缺口 | 症狀 | 影響 |
-|---|---|---|
-| **沒有 profile 切換** | 整個 harness 沒有任何地方執行 `ceph config set osd osd_mclock_profile`；`ceph_qos_gate` 只**驗證** profile | 第一個非 `balanced` 的 cell 會在 preflight 卡死（qos gate 收斂逾時），佇列直接停 |
-| **descope 沒有佇列端效果** | `results/descope.json` 只被 `verdict.py audit` 讀取，`manifest.py next` 不吃它 | 寫了 descope 佇列照跑；目前只能靠 `needs-human` amend 擋（見 §7.3） |
-| **`halted` 沒有解除路徑** | `results/watchdog-state.json` 的 `halted:true` 只寫不清，`_pipeline_py state` 沒有 unhalt 操作 | 人工排除問題後無法恢復佇列，只能手改 JSON（見 §4.7） |
+| 缺口 | 現在的做法 |
+|---|---|
+| ~~沒有 profile 切換~~ | `lib/ceph.sh::ceph_set_profile <profile>`（冪等；三個合法 profile 之外 die），由 `lib/pipeline.sh` 的 preflight 在 `ceph_qos_gate` **之前**呼叫。設定只負責下指令，**是否生效仍由 gate 判定**；campaign 收尾由 `ceph_campaign_unflags` 對稱移除 |
+| ~~descope 沒有佇列端效果~~ | `results/descope.json` 是 merge 視圖的第五種狀態 `descoped`：`manifest.py view` 標示、`next` 跳過、`counts.descoped` 獨立計數（§7.3 已改為單步操作） |
+| ~~`halted` 沒有解除路徑~~ | `run/unhalt.sh "<理由>" [--clear-counts]`（= `_pipeline_py state <path> unhalt`）：清 `halted`／`halt_reason`、**保留** trigger counts 與 drift streak、留痕進 `unhalt_log`（§4.7） |
 
 ---
 
@@ -331,7 +331,7 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 - 漂移**來回抖動**（同一 cell 有時超標有時不超）→ 噪音升高而非漂移。接受並續跑，但把該時段標進 covariate，report 的 noise margin 要用含這段的資料重算。
 - 漂移只出現在**單一 client**（看 `fio/` 各 client 的 per-client log）→ 那台 client VM 的問題，不是叢集漂移。重做該 client 的 unmap/map + smoke。
 
-裁決後要恢復佇列，見 §4.7 的解除步驟（drift streak 也要一併歸零）。
+裁決後要恢復佇列，見 §4.7 的解除步驟——重新校準後用 `bash run/unhalt.sh "<理由>" --clear-counts`（drift streak 要一併歸零，否則下一次 drift 立刻又停）。
 
 ### 4.7 `watchdog: HUMAN-NEEDED <trigger> <ctx>`（佇列停，exit 3）
 
@@ -348,20 +348,20 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
    ```
 
 3. 修復（人工）。**紅線**：不論怎麼修，**嚴禁 deallocate 任何 VM**——8 台 OSD 的 local NVMe 同時消失 = data plane 報廢，整場 campaign 從 provision 重來。停機只能是使用者親自下的放棄決定。
-4. **解除停佇列**（目前沒有 CLI，手改 JSON，見 §1.7）：
+4. **解除停佇列**（單步，理由必填——會寫進 `watchdog-state.json` 的 `unhalt_log` 留痕）：
 
    ```bash
-   python3 - <<'PY'
-   import json
-   p = "results/watchdog-state.json"
-   d = json.load(open(p))
-   d["halted"] = False
-   d["halt_reason"] = None
-   d["drift_streak"] = 0          # drift 裁決後才需要
-   d["counts"] = {}               # 或只歸零已排除的那個 trigger
-   json.dump(d, open(p, "w"), indent=1, sort_keys=True)
-   PY
+   # 一般情況：清 halted，**保留** trigger counts 與 drift streak
+   bash run/unhalt.sh "node-ssh-lost：mclock-osd-3 網卡重設後已恢復"
+   # unhalt: OK
+
+   # 已確定根因排除（例如 drift 裁決後重新校準完）才一併歸零累積計數：
+   bash run/unhalt.sh "baseline drift：已重新校準，切成校準期 B" --clear-counts
+   # unhalt: OK cleared-counts
    ```
+
+   ※ `--clear-counts` 會同時歸零 `counts`（各 trigger 的失敗累積）與 `drift_streak`。不帶旗標時兩者都保留——沒排除的累積不該憑空歸零。
+   ※ 佇列本來就沒停時回 `unhalt: NOOP`（不寫留痕）。
 
    把「做了什麼、為什麼」寫進 journal 留痕：
 
@@ -385,13 +385,24 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
 `fio_calibrate` 要求當下 profile 是 `balanced`（校準是共同參考條件，treatment 不得污染 dose），判定方式是 `ceph config get osd osd_mclock_profile`，**依賴 v19.2.2 編譯預設即 `balanced`**。
 
-若這裡 die（`校準必須在 balanced profile 下做（目前 <x>）`）：
+若這裡 die（`校準必須在 balanced profile 下做（目前 <x>）`），先分清楚**是誰設的**：
+
+**情況 A — 首跑校準（還沒有任何 execution 跑過）**：
 
 > **人工裁決，不可用 `ceph config set osd osd_mclock_profile balanced` 繞過。**
 
-理由：那會把 `osd_mclock_profile` 寫進 mon config store，而 `ceph_qos_gate` 的**來源反向斷言**檢查的正是「QoS / recovery 參數不得來自 mon store」（H-009 / H-018）。雖然目前 `osd_mclock_profile` 本身不在 `FORBIDDEN_IN_MON_STORE` 清單裡，但一旦有人為了繞過而設值，就再也分不清「profile 是 harness 設的還是殘留的」，capacity / 九參數的 provenance 論證同時失效。
+理由：那會把 `osd_mclock_profile` 寫進 mon config store，而 `ceph_qos_gate` 的**來源反向斷言**檢查的正是「QoS / recovery 參數不得來自 mon store」（H-009 / H-018）。雖然 `osd_mclock_profile` 本身不在 `FORBIDDEN_IN_MON_STORE` 清單裡（九個衍生參數才是），但一旦有人為了繞過而設值，就再也分不清「profile 是 harness 設的還是殘留的」，capacity / 九參數的 provenance 論證同時失效。
 
 正確處置：查為什麼不是 balanced（是不是 IaC 交付的 image 帶了 ceph.conf？是不是前一次 campaign 的殘留 mon store？），把污染源清乾淨，而不是往上疊一層設定。
+
+**情況 B — campaign 中途重新校準**（§4.6 的 drift 裁決；已經有 cell 跑過）：這時非 balanced 是 **harness 自己設的**（`ceph_set_profile` 在每個 execution 的 preflight 下 `ceph config set osd osd_mclock_profile <cell 的 profile>`，§1.7）。這不是污染，而是我們自己的 treatment 還掛著。處置是**收掉自己的設定**再校準：
+
+```bash
+sudo ceph config rm osd osd_mclock_profile      # 回到編譯預設 balanced
+sudo ceph config get osd osd_mclock_profile     # 確認是 balanced 才續跑
+```
+
+判別方法：`sudo ceph config dump | grep osd_mclock_profile` 看它的 section 是 `osd`（harness 設的）還是 `global` / `osd.N`（外來污染），並對照 `results/<cell>/<rN>/attempts/*/qos.json` 最後一次通過的 profile。校準完再開佇列時，下一個 execution 的 preflight 會重新把 profile 設回去。
 
 ---
 
@@ -483,20 +494,25 @@ budget-warning: cost_usd=1004 threshold=1000
 | ② | 砍 auto-out 確認組（S3 選配，本來就非必要） | 2 個 |
 | ③ | seq-contention 只留極端壓（砍中壓 3 cells） | 6 個 |
 
-**操作方式**（兩步，缺一不可——見 §1.7 的已知缺口）：
+**操作方式**（單步）：寫 `results/descope.json`，佇列端與 audit 端讀的是同一個檔。
 
 ```bash
-# (1) 讓佇列跳過：needs-human amend，key = cell_id（不帶 /rN 才是整個 cell）
-python3 lib/manifest.py amend --type needs-human --key <cell_id> \
-        --value "descope-① 低壓降 n=1（成本 $X 逼近天花板）" --source human --results results
-
-# (2) 讓 audit 認得這是「有記錄的缺件」而非遺漏：手寫 results/descope.json
 cat > results/descope.json <<'JSON'
-{ "cells": [ { "cell_id": "<cell_id>", "reason": "descope-① ..." } ] }
+{ "cells": [
+  { "cell_id": "<cell_id>", "reason": "descope-① 低壓降 n=1（成本 $X 逼近天花板）" }
+] }
 JSON
+
+# 立刻驗證生效（第五種狀態 descoped）
+python3 lib/manifest.py view --results results \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["counts"]); print(d["descoped"])'
 ```
 
-只做 (1) → audit 會把它列進 `missing` 但不標 descope；只做 (2) → 佇列照跑，descope 無效。
+效果：`manifest.py view` 把該 cell 未完成的 executions 標成 `descoped`、`next` 跳過、`counts.descoped` 獨立計數，`verdict.py audit` 把缺件認成「有記錄的缺件」。**已完成的 replicate 保持 `done`**（descope 是不再跑，不是抹掉既有證據）。
+
+`reason` 必填、`cell_id` 必須存在於 manifest；壞檔或打錯 cell 名一律讓 `view` / `next` **失敗**（不得靜默失效讓佇列照跑）。要撤回 descope 就把該筆從檔案移除。
+
+descoped 的 executions 也**不計入 `queue_progress` 的分母**（`steady: PASS done=x/y` 這類機器行），否則 `run/steady.sh` 的「全數完成才產 margins」判準會被永遠卡住。
 
 **注意**：任何 descope 都會讓 `verdict.py audit` 回 exit 1（`audit: INCOMPLETE`）、進而讓 `all.sh` 印 `campaign: AUDIT-FAIL`。這是預期行為。teardown 的判準不是「audit exit 0」，而是「`EVIDENCE-SUMMARY-<date>.md` 的 missing 清單裡每一筆都有 descope / needs-human 的具名理由」（§8）。
 
@@ -569,7 +585,7 @@ JSON
 
 按「最可能絆倒你」排序：
 
-1. **profile 切換未實作**（§1.7）——第一個非 `balanced` 的 cell 就會卡。**開跑前必補**。
+1. **profile 切換的第一次真跑**（§1.7 已補）——`ceph_set_profile` 在 preflight 下 `ceph config set osd osd_mclock_profile`，接著由 qos gate 驗八顆同時收斂。第一個非 `balanced` 的 cell 是這條路徑的首次真機驗證：若 gate 逾時，先看 `set-profile: SET <old> <new>` 這行有沒有出現、再看是不是九參數沒跟著換。
 2. **`fio_calibrate` 依賴編譯預設即 balanced**（§4.9）——若 die，人工裁決，**不可**用 `ceph config set` 繞過。
 3. **fio parser 對真機輸出的一次性校正**：`fio_smoke_real` 會跑 60s 真 fio、把 raw 三個 log 存成 golden，再用 `verdict.py aggregate --validate-schema` 驗過才放行。**如果這裡失敗，代表本機 fio 版本的 log 格式與 parser 假設不符**（常見：hist log 的 bin 數 / 單位是 ns 還是 us、windowed log 的重複 timestamp、不完整的尾窗）。修 parser，不要修 golden。
 4. **capacity 決策表五狀態**：`accepted-consistent` / `accepted-inconsistent` / `rejected-out-of-range` / `skipped-existing-nondefault` / `failed`。前四種都有自動出口，最後一種 die 叫人（§4.5）。真機第一次跑最常見的是 `rejected-out-of-range`（L8s_v3 的 NVMe 可能量出 > 80000 IOPS 被 Ceph 丟掉）→ 自動改鎖 `min(raw_fio, 72000)` 並標 `fio-derived`，報告要註明。
@@ -595,7 +611,7 @@ experiments/ceph-mclock-profiles/
 │   └── attestation.json           ← IaC 交付（git-ignored）
 ├── lib/                           common / inventory / ceph / fio / inject / collect / pipeline .sh
 │                                  manifest.py / verdict.py
-├── run/                           calibrate / steady / faults / chaos / all / queue .sh
+├── run/                           calibrate / steady / faults / chaos / all / queue / unhalt .sh
 ├── tests/                         gate.sh（= run-tests + shellcheck + make validate）
 └── results/                       **git-ignored**
     ├── manifest.json              63 cells / 147 executions
@@ -605,7 +621,8 @@ experiments/ceph-mclock-profiles/
     ├── capacity-provenance.json   bench 來源證據
     ├── margins.json               雙軌 margin（noise + production）
     ├── schedule-estimate.json     pilot 推導的 cap 與總時程
-    ├── watchdog-state.json        trigger 計數 / halted / drift streak（resume 不重置）
+    ├── watchdog-state.json        trigger 計數 / halted / drift streak / unhalt_log（resume 不重置）
+    ├── descope.json               成本決策（§7.3）：列出的 cell 在 merge 視圖標 descoped
     ├── audit.json                 齊備度總表
     ├── DATASET-SEALED             封閉標記
     ├── .stage-<name>.done         all.sh 的段落 marker
@@ -628,7 +645,8 @@ experiments/ceph-mclock-profiles/
 | `calibrate 步驟失敗：<step>` | 停在原地 | 修好後重跑 calibrate，會從斷點續 |
 | `capacity-dispersion-high` | 8 顆 capacity 太離散 | §4.4 remediation |
 | `capacity-decide: HUMAN-NEEDED` | bench 失敗 / 決策表不齊 | §4.5 |
-| `qos gate：八顆 OSD 未在 <n>s 內同時收斂` | profile / 九參數 / capacity 對不上 | 第一個嫌疑犯是 §1.7 的 profile 切換未實作 |
+| `qos gate：八顆 OSD 未在 <n>s 內同時收斂` | profile / 九參數 / capacity 對不上 | 先確認前一行有 `set-profile: SET/NOOP`（§1.7），再比對 bundle 的 `qos.json` 逐項失敗欄位 |
+| `set-profile: SET <old> <new>` | preflight 真的切了 profile | 正常訊息；後面要跟著 `qos-gate: PASS <new>` |
 | `steady: SMOKE-MISSING <dir>` | golden log 缺 | `fio_smoke_real` 沒過，回去跑 calibrate 的 `fio-smoke-real` 步驟 |
 | `steady: FIRST-CELL-GATE` | 人工 gate（exit 10） | §4.1 |
 | `faults: NO-MARGINS <path>` | 缺 margins.json | 先把穩態跑完（`--pilot` 才可略過） |

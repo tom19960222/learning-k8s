@@ -17,7 +17,8 @@
 #   queue_loop <kind> <hook|-> <limit> [manifest 參數]
 #                                           reconcile 之後的主迴圈；rc 0 = 跑完、
 #                                           3 = 被 watchdog 停佇列、1 = 卡住（STUCK）
-#   queue_progress <kind>                   印 `<done> <total>`（manifest merge 視圖）
+#   queue_progress <kind>                   印 `<done> <total>`（manifest merge 視圖；
+#                                           descoped 的 execution 不計入分母）
 #   queue_has_amend <type> <key>            journal 是否已有該筆 amendment（唯讀）
 #   queue_done_bundles <kind> [<cell>/<rN>...]  已 finalize 的 attempt 目錄
 #   queue_exec_field <exec-json> <a.b>      取 execution JSON 欄位
@@ -96,7 +97,10 @@ def main(argv):
     doc = json.load(sys.stdin)
     if cmd == "progress":
         kind = argv[1]
-        execs = [e for e in doc.get("executions", []) if e.get("kind") == kind]
+        # descoped（§7.3 的成本決策）已裁決不跑 → 不計入分母，否則 done/total 永遠
+        # 到不了，run/steady.sh 的「全數完成才產 margins」判準會被卡死。
+        execs = [e for e in doc.get("executions", [])
+                 if e.get("kind") == kind and e.get("status") != "descoped"]
         done = sum(1 for e in execs if e.get("status") == "done")
         sys.stdout.write("%d %d\n" % (done, len(execs)))
         return 0

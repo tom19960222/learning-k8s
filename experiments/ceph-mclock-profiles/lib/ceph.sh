@@ -18,6 +18,7 @@
 #   ceph_campaign_flags/unflags    campaign 固定設定（設定當下即註冊對稱 unset）
 #
 # 對外介面（Task 6）：
+#   ceph_set_profile <profile>              切換 mclock profile（冪等；gate 之前呼叫）
 #   ceph_qos_gate <profile> [bundle]        每 execution preflight 的驗證集合 + settle + 證據 JSON
 #   ceph_capacity_provenance [out]          per-OSD bench 來源證據
 #   ceph_capacity_decide [prov] [out]       五狀態決策表 + 跨 8 顆 CoV gate
@@ -1104,6 +1105,7 @@ ceph_setup_client_auth() {
 
 _ceph_unset_flag() { ceph_adm "ceph osd unset $1" >&2; }
 _ceph_config_rm_mon() { ceph_adm "ceph config rm mon $1" >&2; }
+_ceph_config_rm_osd() { ceph_adm "ceph config rm osd $1" >&2; }
 _ceph_balancer_on() { ceph_adm "ceph balancer on" >&2; }
 
 ceph_campaign_flags() {
@@ -1130,8 +1132,45 @@ ceph_campaign_unflags() {
   _ceph_balancer_on || rc=1
   _ceph_config_rm_mon mon_osd_adjust_heartbeat_grace || rc=1
   _ceph_config_rm_mon mon_osd_adjust_down_out_interval || rc=1
+  # Task 0.1 Step 3 的裁決：profile 由每個 execution 的 preflight 設定（campaign 級的
+  # 持續狀態，非單一 execution 的注入），因此對稱回退掛在 campaign 收尾——設什麼就
+  # 回退什麼，teardown 前最後一次 `ceph config dump` 乾淨才證得了 cleanup stack 對稱。
+  _ceph_config_rm_osd osd_mclock_profile || rc=1
   [ "$rc" -eq 0 ] || log "campaign unflags 有項目失敗（請人工確認）"
   return "$rc"
+}
+
+# ceph_set_profile <profile>：切換 mclock profile（runtime-changeable，不需重啟 OSD）。
+#   - 只接受三個合法 profile：打錯字若放行，要等 qos gate 撞完 QOS_CONVERGE_SECS 才發現。
+#   - 已經是目標 profile 就不重下指令（冪等）——resume 與同 profile 連跑的 cell 很常見。
+#   - 本函式只負責「下指令」；**是否生效一律由 ceph_qos_gate 判定**（八顆同時收斂 +
+#     settle window + 逐 OSD effective config），所以這裡不做任何等待或驗證。
+#   - H-018：九個衍生參數是 set_val_default、不進 mon config store，
+#     `FORBIDDEN_IN_MON_STORE` 也不含 osd_mclock_profile → 設 profile 不會踩到
+#     qos gate 的「來源反向斷言」。
+#   - 不註冊 per-execution 的對稱回退：profile 是 campaign 級持續狀態，
+#     收尾由 `ceph_campaign_unflags` 一併 `ceph config rm osd osd_mclock_profile`。
+ceph_set_profile() {
+  [ $# -eq 1 ] || die "用法：ceph_set_profile <profile>"
+  local profile="$1" current
+  case "$profile" in
+    balanced|high_client_ops|high_recovery_ops) : ;;
+    *) die "未知的 mclock profile：${profile}（合法：balanced / high_client_ops / high_recovery_ops）" ;;
+  esac
+  # 先取當下值再決定要不要下指令；管線會吃掉 rc，所以取值與 trim 分兩步。
+  current="$(ceph_adm "ceph config get osd osd_mclock_profile")" \
+    || die "取不到當下的 osd_mclock_profile（不得盲設）"
+  current="$(printf '%s' "$current" | tr -d ' \r\n')"
+  [ -n "$current" ] || die "osd_mclock_profile 查詢結果是空的（不得盲設）"
+  if [ "$current" = "$profile" ]; then
+    log "mclock profile 已是 ${profile}（不重下指令）"
+    printf 'set-profile: NOOP %s\n' "$profile"
+    return 0
+  fi
+  ceph_adm "ceph config set osd osd_mclock_profile $profile" >&2 \
+    || die "設定 osd_mclock_profile=${profile} 失敗"
+  log "mclock profile：${current} → ${profile}（收斂與否交給 qos gate 判定）"
+  printf 'set-profile: SET %s %s\n' "$current" "$profile"
 }
 
 # =============================================================================

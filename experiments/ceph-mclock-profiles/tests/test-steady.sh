@@ -132,6 +132,26 @@ rt_eq "$(grep -c 'pipeline_run_execution' "$RT_TRACE")" "1" "停佇列後不得�
 rt_hasnt "$RT_VERDICT_LOG" "margins" "佇列沒跑完不得產 margins"
 
 # =============================================================================
+# 10. descope（§7.3）：被裁決不跑的 cell 不得卡住「全數完成」的判準
+#     （Task 0.2：descope 的佇列端效果要一路貫穿到 queue_progress 的分母）
+# =============================================================================
+rt_reset
+rt_manifest '{"steady":2}'
+golden_ok
+cell_dropped="$(python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+print([c["cell_id"] for c in d["cells"] if c["kind"] == "steady"][0])' "$RESULTS_DIR/manifest.json")"
+python3 -c 'import json,sys
+json.dump({"cells": [{"cell_id": sys.argv[2], "reason": "descope-① 成本天花板"}]},
+          open(sys.argv[1], "w"))' "$RESULTS_DIR/descope.json" "$cell_dropped"
+rt_run "$sb" steady.sh --yes-really-inject --resume
+rt_eq "$RT_RC" "0" "descope 後仍應正常跑完（不得卡在 done<total）"
+rt_has "$RT_OUT" "steady: PASS done=3/3" "descoped 的 executions 不計入分母"
+rt_eq "$(grep -c 'pipeline_run_execution' "$RT_TRACE")" "3" "descoped 的 cell 一個 execution 都不跑"
+[ -s "$RESULTS_DIR/margins.json" ] || rt_fail "descope 後 margins 仍應產出"
+rt_ok
+
+# =============================================================================
 # 9. 靜態斷言：薄入口不得繞過 pipeline 自己下遠端指令
 # =============================================================================
 rt_assert_thin "$RT_ROOT/run/steady.sh"

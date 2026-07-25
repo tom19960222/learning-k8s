@@ -414,6 +414,7 @@ script_unflags() {
   expect_ssh 'balancer on' 0 0 ""
   expect_ssh 'config rm mon mon_osd_adjust_heartbeat_grace' 0 0 ""
   expect_ssh 'config rm mon mon_osd_adjust_down_out_interval' 0 0 ""
+  expect_ssh 'config rm osd osd_mclock_profile' 0 0 ""
 }
 # 23) 兩個 adjust 開關都要關（H-015：只關 heartbeat grace 控制不完全）
 reset_ssh
@@ -429,6 +430,11 @@ has "$FAKE_SSH_LOG" "balancer off" "campaign 期間 balancer off"
 ceph_campaign_unflags || fail "ceph_campaign_unflags 應成功"
 ok
 has "$FAKE_SSH_LOG" "config rm mon mon_osd_adjust_down_out_interval" "unflags 對稱移除"
+# Task 0.1 Step 3 的裁決：profile 由 execution preflight 設定（campaign 級的持續狀態），
+# 收尾一併移除——設什麼就回退什麼，teardown 前最後一次 config dump 才乾淨。
+has "$FAKE_SSH_LOG" "config rm osd osd_mclock_profile" "unflags 一併移除 osd_mclock_profile"
+# 但 flags 階段**不得**先設 profile（校準必須在 balanced 下完成，profile 由 preflight 設）
+hasnt "$FAKE_SSH_LOG" "config set osd osd_mclock_profile" "campaign flags 不得自己設 profile"
 
 # 24) 設定當下就註冊對稱 unset：腳本結束時 cleanup stack 一定跑到
 reset_ssh

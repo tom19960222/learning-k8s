@@ -170,11 +170,17 @@ _node_sh() { t "node_sh $1 $3"; return "${FAKE_NODE_SSH_RC:-0}"; }
 remote_bg_stop() { t "remote_bg_stop $1 $2"; }
 remote_bg_list() { t "remote_bg_list $1"; printf '%s\n' "${FAKE_BG_LIST:-}"; }
 
+ceph_set_profile() {
+  t "ceph_set_profile $1"
+  printf 'set-profile: SET balanced %s\n' "$1"
+  return "${FAKE_SETPROF_RC:-0}"
+}
 ceph_qos_gate() {
   t "ceph_qos_gate $1"
   mkdir -p "$2"
   printf '{"profile": "%s"}\n' "$1" > "$2/qos.json"
   printf 'qos-gate: PASS %s\n' "$1"
+  return "${FAKE_QOS_RC:-0}"
 }
 ceph_wait_final_clean() { t "ceph_wait_final_clean ${1:-}"; return "${FAKE_FINAL_CLEAN_RC:-0}"; }
 ceph_wait_recovery_complete() { t "ceph_wait_recovery_complete $1"; return "${FAKE_RECOVERY_RC:-0}"; }
@@ -332,6 +338,7 @@ reset_state() {
   FAKE_COV_TAINTED=false; FAKE_COVFIN_RC=0; FAKE_SAMPLER_RC=0; FAKE_BGC_RC=0
   FAKE_READY_RC=0; FAKE_FIO_STOP_RC=0; FAKE_CHAOS_RC=0; FAKE_RECOVERY_RC=0
   FAKE_BASELINE_RC=0; FAKE_BASELINE_LINE="baseline-check: OK"
+  FAKE_SETPROF_RC=0; FAKE_QOS_RC=0
   _pipeline_reset_runtime_state
 }
 reset_state
@@ -481,6 +488,7 @@ out="$(pipeline_run_execution "$tmp/ex-budget.json" 2>/dev/null)"; rc=$?
 eq "$rc" "5" "預算耗盡的 replicate 應直接 SKIP"
 eq "$out" "pipeline: SKIP ${CELL}/r1 needs-human" "SKIP 機器行"
 hasnt "$TRACE" "ceph_qos_gate" "SKIP 不該進 preflight"
+hasnt "$TRACE" "ceph_set_profile" "SKIP 不該去動叢集的 profile"
 hasnt "$FAKE_MANIFEST_LOG" "needs-human" "needs-human 只發一次（不得重發）"
 # 成功一次即清零
 pipeline_taint_clear "$CELL" r1
@@ -532,6 +540,9 @@ before "sampler_assert_alive" "fio_start_bg" "assert 之後才啟動 fio"
 before "fio_start_bg" "fio_readiness_barrier" "fio 啟動後才等 readiness"
 before "fio_readiness_barrier" "fault_osd_down" "**fio readiness 必須在注入之前**（workload 先行）"
 before "ceph_qos_gate" "sampler_start" "preflight 在 sampler 之前"
+# Task 0.1：先「設定」profile 才「驗證」——順序倒過來就是第一個非 balanced 的 cell 卡死
+before "ceph_set_profile" "ceph_qos_gate" "**profile 切換必須在 qos gate 之前**"
+has "$TRACE" "ceph_set_profile balanced" "設定的 profile 取自 execution 的 profile 欄位"
 before "fault_osd_down" "fio_wait_segments" "注入後才進量測窗（fio 持續跑）"
 before "fio_wait_segments" "fio_stop" "量測窗結束才停 fio"
 before "fio_stop" "fault_osd_down_recover" "先停 fio 才回歸"
@@ -731,5 +742,114 @@ rc=0
 out="$(pipeline_run_execution "$tmp/ex-halt.json" 2>/dev/null)" || rc=$?
 eq "$rc" "3" "佇列已停 → 不得再開新 execution"
 hasnt "$TRACE" "ceph_qos_gate" "佇列停止後不該進 preflight"
+hasnt "$TRACE" "ceph_set_profile" "佇列停止後不該去動叢集的 profile"
+
+# ================================ 17. Task 0.1：qos gate 仍是 preflight 的唯一判準 ==
+# 設定 profile 只是「下指令」，通過與否一律由 gate（八顆同時收斂）判定。
+reset_state
+mk_exec "$tmp/ex-qosfail.json" fault osd-down mid 4k
+FAKE_QOS_RC=1
+rc=0
+out="$(pipeline_run_execution "$tmp/ex-qosfail.json" 2>/dev/null)" || rc=$?
+eq "$rc" "1" "gate 未過 → abort（設定成功不算數）"
+eq "$out" "pipeline: ABORT osd-down-4k-mid+balanced/r1 qos-gate" "abort 理由是 qos-gate"
+has "$TRACE" "ceph_set_profile balanced" "gate 未過前 profile 已設定過"
+hasnt "$TRACE" "sampler_start" "gate 未過不得往下走"
+FAKE_QOS_RC=0
+
+# profile 設定失敗 → 不得進 gate（避免拿舊 profile 去撞收斂逾時）
+reset_state
+mk_exec "$tmp/ex-spfail.json" fault osd-down mid 4k
+FAKE_SETPROF_RC=1
+rc=0
+out="$(pipeline_run_execution "$tmp/ex-spfail.json" 2>/dev/null)" || rc=$?
+eq "$rc" "1" "profile 設定失敗 → abort"
+eq "$out" "pipeline: ABORT osd-down-4k-mid+balanced/r1 set-profile" "abort 理由是 set-profile"
+hasnt "$TRACE" "ceph_qos_gate" "profile 沒設成功就不該進 gate"
+FAKE_SETPROF_RC=0
+
+# ============================== 18. Task 0.3：halted 的解除路徑（人工排除後恢復）==
+reset_state
+W="$(watchdog_state_path)"
+_pipeline_py state "$W" bump collector-heartbeat >/dev/null
+_pipeline_py state "$W" bump collector-heartbeat >/dev/null
+_pipeline_py state "$W" drift-bump >/dev/null
+_pipeline_halt_queue "collector-heartbeat 修不好"
+if watchdog_halted; then ok; else fail "前置：佇列應為 halted"; fi
+
+# 18a) 理由是必填（不得無聲清除）
+_pipeline_py state "$W" unhalt >/dev/null 2>&1 && fail "unhalt 缺理由應失敗"
+ok
+_pipeline_py state "$W" unhalt "" >/dev/null 2>&1 && fail "unhalt 空理由應失敗"
+ok
+if watchdog_halted; then ok; else fail "失敗的 unhalt 不得改動狀態"; fi
+
+# 18b) 正常解除：清 halted / halt_reason、**保留** trigger counts、留痕
+out="$(_pipeline_py state "$W" unhalt "collector 已人工重啟")" || fail "unhalt 應成功"
+ok
+eq "$out" "unhalt: OK" "unhalt 機器行"
+if watchdog_halted; then fail "unhalt 後 watchdog_halted 必須回 false"; else ok; fi
+eq "$(jget "$W" halted)" "False" "halted 已清"
+eq "$(jget "$W" halt_reason)" "None" "halt_reason 已清"
+eq "$(watchdog_count collector-heartbeat)" "2" "**預設保留 trigger counts**（沒排除的不得歸零）"
+eq "$(pipeline_drift_streak)" "1" "預設保留 drift streak"
+eq "$(jget "$W" unhalt_reason)" "collector 已人工重啟" "理由留痕"
+has "$W" "unhalted_at" "寫入解除時刻"
+eq "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["unhalt_log"]))' "$W")" \
+  "1" "解除事件進 append-only 留痕清單"
+
+# 18c) --clear-counts：明示才歸零（counts + drift streak 一起）
+_pipeline_halt_queue "第二次停"
+out="$(_pipeline_py state "$W" unhalt "recalibrate 已完成" --clear-counts)" || fail "unhalt --clear-counts 應成功"
+ok
+eq "$out" "unhalt: OK cleared-counts" "帶旗標的機器行不同（人看得出做了什麼）"
+eq "$(watchdog_count collector-heartbeat)" "0" "--clear-counts 才歸零 trigger counts"
+eq "$(pipeline_drift_streak)" "0" "--clear-counts 一併歸零 drift streak"
+eq "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["unhalt_log"]))' "$W")" \
+  "2" "第二次解除不得覆蓋第一次的留痕"
+eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["unhalt_log"][1]["cleared_counts"])' "$W")" \
+  "True" "留痕記下是否清了計數"
+
+# 18d) 沒停佇列時解除 → 明示 no-op（不得假裝有做事）
+out="$(_pipeline_py state "$W" unhalt "重複解除")" || fail "重複 unhalt 不該報錯"
+ok
+eq "$out" "unhalt: NOOP" "本來就沒停 → NOOP"
+eq "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["unhalt_log"]))' "$W")" \
+  "2" "NOOP 不寫留痕"
+
+# 18e) pipeline_unhalt：shell 層薄包裝（run/unhalt.sh 用）
+_pipeline_halt_queue "第三次停"
+out="$(pipeline_unhalt "節點已換掉")" || fail "pipeline_unhalt 應成功"
+ok
+eq "$out" "unhalt: OK" "pipeline_unhalt 機器行"
+if watchdog_halted; then fail "pipeline_unhalt 後應恢復"; else ok; fi
+( pipeline_unhalt ) >/dev/null 2>&1 && fail "pipeline_unhalt 缺理由應 die"
+ok
+
+# 18g) run/unhalt.sh：run 層薄入口（以子行程真的跑一次）
+_pipeline_halt_queue "第四次停"
+out="$(bash "$root/run/unhalt.sh" "磁碟已換")" || fail "run/unhalt.sh 應成功"
+ok
+eq "$out" "unhalt: OK" "run/unhalt.sh 機器行"
+if watchdog_halted; then fail "run/unhalt.sh 後應恢復"; else ok; fi
+bash "$root/run/unhalt.sh" >/dev/null 2>&1 && fail "run/unhalt.sh 缺理由應非 0"
+ok
+_pipeline_halt_queue "第五次停"
+out="$(bash "$root/run/unhalt.sh" "recalibrate 完成" --clear-counts)" || fail "run/unhalt.sh --clear-counts 應成功"
+ok
+eq "$out" "unhalt: OK cleared-counts" "run/unhalt.sh 旗標透傳"
+
+# 18f) 解除後佇列真的能再開工（不是只有 JSON 好看）
+reset_state
+_pipeline_halt_queue "擋住"
+mk_exec "$tmp/ex-unhalt.json" fault osd-down mid 4k
+rc=0
+pipeline_run_execution "$tmp/ex-unhalt.json" >/dev/null 2>&1 || rc=$?
+eq "$rc" "3" "解除前佇列仍停"
+pipeline_unhalt "已排除" >/dev/null || fail "unhalt 應成功"
+reset_trace
+out="$(pipeline_run_execution "$tmp/ex-unhalt.json")" || fail "解除後應能開工"
+eq "$out" "pipeline: DONE osd-down-4k-mid+balanced/r1" "解除後 execution 正常完成"
+has "$TRACE" "ceph_qos_gate" "解除後 preflight 恢復"
 
 printf 'test-pipeline: %d assertions passed\n' "$asserts"

@@ -19,6 +19,8 @@
   `measurement_cap_source="bundle"`，不追溯改寫）；rescue-replicate 攜帶自己的 cap。
 - 完成判定用 replicate 級 DONE（`results/<cell>/<rN>/DONE`，由 common.sh 的 bundle_finalize 寫入），
   不遞迴 attempts/。
+- `results/descope.json`（§7.3 成本決策）是 merge 視圖的第五種狀態 `descoped`：`view` 標示、
+  `next` 跳過、`counts.descoped` 獨立計數；優先於 needs-human，但不覆蓋已完成的 replicate。
 
 家規：標準庫 only；stdout 只放機器要抓的行，log/警告一律 stderr。
 """
@@ -59,6 +61,9 @@ AMEND_TYPES = ("extra-replicates", "cap-update", "rescue-replicate", "needs-huma
 
 AMENDMENTS_BASENAME = "schedule-amendments.json"
 MANIFEST_BASENAME = "manifest.json"
+# 成本決策（§7.3 descope 階梯）：列在這裡的 cell 進 merge 視圖的第五種狀態 `descoped`，
+# `next` 跳過、`counts` 獨立計數；`verdict.py audit` 讀同一個檔把它認成「有記錄的缺件」。
+DESCOPE_BASENAME = "descope.json"
 
 _LIB_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_LIB_DIR)
@@ -354,6 +359,39 @@ def load_amendments(results_dir):
     return records
 
 
+def load_descope(results_dir, man):
+    """讀 `results/descope.json` → {cell_id: reason}（沒有檔案 = 沒 descope）。
+
+    壞檔 / 未知 cell / 缺理由一律 die：descope 是「有意識的缺件」，靜默失效等於佇列
+    照跑（成本沒省到）或帳目上出現「不知道為什麼少」的項目（README §8 的收尾判準）。
+    """
+    path = os.path.join(results_dir, DESCOPE_BASENAME)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except ValueError as exc:
+        fail("%s 不是合法 JSON：%s" % (path, exc))
+    if not isinstance(doc, dict) or not isinstance(doc.get("cells"), list):
+        fail('%s 必須是 {"cells": [{"cell_id": ..., "reason": ...}]} 結構' % path)
+    known = set(c["cell_id"] for c in man["cells"])
+    out = {}
+    for i, rec in enumerate(doc["cells"], 1):
+        if not isinstance(rec, dict):
+            fail("%s 第 %d 筆不是 object" % (path, i))
+        cell_id = str(rec.get("cell_id") or "").strip()
+        reason = str(rec.get("reason") or "").strip()
+        if not cell_id:
+            fail("%s 第 %d 筆缺 cell_id" % (path, i))
+        if cell_id not in known:
+            fail("%s 指向不存在的 cell：%s" % (path, cell_id))
+        if not reason:
+            fail("%s 的 %s 缺 reason——descope 必須具名理由（audit 要引用）" % (path, cell_id))
+        out[cell_id] = reason
+    return out
+
+
 def _needs_human_index(amendments):
     """回傳 (cell 級集合, 'cell/rN' 級集合, 呈報清單)。"""
     cells = set()
@@ -413,8 +451,13 @@ def expand_schedule(man, amendments):
 
 
 def merged_view(man, results_dir):
-    """`next` 與 audit 共用的 merge 視圖（四型都有定義的語意）。"""
+    """`next` 與 audit 共用的 merge 視圖（四型 amendments + descope 都有定義的語意）。
+
+    這裡是唯一的 merge 點——`schedule` / `view` / `next` 全部經過它，所以 journal 與
+    descope.json 的讀取都收斂在這一個函式，不散在各子命令。
+    """
     amendments = load_amendments(results_dir)
+    descoped = load_descope(results_dir, man)
     execs = expand_schedule(man, amendments)
 
     # cap-update：只影響「尚未執行」者；已執行者的 cap 以 bundle 為準，不追溯改寫。
@@ -428,12 +471,18 @@ def merged_view(man, results_dir):
     done = 0
     pending = 0
     blocked = 0
+    dropped = 0
     for ex in execs:
         cap_override = ex.pop("_cap_override")
         key = "%s/%s" % (ex["cell_id"], ex["replicate"])
         marker = os.path.join(results_dir, ex["cell_id"], ex["replicate"], "DONE")
         if os.path.isfile(marker):
+            # 已完成的 replicate 一律保持 done：descope 是「不再跑」，不是抹掉既有證據。
             ex["status"] = "done"
+        elif ex["cell_id"] in descoped:
+            # descoped 優先於 needs-human：cell 級成本決策是終局裁決，人不必再看。
+            ex["status"] = "descoped"
+            ex["descope_reason"] = descoped[ex["cell_id"]]
         elif ex["cell_id"] in nh_cells or key in nh_reps:
             ex["status"] = "needs-human"
         else:
@@ -463,6 +512,8 @@ def merged_view(man, results_dir):
                 ex["measurement_cap_source"] = "base"
             if ex["status"] == "pending":
                 pending += 1
+            elif ex["status"] == "descoped":
+                dropped += 1
             else:
                 blocked += 1
         # guard 不變條件（§Cap policy）：guard_deadline >= measurement_deadline + 600
@@ -481,10 +532,12 @@ def merged_view(man, results_dir):
             "done": done,
             "pending": pending,
             "needs_human": blocked,
+            "descoped": dropped,
         },
         "executions": execs,
         "amendments": amendments,
         "needs_human": nh_list,
+        "descoped": [{"cell_id": k, "reason": v} for k, v in sorted(descoped.items())],
     }
 
 

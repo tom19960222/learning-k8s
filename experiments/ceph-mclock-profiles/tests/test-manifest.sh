@@ -394,6 +394,84 @@ cp "$tmp/journal.bak" "$J"
 mp view --results "$R4" >/dev/null || fail "還原 journal 後 view 應恢復"
 ok
 
+# =============================================================================
+# 13. Task 0.2：descope 的佇列端效果（第五種狀態，與 needs-human 分開）
+# =============================================================================
+R5="$tmp/r5"
+mp generate --inventory "$fixture" --results "$R5" --assert >/dev/null
+M5="$R5/manifest.json"
+D5="$R5/descope.json"
+V5="$tmp/view5.json"
+cell_d="$(pyq "$M5" '[c["cell_id"] for c in d["cells"] if c["fault"]=="osd-down" and c["profile"]=="balanced"][0]')"
+cell_d2="$(pyq "$M5" '[c["cell_id"] for c in d["cells"] if c["fault"]=="flapping" and c["profile"]=="balanced"][0]')"
+
+# 前置：沒有 descope.json 時一切照常（第五種狀態不得憑空冒出來）
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" 'd["counts"]["descoped"]')" "0" "無 descope.json 時 counts.descoped=0"
+eq "$(pyq "$V5" 'sorted(set(e["status"] for e in d["executions"]))')" "['pending']" "無 descope.json 時只有 pending"
+
+write_descope() { # write_descope <json>
+  printf '%s\n' "$1" > "$D5"
+}
+write_descope "{\"cells\": [{\"cell_id\": \"${cell_d}\", \"reason\": \"descope-① 低壓降 n=1（成本逼近天花板）\"}]}"
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" 'sorted(set(e["status"] for e in d["executions"] if e["cell_id"]=="'"$cell_d"'"))')" \
+   "['descoped']" "descope.json 列出的 cell 在 view 標 descoped"
+eq "$(pyq "$V5" 'sorted(set(e["status"] for e in d["executions"] if e["cell_id"]!="'"$cell_d"'"))')" \
+   "['pending']" "只影響被 descope 的 cell"
+# counts 獨立欄位：descoped 不得混進 pending / needs_human
+base_n_d="$(pyq "$M5" '[c["base_n"] for c in d["cells"] if c["cell_id"]=="'"$cell_d"'"][0]')"
+eq "$(pyq "$V5" 'd["counts"]["descoped"]')" "$base_n_d" "counts.descoped 獨立計數"
+eq "$(pyq "$V5" 'd["counts"]["needs_human"]')" "0" "descoped 不得混進 needs_human"
+eq "$(pyq "$V5" 'd["counts"]["done"] + d["counts"]["pending"] + d["counts"]["needs_human"] + d["counts"]["descoped"]')" \
+   "$(pyq "$V5" 'd["counts"]["total_executions"]')" "四種未完成/完成狀態相加 = 總數"
+eq "$(pyq "$V5" '[x["reason"] for x in d["descoped"] if x["cell_id"]=="'"$cell_d"'"][0]')" \
+   "descope-① 低壓降 n=1（成本逼近天花板）" "view 帶出 descope 理由（audit 要引用）"
+# next 跳過（單步操作：不必再補 needs-human amend）
+eq "$(mp next --results "$R5" --kind fault | python3 -c 'import json,sys;print(json.load(sys.stdin)["cell_id"])' | grep -c "^${cell_d}\$" || true)" \
+   "0" "next 跳過 descoped 的 cell"
+
+# 已完成的 replicate 保持 done（descope 是「不再跑」，不是「抹掉已有證據」）
+mark_done "$R5" "$cell_d" r1
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" '[e["status"] for e in d["executions"] if e["cell_id"]=="'"$cell_d"'" and e["replicate"]=="r1"][0]')" \
+   "done" "descope 不得改寫已完成的 replicate"
+eq "$(pyq "$V5" 'd["counts"]["descoped"]')" "$((base_n_d - 1))" "已完成者不計入 descoped"
+
+# descoped 優先於 needs-human：cell 級成本決策是終局，人不必再看
+mp amend --results "$R5" --type needs-human --key "${cell_d}/r2" --value "taint budget" --source watchdog >/dev/null
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" '[e["status"] for e in d["executions"] if e["cell_id"]=="'"$cell_d"'" and e["replicate"]=="r2"][0]')" \
+   "descoped" "同時 descope + needs-human → descoped 優先（終局決策）"
+eq "$(pyq "$V5" 'd["counts"]["needs_human"]')" "0" "兩者不得重複計數"
+
+# 多個 cell
+write_descope "{\"cells\": [{\"cell_id\": \"${cell_d}\", \"reason\": \"r1\"}, {\"cell_id\": \"${cell_d2}\", \"reason\": \"r2\"}]}"
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" 'len(d["descoped"])')" "2" "多筆 descope 都要進視圖"
+
+# 壞檔一律 die（成本決策不得靜默失效——這正是原本兩步操作的失敗模式）
+write_descope 'not-json'
+mp view --results "$R5" >/dev/null 2>&1 && fail "descope.json 壞檔應讓 view 失敗"
+ok
+mp next --results "$R5" >/dev/null 2>&1 && fail "descope.json 壞檔應讓 next 失敗"
+ok
+write_descope "{\"cells\": [{\"cell_id\": \"no-such-cell+balanced\", \"reason\": \"x\"}]}"
+mp view --results "$R5" >/dev/null 2>&1 && fail "descope 指向不存在的 cell 應 die"
+ok
+write_descope "{\"cells\": [{\"cell_id\": \"${cell_d}\"}]}"
+mp view --results "$R5" >/dev/null 2>&1 && fail "descope 缺 reason 應 die（不得有無理由的缺件）"
+ok
+write_descope "{\"cells\": [{\"cell_id\": \"${cell_d}\", \"reason\": \"  \"}]}"
+mp view --results "$R5" >/dev/null 2>&1 && fail "descope 理由空白應 die"
+ok
+write_descope "{\"cells\": [{\"cell_id\": \"${cell_d}\", \"reason\": \"ok\"}]}"
+mp view --results "$R5" >/dev/null || fail "修好 descope.json 後 view 應恢復"
+ok
+rm -f "$D5"
+mp view --results "$R5" > "$V5"
+eq "$(pyq "$V5" 'd["counts"]["descoped"]')" "0" "移除 descope.json 即恢復（成本決策可撤回）"
+
 # 沒有 journal 時（campaign 初期）一切正常
 eq "$(pyq "$V" 'd["schema_version"]')" "1" "view schema_version"
 V0="$tmp/view0.json"

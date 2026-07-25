@@ -167,6 +167,79 @@ QOS_CONVERGE_SECS=30 ceph_qos_gate balanced "$bundle4" >/dev/null \
 ok
 eq "$(count_of "$FAKE_SSH_LOG" 'config show')" "24" "未收斂就重驗整組（8×3）"
 
+# ============================================================== ceph_set_profile ==
+# Task 0.1：qos gate 只**驗證** profile，必須另有地方真的**設定**它，否則第一個非
+# balanced 的 cell 會在 preflight 卡到收斂逾時。
+prof_file() { # <profile> → 檔案路徑（模擬 `ceph config get` 的輸出）
+  printf '%s\n' "$1" > "$tmp/prof-$1.txt"
+  printf '%s\n' "$tmp/prof-$1.txt"
+}
+P_BAL="$(prof_file balanced)"
+P_HCO="$(prof_file high_client_ops)"
+
+# 6a) 三個合法 profile 之外一律 die，且**不得**對叢集下任何指令
+reset_ssh
+( ceph_set_profile mclock_scheduler ) >/dev/null 2>&1 && fail "非法 profile 應 die"
+ok
+( ceph_set_profile "" ) >/dev/null 2>&1 && fail "空 profile 應 die"
+ok
+( ceph_set_profile ) >/dev/null 2>&1 && fail "缺參數應 die"
+ok
+eq "$(cat "$FAKE_SSH_STATE/count" 2>/dev/null || echo 0)" "0" "非法 profile 不得下任何遠端指令"
+
+# 6b) 已經是目標 profile → 冪等，不得重下 config set
+reset_ssh
+expect_ssh 'config get osd osd_mclock_profile' 0 0 "$P_BAL"
+out="$(ceph_set_profile balanced)" || fail "ceph_set_profile balanced 應成功"
+ok
+eq "$out" "set-profile: NOOP balanced" "冪等時的機器行"
+hasnt "$FAKE_SSH_LOG" "config set osd osd_mclock_profile" "已是目標 profile 不得重下指令"
+
+# 6c) 切換：argv 逐字斷言（section 一律 osd，不是 global／osd.N）
+reset_ssh
+expect_ssh 'config get osd osd_mclock_profile' 0 0 "$P_BAL"
+expect_ssh 'config set osd osd_mclock_profile high_client_ops' 0 0 ""
+out="$(ceph_set_profile high_client_ops)" || fail "切換到 high_client_ops 應成功"
+ok
+eq "$out" "set-profile: SET balanced high_client_ops" "切換的機器行（含前一個 profile 留痕）"
+has "$FAKE_SSH_LOG" "sudo ceph config set osd osd_mclock_profile high_client_ops" "argv 逐字"
+eq "$(count_of "$FAKE_SSH_LOG" 'config set osd osd_mclock_profile')" "1" "切換只下一次指令"
+eq "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" "1" "stdout 只有一行機器行"
+
+# 6d) 第三個合法 profile 也要能設
+reset_ssh
+expect_ssh 'config get osd osd_mclock_profile' 0 0 "$P_HCO"
+expect_ssh 'config set osd osd_mclock_profile high_recovery_ops' 0 0 ""
+out="$(ceph_set_profile high_recovery_ops)" || fail "切換到 high_recovery_ops 應成功"
+ok
+eq "$out" "set-profile: SET high_client_ops high_recovery_ops" "high_recovery_ops 機器行"
+
+# 6e) 查不到當下 profile → die（不得盲設）
+reset_ssh
+expect_ssh 'config get osd osd_mclock_profile' 1 0 ""
+( ceph_set_profile high_client_ops ) >/dev/null 2>&1 && fail "查當下 profile 失敗應 die"
+ok
+hasnt "$FAKE_SSH_LOG" "config set osd osd_mclock_profile" "查詢失敗後不得續下 set"
+
+# 6f) 設定指令失敗 → die（不得靜默續行讓 gate 去撞逾時）
+reset_ssh
+expect_ssh 'config get osd osd_mclock_profile' 0 0 "$P_BAL"
+expect_ssh 'config set osd osd_mclock_profile high_client_ops' 1 0 ""
+( ceph_set_profile high_client_ops ) >/dev/null 2>&1 && fail "config set 失敗應 die"
+ok
+
+# 6g) H-018：osd_mclock_profile **不在** FORBIDDEN_IN_MON_STORE（九個衍生參數才是
+#     set_val_default）——所以「設 profile」與 qos gate 的來源反向斷言不衝突。
+has "$fx/config-dump-clean.json" '"name": "osd_mclock_profile"' \
+  "乾淨的 config dump 本來就帶 osd_mclock_profile（mon store 有它是正常的）"
+reset_ssh
+bundle_sp="$tmp/bundle-setprof"; mkdir -p "$bundle_sp"
+qos_expect_pass "$fx/config-show-balanced.json" "$fx/config-dump-clean.json"
+qos_expect_pass "$fx/config-show-balanced.json" "$fx/config-dump-clean.json"
+ceph_qos_gate balanced "$bundle_sp" >/dev/null \
+  || fail "mon store 有 osd_mclock_profile 不得讓 qos gate 擋下"
+ok
+
 # ====================================================== ceph_capacity_provenance ==
 prov_expect() { # <journal fixture for all 8> <cluster-log fixture> <config-show fixture>
   local i

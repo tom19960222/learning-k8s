@@ -12,12 +12,13 @@
 #   claim_acquire / claim_release <cell> <rN>  replicate 級 lease（同上）
 #   watchdog_handle <trigger> <ctx>           trigger-specific 修復（表見下）
 #   watchdog_count <trigger> / watchdog_halted / pipeline_drift_streak
+#   pipeline_unhalt <理由> [--clear-counts]   人工排除後解除停佇列（留痕；入口 run/unhalt.sh）
 #   pipeline_taint_count|bump|clear <cell> <rN> [reason]   taint/abort 重試預算
 #   pipeline_apply_amendments <cell>          verdict.py 的建議 → manifest.py amend
 #
 # 順序不可變（plan §Replicate Pipeline，測試逐項斷言）
 # -------------------------------------------------
-#   claim → preflight（qos gate + final_clean + bg-collector）→ prediction freeze →
+#   claim → preflight（set profile → qos gate + final_clean + bg-collector）→ prediction freeze →
 #   sampler_start → sampler_assert_alive → **fio 啟動 + readiness barrier（注入之前！）** →
 #   fault_t0 + measurement_deadline → 注入 → 量測窗（stop-condition = recovery_complete，
 #   撞 cap = right-censored 仍是有效觀測）→ 停 fio → 回歸 → safety gate（final_clean +
@@ -153,6 +154,39 @@ def cmd_state(path, op, *rest):
         doc["halted"] = True
         doc["halt_reason"] = rest[0]
         out = rest[0]
+    elif op == "unhalt":
+        # 人工排除問題後解除停佇列。設計約束（Task 0.3）：
+        #   - 理由必填：解除是人工裁決，不得無聲清除（留痕進 unhalt_log，append-only）
+        #   - **預設保留** trigger counts 與 drift streak：沒被排除的累積不該憑空歸零，
+        #     要歸零得明示 --clear-counts（例如 recalibrate 裁決完才清 drift streak）
+        clear = False
+        positional = []
+        for arg in rest:
+            if arg == "--clear-counts":
+                clear = True
+            elif arg.startswith("--"):
+                die("unhalt 未知旗標：%s" % arg)
+            else:
+                positional.append(arg)
+        reason = positional[0].strip() if positional else ""
+        if not reason:
+            die("unhalt 需要理由（留痕）：state <path> unhalt <理由> [--clear-counts]")
+        if not doc.get("halted"):
+            print("unhalt: NOOP")
+            return
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        doc.setdefault("unhalt_log", []).append({
+            "at": now, "reason": reason, "cleared_counts": clear,
+            "halt_reason": doc.get("halt_reason"),
+        })
+        doc["halted"] = False
+        doc["halt_reason"] = None
+        doc["unhalted_at"] = now
+        doc["unhalt_reason"] = reason
+        if clear:
+            doc["counts"] = {}
+            doc["drift_streak"] = 0
+        out = "unhalt: OK cleared-counts" if clear else "unhalt: OK"
     elif op == "drift-bump":
         n = int(doc.get("drift_streak", 0)) + 1
         doc["drift_streak"] = n
@@ -388,6 +422,13 @@ watchdog_count() { # <trigger>
 watchdog_halted() { _pipeline_py state "$(watchdog_state_path)" halted; }
 
 pipeline_drift_streak() { _pipeline_py state "$(watchdog_state_path)" drift; }
+
+# pipeline_unhalt <理由> [--clear-counts]：人工排除問題後解除停佇列（run/unhalt.sh 的核心）。
+# 理由必填且會留痕（results/watchdog-state.json 的 unhalt_log）；trigger counts 預設保留。
+pipeline_unhalt() {
+  [ $# -ge 1 ] || die "用法：pipeline_unhalt <理由> [--clear-counts]"
+  _pipeline_py state "$(watchdog_state_path)" unhalt "$@"
+}
 
 _pipeline_halt_queue() { # <reason>
   [ $# -eq 1 ] || die "用法：_pipeline_halt_queue <reason>"
@@ -906,7 +947,11 @@ _pipeline_freeze_prediction() {
 _pipeline_attempt() {
   local b="$_PIPE_BUNDLE" mode t0 deadline guard t_in t_clean wrc=0 irc=0
 
-  # --- preflight：qos gate（含 mclock scheduler / skip_benchmark）+ final_clean + collector ---
+  # --- preflight：設 profile → qos gate（含 mclock scheduler / skip_benchmark）
+  #     + final_clean + collector ---
+  # 順序不可倒：`ceph_set_profile` 只下指令（冪等），八顆是否同時收斂到該 profile
+  # 一律由 `ceph_qos_gate` 判定——gate 仍是 preflight 的唯一通過判準。
+  ceph_set_profile "$_PIPE_PROFILE" >&2 || { _PIPE_REASON="set-profile"; return 1; }
   ceph_qos_gate "$_PIPE_PROFILE" "$b" >&2 || { _PIPE_REASON="qos-gate"; return 1; }
   _pipeline_final_clean_gate || { _PIPE_REASON="preflight-final-clean"; return 1; }
   bg_collect_assert_alive >&2 || bg_collect_ensure >&2 \
