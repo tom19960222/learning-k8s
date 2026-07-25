@@ -25,8 +25,10 @@ files=()
 while IFS= read -r f; do
   files+=("$f")
 done < <(find "$exp_root" -type f -name '*.sh' -not -path '*/results/*' | sort)
-# fake ssh 沒有 .sh 副檔名（必須叫 ssh 才能被 PATH 覆蓋），但一樣是 bash 腳本。
-[ -f "$here/fakes/ssh" ] && files+=("$here/fakes/ssh")
+# fakes 沒有 .sh 副檔名（必須叫 ssh / az 才能被 PATH 覆蓋），但一樣是 bash 腳本。
+while IFS= read -r f; do
+  files+=("$f")
+done < <(find "$here/fakes" -type f | sort)
 if [ "${#files[@]}" -gt 0 ]; then
   # -x：跟進 source 的檔案（各檔已標 source-path=SCRIPTDIR）；-S style：含 info/style 級。
   shellcheck -x -S style "${files[@]+"${files[@]}"}" >&2 || die "shellcheck 有發現"
