@@ -262,6 +262,13 @@ R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望�
 
 **Files:** Create `lib/pipeline.sh`、`tests/test-pipeline.sh`
 
+**與已完成 lib 的接合契約（v4.4，Task 4/10 實作後定案，實作 Task 11 時必遵）**：
+- `bundle_finalize` 的契約只吃「必備檔清單」；**cross-check（cell/profile/manifest-hash/time-window/freeze-sha/tainted）在 `verdict.py schemas <kind> --verify <bundle>`**——pipeline **必須顯式呼叫它**，否則交叉核對永遠不會執行。
+- prediction 的 `manifest_hash` 寫 `manifest.py next` 給的值（= cells 內容 hash，跨重新產生穩定）。
+- **`return-backfill.json`**（H-008 的兩個時戳 + 該區間 recovery bytes/s）已進 fault schema，由 pipeline 於 safety gate 期間產出。
+- `verdict.py --emit-amend` 的輸出是**建議**（無 `seq`），**不可**直接 append 進 journal；一律轉譯成 `manifest.py amend --type ... --key ... --value ...` 呼叫（由它配 `seq`）。
+- `manifest.py next` 佇列耗盡回 **exit 3**（與錯誤區分）；`--kind steady|fault|chaos` 讓薄入口只消費自己的區塊。
+
 - `pipeline_run_execution <execution-json>`：實作 §Replicate Pipeline 全序列（claim → preflight → freeze → sampler → **fio 先行 + readiness** → fault_t0 → 注入 → stop-condition=recovery_complete|measurement_deadline → 停 fio → 回歸 → final_clean → baseline → collect → aggregate → verdict → finalize → release）；per-fault 行為由 `fault_params` 分派到 Task 8 狀態機；穩態/chaos 為同一機的參數化路徑。
 - `reconcile`：單 runner lock、殘留掃描（MCLOCK-ISO/down-out OSD/registry process/未 finalize attempt）、**bg-collector 存活檢查（死了就 restart——resume 路徑的 start 點之一）**、final_clean 後才放行。
 - claim lease：`results/<cell>/rN/.claim`（mkdir 原子 + runner id + 心跳；stale 接管）。
@@ -305,7 +312,7 @@ R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望�
 
 **Files:** Create `run/chaos.sh`、`run/all.sh`、`tests/test-chaos-all.sh`
 
-- chaos：manifest 驅動 3 executions，走同一 pipeline（chaos 也有 prediction/verdict/finalize，round2/F21）。
+- chaos：manifest 驅動 3 executions，走同一 pipeline（chaos 也有 prediction/verdict/finalize，round2/F21）；**chaos schema 含 `cleanup-proof.json`**（v4.4：chaos 注入多重故障，必須證明全數回退）。
 - `all.sh` 收尾順序（round2 blocker 10 修正）：faults/chaos 完 → 停全部注入/fio（reconcile 級掃描）→ `ceph_campaign_unflags` + `client_tuning_restore` → `sampler`/`bg_collect` 全停 → **資料集封閉**（不再有 writer）→ `verdict.py audit`（唯讀）→ `campaign: DONE`。audit FAIL 也不會留下 flags/writer。
 - [ ] Step 1: 測試先行（收尾順序、audit 唯讀、audit FAIL 不留殘態）。
 - [ ] Step 2: 實作至 gate 綠。
