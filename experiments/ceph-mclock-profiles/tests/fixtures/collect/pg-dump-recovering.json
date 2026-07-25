@@ -1,0 +1,152 @@
+{
+ "pg_ready": true,
+ "pg_map": {
+  "version": 40012,
+  "stamp": "2026-07-25T03:10:05.123456+0000",
+  "last_osdmap_epoch": 514,
+  "last_pg_scan": 511,
+  "pg_stats_sum": {
+   "stat_sum": {
+    "num_bytes": 322122547200,
+    "num_objects": 76800,
+    "num_object_copies": 230400,
+    "num_objects_degraded": 12000,
+    "num_objects_misplaced": 0,
+    "num_objects_recovered": 2560,
+    "num_bytes_recovered": 10737418240,
+    "num_keys_recovered": 0,
+    "num_read": 0,
+    "num_write": 0
+   },
+   "store_stats": {
+    "total": 0,
+    "available": 0
+   },
+   "log_size": 12800,
+   "ondisk_log_size": 12800
+  },
+  "osd_stats_sum": {
+   "up_from": 15,
+   "seq": 0,
+   "num_pgs": 384,
+   "num_osds": 8,
+   "num_per_pool_osds": 8
+  },
+  "pg_stats_delta": {
+   "stat_sum": {
+    "num_bytes_recovered": 268435456,
+    "num_objects_recovered": 64
+   },
+   "stamp_delta": "5.000000"
+  },
+  "pg_stats": [
+   {
+    "pgid": "2.0",
+    "version": "514'12000",
+    "reported_epoch": 514,
+    "state": "active+clean",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 0,
+     "num_bytes_recovered": 0,
+     "num_objects_recovered": 0
+    },
+    "up": [0, 3, 5],
+    "acting": [0, 3, 5]
+   },
+   {
+    "pgid": "2.1",
+    "version": "514'12001",
+    "reported_epoch": 514,
+    "state": "active+undersized+degraded",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 600,
+     "num_bytes_recovered": 0,
+     "num_objects_recovered": 0
+    },
+    "up": [0, 5],
+    "acting": [0, 5]
+   },
+   {
+    "pgid": "2.2",
+    "version": "514'12002",
+    "reported_epoch": 514,
+    "state": "active+recovering+degraded",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 300,
+     "num_bytes_recovered": 5368709120,
+     "num_objects_recovered": 1280
+    },
+    "up": [1, 4, 6],
+    "acting": [1, 4, 6]
+   },
+   {
+    "pgid": "2.3",
+    "version": "514'12003",
+    "reported_epoch": 514,
+    "state": "active+recovering+degraded",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 300,
+     "num_bytes_recovered": 5368709120,
+     "num_objects_recovered": 1280
+    },
+    "up": [2, 4, 7],
+    "acting": [2, 4, 7]
+   },
+   {
+    "pgid": "2.4",
+    "version": "514'12004",
+    "reported_epoch": 514,
+    "state": "peering",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 0,
+     "num_bytes_recovered": 0,
+     "num_objects_recovered": 0
+    },
+    "up": [1, 5, 7],
+    "acting": [1, 5, 7]
+   },
+   {
+    "pgid": "2.5",
+    "version": "514'12005",
+    "reported_epoch": 514,
+    "state": "active+remapped+backfilling",
+    "stat_sum": {
+     "num_bytes": 2516582400,
+     "num_objects": 600,
+     "num_objects_degraded": 0,
+     "num_bytes_recovered": 0,
+     "num_objects_recovered": 0
+    },
+    "up": [2, 6, 7],
+    "acting": [2, 6, 4]
+   }
+  ],
+  "pool_stats": [
+   {
+    "poolid": 2,
+    "num_pg": 128,
+    "stat_sum": {
+     "num_bytes": 322122547200,
+     "num_objects": 76800
+    }
+   }
+  ],
+  "osd_stats": [
+   {
+    "osd": 0,
+    "up_from": 15,
+    "num_pgs": 48
+   }
+  ]
+ }
+}
