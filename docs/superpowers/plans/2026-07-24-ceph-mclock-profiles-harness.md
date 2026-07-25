@@ -23,6 +23,8 @@
 - **fio 常數**：krbd、`ioengine=libaio`、`direct=1`、`randseed=4242`；4K randrw 70/30 `iodepth=16 numjobs=4`；1M seq write `iodepth=8 numjobs=2`；穩態單段 300s+ramp 30s；故障/chaos 連續 300s segment；time-series 契約 `log_avg_msec=1000` + `write_iops_log`/`write_lat_log`/`write_hist_log`（`log_hist_msec=1000`）+ `log_unix_epoch=1`；**fio 版本記入 env snapshot 並在 first-cell 前用真機 raw log 校正 parser**（Task 7/12）。
 - **clean 判準（spec rev 7，全 plan 唯一引用）**：`recovery_complete`（當下 up set 下 PG 100% active+clean）｜`final_clean`（OSD 全 up+in + PG 100% active+clean + health 僅允許自設 noscrub/nodeep-scrub）。
 - campaign 固定設定：noscrub、nodeep-scrub、balancer off、autoscaler off、`mon_osd_adjust_heartbeat_grace=false`、**`mon_osd_adjust_down_out_interval=false`**（v4.3/H-015：獨立開關、預設 true，只關前者控制不完全）；**設定當下即以 cleanup stack 註冊對稱 unset**（abort path 也會執行）。
+  **跨 script 交棒（v4.5，實作時發現的真 bug）**：`common.sh` 有 `trap cleanup_run EXIT`，calibrate 一結束就會把 flags 還原 → 整個 campaign 在**沒有 noscrub** 的狀態下跑。故 calibrate **成功**收尾時必須把 flags 那段 cleanup 區間移除（以索引記錄，不動其他項目）完成交棒；失敗／中斷路徑照常回退，且回退時必須**對稱清掉 `campaign-flags.done` marker**，否則續跑會跳過該步、整場 campaign 無 noscrub。
+- **profile 基準的取得方式**：`fio_calibrate` 要求 balanced，但**不得**用 `ceph config set osd osd_mclock_profile balanced` 取得——那會寫進 mon config store，撞上 `ceph_qos_gate` 的來源反向斷言（H-009/H-018）。依賴 v19.2.2 編譯預設即 balanced；真機首跑若因 profile 不符 die，**人工裁決，不可用 config set 繞過**。
 
 ## Replicate Pipeline（所有 execution 的唯一流程 SoT）
 
@@ -293,7 +295,7 @@ R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望�
 
 **Files:** Create `run/calibrate.sh`、`tests/test-calibrate.sh`
 
-順序：verify-provision（含 az preflight）→ `env_snapshot_provision` → **raw NVMe fio ×8（bootstrap 前）** → 部署鏈（Task 5 序列含 versions gate + smoke）→ `campaign_flags` → `env_snapshot_cluster` → capacity provenance + **decide（全五狀態決策表 + 跨 8 顆 CoV gate）** + lock → **reboot canary（`ceph_verify_no_rebench`：current-boot 合取證據——boot ID 變更 + unit-scoped `journalctl -b -u ceph-<fsid>@osd.N` 無 bench log + effective skip + 值未變）** → network baseline（iperf3）→ images + `client_tuning_apply` + map + `env_snapshot_map` + precondition → **`fio_smoke_real`（parser 校正）** → calibrate ×2 → `manifest.py generate --assert` → **`bg_collect_start`（v4.1：campaign 級收集在此啟動——所有 execution preflight 的 `bg-collector alive` 由此保證；all.sh 收尾對稱 stop、reconcile 負責 resume 時重啟）** → `calibrate: PASS`。
+順序：verify-provision（含 az preflight）→ `env_snapshot_provision` → **raw NVMe fio ×8（bootstrap 前）** → 部署鏈（Task 5 序列含 versions gate + smoke）→ `campaign_flags` → `env_snapshot_cluster` → capacity provenance + **decide（全五狀態決策表 + 跨 8 顆 CoV gate）** + lock → **reboot canary（`ceph_verify_no_rebench`：current-boot 合取證據——boot ID 變更 + unit-scoped `journalctl -b -u ceph-<fsid>@osd.N` 無 bench log + effective skip + 值未變）** → network baseline（iperf3）→ images → **map → `client_tuning_apply` + verify**（v4.5 實作修正：tuning 走 `_fio_blk → fio_device`，依賴 `fio_map_all` 寫下的 rbd map 記錄，故必須在 map 之後）→ `env_snapshot_map` + precondition → **`fio_smoke_real`（parser 校正）** → calibrate ×2 → `manifest.py generate --assert` → **`bg_collect_start`（v4.1：campaign 級收集在此啟動——所有 execution preflight 的 `bg-collector alive` 由此保證；all.sh 收尾對稱 stop、reconcile 負責 resume 時重啟）** → `calibrate: PASS`。
 
 - [ ] Step 1: 測試先行（順序含 smoke_real、五狀態決策表、CoV gate；canary 用 current-boot 合取證據（boot ID + **unit-scoped** `journalctl -b -u ceph-<fsid>@osd.N`）**且測試中不得出現 pre-reboot cursor 或裸 `journalctl -b`**；`bg_collect_start` 在 `calibrate: PASS` 前——即 steady 第一個 preflight 之前）。
 - [ ] Step 2: 實作至 gate 綠。
