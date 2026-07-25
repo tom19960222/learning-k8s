@@ -126,9 +126,11 @@ _b64() { base64 < "$1" | tr -d '\n'; }
 
 # ceph_fsid：cephadm 部署後的 cluster fsid（OSD 的 systemd unit 名要用），快取。
 ceph_fsid() {
+  local _raw
   if [ -z "${CEPH_FSID:-}" ]; then
-    CEPH_FSID="$(ceph_adm "ceph fsid" | tr -d ' \r\n')" \
-      || die "取不到 ceph fsid"
+    # 取值與 trim 分兩步：`$(cmd | tr)` 的 rc 來自 tr（恆 0），`|| die` 會失效。
+    _raw="$(ceph_adm "ceph fsid")" || die "取不到 ceph fsid"
+    CEPH_FSID="$(printf '%s' "$_raw" | tr -d ' \r\n')"
     [ -n "$CEPH_FSID" ] || die "ceph fsid 是空的"
     export CEPH_FSID
   fi
@@ -137,9 +139,10 @@ ceph_fsid() {
 
 # ceph_osd_ids：八顆 OSD 的 id（空白分隔），快取。
 ceph_osd_ids() {
+  local _raw
   if [ -z "${CEPH_OSD_IDS:-}" ]; then
-    CEPH_OSD_IDS="$(ceph_adm "ceph osd ls" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')" \
-      || die "取不到 osd 清單"
+    _raw="$(ceph_adm "ceph osd ls")" || die "取不到 osd 清單"
+    CEPH_OSD_IDS="$(printf '%s' "$_raw" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')"
     [ -n "$CEPH_OSD_IDS" ] || die "ceph osd ls 是空的"
     export CEPH_OSD_IDS
   fi

@@ -1208,8 +1208,12 @@ fio_calibrate() {
   [ $# -eq 1 ] || die "用法：fio_calibrate <shape>"
   local shape="$1" profile base b r ceilings="" achieved
   local ceiling low mid high rates refs="" pressure rate p99
-  profile="$(ceph_adm "ceph config get osd osd_mclock_profile" | tr -d ' \r\n')" \
+  local _praw
+  # 取值與 trim 分兩步：`$(cmd | tr)` 的 rc 來自 tr（恆 0），`|| die` 會失效。
+  _praw="$(ceph_adm "ceph config get osd osd_mclock_profile")" \
     || die "取不到目前的 mclock profile"
+  profile="$(printf '%s' "$_praw" | tr -d ' \r\n')"
+  [ -n "$profile" ] || die "取到的 mclock profile 是空的"
   [ "$profile" = "balanced" ] \
     || die "校準必須在 balanced profile 下做（目前 ${profile}）——treatment 不得污染 dose"
   ceph_wait_final_clean "$FIO_CALIB_CLEAN_SECS" >/dev/null \
