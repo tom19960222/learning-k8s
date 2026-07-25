@@ -1,6 +1,6 @@
 # Ceph mClock profile 對照實驗（Azure 真機）— 設計（spec）
 
-> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行；rev 4：provisioning 改由 IaC agent 依 PROVISIONING-REQUIREMENTS.md 實作；rev 5：套用 plan review 波及 spec 的修正——clean 判準、capacity 順序+skip_benchmark、fio segment 續跑、adaptive grace 裁決、生效驗證強化、node loss 命名統一；rev 6：兩層 clean 判準（recovery-complete vs final-clean）、故障 replicate 改 workload 先行、fault_t0 絕對時間軸、殘留 HEALTH_OK/power-off 清除；rev 7：degradation ratio 分母改 within-replicate 注入前健康窗、雙軌 margin（noise + production 預註冊門檻）、mon repair vs injection 釐清）
+> 日期：2026-07-24（rev 2：套用 codex gpt-5.6-sol high review 21 條 findings；rev 3：krbd datapath、單 NIC 網路設計、node 故障改 ssh-native 網路隔離、stall/brownout 判準、完全自主執行；rev 4：provisioning 改由 IaC agent 依 PROVISIONING-REQUIREMENTS.md 實作；rev 5：套用 plan review 波及 spec 的修正——clean 判準、capacity 順序+skip_benchmark、fio segment 續跑、adaptive grace 裁決、生效驗證強化、node loss 命名統一；rev 6：兩層 clean 判準（recovery-complete vs final-clean）、故障 replicate 改 workload 先行、fault_t0 絕對時間軸、殘留 HEALTH_OK/power-off 清除；rev 7：degradation ratio 分母改 within-replicate 注入前健康窗、雙軌 margin（noise + production 預註冊門檻）、mon repair vs injection 釐清；rev 8：Task 1 Frame 讀碼補正——res 相加=1.0 的 weight 死碼、replica 寫繞過 mClock、cost model 實際刻度、best_effort lim 改 in-scope、adjust_down_out_interval 一併關閉）
 > 方法論：`skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize）
 > 目標版本：**Ceph v19.2.2**（實機部署與原始碼引用皆以 v19.2.2 為準；repo submodule pin 維持 v19.2.3 不動，讀碼用 `git show v19.2.2:<path>`）
 > 產出：`experiments/ceph-mclock-profiles/` 完整實驗報告（`skills/writing-experiment-reports` 五欄格式 + 參數建議總表）
@@ -29,6 +29,11 @@
 
 **機制定位（rev 2 修正）**：res/lim 是**無因次 scheduler ratio**，不是「實體 IOPS × 百分比」的硬配額。Classic OSD 把 ratio 乘上 `osd_mclock_max_sequential_bandwidth_* / num_shards` 換算成 per-shard 的 cost/s（`mClockScheduler.cc:152-185,250-275`）；`osd_mclock_max_capacity_iops_*` 則透過 `sequential_bandwidth / IOPS` 決定每筆 op 的最低成本（`calc_scaled_cost()`，`mClockScheduler.cc:427-436`）。語意：**reservation = 最低保障、weight = 剩餘 capacity 的比例分配、limit = 上限**（lim=0 表示不設限；classic OSD 用 `AtLimit::Wait`）。三個 profile 的 client lim 都是 max —— 無競爭時 client 理論上可借滿全部 capacity。
 
+**rev 8 讀碼補正（Task 1 Frame 產出，全部有 source 錨點）**——這三點決定整份報告怎麼解讀：
+- **三 profile 的 client_res + recovery_res 恆 = 1.0**（60+40 / 50+50 / 30+70）→ 實際吞吐低於鎖定 capacity 時，所有 op 都在 reservation 階段就被派完，**weight 完全不參與排序**；profile 差異退化成純 reservation 比。「weight 是否可觀測」是報告的解讀分水嶺（H-001）。
+- **replica 寫流量完全繞過 mClock**：`PGOpItem::get_scheduler_class`（`OpSchedulerItem.h:243-251`）白名單只有 `CEPH_MSG_OSD_OP`/`CEPH_MSG_OSD_BACKOFF`，REPOP 等一律 `immediate`。4K 70/30 下 immediate 佔入列約 37.5%、1M 全寫約 66.7%——profile 只管得到一部分的 OSD 工作（H-006）。peering 同樣恆 immediate（H-007）。
+- **cost model 的實際刻度**：`Message::get_cost()` = data 長度 → **4K 讀的 cost 為 0**，與 4K 寫在 cost floor 下同價（randrw 的讀寫比在 mClock 帳上不存在）；1M 只等於 4K 的 **17.9×**（非 256×），因 `calc_scaled_cost = max(item_cost, cost_per_io)`、`cost_per_io` 預設 58,525 bytes（H-004）。
+
 - capacity 量測：OSD 啟動時 osd bench **只量 4KiB random write IOPS**（`OSD.cc:10039-10122`），寫入 mon config store；**sequential bandwidth 不量測**，固定用預設 `osd_mclock_max_sequential_bandwidth_ssd=1200 MiB/s`。已有非預設 IOPS 值時啟動即跳過 benchmark；量出值超出 1,000–80,000 IOPS 區間則不採用（`osd.yaml.in:1258-1291`）；`osd_mclock_force_run_benchmark_on_init` 只保證重跑、不保證接受，且需重啟。
 - 九個底層參數：`osd_mclock_scheduler_{client,background_recovery,background_best_effort}_{res,wgt,lim}`。**注意：profile 衍生值是 OSD process 內 `set_val_default()` 套用，不寫入 mon config store，`ceph config dump` 看不到**（`mClockScheduler.cc:396-424`）——生效驗證必須逐 OSD 查 effective config（§6）。
 - `osd_mclock_profile` 可 runtime 切換（`ceph config set osd` 即生效，不需重啟）。
@@ -39,7 +44,7 @@
 - mClock 模式下 `osd_max_backfills`（=1）/ `osd_recovery_max_active_ssd`（=10）被鎖定的機制（`osd_mclock_override_recovery_settings`）——實驗全程保持鎖定預設，只動 profile。
 - `mon_osd_adjust_heartbeat_grace` / `laggy_probability` 累積機制（`OSDMonitor.cc:3195-3239`）——flapping 場景的設計前提。
 - `mon_osd_down_out_subtree_limit=rack` 預設值 → **整個 rack down 時不會 auto-out**（`OSDMonitor.cc:5160-5187`）——rack 場景的核心生產語意。
-- SnapTrim / scrub 落在 best_effort class 的證據（best_effort lim 90% vs 70% 何時可觀測——本實驗不主測，標註為已知邊界）。
+- **best_effort lim 改為 in-scope（rev 8/H-008 裁決）**：非 degraded 的**回歸 backfill**（`osd in` 之後把資料搬回去那一段，`PeeringState.h:1588-1601` 判為 `BEST_EFFORT`）就落在 best_effort class——而 harness 的 safety gate 本來就要等它完成。只要在等待期間多記兩個時戳（回歸開始 → final_clean），就能免費拿到 `lim` 90%（balanced）vs 70%（high_client_ops）vs 無上限（high_recovery_ops）的乾淨對照，這是全實驗**唯一** lim 會 binding 的場景。不加這兩個時戳，報告只能寫「未觀測」。
 
 ## 3. 環境設計（Azure japanwest）
 
@@ -117,7 +122,7 @@
 | node loss（變體） | **網路隔離**（iptables drop 該 node 全部 Ceph 流量、保留 bastion ssh）——ssh-native、可維持任意 down 時長、免 Azure API（rev 3） | 手動 out ×1 OSD | 同 OSD down 但故障路徑不同（heartbeat 逾時 + 整機消失視角） |
 | synthetic CRUSH-rack loss | 同上 ×2 台（同 rack） | 手動 out ×2 OSD | 最大規模 backfill（~1/4 資料）下的 QoS 行為 |
 
-- **flapping 的 adaptive grace（rev 2/F5 + rev 5/F17 裁決）**：Squid 預設 `mon_osd_adjust_heartbeat_grace=true`，重複 down/up 累積 `laggy_probability`；且 **daemon restart 並非可靠的 laggy reset**（`OSDMonitor.cc:3692-3714` 只是更新/衰減，非歸零）→ 跨 cell 污染無法靠 restart 清除。裁決：**campaign 全程設 `mon_osd_adjust_heartbeat_grace=false`**（控制變因，主比較在關閉 adaptive grace 下進行，報告如實標註）；逐輪仍以 OSDMap 事件驗證 down/up，未達 down 即 `ceph osd down` 顯式標記；S3 選配一組 production-default（adaptive grace on）特性化 run。
+- **flapping 的 adaptive grace（rev 2/F5 + rev 5/F17 裁決）**：Squid 預設 `mon_osd_adjust_heartbeat_grace=true`，重複 down/up 累積 `laggy_probability`；且 **daemon restart 並非可靠的 laggy reset**（`OSDMonitor.cc:3692-3714` 只是更新/衰減，非歸零）→ 跨 cell 污染無法靠 restart 清除。裁決：**campaign 全程設 `mon_osd_adjust_heartbeat_grace=false` 與 `mon_osd_adjust_down_out_interval=false`**（rev 8/H-015：後者是**獨立開關且預設 true**，只關前者控制不完全）；**limitations 須記**：laggy 值本身在 48×halflife 內不歸零（`OSDMonitor.cc:3425-3444`），跨 cell 的 laggy 歷史無法完全消除，只能靠 target 綁 group + covariate 記錄降低影響；逐輪仍以 OSDMap 事件驗證 down/up，未達 down 即 `ceph osd down` 顯式標記；S3 選配一組 production-default（adaptive grace on）特性化 run。
 - **managed-out 語意（rev 2/F6）**：手動 out ≠「生產再加 600s」——(a) auto-out 是「至少」600s 再疊 adaptive grace；(b) **rack down 預設 `mon_osd_down_out_subtree_limit=rack` 會一直不 auto-out**，生產上需 operator 手動介入；(c) 立即 out 消除了 down-but-in 期間的 write debt（repo 既有 E-39 已觀察到差異）。報告以「managed-out backfill」定位所有故障 cell，生產語意差異獨立成節。S3 時間允許時加 2 組 auto-out 確認組（OSD down × 中壓 × balanced/high_client_ops，等真 600s+grace）。
 - **node 級故障改用網路隔離的理由（rev 3，取代 rev 2/F18 的 az stop 方案）**：(a) 從叢集視角語意等價（heartbeat 全滅 → node 判 down），而 mClock QoS 行為正是本實驗的觀測對象；(b) ssh-native → 免 Azure API、夜間全自主、down 時長任意可控；(c) 完全避開「stop 是否保留 local NVMe」的文件不一致風險。與真實斷電的差異（OSD process 仍存活、恢復時無 journal replay）在報告如實註明。**reboot canary（Phase 0）**：對 1 台 OSD node `sudo reboot`（planned reboot 不換 host、NVMe 保留），驗證 BlueStore 可讀 + OSD rejoin——這是 watchdog 第二層自救的前提驗證。
 - **選配（S3，時間允許）**：gray network failure——`tc netem` 對單一 OSD node 注入 1–5% packet loss/延遲抖動（對應生產「ping 掉兩個封包」的灰色故障情境），觀察 heartbeat 未斷但效能劣化下三 profile 的 client latency 差異；進 HYPOTHESES.md backlog。

@@ -7,7 +7,7 @@
 
 **Architecture:** bash 3.2 orchestrator（macOS bastion）+ python3；ssh（ProxyJump 過 admin）駆動 15 台 VM。測試靠可程式化 fake ssh + fixtures。campaign 期間零 az 依賴（僅兩個例外：watchdog 2b 的 `az vm restart`、12h 回報循環的唯讀 `az account show` 登入態檢查；campaign 開跑前 az preflight）。
 
-**Spec:** `docs/superpowers/specs/2026-07-24-ceph-mclock-profiles-azure-design.md`（**rev 7**——兩層 clean 判準、workload 先行、fault_t0 絕對時間軸、within-replicate 基線、雙軌 margin）
+**Spec:** `docs/superpowers/specs/2026-07-24-ceph-mclock-profiles-azure-design.md`（**rev 8**——兩層 clean 判準、workload 先行、fault_t0 絕對時間軸、within-replicate 基線、雙軌 margin）
 **Provisioning 契約:** `experiments/ceph-mclock-profiles/PROVISIONING-REQUIREMENTS.md`（v3——netcat/fping、attestation 驗值）
 **Ceph 原始碼讀取**：一律用主 checkout 絕對路徑 `git -C /Users/ikaros/Documents/code/learning-k8s/ceph show v19.2.2:<path>`（本 worktree 的 `ceph/` submodule 未初始化，**不可用**）。
 
@@ -22,7 +22,7 @@
 - **常數**：ssh user=`ikaros`、key=repo `.ssh/id_ed25519`；campaign 專用 cephadm keypair 由 harness 產生（見 Task 5）；inventory=`azure/inventory.json` + `azure/attestation.json`（皆 git-ignored）；image `quay.io/ceph/ceph:v19.2.2`；pool=`mclock`（replica 3、rule `mclock-rack`、pg_num 128、autoscaler off）；client auth=`client.mclock-fio`；RBD image `fio-c1..c4` 各 300 GiB；chaos seed=4242。
 - **fio 常數**：krbd、`ioengine=libaio`、`direct=1`、`randseed=4242`；4K randrw 70/30 `iodepth=16 numjobs=4`；1M seq write `iodepth=8 numjobs=2`；穩態單段 300s+ramp 30s；故障/chaos 連續 300s segment；time-series 契約 `log_avg_msec=1000` + `write_iops_log`/`write_lat_log`/`write_hist_log`（`log_hist_msec=1000`）+ `log_unix_epoch=1`；**fio 版本記入 env snapshot 並在 first-cell 前用真機 raw log 校正 parser**（Task 7/12）。
 - **clean 判準（spec rev 7，全 plan 唯一引用）**：`recovery_complete`（當下 up set 下 PG 100% active+clean）｜`final_clean`（OSD 全 up+in + PG 100% active+clean + health 僅允許自設 noscrub/nodeep-scrub）。
-- campaign 固定設定：noscrub、nodeep-scrub、balancer off、autoscaler off、`mon_osd_adjust_heartbeat_grace=false`；**設定當下即以 cleanup stack 註冊對稱 unset**（abort path 也會執行）。
+- campaign 固定設定：noscrub、nodeep-scrub、balancer off、autoscaler off、`mon_osd_adjust_heartbeat_grace=false`、**`mon_osd_adjust_down_out_interval=false`**（v4.3/H-015：獨立開關、預設 true，只關前者控制不完全）；**設定當下即以 cleanup stack 註冊對稱 unset**（abort path 也會執行）。
 
 ## Replicate Pipeline（所有 execution 的唯一流程 SoT）
 
@@ -42,6 +42,7 @@ claim（原子取得 cell+replicate 的 lease）
    任一持續 gap → 該 attempt 標 taint（禁止 finalize 為有效 replicate），量測繼續以保 cluster 安全回收
 → 停 fio（收 exit proof）→ 回歸（heal/daemon start + osd in）
 → safety gate：等 final_clean（progress deadline：PG 10min 零進展 → watchdog；censor 已在量測窗判定，不因此階段改變）
+   **best_effort 觀測（v4.3/H-008）**：記錄「回歸開始（osd in 完成）」與「final_clean」兩個時戳 + 該區間的 recovery bytes/s ——非 degraded 的回歸 backfill 落 best_effort class，是全實驗唯一 `lim`（90/70/max）會 binding 的場景；兩時戳進 bundle schema
 → baseline 復測（60s）+ `verdict.py baseline-check`（drift gate，見 Task 10）→ sampler_stop → collect_cell → aggregate → verdict → bundle_finalize（per-kind schema）
 → release claim
 ```
@@ -177,14 +178,14 @@ R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望�
 
   | bench_status | 條件 | decision |
   |---|---|---|
-  | `accepted-consistent` | bench 被 Ceph 採用且 bench/raw_fio ∈ [0.5, 2] | 鎖 bench 值 |
+  | `accepted-consistent` | bench 被 Ceph 採用且 bench/raw_fio ∈ [0.5, 2] | 鎖 bench 值（**若恰等於 compiled default 21500 → 偏移 1 IOPS 再鎖**；v4.3/H-012：值 == default 會讓每次 boot 重跑 bench，skip_benchmark 之外的第二道防線） |
   | `accepted-inconsistent` | bench 被採用但比值出界 | 鎖 `min(raw_fio, 72000)`、標 `fio-derived`、報告註明 |
   | `rejected-out-of-range` | bench 值超出 1000–80000 被 Ceph 丟棄 | 鎖 `min(raw_fio, 72000)`、標 `fio-derived` |
   | `skipped-existing-nondefault` | mon store 已有非預設值、bench 未跑 | 對 stored 值做同一比值檢查：consistent → 鎖 stored；inconsistent → 鎖 fio-derived |
   | `failed / no-result` | bench 執行錯誤或 log 缺失 | **die**（`capacity-decide: HUMAN-NEEDED`，不得自動選值） |
 
   決策表齊 8 顆 + **跨 OSD dispersion gate**（8 顆 `locked_value` 的 CoV > 20% → die `capacity-dispersion-high`，不得 lock、不得開跑——spec §4 的異質 NVMe 防線；die 訊息指向 README 的 remediation 步驟：outlier OSD 以 `force_run_benchmark_on_init` + restart 重測、或 operator override 帶 provenance 記錄）才可 `ceph_lock_capacity`（逐顆 set + `skip_benchmark=true`）。
-- `ceph_verify_no_rebench`（v4.2 精確化）：reboot canary 後以**新 boot 證據的合取**判定——boot ID 已變更 + **`journalctl -b -u ceph-<fsid>@osd.N`**（fsid 取自部署步驟；cephadm OSD 在 podman 內、log 走 fsid-scoped unit，裸 `journalctl -b` 撈不到等於空集合假通過）內**無 `osd bench result` 行** + effective `skip_benchmark=true` + capacity 值未變。注意：v19.2.2 的 skip 路徑（`OSD.cc:10024` early return）**沒有**正向「skipped」log 可斷言，只能靠上述合取。
+- `ceph_verify_no_rebench`（v4.2 精確化）：reboot canary 後以**新 boot 證據的合取**判定——boot ID 已變更 + **`journalctl -b -u ceph-<fsid>@osd.N`**（fsid 取自部署步驟；cephadm OSD 在 podman 內、log 走 fsid-scoped unit，裸 `journalctl -b` 撈不到等於空集合假通過）內**無 `osd bench result` 行** + effective `skip_benchmark=true` + capacity 值未變。注意：`skip_benchmark=true` 的 early return（`OSD.cc:10024`）**沒有**正向 log；但 v4.3/H-013 補一個 **positive control**——「值≠default」的 skip 分支（`OSD.cc:10056-10061`）**有** `dout(1) "Skip OSD benchmark test."`，且 capacity 生效有正向 `dout(1)`（H-019）：斷言中必須包含**至少一條該 OSD 本次 boot 的已知存在 log**，否則「查無 bench log」可能只是 log 管道壞掉的假通過。
 - `ceph_wait_recovery_complete <deadline-epoch>`（相對當下 up set 的 active+clean；絕對 deadline）與 `ceph_wait_final_clean <progress-deadline>`（up+in 全員 + clean + flags 白名單；PG 10min 零進展 → exit 3 交 watchdog）。
 - `ceph_osd_state`（up/down 以 `up_from`/`down_at` vs pre-state 判定）、`ceph_wait_pgs_active_for_osd <id>`（round2/F23：`pg ls-by-osd` 全 active）、`ceph_daemon_stop|start`（orch）、`ceph_osd_out|in`、`ceph_check_laggy`（**僅記錄 covariate，不 gate**——round2 REGRESSED 修正）。
 
@@ -212,6 +213,7 @@ R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望�
 
 - `fault_flapping <osd-id>`：attempt 開始先設 **`noout`**（cleanup stack 對稱 unset；v4.2/F5-8——某輪 start 卡住超過 `mon_osd_down_out_interval=600s` 會觸發 auto-out，非計畫 backfill 讓整個 attempt 變質）→ 10 輪 {stop → 等 down（超 grace 顯式 `ceph osd down`）→ start → 等 up → **`ceph_wait_pgs_active_for_osd`** + **斷言該 OSD 未被 out**（被 out 即 taint）}→ unset noout；laggy 逐輪記錄（covariate）。
 - `fault_osd_down <osd-id>`：pre-state 存檔 → `ceph_daemon_stop` → 等 down（`ceph_osd_state` 判定）→ **立即 `ceph osd out`**（fault_t0 已由 pipeline 記錄）。`fault_osd_down_recover <osd-id>`：`ceph_daemon_start` → 等 up → `ceph osd in`。
+- **down 偵測延遲差異（v4.3/H-020）**：`ceph orch daemon stop` 會送 `MOSDMarkMeDown`（<5s 判 down），network isolation 只能等 heartbeat 逾時（≈20s）——兩者的 fault_t0→down 間距本質不同，**必須以 OSDMap epoch 對齊**再比較，不可直接以注入時刻對齊時間軸（否則 node-loss cell 會平白多出 ~15s 的「無故障」窗被算進 stall）。
 - `fault_node_isolate <name>`（round2/F16 + blocker 9 修正）：
   - 規則檔：專用 chain `MCLOCK-ISO`，**ESTABLISHED,RELATED 只允許 admin_private_ip 的 tcp/22 flow**（`-s/-d ${ADMIN_PRIVATE_IP} -p tcp --dport/--sport 22 -m state --state ESTABLISHED,RELATED,NEW`）；其餘 subnet 流量雙向 DROP（**既有 Ceph messenger/heartbeat 連線因無 general ESTABLISHED accept 而立即斷流**）。`iptables-restore --noflush` 原子套用。
   - **自動回退 guard（v4 順序與期限定義）**：guard 於**套用 chain 之前**先武裝（`remote_bg_start` 一支 `sleep ${GUARD_DEADLINE_SECS} && flush MCLOCK-ISO`；`GUARD_DEADLINE_SECS = measurement_cap + 600`，不變條件見 §Cap policy）——避免「chain 套了、guard 沒起來」的窗口；heal 時先 kill guard 再 flush。guard 觸發 = 該 attempt 標 taint（guard 是安全網不是 heal 路徑）。
