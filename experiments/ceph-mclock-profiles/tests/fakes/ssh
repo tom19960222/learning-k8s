@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# fake ssh v2（Task 2）——可程式化的 ssh 替身，供 PATH 覆蓋使用。
+#
+# 協定：
+#   FAKE_SSH_SCRIPT  必填。每行一筆期望：`pattern|rc|delay|stdout-file`
+#                    - pattern：對「完整 argv 字串」做 grep -F 子字串比對（不得含 `|`）
+#                    - rc：離開碼；delay：秒（模擬 hang）；stdout-file：空 = 無輸出
+#                    - 空行與 `#` 開頭忽略
+#   FAKE_SSH_LOG     每次呼叫記一行（argv 內的換行以空白取代，方便 grep）
+#   FAKE_SSH_STATE   狀態目錄（預設 <script>.state）：
+#                    - count：累計呼叫次數（含非預期呼叫）
+#                    - consumed：已消費的行號
+#                    - call.<n>.args：該次呼叫的完整 argv（保真）
+#
+# 消費規則：從「第一筆未消費」往後找第一筆 pattern 命中者並標記消費。
+# 因此同一 pattern 連兩筆即「先敗後成」；非預期指令一律 exit 97（不得靜默成功）。
+set -u
+
+args="$*"
+script="${FAKE_SSH_SCRIPT:-}"
+state="${FAKE_SSH_STATE:-${script}.state}"
+mkdir -p "$state" 2>/dev/null || true
+
+# --- 呼叫計數 + argv 記錄（先做，非預期呼叫也要看得到）------------------------
+lock="$state/.lock"
+i=0
+while [ "$i" -lt 200 ] && ! mkdir "$lock" 2>/dev/null; do
+  i=$((i + 1)); sleep 0.05
+done
+n=0
+[ -f "$state/count" ] && n="$(cat "$state/count")"
+n=$((n + 1))
+printf '%s\n' "$n" > "$state/count"
+printf '%s' "$args" > "$state/call.${n}.args"
+if [ -n "${FAKE_SSH_LOG:-}" ]; then
+  printf '%s' "$args" | tr '\n\r' '  ' >> "$FAKE_SSH_LOG"
+  printf '\n' >> "$FAKE_SSH_LOG"
+fi
+
+# --- 比對腳本 ----------------------------------------------------------------
+consumed="$state/consumed"
+[ -f "$consumed" ] || : > "$consumed"
+
+lineno=0
+matched=0
+hit=""
+if [ -n "$script" ] && [ -f "$script" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    grep -qx -- "$lineno" "$consumed" && continue
+    pat="${line%%|*}"
+    if printf '%s' "$args" | grep -qF -- "$pat"; then
+      matched=1
+      hit="${line#*|}"
+      printf '%s\n' "$lineno" >> "$consumed"
+      break
+    fi
+  done < "$script"
+fi
+rmdir "$lock" 2>/dev/null || true
+
+if [ "$matched" -eq 0 ]; then
+  printf 'fake-ssh: UNEXPECTED call #%s: %s\n' "$n" "$args" >&2
+  exit 97
+fi
+
+rc="${hit%%|*}"; hit="${hit#*|}"
+delay="${hit%%|*}"; outfile="${hit#*|}"
+
+case "$delay" in ''|0|0.0) : ;; *) sleep "$delay" ;; esac
+if [ -n "$outfile" ] && [ -f "$outfile" ]; then
+  cat "$outfile"
+fi
+exit "${rc:-0}"

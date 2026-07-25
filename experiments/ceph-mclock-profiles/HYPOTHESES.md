@@ -1,0 +1,510 @@
+# ceph-mclock-profiles — Hypothesis Backlog（Phase 1 Frame 產出）
+
+> 方法論：`skills/researching-system-behavior/SKILL.md`（Frame → Enumerate → Falsify → Automate → Synthesize）
+> spec：`docs/superpowers/specs/2026-07-24-ceph-mclock-profiles-azure-design.md`（rev 7）
+> plan：`docs/superpowers/plans/2026-07-24-ceph-mclock-profiles-harness.md`（v4.2.1）
+> 本檔狀態：**Task 1 Step 1–7 完成，等 Step 8 使用者 gate**。
+
+## Charter
+
+- **Goal**：在 Azure 15 台 VM 的 Ceph v19.2.2 叢集上，量出 mClock 三個內建 profile（`balanced` / `high_client_ops` / `high_recovery_ops`）在穩態、四類故障、chaos 下對 client IO 與 recovery 的取捨曲線；所有機制主張錨定 pinned source，所有行為主張錨定 evidence bundle，量不出可信差異的一律標記為「等效」或「靈敏度不足」（兩者必須可區分，見 §預註冊生產門檻）。
+- **Scope**
+  - **in**：mClock scheduler 的 profile 切換與其九個衍生參數、cost model（`osd_mclock_max_capacity_iops_ssd` / `osd_mclock_max_sequential_bandwidth_ssd`）、mClock 仲裁涵蓋邊界（immediate / high-priority 旁路）、四類故障注入（OSD flapping、OSD down、node loss = network-isolation、synthetic CRUSH-rack loss）、固定 seed chaos、harness 自動化與 evidence bundle。
+  - **out**：**任何 profile 以外的 QoS 調參**（九參數手改、`osd_mclock_override_recovery_settings=true`、custom profile）、mon 的故障**注入**（repair 不在此限）、Azure 層調校、cross-environment 絕對數字外推、EC pool、HDD/hybrid、crimson OSD。
+  - **明確不主測（標為已知邊界）**：scrub / deep-scrub（campaign 全程 noscrub）、snap trim（無 snapshot）、per-client QoS（v19.2.2 classic OSD 未實作，見 H-022）。
+- **Version anchors**
+  - Ceph **v19.2.2**（`git -C ceph show v19.2.2:<path>`；repo submodule pin 為 v19.2.3，兩者的 dmclock vendor 內容不同，**嚴禁混用**）。
+  - dmclock **`dmclock@e4ccdcfa`**（= `git ls-tree v19.2.2 src/dmclock` 的 gitlink `e4ccdcfa828c84b8ea775a928118f2b8012d0f42`，已比對確認）。
+  - 錨點格式：Ceph = `path:line`；dmclock = `dmclock@e4ccdcfa:src/dmclock_server.h:line`。
+- **Tiers**
+  - **T1**：pinned source（ceph v19.2.2、dmclock@e4ccdcfa）。
+  - **T2**：官方文件（docs.ceph.com mClock config reference、Azure SKU/網路文件）。
+  - **T3**：Azure japanwest 15-VM campaign（8× L8s_v3 OSD node、1 admin + 2 mon、4 fio client；krbd datapath；replica 3、failure domain = rack）。**全程 ssh-native、可回退**；破壞性動作限本 campaign 專用 RG。
+- **本檔的三個用途**（缺一不可）
+  1. 六個機制題的 source-anchored 敘述（M-1 … M-6），供報告的「機制」章節直接引用。
+  2. 可證偽假說 backlog（H-001 … H-023），每條含 prediction 與證偽條件。
+  3. **prediction freeze 的母版**：63 cells 的方向性預測骨架（§Cell 預測骨架）——pipeline 在每個 replicate 開跑前把對應 cell 的預測凍進 bundle。
+
+---
+
+## 預註冊生產門檻（production margin，Task 1 Step 7）
+
+`indistinguishable` 這個 verdict 在 Azure 這種噪音環境裡最危險：它同時可能是「三個 profile 真的等效」或「我們的靈敏度根本不夠」。因此**在看到任何資料之前**先把「生產有感」的絕對門檻寫死；分析時 `verdict.py margins` 同時報 noise margin（觀測 CoV 導出）與下表的 production margin：
+
+| primary endpoint | 定義 | **profile 間 production margin（有感差異）** | **絕對嚴重度門檻** |
+|---|---|---|---|
+| client p99 degradation ratio | 故障窗 p99 ÷ 同 replicate 注入前 60s 健康窗 p99 | Δratio ≥ **1.0**（例：2.0× vs 3.0×）或相對差 ≥ **50%**，取較大者 | ratio ≥ **3×** = 生產顯著劣化；≥ **10×** = 事故級 |
+| max IO stall duration | fio 逐秒 log 中「該秒完成數 = 0」的最長連續秒數 | Δ ≥ **2 s** | ≥ **5 s** = 事故級（使用者標準：關鍵生產系統 IO delay 數秒即事故）；≥ **30 s** = guest 層 IO error 風險 |
+| recovery bytes/s | `ceph pg dump` 差分的 recovery+backfill bytes/s（量測窗中位數） | 相對差 ≥ **25%** | — |
+| time-to-recovery-complete | `fault_t0` → 當下 up set 下 PG 100% active+clean 的秒數（right-censored 有效） | 相對差 ≥ **20%** **且** 絕對差 ≥ **300 s** | 超過 `measurement_cap` = censored |
+
+**`indistinguishable` 的兩型判別規則（寫死，不得事後改）**：
+
+- **等效（equivalent）**：`|觀測差異| < production margin` **且** `noise margin < production margin`。→ 可以寫「在本環境下三 profile 對此 endpoint 沒有生產意義上的差別」。
+- **靈敏度不足（underpowered）**：`noise margin ≥ production margin`。→ **禁止**寫成「profile 沒差」，只能寫「本環境的噪音大於生產門檻，無法回答」，並列入 S3 補跑或 n 升級清單。
+
+補充規則：
+
+- 極端壓（closed-loop）cells 的 p99 不可與固定速率 cells 直接比較（spec §4）；極端壓的 profile 比較只在「同為極端壓」的組內做。
+- `recovery bytes/s` 與 `time-to-recovery-complete` 在 censored replicate 上只採後者的下界，前者仍有效。
+- 三態 verdict = `confirmed / violated / indistinguishable(equivalent|underpowered)`。
+
+---
+
+## M-1 dmclock 的三段式排程與 `AtLimit::Wait`（Step 1）
+
+**機制**（全部 T1）：
+
+- 每個 dmclock client 由 `ClientInfo{reservation, weight, limit}` 描述，內部同時保存三個倒數 `*_inv`；**任一項為 0 → 對應的 `*_inv` = 0**（`dmclock@e4ccdcfa:src/dmclock_server.h:97-134`，`update()` 在 :113-120）。
+- 每個 request 進佇列時算三個 tag（`dmclock@e4ccdcfa:src/dmclock_server.h:137-185`）：`reservation`、`proportion`（weight 用）、`limit`。tag 的遞增量 = `inv × (dist_req_val + cost)`，並對「現在時刻」取 max（`:248-261`）。**關鍵分支：`increment == 0` 時，res/prop 回傳 `max_tag`（+∞）、limit 回傳 `min_tag`（−∞）**（`:254-255`，由 `extreme_is_high` 決定）。
+- 出隊決策 `do_next_request`（`dmclock@e4ccdcfa:src/dmclock_server.h:1124-1195`）嚴格三段：
+  1. **reservation 階段**：`resv_heap` 頂端的 request 若 `tag.reservation <= now` → 直接出隊（`:1133-1137`）。
+  2. **limit → ready 提升**：把 `limit_heap` 裡 `tag.limit <= now` 的 client 提升進 `ready_heap`（`:1144-1153`）。
+  3. **weight（proportion）階段**：`ready_heap` 頂端出隊（`:1155-1160`）。
+  4. 都不行 → 回傳「未來時間」，等 limit/reservation tag 成熟（`:1179-1194`）。
+- Classic OSD 用 **`AtLimit::Wait`**（`src/osd/scheduler/mClockScheduler.cc:137`）→ `:1166-1174` 的「破 limit」分支**不會執行**，超過 limit 的 request 只能等。`anticipation_timeout` 取自 `osd_mclock_scheduler_anticipation_timeout`（`mClockScheduler.cc:138`），預設 **0**（`src/common/options/osd.yaml.in:1090-1095`）→ 無 anticipation 行為。
+- **ratio → bytes/s 的轉換**在 `ClientRegistry::update_from_config`（`mClockScheduler.cc:166-224`）：`res=0` → `default_min`、`lim=0` → `default_max`，而 `default_min = 0.0`、`default_max = ∞`（`src/osd/scheduler/mClockScheduler.h:45-47`）。合起來看：
+  - **client 三個 profile 的 `lim` 都是 0 → ∞ → `limit_inv = 0` → limit tag = −∞ → 永遠 ready，client class 沒有上限。**
+  - **`background_best_effort` 三個 profile 的 `res` 都是 0 → 0.0 → `reservation_inv = 0` → reservation tag = +∞ → best_effort 永遠不會從 reservation 階段出隊**（只能靠第 3 段的 weight 階段）。
+- idle client 重新活躍時，其 proportion tag 會被拉到「目前最低的 active proportion tag」（`dmclock@e4ccdcfa:src/dmclock_server.h:946-994`）→ **閒置不累積 credit、也不累積 debt**。
+
+### H-001: 三個 profile 的 reservation 總和都剛好 = 100% 名義 capacity，因此只要實際裝置吞吐低於鎖定的 capacity 值，dmclock 就長期停在 reservation 階段，weight（client wgt 2 vs 1）完全不參與排序 — profile 差異退化成純 res 比值
+- Status: proposed
+- Priority: P0
+- Tier: T1 → T3
+- Origin: 讀碼（`do_next_request` 三段式 + profile 表相加 = 1.0）
+- Prediction: 在 recovery 與 client 併發、且 client 需求已達 res 門檻的 cells（極端壓）中，client:background_recovery 的實際服務比 ≈ **res 比**（balanced 0.5:0.5、high_client_ops 0.6:0.4、high_recovery_ops 0.3:0.7），而**不是** weight 暗示的 2:1。具體：`high_client_ops` 的 client 吞吐相對 `balanced` 的提升落在 **1.1–1.3×**（0.6/0.5 = 1.2 附近）。
+- 證偽條件: 極端壓 osd-down cells 量到 `high_client_ops` client 吞吐 ≥ 1.5 × `balanced` → weight 有參與排序 → violated（代表 reservation 常態被滿足，系統處在 weight regime）。
+- Evidence（機制）: dmclock_server.h:1133-1137（reservation 分支優先）、:1155-1160（weight 分支）；mClockScheduler.cc:337-373（三 profile 的 res 相加皆 = 1.0）。
+- Artifacts: 每個 replicate 收 `ceph tell osd.N perf dump` 的 `mclock-shard-queue-*` 佇列長度組成（`mClockScheduler.cc:93-114`）作為 regime 判定 covariate。
+- Notes: 這條決定整個實驗的解讀框架 — 若成立，「weight」在報告裡必須降級為「幾乎不可觀測的參數」。
+
+### H-002: `background_best_effort` 的 `res=0` 使它永遠進不了 reservation 階段，因此只要 client + background_recovery 的 reservation 已吃滿裝置，best_effort 近乎完全餓死，三 profile 的 best_effort `lim`（90% / 70% / max）差異在中高壓下不可觀測
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼（`default_min = 0.0` → `reservation_inv = 0` → tag = +∞）
+- Prediction: 中壓以上的故障 cells 中，best_effort class 的服務量三 profile 皆 ≈ 0（差異 < noise margin）；只有低壓（25%）cells 才可能出現 90/70/max 的分層。
+- 證偽條件: 中壓或極端壓 cells 量到三 profile 的 best_effort 吞吐分層符合 90:70:100 → violated。
+- Evidence: mClockScheduler.h:45（`default_min = 0.0`）；mClockScheduler.cc:171-177（`get_res`）；dmclock_server.h:117（`reservation_inv = 0`）、:254-255（`increment == 0` → `max_tag`）、:1133-1137。
+- Notes: best_effort 在本 campaign 的主要來源 = **非 degraded 的 backfill**（見 H-008），不是 scrub/snap trim（皆已關閉/不存在）。
+
+### H-003: idle client 的 proportion tag 重置機制使「注入前 client 獨占 → 注入後 recovery 湧入」不會產生補償性 credit，因此 `fault_t0` 之後頭幾秒的 client latency spike 不是 mClock 造成的
+- Status: proposed
+- Priority: P2
+- Tier: T1 → T3
+- Origin: 讀碼（`do_add_request` 的 `client.idle` 分支）
+- Prediction: `fault_t0` 後首 5 秒的 client p99 三 profile 差異 < production margin（Δratio < 1.0）；該區間的劣化由 peering / OSDMap 更新主導（見 H-007）。
+- 證偽條件: 首 5 秒即出現符合 res 比的 profile 分層 → violated（代表 mClock 在故障瞬間就 binding）。
+- Evidence: dmclock_server.h:946-994（`prop_delta = lowest_prop_tag - time`）。
+
+### H-022: v19.2.2 的 classic OSD 對所有外部 client 共用同一個 dmclock client record（`get_scheduler_id` 永遠回傳預設的 `client_profile_id_t()`），因此 mClock 只有 class 級 QoS、沒有 per-client 公平性 — 單一 fio client 可以吃光整個 client class 的保障
+- Status: proposed
+- Priority: P2
+- Tier: T1 → T3
+- Origin: 讀碼（`external_client_infos` 在 v19.2.2 實際上是 dead map）
+- Prediction: 4 台 fio client 的 IOPS 分佈在同一 cell 內的 CoV 不受 profile 影響（三 profile 的「client 間不均勻度」差異 < noise margin）；且不存在任何 profile 能改善 client 之間的公平性。
+- 證偽條件: 某 profile 明顯壓低 client 間 CoV → violated。
+- Evidence: mClockScheduler.h:206-211（`get_scheduler_id` 用預設 `client_profile_id_t()`）、:165-170（`default_external_client_info` + 空的 `external_client_infos`）；mClockScheduler.cc:226-234（`get_external_client` 永遠 miss → 回預設）。
+- Notes: 報告的「何時選哪個 profile」裁決樹必須明講：mClock 不解決 noisy-neighbour tenant 問題。
+
+---
+
+## M-2 cost model：ratio 如何變成 bytes/s，以及 1M IO 的實際成本（Step 2）
+
+**機制**（全部 T1）：
+
+- 兩個衍生量在 `set_osd_capacity_params_from_config()`（`mClockScheduler.cc:250-283`）算出：
+  - `osd_bandwidth_cost_per_io = 名義 sequential bandwidth ÷ 名義 IOPS capacity`（`:272-273`），單位 bytes/io。
+  - `osd_bandwidth_capacity_per_shard = 名義 sequential bandwidth ÷ num_shards`（`:274-275`），單位 bytes/s。
+- 每筆 op 的排程成本：`calc_scaled_cost(item_cost) = max(max(1, item_cost), (uint32)cost_per_io)`（`mClockScheduler.cc:427-436`）——**只有 floor，沒有其他換算**。`item_cost` 來自 `Message::get_cost()`，其定義是 `data.length()`（`src/msg/Message.h:478-480`），由 `OSD::enqueue_op` 取出（`src/osd/OSD.cc:9674-9675`）。
+- res/lim 的 ratio 乘上 `capacity_per_shard` 變成 bytes/s（`mClockScheduler.cc:171-185`）。
+- `num_shards` = `osd_op_num_shards_ssd` = **8**（非 rotational；`OSD.cc:3627-3635`、`osd.yaml.in:900-904`），由 `OSDShard` 建構時傳入（`OSD.cc:10830-10847`、`src/osd/scheduler/OpScheduler.cc:24-45`）。
+- 名義值預設：`osd_mclock_max_sequential_bandwidth_ssd = 1200 MiB/s`（`osd.yaml.in:1110-1121`）、`osd_mclock_max_capacity_iops_ssd = 21500`（`osd.yaml.in:1137-1147`）。
+
+**1M IO cost 算例**（用 compiled default 21500 IOPS，campaign 實際會鎖成校準值，屆時重算並寫進 bundle）：
+
+| 量 | 算式 | 值 |
+|---|---|---|
+| 名義 seq bandwidth | `1200 × 1024 × 1024` | 1,258,291,200 bytes/s |
+| `capacity_per_shard` | `÷ 8 shards` | 157,286,400 bytes/s |
+| `cost_per_io` | `1,258,291,200 ÷ 21500` | 58,525 bytes/io |
+| 4K random **write** 的 scaled cost | `max(4096, 58525)` | **58,525** |
+| 4K random **read** 的 scaled cost | `max(max(1, 0), 58525)`（read 請求 `data.length() = 0`） | **58,525**（與寫相同） |
+| 1M seq write 的 scaled cost | `max(1048576, 58525)` | **1,048,576** = 4K op 的 **17.92×** |
+| balanced client res 的 bytes/s（per shard） | `0.5 × 157,286,400` | 78,643,200 |
+| 換算成 4K ops/s（整顆 OSD） | `78,643,200 ÷ 58,525 × 8` | **10,750** = `0.5 × 21500` ✓ |
+| 換算成 1M ops/s（整顆 OSD） | `78,643,200 ÷ 1,048,576 × 8` | **600 ops/s = 600 MiB/s** = `0.5 × 1200 MiB/s` ✓ |
+
+→ 語意結論：**同一個 res ratio，在小 IO 世界代表「ratio × 名義 IOPS」，在大 IO 世界代表「ratio × 名義 sequential bandwidth」**，兩者的交叉點正好在 `cost_per_io`（預設 ≈ 57 KiB）。1M 相對 4K 只貴 17.9 倍，而非 bytes 比的 256 倍。
+
+### H-004: 因為 `calc_scaled_cost` 只是 `max(item_cost, cost_per_io)`，4K 讀與 4K 寫的排程成本完全相同，randrw 的讀寫比不影響 mClock 的帳；而 1M op 只被計為 4K op 的 ~17.9 倍
+- Status: proposed
+- Priority: P1
+- Tier: T1
+- Origin: 讀碼（`Message::get_cost()` = `data.length()`，read 請求無 data）
+- Prediction: 同壓力等級下，把 4K randrw 從 70/30 改成 50/50 不會改變三 profile 的相對分離度（S3 選配確認組；主 campaign 只做 70/30）。且 1M seq cells 的 client 保障換算成頻寬 = `res × 1200 MiB/s`（balanced 600 / high_client_ops 720 / high_recovery_ops 360 MiB/s per OSD）。
+- 證偽條件: rw mix 改變後 profile 分離度顯著改變 → violated（代表 cost 另有 read/write 不對稱來源，例如 BlueStore 層而非 scheduler 層）。
+- Evidence: mClockScheduler.cc:427-436；Message.h:478-480；OSD.cc:9674-9675。
+- Artifacts: 報告的參數建議總表必須附「cost_per_io 交叉點」欄位（鎖定 capacity 後的實際 bytes 值）。
+
+### H-005: 壓力等級（相對 balanced-healthy ceiling）與 mClock 的 res 門檻分母不同，必須用校準後的 ρ 換算；只有當「per-OSD client-class 需求比 > 該 profile 的 client res」時 profile 才會分離
+- Status: proposed
+- Priority: **P0**（決定全部 63 cells 的方向性預測）
+- Tier: T1 → T3
+- Origin: 讀碼 + 矩陣推導（ceiling 的分母是實測 aggregate、res 的分母是鎖定的名義 per-OSD capacity）
+- 換算式（**在 calibrate 完成後填值，並凍進每個 cell 的 prediction**）：
+  - `C` = 鎖定的 per-OSD `osd_mclock_max_capacity_iops_ssd`（4K）。
+  - `ceiling` = balanced + final-clean 下實測的 aggregate 4K randrw ceiling（IOPS）。
+  - **`ρ = ceiling ÷ (8 × C)`**；某壓力等級 `L ∈ {0.25, 0.5, 0.8, ~1.0}` 對應的 per-OSD client-class 需求比 = **`ρ × L`**。
+  - 推導依據：read 只由 primary 服務、write 的兩份 replica op 走 immediate class 不計入 client class（H-006），故 client-class ops 總數 = client IOPS 本身，均分到 8 顆 OSD。
+- Prediction（以 ρ 參數化；`res_client` = 0.5 / 0.6 / 0.3）：
+  - `ρ × L < 0.3` → 三 profile **全部** indistinguishable（client 需求低於最小的 client res，reservation 對誰都不 binding）。
+  - `0.3 ≤ ρ × L < 0.5` → 只有 `high_recovery_ops` 劣化；`balanced` 與 `high_client_ops` indistinguishable。
+  - `0.5 ≤ ρ × L < 0.6` → `high_recovery_ops` < `balanced` < `high_client_ops`（client 面），但 balanced/high_client_ops 的差可能落在 margin 內。
+  - `ρ × L ≥ 0.6` → 三 profile 完整分離，服務比 ≈ res 比（接上 H-001）。
+- 證偽條件: 出現「ρ×L 明顯低於 0.3 卻量到超過 production margin 的 profile 分離」或「ρ×L ≥ 0.6 卻三者等效」→ violated，代表換算式漏了項（第一嫌疑：immediate class 的 off-book 佔用，見 H-006）。
+- Artifacts: `run/calibrate.sh` 的 `results/calibration.json` 必須輸出 ρ；`manifest.py generate` 把每個 cell 的 `ρ×L` 與預期分支寫進 `prediction`。
+
+---
+
+## M-3 mClock 的仲裁涵蓋邊界：什麼繞過 scheduler（Step 3）
+
+**機制**（全部 T1）：
+
+- `mClockScheduler::enqueue`（`mClockScheduler.cc:476-513`）三分支：
+  1. `class_id == immediate` → 丟進 `high_priority`，優先權 = `immediate_class_priority` = `numeric_limits<unsigned>::max()`（`mClockScheduler.h:204`）。
+  2. `item priority >= cutoff_priority` → 也丟 `high_priority`（`:484-485`）。
+  3. 其餘才進 dmclock（`:487-499`）。
+  `dequeue` 永遠先清空 `high_priority`（`mClockScheduler.cc:548-568`），而 `high_priority` 是 `std::map<priority_t, ..., std::greater<>>`（`mClockScheduler.h:193-195` 定義、`:203` 成員）→ immediate 排在最前。
+- `cutoff_priority` 來自 `osd_op_queue_cut_off`，預設 `high` → `CEPH_MSG_PRIO_HIGH = 196`（`OSD.cc:2436-2448`、`osd.yaml.in:947-969`、`src/include/msgr.h:223-226`）。
+- **class 的判定表**（`src/osd/scheduler/OpSchedulerItem.h`）：
+
+  | queueable | class | 錨點 |
+  |---|---|---|
+  | `PGOpItem`（訊息型 op） | 只有 `CEPH_MSG_OSD_OP` / `CEPH_MSG_OSD_BACKOFF` → `client`；**其餘一律 `immediate`** | :243-251 |
+  | `PGPeeringItem` | 恆 `immediate` | :276-278 |
+  | `PGRecovery` / `PGRecoveryContext` | `priority_to_scheduler_class(priority)` | :522-524、:550-551 |
+  | `PGRecoveryMsg`（push/pull/backfill/scan） | `priority_to_scheduler_class(訊息 priority)` | :613-615、:587-598 |
+  | `PGSnapTrim` / `PGScrub` / `PGScrubItem` 系 / `PGDelete` | 恆 `background_best_effort` | :299-301、:322-324、:362-364、:574-576 |
+
+- `priority_to_scheduler_class`（`OpSchedulerItem.h:204-212`）：`>= 196` → immediate；`>= DEGRADED(10)` → background_recovery；否則 → background_best_effort。
+- recovery 的 priority 值在 mClock 下是特製的小整數（`src/osd/PeeringState.h:1580-1585`）：`FORCED=20 / UNDERSIZED=15 / DEGRADED=10 / BEST_EFFORT=5`，由 `get_recovery_op_priority()` 依 PG 狀態選出（`PeeringState.h:1588-1601`）。→ **PG 只是 misplaced（不 degraded、不 undersized）時，其 recovery/backfill 落在 `background_best_effort`**。
+- 路由：`OSD::enqueue_op` 先判 `PGRecoveryMsg::is_recovery_msg(op)`，是則包成 `PGRecoveryMsg`，否則包成 `PGOpItem`（`OSD.cc:9698-9711`）。本地發起的 recovery 走 `_queue_for_recovery`，item priority 用 `osd_recovery_priority`、cost 用 `cost_per_object × reserved_pushes`（`OSD.cc:2060-2087`）。
+
+### H-006: replica 寫（`MSG_OSD_REPOP` 等非 `CEPH_MSG_OSD_OP` 訊息）在 replica OSD 上被判為 `immediate`，完全繞過 mClock；replica 3 下每顆 OSD 有可觀比例的裝置工作是「不計入任何 class」的表外負載，這會系統性壓縮 mClock 能分配的實際容量
+- Status: proposed
+- Priority: **P0**（頭牌機制發現）
+- Tier: T1 → T3
+- Origin: 讀碼（`PGOpItem::get_scheduler_class` 的白名單只有兩個訊息型別）
+- Prediction:
+  1. 4K randrw 70/30 下，每 100 個 client IO 在叢集內產生 100 個 client-class op + 60 個 immediate REPOP → **immediate 佔 scheduler 入列量的 ≈ 37.5%**；1M seq write（100% 寫）下 ≈ **66.7%**。以 `mclock-shard-queue-*` 的 `mclock_immediate_queue_len` vs `mclock_client_queue_len` 佇列長度組成驗證量級。
+  2. 因為表外負載在寫比重高時更大，**profile 對 client 的保護效果在寫重負載下更弱**：1M seq cells（100% 寫）的 profile 分離度 < 4K randrw cells（30% 寫）。
+- 證偽條件: 量到 immediate 佇列長期為 0，或 1M seq cells 的 profile 分離度 ≥ 4K cells → violated。
+- Evidence: OpSchedulerItem.h:243-251；mClockScheduler.cc:476-486、:548-568；mClockScheduler.h:204；OSD.cc:9698-9711。
+- Artifacts: `collect.sh` 必須收 per-OSD per-shard 的四個 mclock 佇列長度（counter 名稱見 `mClockScheduler.cc:96-105`）；報告需獨立一節說明「mClock 的帳只涵蓋 primary client op」。
+
+### H-007: peering 恆走 immediate（且 peering 訊息本身 priority ≥ 196 也會落進 high_priority queue），因此 flapping 場景的 IO stall 主要由 peering 期間的 PG 不可用造成，與 profile 無關
+- Status: proposed
+- Priority: P0
+- Tier: T1 → T3
+- Origin: 讀碼 + spec §2「量測要把 peering 區間與 recovery 區間分開」
+- Prediction: flapping 的 9 個 cells 中，**max IO stall duration 三 profile indistinguishable**（Δ < 2 s）；profile 差異只在每輪 OSD up 之後的 log-based recovery 區段（`background_recovery` class）可見，因此 flapping 的 p99 degradation ratio 分離度 < 同壓力的 osd-down cells。
+- 證偽條件: 某 profile 的 max stall 顯著較長（Δ ≥ 2 s 且跨 replicate 一致）→ violated，代表 stall 有 mClock 成因。
+- Evidence: OpSchedulerItem.h:276-278（`PGPeeringItem` → immediate）；mClockScheduler.cc:482-486；msgr.h:223-226；OSD.cc:2436-2448。
+- Artifacts: sampler 必須能切出 peering 區間（PG state 含 `peering`/`activating` 的時窗）供分段統計。
+
+### H-008: 回歸階段（heal → `osd in`）的 backfill 因為 PG 只是 misplaced 而非 degraded，落在 `background_best_effort` class — 那是三個 profile 的 `lim`（90% / 70% / max）**唯一**會 binding 的地方，而現行 pipeline 把這段當成純安全 gate、沒有量測
+- Status: proposed
+- Priority: **P0**（同時是對 plan 的具體修改建議）
+- Tier: T1 → T3
+- Origin: 讀碼（`get_recovery_op_priority()` 的 `BEST_EFFORT=5` 分支 → `priority_to_scheduler_class` 落在 best_effort）
+- Prediction: 在 heal 之後、無 client 負載的「回歸 backfill」區段，`time(heal_t0 → final_clean)` 呈 `high_recovery_ops` < `balanced` < `high_client_ops`，比值約 **1 : 1.11 : 1.43**（= 1 : 1/0.9 : 1/0.7）。
+- 證偽條件: 三者 indistinguishable → violated，代表回歸 backfill 的瓶頸不是 mClock 的 lim，而是 `osd_max_backfills=1` / PG 數 / 裝置本身（此時應在報告標註 lim 在本拓撲不可觀測）。
+- Evidence: PeeringState.h:1588-1601（非 degraded/undersized → `BEST_EFFORT=5`）；OpSchedulerItem.h:204-212、:613-615；mClockScheduler.cc:369-373 / :337-341 / :353-357（三 profile 的 best_effort lim = .9 / .7 / 0=max）；H-002 說明為何這段必須「無 client 負載」才觀測得到。
+- **Artifacts（plan 修改建議）**：
+  - `lib/pipeline.sh` 的 safety gate 需記錄 `heal_t0`、`final_clean_t` 兩個絕對時戳，並讓 sampler 在該區段維持取樣（現行流程是「停 fio → 回歸 → 等 final_clean → sampler_stop」，時序上 sampler 仍活著，只需把時戳與區段標記寫進 bundle）。
+  - `verdict.py` 新增 secondary endpoint `return-backfill-duration`；`schemas` 的 fault kind 加入 `return-backfill.json`。
+  - 成本 = 0 額外 cluster 時間（這段本來就要等）。
+
+---
+
+## M-4 mClock 模式下被鎖定的 recovery 參數（Step 4）
+
+**機制**（全部 T1）：
+
+- `OSD::maybe_override_options_for_qos()`（`OSD.cc:10126-10222`）只在 `osd_op_queue == mclock_scheduler` 時作用（`:10130`），鎖定表為（`:10131-10136`）：
+
+  | key | mClock 下的值 |
+  |---|---|
+  | `osd_recovery_max_active` | 0 |
+  | `osd_recovery_max_active_hdd` | 3 |
+  | **`osd_recovery_max_active_ssd`** | **10** |
+  | **`osd_max_backfills`** | **1** |
+
+- **boot 路徑**（`changed == nullptr`，`:10199-10222`）用 **`set_val_default`**（`:10208`）——原始碼註解自己說明：`set_val_default` 不會覆蓋更高層級（mon config store / ceph.conf）的既有設定。
+- **runtime 變更路徑**（`:10139-10195`）：若 `osd_mclock_override_recovery_settings == false`（預設，`osd.yaml.in:1203-1223`），OSD 會**主動向 mon 送 `config rm` 把你設的值刪掉**（`:10166-10188`）並發 cluster warning `"Change to <key> on osd.N did not take effect. Enable osd_mclock_override_recovery_settings before setting this option."`（`:10190-10194`）。
+- 另有 `OSD::maybe_override_sleep_options_for_qos()`（`OSD.cc:10227-10254`）：mClock 下把 `osd_recovery_sleep{,_hdd,_ssd,_hybrid}`、`osd_delete_sleep*`、`osd_snap_trim_sleep*`、`osd_scrub_sleep` 全部 **`set_val`（非 default）為 0** — 這是**無條件覆蓋** operator 設定。
+- 三個 override 函式都在 OSD boot 的同一處依序呼叫（`OSD.cc:4097-4099`：sleep → options → capacity）；`osd_max_backfills` 的 runtime hook 在 `OSD.cc:9888-9897`。
+
+### H-009: boot 路徑用 `set_val_default`，所以 mon config store 或 ceph.conf 裡任何既有的 `osd_max_backfills` / `osd_recovery_max_active_*` override 都會存活下來 — 「recovery 併發度全 campaign 固定」這個前提必須由 qos gate 驗值**且**驗來源，不能只信 mClock 會鎖
+- Status: proposed
+- Priority: **P0**（harness gate 設計依據）
+- Tier: T1 → T3
+- Origin: 讀碼（`set_val_default` 的註解 `:10201-10206`）
+- Prediction: 乾淨的 cephadm v19.2.2 部署下，八顆 OSD 的 effective `osd_max_backfills = 1`、`osd_recovery_max_active_ssd = 10`，且 `ceph config dump` 不含這兩個 key；任一顆不符 → 必為外部 override。
+- 證偽條件: 乾淨部署即出現非預設值 → violated（則必須在報告標註 cephadm/IaC 有預設注入）。
+- Evidence: OSD.cc:10199-10222（尤其 :10201-10208 的註解與 `set_val_default`）。
+- Artifacts: `ceph_qos_gate` 除了比對 effective 值，另跑 `ceph config dump` 交叉核對「這些 key 不應出現在 mon store」；不符即 die。
+
+### H-010: 在 `osd_mclock_override_recovery_settings=false` 下，任何對這四個 key 的 `ceph config set` 會被 OSD 反向刪除並產生 cluster warning — 症狀是「設了、值消失、health 出現 warning」
+- Status: proposed
+- Priority: P1
+- Tier: T1
+- Origin: 讀碼
+- Prediction: harness 不做此操作；若 campaign 期間出現 cluster log `did not take effect. Enable osd_mclock_override_recovery_settings` → 判定為外部污染事件，該時窗所有 replicate 標 taint。
+- 證偽條件: 手動 `ceph config set osd osd_max_backfills 3` 後值持續存在且無 warning → violated（v19.2.2 行為與讀碼不符，必須重查）。此驗證可在 calibrate 階段以 1 分鐘成本做一次 positive control，做完立即 `config rm` 還原。
+- Evidence: OSD.cc:10145-10194。
+- Artifacts: `bg_collect` 的 health/事件 log 加這條字串的偵測規則。
+
+### H-011: mClock 模式下所有 sleep 節流（recovery / delete / snap trim / scrub）被無條件設為 0，因此 recovery 節流 100% 由 scheduler 承擔、沒有 sleep 後備 — 這排除了一整類混淆變因
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼
+- Prediction: 八顆 OSD 的 effective `osd_recovery_sleep_ssd` / `osd_delete_sleep_ssd` / `osd_snap_trim_sleep_ssd` / `osd_scrub_sleep` 全部恆為 0（含 profile 切換後）。
+- 證偽條件: 任一顆非 0 → violated（代表有更高優先級的設定管道，需重新評估 recovery 節流歸因）。
+- Evidence: OSD.cc:10227-10254（`set_val` 非 `set_val_default`）。
+- Artifacts: 併入 `ceph_qos_gate` 的驗證集合（成本近乎 0，但把「recovery 慢是因為 sleep」這個替代解釋一次排除）。
+
+---
+
+## M-5 capacity 全路徑與它的三個陷阱（Step 5）
+
+**機制**（全部 T1，`OSD::maybe_override_max_osd_capacity_for_qos()`，`OSD.cc:10019-10123`）：
+
+1. **前提閘門**（`:10024-10026`）：三個條件同時成立才會跑 bench —— `osd_op_queue == mclock_scheduler` **且** `osd_mclock_skip_benchmark == false` **且** objectstore != `memstore`。任一不成立 → 整個函式什麼都不做、**不留任何 log**。
+2. **skip 判定**（`:10039-10062`）：非 force 模式下，取 `cur_iops`（目前 effective 值）與 `get_val_default()`（compiled default）比對，**只要 `default_iops != cur_iops` 就 return**（`:10056-10061`），**完全不看值的來源**。此分支**有**正向 log：`dout(1) ... "Skip OSD benchmark test."`。
+3. **bench 內容**（`:10064-10069`）：寫 100 個 4 MiB 物件、block size **4 KiB**、總計 12,288,000 bytes ——**只量 4K random write IOPS，從不量 sequential bandwidth**。
+4. **採納判定**（`:10091-10121`）：量出的 iops 若落在 `[osd_mclock_iops_capacity_low_threshold_ssd, osd_mclock_iops_capacity_threshold_ssd]` = **[1000, 80000]**（`osd.yaml.in:1258-1291`）之外 → 只發 cluster warning、**保留現值**（`:10108-10117`）；落在範圍內才 `mon_cmd_set_config` 寫進 mon store（`:10121`）。
+5. `osd_mclock_force_run_benchmark_on_init` 是 **startup** flag（`osd.yaml.in:1150-1165`），`osd_mclock_skip_benchmark` 是 **runtime** flag（`osd.yaml.in:1166-1178`），但後者只在 boot 路徑上有意義。
+6. capacity 與 profile 都在 `get_tracked_conf_keys()` 內（`mClockScheduler.cc:593-613`），runtime 改值會重跑 `set_osd_capacity_params_from_config()` + `update_from_config()`（`mClockScheduler.cc:619-635`），而前者會印一行 `dout(1)` 帶 `osd_bandwidth_cost_per_io` 與 `osd_bandwidth_capacity_per_shard`（`mClockScheduler.cc:277-282`）。
+
+### H-012: 若鎖定的 capacity 值剛好等於 compiled default（v19.2.2 的 `osd_mclock_max_capacity_iops_ssd = 21500`），skip 判定不成立，OSD 每次重啟都會重跑 bench 並可能覆寫 — 決策表必須禁止 `locked_value == 21500`
+- Status: proposed
+- Priority: **P0**（harness 不變條件）
+- Tier: T1 → T3
+- Origin: 讀碼（`:10056` 的 `default_iops != cur_iops`）
+- Prediction: 鎖成 21500 的 OSD 在 reboot canary 後其 log 出現 `osd bench result`；鎖成 21499 的則出現 `Skip OSD benchmark test.`。（可在單顆 OSD 上做，成本 < 5 分鐘。）
+- 證偽條件: 鎖 21500 後 reboot 未重跑 bench → violated（代表另有 skip 條件）。
+- Evidence: OSD.cc:10039-10062；osd.yaml.in:1137-1147（default 21500）。
+- Artifacts: `ceph_capacity_decide` 加不變條件 `locked_value != 21500`（命中則 ±1 並記錄 provenance）；此不變條件要有測試。
+
+### H-013: 現行 `ceph_verify_no_rebench` 的「無 `osd bench result` 行」是**必要非充分**證據，且缺少 positive control — 若 `journalctl -b -u ceph-<fsid>@osd.N` 因 unit 名稱或 fsid 取錯而回空集合，斷言會假通過
+- Status: proposed
+- Priority: **P0**（方法論缺口 + 對 plan 的修改建議）
+- Tier: T1 → T3
+- Origin: 讀碼與 plan Task 6 敘述比對（見 §與 plan/spec 的出入 #1）
+- Prediction: 在 reboot canary 中，若刻意把某顆 OSD 設成 `skip_benchmark=false` 且 capacity 值 ≠ 21500，其 log **必定**出現 `Skip OSD benchmark test.`（`:10059-10060` 是 `dout(1)`，預設 log level 撈得到）。這行的出現即證明「log 管道確實抓得到該 OSD 的 boot log」。
+- 證偽條件: 上述設定下仍撈不到該行 → 代表 log 管道有問題（正是本假說要偵測的失效），或 log level 不足 → 兩者都必須在 canary 階段解決才能開跑。
+- Evidence: OSD.cc:10024-10026（skip flag 路徑無 log）、:10056-10061（值差異路徑**有** log）。
+- Artifacts（plan 修改建議）: `run/calibrate.sh` 的 reboot canary 增加一步 **positive control**：對 canary node 的 OSD 暫時 `skip_benchmark=false`（值仍 ≠ default）→ reboot → 斷言看得到 `Skip OSD benchmark test.` → 還原 `skip_benchmark=true` → 再 reboot → 斷言看不到 `osd bench result` 且 capacity 值未變。沒有這個 positive control，現行合取證據無法區分「真的沒重跑」與「根本沒抓到 log」。
+
+### H-014: osd bench 只量 4K random write，sequential bandwidth 從不量測（固定 1200 MiB/s）— cost model 的兩個端點只有一個被校準到本機，所有大 IO 結論都必須標註「Ceph 預設 cost model 下的結果」
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼 + spec §2
+- Prediction: (a) 實測 raw NVMe 4K randwrite IOPS 與 osd bench IOPS 的比值落在 `[0.5, 2]`（決策表 `accepted-consistent` 分支）；(b) 實測 1M seq write 的 per-OSD 可達頻寬與名義 1200 MiB/s 的比值**顯著偏離 1**（L8s_v3 單 NIC 12.5 Gbps ≈ 1.45 GiB/s，replica 3 放大後 per-OSD 可用寫入頻寬預期遠低於 1200 MiB/s）。
+- 證偽條件: 實測 seq 頻寬 ≈ 1200 MiB/s（±15%）→ 名義值恰好正確，H-004 / H-005 對 seq cells 的推論需重算。
+- Evidence: OSD.cc:10064-10069（bench 參數）；mClockScheduler.cc:255-267（rotational 分支只取兩個 config，沒有任何量測）；osd.yaml.in:1110-1121。
+- Artifacts: `env_snapshot_cluster` 記錄 `osd_bandwidth_cost_per_io` 的實際值（由 H-019 的 log 行取得）；報告的每個 seq 結論加註。
+
+### H-019: capacity 與 profile 都是 runtime-changeable，且 `set_osd_capacity_params_from_config()` 會印出 `osd_bandwidth_cost_per_io` / `osd_bandwidth_capacity_per_shard` — 這提供比「讀 config show」更強的**生效**斷言
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼
+- Prediction: `ceph config set osd.N osd_mclock_max_capacity_iops_ssd <X>` 之後，osd.N 的 log 立即出現一行含 `osd_bandwidth_cost_per_io: <1258291200/X>` 的訊息，且不需重啟 OSD。
+- 證偽條件: 改值後無此 log 或值未變 → violated（則 capacity lock 必須改為 restart 才算生效，會顯著拉長 campaign）。
+- Evidence: mClockScheduler.cc:593-613（tracked keys）、:619-630（handle_conf_change 重算）、:277-282（dout(1) 內容）。
+- Artifacts: `ceph_lock_capacity` 與 `ceph_qos_gate` 把這行 log 納入生效證據（config show + log 雙證據）。
+
+---
+
+## M-6 mon 側：heartbeat grace、laggy 累積、down-out subtree limit（Step 6）
+
+**機制**（全部 T1）：
+
+- `OSDMonitor::get_grace_time()`（`src/mon/OSDMonitor.cc:3195-3239`）：起點是 `osd_heartbeat_grace`（預設 **20** 秒，`src/common/options/global.yaml.in:2833-2836`）；**`mon_osd_adjust_heartbeat_grace == false` 時直接回傳原值**（`:3200-3202`），不做任何 laggy 加成。預設為 true（`src/common/options/mon.yaml.in:885-897`）。
+- **laggy 值仍會照常更新**：`OSDMonitor::prepare_boot()`（函式起點 `:3592`）在 OSD 開機時更新 `osd_xinfo_t`（`:3693-3714`）——`boot_epoch == 0` 走衰減分支 `× (1 - mon_osd_laggy_weight)`，否則 `laggy_probability = w + p × (1-w)`（w = `mon_osd_laggy_weight` 預設 **0.3**，`mon.yaml.in:859-867`）、`laggy_interval` 為 down 時長的 EWMA 並被 `mon_osd_laggy_max_interval`（預設 **5 分鐘**，`mon.yaml.in:873-881`）截斷。**關掉 adaptive grace ≠ 關掉 laggy 累積。**
+- laggy 的**唯一自動歸零**路徑：OSD 被標 DOWN 時，若距上次 down 超過門檻才呼叫 `set_default_laggy_params()`（`:1961-1970` → `:3446-3456`）；門檻 = `48 × mon_osd_laggy_halflife` = **48 小時**（`:3425-3432`，halflife 預設 1 小時，`mon.yaml.in:850-855`）。
+- **另一條 laggy 生效路徑沒被關掉**：auto-out 的 grace 由 `mon_osd_adjust_down_out_interval`（預設 **true**，`mon.yaml.in:905-910`）縮放（`OSDMonitor.cc:5164-5175`），與 `mon_osd_adjust_heartbeat_grace` 是**兩個獨立開關**。
+- `mon_osd_down_out_subtree_limit` 預設 **`rack`**（`mon.yaml.in:966-975`）：tick 時若「包含該 OSD 的整個 rack subtree 都 down」→ **重置 `down_pending_out` 計時器並 `continue`**（`OSDMonitor.cc:5177-5188`）→ **永遠不會 auto-out**。
+- `can_mark_out()`（`OSDMonitor.cc:3132-3160`）檢查 `noout` 與 `mon_osd_min_in_ratio`（預設 **0.75**，`mon.yaml.in:994-1000`），但它**只被 auto-out tick 呼叫**（`:5145`、`:5159`）；手動 `ceph osd out` 走 `prepare_command` 路徑（`:11991-12070`），**沒有 min_in_ratio 檢查**。
+- OSD 正常關閉時會主動送 `MOSDMarkMeDown`（`OSD.cc:1338-1360`，由 shutdown 路徑呼叫 `:4562`/`:4569`）→ daemon stop 幾乎立即被標 down；網路隔離沒有這條路徑，只能等 heartbeat grace + failure report。
+
+### H-015: `mon_osd_adjust_heartbeat_grace=false` 只關掉 heartbeat grace 的 laggy 加成，`mon_osd_adjust_down_out_interval` 仍是 true，且 laggy 值 48 小時內不會自然歸零 — flapping cells 之間存在無法靠 restart 清除的跨 cell 污染
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼（兩個獨立開關 + 48 × halflife 門檻）
+- Prediction: 每個 flapping cell（10 輪）結束後，目標 OSD 的 `laggy_probability` 單調上升並逼近 1（每輪 `p ← 0.3 + 0.7p`：3 輪後 ≈ 0.66、10 輪後 ≈ 0.97），且在 72 小時 campaign 內**不會**回到 0；`laggy_interval` 被 300 秒截斷。
+- 證偽條件: 觀測到 `laggy_probability` 在 cells 之間回到 0 → 存在其他重置路徑，需重查（讀碼結論錯誤）。
+- Evidence: OSDMonitor.cc:3200-3202、:3693-3714、:3425-3444、:1961-1970、:3446-3456、:5164-5175；mon.yaml.in:850-910。
+- Artifacts: 每個 replicate 收 `ceph osd dump --format json` 的 `osd_xinfo` 作 covariate（**只記錄不 gate**）；報告需說明「flapping 的 profile 比較在 laggy 已飽和的狀態下進行」。
+
+### H-016: `mon_osd_down_out_subtree_limit=rack` 使整個 rack down 時 auto-out 計時器被反覆重置 — 生產上沒有 operator 介入就永遠不會觸發 backfill，這是 rack 場景最重要的生產語意
+- Status: proposed
+- Priority: P0
+- Tier: T1 → T3
+- Origin: 讀碼 + spec §2
+- Prediction: rack cells 注入後（兩台隔離、OSD 判 down）在下手動 `osd out` 之前的觀察窗內，兩顆 OSD 維持 `down + in`、`degraded%` 不下降、`recovery bytes/s ≈ 0`；下 out 之後才起 backfill。此觀察可在 rack pilot 的注入後前 60 秒順帶完成，不需額外 cell。
+- 證偽條件: 未手動 out 即自動起 backfill → violated（則 subtree limit 未生效，需檢查 CRUSH type 名稱是否真的是 `rack`）。
+- Evidence: OSDMonitor.cc:5177-5188；mon.yaml.in:966-975。
+- Artifacts: rack pilot 的 bundle 需含這 60 秒的 `ceph -s` 序列作為報告素材。
+
+### H-017: 手動 `ceph osd out` 不受 `mon_osd_min_in_ratio` 限制，rack 場景一次 out 兩顆（in 比降到 6/8 = 0.75）不會被拒
+- Status: proposed
+- Priority: P1
+- Tier: T1 → T3
+- Origin: 讀碼（`can_mark_out` 的呼叫點只有 auto-out tick）
+- Prediction: rack commit 步驟的兩顆 `ceph osd out` 恆成功；若失敗必為其他原因（mon 不可用、id 錯誤）。
+- 證偽條件: 出現 `will not mark osd.N out` 之類拒絕 → violated。
+- Evidence: OSDMonitor.cc:3132-3160（定義）、:5145/:5159（唯二呼叫點）、:11991-12070（手動路徑無此檢查）；mon.yaml.in:994-1000。
+
+### H-020: 網路隔離的「注入 → 判 down」延遲 ≈ heartbeat grace（20 秒）+ mon tick，而 daemon stop 因為有 `MOSDMarkMeDown` 幾乎立即 down — 兩種故障的時間軸必須以 OSDMap down epoch 對齊，不能都用 `fault_t0`
+- Status: proposed
+- Priority: **P0**（分析正確性前提）
+- Tier: T1 → T3
+- Origin: 讀碼 + spec 對 node loss 的定位
+- Prediction: `node-isolation` 的 `fault_t0 → OSDMap down epoch` 延遲 ≈ **20–30 秒**；`osd-down`（daemon stop）的同一延遲 **< 5 秒**。若以 `fault_t0` 為量測窗起點，node-isolation 的 degradation ratio 會被前段「什麼都沒發生」的 20 秒稀釋。
+- 證偽條件: 兩者延遲差 < 5 秒 → violated（代表隔離規則也切斷了某條讓 OSD 自我回報的路徑，或 mon 用其他機制更快判定）。
+- Evidence: OSD.cc:1338-1360（`MOSDMarkMeDown`）、:4562/:4569；OSDMonitor.cc:3195-3202（grace = 20s）；global.yaml.in:2833-2836。
+- Artifacts: `verdict.py aggregate` 對 fault cells 同時輸出以 `fault_t0` 與以 `down_epoch_t` 為原點的兩組窗口統計；跨故障型比較一律用後者。
+
+---
+
+## 橫向假說
+
+### H-018: profile 的九個衍生參數是 OSD process 內的 `set_val_default`，不進 mon config store；而在非 `custom` profile 下對這九個 key 做 `ceph config set` 會被 OSD 反向 `config rm` — 生效驗證只能逐 OSD 讀 effective config
+- Status: proposed
+- Priority: **P0**（qos gate 設計依據）
+- Tier: T1 → T3
+- Origin: 讀碼 + spec §2
+- Prediction: (a) 每次 profile 切換後 30 秒 settle window 內，八顆 OSD 的九個 effective 參數全部收斂到該 profile 的值；(b) `ceph config dump` 恆不含這九個 key；(c) 若誤下 `ceph config set osd osd_mclock_scheduler_client_res 0.9`，該 key 會在數秒內從 mon store 消失（且 profile 值不變）。
+- 證偽條件: (a) 有 OSD 在 30 秒後仍未收斂 → settle window 需加長並記錄；(c) 值持續存在 → 讀碼結論錯誤。
+- Evidence: mClockScheduler.cc:320-325（只有 shard 0 設 profile defaults）、:396-425（`set_val_default` + `apply_changes`）、:631-635（profile 變更 → 重算）、:658-695（非 custom profile 下的 QoS 參數變更 → 向 mon 送 `config rm` + `rm_val`）。
+- Artifacts: `ceph_qos_gate` 的驗證集合（已在 plan Task 6）＝ profile 名 + 九參數 + capacity + seq bw + `osd_max_backfills` + `osd_recovery_max_active_ssd` + `override_recovery_settings=false` + `skip_benchmark=true` + `osd_op_queue=mclock_scheduler`；本假說補上「`ceph config dump` 不得含九個 key」的反向斷言。
+
+### H-021: 灰色網路故障（1–5% packet loss / 延遲抖動）下 heartbeat 未斷但效能劣化，三 profile 的 client latency 差異可能與硬故障相反
+- Status: proposed（**S3 選配，時間允許才做**）
+- Priority: P2
+- Tier: T3
+- Origin: spec §5 選配 + repo 既有 gray-failure 研究線
+- Prediction: `tc netem` 對單一 OSD node 注入 2% loss 時，OSD 不被標 down（無 backfill），client p99 劣化主要來自該 OSD 的重傳；三 profile indistinguishable（沒有 recovery 流量可分配）。
+- 證偽條件: 出現符合 res 比的 profile 分層 → 代表灰色故障也會觸發可被 mClock 分配的背景流量。
+- Notes: 若主 campaign 超時，此條直接留在 backlog、報告標為未驗證。
+
+### H-023: `rack-loss × 極端壓 × high_client_ops` 是最可能撞 measurement cap 的 cell，其 `time-to-recovery-complete` 會是全矩陣最長、`recovery bytes/s` 最低
+- Status: proposed
+- Priority: P1
+- Tier: T3
+- Origin: 矩陣推導（最大 backfill footprint × 最高 client 壓 × 最不利 recovery 的 profile）
+- Prediction: 該 cell 的 `time-to-recovery-complete` ≥ 其他 rack cells 的 1.4 倍；若 `measurement_cap = 2700s` 不足，它是第一個 censored 的 cell。plan 的 pilot 選擇規則（每故障型取「極端壓 × `high_client_ops`」）與本預測一致 → **pilot 的 cap 推導不會系統性低估**。
+- 證偽條件: 其他組合先 censored → cap 推導的反偏誤假設不成立，需重新選 pilot 組合。
+- Artifacts: 若 pilot 自己 censored，走 plan §Cap policy 的 `PILOT-CENSORED` 人工 gate。
+
+---
+
+## Cell 預測骨架（63 cells，Task 1 Step 7）
+
+**共同規則**
+
+- 每個 replicate 開跑前，pipeline 把對應 cell 的預測**凍進 bundle**（`prediction.json`），事後不可改。
+- 方向性符號：`A < B` 表示「A 的 client 劣化小於 B」；recovery 面的方向相反時會明講。
+- 所有「分離 / 等效」的判定都套 §預註冊生產門檻，且 `indistinguishable` 必須標 equivalent 或 underpowered。
+- **ρ（H-005）在 calibrate 後填入**；下表的 `ρ×L` 分支決定該 cell 是「預測分離」還是「預測等效」。若 calibrate 得到的 ρ 使某 cell 落在不同分支，以 ρ 為準改寫該 cell 的預測（改寫發生在 freeze 之前，並記入 journal）。
+
+### A. 穩態 24 cells（3 profiles × 4 壓力 × 2 形態，n=3）— negative control
+
+| 壓力 | 形態 | 預測 |
+|---|---|---|
+| 低 / 中 / 高 / 極端 | 4K randrw 70/30 | **三 profile indistinguishable（equivalent）**：無 recovery 流量 → 只有一個 active class；client `lim` 三 profile 皆 max（`mClockScheduler.cc:337-373`）→ reservation 只是下限、不構成上限。 |
+| 低 / 中 / 高 / 極端 | 1M seq write | 同上。 |
+
+- **這 24 cells 的功能是偵測混淆變因**：任何超過 production margin 的 profile 差異都代表有未受控來源（best_effort 背景流量、Azure 鄰居效應、校準漂移），必須先解釋才能相信故障區塊的結論。
+- 次要預測：極端壓的 achieved IOPS 即 `ceiling`（校準值）；三 profile 的 ceiling 差異 < noise margin。
+
+### B. 故障主軸 27 cells（3 profiles × 3 壓力 × 3 故障型，4K randrw，n=2）
+
+以 `ρ×L` 分支（H-005）給方向性預測；`res_client` = balanced 0.5 / high_client_ops 0.6 / high_recovery_ops 0.3。
+
+| 故障型 | 壓力 L | client 面預測 | recovery 面預測 | 主要依據 |
+|---|---|---|---|---|
+| **OSD down** | 低 (0.25) | `ρ×L < 0.3` → 三者 **indistinguishable** | `high_recovery_ops` ≥ `balanced` ≈ `high_client_ops`（recovery 拿走 client 沒用完的全部） | H-005、H-001 |
+| | 中 (0.5) | `0.3 ≤ ρ×L < 0.6` → `high_recovery_ops` 顯著劣化；`balanced` ≈ `high_client_ops` | recovery bytes/s：`high_recovery_ops` > `balanced` ≳ `high_client_ops` | H-005 |
+| | 極端 (~1.0) | 完整分離：`high_client_ops` < `balanced` < `high_recovery_ops`，且 client 吞吐比 ≈ 0.6 : 0.5 : 0.3 | time-to-recovery：`high_recovery_ops` < `balanced` < `high_client_ops` | H-001、H-005 |
+| **OSD flapping** | 低 / 中 / 極端 | **max IO stall duration 三者 indistinguishable**（peering 主導）；p99 degradation ratio 的分離度**小於**同壓力的 OSD down cells | 每輪 up 後的 log-based recovery 量小 → recovery 面差異可能落在 margin 內 | H-007、H-015 |
+| **synthetic CRUSH-rack loss** | 低 | 三者 indistinguishable（同 OSD down 低壓） | backfill footprint ≈ 1/4 資料、2 顆 OSD 同時 → 絕對值最大 | H-005、H-016 |
+| | 中 | `high_recovery_ops` 顯著劣化 | 同上 | |
+| | 極端 | 分離最大（全矩陣中 profile 差異最明顯的 9 cells）；`high_client_ops` 的 client 保護最好但 time-to-recovery 最長，**最可能 censored** | time-to-recovery 全矩陣最長 | H-001、H-023 |
+
+- 全 27 cells 共同預測：`fault_t0` 後首 5 秒的 p99 spike 與 profile 無關（H-003、H-007）。
+- 全 27 cells 共同預測：heal 後的回歸 backfill 時間呈 `high_recovery_ops` < `balanced` < `high_client_ops`，比值 ≈ 1 : 1.11 : 1.43（H-008；需 plan 補時戳）。
+
+### C. node loss 變體 3 cells（3 profiles × 中壓 × network-isolation，n=2）
+
+- 主預測：**以 OSDMap down epoch 對齊後**，與「OSD down × 中壓」的三個 cells 在四個 primary endpoint 上皆 indistinguishable（backfill footprint 相同、只有故障路徑不同）。
+- 次預測（H-020）：`fault_t0 → down epoch` 延遲 ≈ 20–30 秒，顯著大於 OSD down 的 < 5 秒；若誤用 `fault_t0` 對齊，node-isolation 的 degradation ratio 會被系統性低估。
+- 差異來源（如實記錄，不做歸因）：隔離期間 OSD process 仍活著、恢復時無 journal replay。
+
+### D. large-IO contention 6 cells（3 profiles × {中, 極端} × OSD down × 1M seq write，n=2）
+
+- 主預測（H-004 + H-006 + H-014）：**六個 cells 全部 indistinguishable**。理由：(a) 1M 形態下 client 的 res 換算成 `res × 1200 MiB/s`（600 / 720 / 360 MiB/s per OSD），而實測 per-OSD 可達寫入頻寬預期遠低於 360 MiB/s（單 NIC 12.5 Gbps + replica 3）→ 三個 profile 的 client reservation 都不 binding；(b) 100% 寫使 immediate class 的表外佔比升到 ~2/3，進一步壓縮 mClock 的有效仲裁空間。
+- **證偽點（本區塊的價值所在）**：任一對 profile 分離 > production margin → H-004/H-014 的名義值假設錯誤，須用實測 seq 頻寬重算 cost model。
+- 必收 covariate：per-OSD achieved MiB/s、NIC tx/rx/drop/retransmit（判定是否 NIC-bound）、`osd_bandwidth_cost_per_io` 實際值。
+
+### E. chaos 3 cells（3 profiles × 極端壓 × 固定 seed，n=1）
+
+- 定位 showcase，**不做嚴格 verdict**（n=1，只報描述性統計 + 與 B 區塊的一致性檢查）。
+- 方向性預測：累積 stall 秒數 `high_client_ops` < `balanced` < `high_recovery_ops`；三者重播同一事件序列，事件序列本身滿足 min_size ≥ 2 的安全不變條件（plan §Task 8）。
+- 一致性檢查：若 chaos 的方向與 B 區塊極端壓 cells 相反 → 標為異常，列入報告的「未解釋觀測」。
+
+### 齊備度
+
+`24 + 27 + 3 + 6 + 3 = 63 cells`；executions `72 + 54 + 6 + 12 + 3 = 147`（與 spec §5 一致，`manifest.py generate --assert 63/147` 驗）。
+
+---
+
+## 讀碼結果與 plan / spec 敘述的出入（**高價值，須在 Step 8 gate 一併裁示**）
+
+1. **plan Task 6 說「v19.2.2 的 skip 路徑（`OSD.cc:10024` early return）沒有正向『skipped』log 可斷言」——只對一半。**
+   - `osd_mclock_skip_benchmark=true` 造成的 early return（`OSD.cc:10024-10026`）確實無 log ✔。
+   - 但「值 ≠ compiled default」造成的 skip（`OSD.cc:10056-10061`）**有** `dout(1) ... "Skip OSD benchmark test."`。
+   - 影響：harness 兩個條件都設，實際落在無 log 的那條，所以 plan 的結論在該設定下仍成立，但**理由陳述不精確**，且因此漏掉了一個免費的 positive control（H-013）。建議照 H-013 的 Artifacts 修改 `run/calibrate.sh`。
+
+2. **spec §2 說「best_effort lim 90% vs 70% 何時可觀測——本實驗不主測，標註為已知邊界」——低估了。**
+   - `PeeringState::get_recovery_op_priority()`（`PeeringState.h:1588-1601`）在 PG 非 degraded、非 undersized 時回傳 `BEST_EFFORT=5`，經 `priority_to_scheduler_class`（`OpSchedulerItem.h:204-212`）落在 `background_best_effort`。
+   - 也就是說 best_effort 的內容**不只是 scrub / snap trim**（本 campaign 都關掉了），還包含**每個 fault replicate heal 之後的回歸 backfill**——而那正是 lim 唯一 binding 的場景，且 harness 本來就要等它完成（safety gate）。
+   - 影響：只要補兩個時戳就能免費拿到一個乾淨的 lim 對照（H-008），否則整份報告對「best_effort lim」只能寫「未觀測」。**建議 in-scope**。
+
+3. **spec §5 說「campaign 全程設 `mon_osd_adjust_heartbeat_grace=false`（控制變因）」——控制不完全。**
+   - `mon_osd_adjust_down_out_interval` 是**另一個獨立開關**且預設 true（`mon.yaml.in:905-910`、`OSDMonitor.cc:5164-5175`），laggy 仍會影響 down→auto-out 的等待時間。
+   - 影響：本 campaign 以手動 out + flapping 期間 `noout` 迴避，實務上不受影響；但報告若寫「已關閉 adaptive grace」需限定為「heartbeat grace 面」。另 laggy 值本身 48 小時內不歸零（H-015），跨 cell 污染的存在必須誠實寫進 limitations。
+
+4. **spec §2 對 `calc_scaled_cost()` 的敘述（「`osd_mclock_max_capacity_iops_*` 透過 `sequential_bandwidth / IOPS` 決定每筆 op 的最低成本」）正確，但缺了一個推論**：因為 `Message::get_cost()` = `data.length()`（`Message.h:478-480`），**read 請求的 item_cost 是 0**，所以 4K 讀與 4K 寫的 scaled cost 完全相同（都等於 floor）。randrw 的讀寫比在 mClock 的帳上不存在（H-004）。
+
+5. **spec §2 對 profile 表的「res 是無因次 ratio」正確，但沒有指出三個 profile 的 client + background_recovery reservation 相加**都**等於 1.0**（0.5+0.5 / 0.6+0.4 / 0.3+0.7）。這使得「weight 是否可觀測」成為整個實驗的解讀分水嶺（H-001），建議在報告的機制章節明列。
+
+---
+
+## Triage（等使用者 Step 8 裁示）
+
+| 優先 | 條目 | 為何現在就要決定 |
+|---|---|---|
+| **P0** | H-001、H-005、H-006、H-007、H-008、H-009、H-012、H-013、H-016、H-018、H-020 | 前四條決定全部 cells 的預測與報告框架；後六條是 harness 的 gate / 不變條件 / 時間軸對齊，**Phase 2 收尾前必須決定是否採納**（H-008 與 H-013 需要改 plan Task 6/9/10/11/12）。 |
+| **P1** | H-002、H-004、H-010、H-011、H-014、H-015、H-017、H-023 | campaign 期間的斷言與 covariate，改動集中在 `collect.sh` / `ceph_qos_gate`，成本低。 |
+| **P2** | H-003、H-019、H-021、H-022 | 研究線與加強型證據；H-021 明確為 S3 選配，時間不足即留 backlog。 |
+
+**驗收（spec §11.5）**：所有 P0/P1 條目在 Phase 5 收官時必須離開 `proposed`（confirmed / violated / indistinguishable(equivalent|underpowered) / killed 四選一）。

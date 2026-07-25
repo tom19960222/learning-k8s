@@ -1,0 +1,5 @@
+# 真機 campaign 產物與 IaC 交付物（不進 git）。
+# EVIDENCE-SUMMARY-*.md 在實驗根目錄，不受影響。
+results/
+azure/inventory.json
+azure/attestation.json
