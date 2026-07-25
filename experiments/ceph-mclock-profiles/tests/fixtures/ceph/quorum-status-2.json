@@ -1,0 +1,19 @@
+{
+ "election_epoch": 28,
+ "quorum": [
+  0,
+  1
+ ],
+ "quorum_names": [
+  "mclock-admin",
+  "mclock-mon-1"
+ ],
+ "quorum_leader_name": "mclock-admin",
+ "quorum_age": 300,
+ "monmap": {
+  "epoch": 2,
+  "fsid": "3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90",
+  "min_mon_release_name": "squid",
+  "mons": []
+ }
+}

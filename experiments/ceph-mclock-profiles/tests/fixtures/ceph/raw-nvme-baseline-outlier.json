@@ -1,0 +1,34 @@
+{
+ "mclock-osd-1": {
+  "bw_bytes": 196608000,
+  "iops": 48000.0
+ },
+ "mclock-osd-2": {
+  "bw_bytes": 194560000,
+  "iops": 47500.0
+ },
+ "mclock-osd-3": {
+  "bw_bytes": 200704000,
+  "iops": 49000.0
+ },
+ "mclock-osd-4": {
+  "bw_bytes": 197427200,
+  "iops": 48200.0
+ },
+ "mclock-osd-5": {
+  "bw_bytes": 192921600,
+  "iops": 47100.0
+ },
+ "mclock-osd-6": {
+  "bw_bytes": 199884800,
+  "iops": 48800.0
+ },
+ "mclock-osd-7": {
+  "bw_bytes": 196198400,
+  "iops": 47900.0
+ },
+ "mclock-osd-8": {
+  "bw_bytes": 49152000,
+  "iops": 12000.0
+ }
+}

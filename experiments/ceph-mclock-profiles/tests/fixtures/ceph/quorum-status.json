@@ -1,0 +1,45 @@
+{
+ "election_epoch": 30,
+ "quorum": [
+  0,
+  1,
+  2
+ ],
+ "quorum_names": [
+  "mclock-admin",
+  "mclock-mon-1",
+  "mclock-mon-2"
+ ],
+ "quorum_leader_name": "mclock-admin",
+ "quorum_age": 43200,
+ "features": {
+  "quorum_con": "4540138322906710015",
+  "quorum_mon": [
+   "kraken",
+   "luminous",
+   "squid"
+  ]
+ },
+ "monmap": {
+  "epoch": 3,
+  "fsid": "3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90",
+  "min_mon_release_name": "squid",
+  "mons": [
+   {
+    "rank": 0,
+    "name": "mclock-admin",
+    "addr": "10.60.1.10:6789/0"
+   },
+   {
+    "rank": 1,
+    "name": "mclock-mon-1",
+    "addr": "10.60.1.11:6789/0"
+   },
+   {
+    "rank": 2,
+    "name": "mclock-mon-2",
+    "addr": "10.60.1.12:6789/0"
+   }
+  ]
+ }
+}

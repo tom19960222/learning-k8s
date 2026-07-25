@@ -1,0 +1,8 @@
+Jul 25 03:14:04 mclock-osd-1 systemd[1]: Starting Ceph osd.0 for 3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90...
+Jul 25 03:14:05 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:05.101+0000 7f0a1b2c3d40  0 set uid:gid to 167:167 (ceph:ceph)
+Jul 25 03:14:05 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:05.102+0000 7f0a1b2c3d40  0 ceph version 19.2.2 (0eceb0defba60152a8182f7bd87d164b639885b8) squid (stable), process ceph-osd, pid 7
+Jul 25 03:14:06 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:06.480+0000 7f0a1b2c3d40  1 osd.0 512 set_osd_capacity_params_from_config: osd_bandwidth_cost_per_io: 27968.31 bytes/io, osd_bandwidth_capacity_per_shard 209715200.00 bytes/second
+Jul 25 03:14:07 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:07.001+0000 7f0a1b2c3d40  0 osd.0 512 done with init, starting boot process
+Jul 25 03:14:07 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:07.002+0000 7f0a1b2c3d40  1 osd.0 512 maybe_override_options_for_qos osd_recovery_max_active_ssd set to 10
+Jul 25 03:14:07 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:07.003+0000 7f0a1b2c3d40  1 osd.0 512 maybe_override_options_for_qos osd_max_backfills set to 1
+Jul 25 03:14:08 mclock-osd-1 ceph-3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90-osd-0[2201]: debug 2026-07-25T03:14:08.551+0000 7f0a1b2c3d40 -1 osd.0 512 maybe_override_max_osd_capacity_for_qos osd bench err: -5 osd bench errstr: internal error

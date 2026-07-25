@@ -1,0 +1,269 @@
+{
+ "pg_ready": true,
+ "pg_stats": [
+  {
+   "pgid": "2.0",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.1",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.2",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "peering",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.3",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.4",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.5",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.6",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.7",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "activating+degraded",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.8",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.9",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.a",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  },
+  {
+   "pgid": "2.b",
+   "version": "512'1200",
+   "reported_seq": 4200,
+   "state": "active+clean",
+   "up": [
+    0,
+    3,
+    5
+   ],
+   "acting": [
+    0,
+    3,
+    5
+   ],
+   "up_primary": 0,
+   "acting_primary": 0,
+   "stat_sum": {
+    "num_objects": 600,
+    "num_bytes": 2516582400
+   }
+  }
+ ]
+}

@@ -1,0 +1,70 @@
+[
+ {
+  "addr": "10.60.1.10",
+  "hostname": "mclock-admin",
+  "labels": [
+   "_admin"
+  ],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.11",
+  "hostname": "mclock-mon-1",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.12",
+  "hostname": "mclock-mon-2",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.21",
+  "hostname": "mclock-osd-1",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.22",
+  "hostname": "mclock-osd-2",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.23",
+  "hostname": "mclock-osd-3",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.24",
+  "hostname": "mclock-osd-4",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.25",
+  "hostname": "mclock-osd-5",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.26",
+  "hostname": "mclock-osd-6",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.27",
+  "hostname": "mclock-osd-7",
+  "labels": [],
+  "status": ""
+ },
+ {
+  "addr": "10.60.1.28",
+  "hostname": "mclock-osd-8",
+  "labels": [],
+  "status": ""
+ }
+]

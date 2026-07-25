@@ -1,0 +1,1 @@
+2026-07-25T03:14:09.000000+0000 mon.mclock-admin (mon.0) 120 : cluster [INF] osdmap e512: 8 total, 8 up, 8 in

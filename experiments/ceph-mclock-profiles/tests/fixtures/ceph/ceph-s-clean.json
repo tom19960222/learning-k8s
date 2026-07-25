@@ -1,0 +1,80 @@
+{
+ "fsid": "3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90",
+ "health": {
+  "status": "HEALTH_WARN",
+  "checks": {
+   "OSDMAP_FLAGS": {
+    "severity": "HEALTH_WARN",
+    "summary": {
+     "message": "noscrub,nodeep-scrub flag(s) set",
+     "count": 2
+    },
+    "muted": false
+   }
+  },
+  "mutes": []
+ },
+ "election_epoch": 30,
+ "quorum": [
+  0,
+  1,
+  2
+ ],
+ "quorum_names": [
+  "mclock-admin",
+  "mclock-mon-1",
+  "mclock-mon-2"
+ ],
+ "quorum_age": 43200,
+ "monmap": {
+  "epoch": 3,
+  "min_mon_release_name": "squid",
+  "num_mons": 3
+ },
+ "osdmap": {
+  "epoch": 512,
+  "num_osds": 8,
+  "num_up_osds": 8,
+  "osd_up_since": 1785000000,
+  "num_in_osds": 8,
+  "osd_in_since": 1785000000,
+  "num_remapped_pgs": 0
+ },
+ "pgmap": {
+  "pgs_by_state": [
+   {
+    "state_name": "active+clean",
+    "count": 128
+   }
+  ],
+  "num_pgs": 128,
+  "num_pools": 2,
+  "num_objects": 76800,
+  "data_bytes": 322122547200,
+  "bytes_used": 966367641600,
+  "bytes_avail": 14000000000000,
+  "bytes_total": 15000000000000,
+  "degraded_objects": 0,
+  "misplaced_objects": 0
+ },
+ "fsmap": {
+  "epoch": 1,
+  "by_rank": [],
+  "up:standby": 0
+ },
+ "mgrmap": {
+  "available": true,
+  "num_standbys": 0,
+  "modules": [
+   "iostat",
+   "restful"
+  ],
+  "services": {}
+ },
+ "servicemap": {
+  "epoch": 12,
+  "modified": "2026-07-25T00:00:00.000000+0000",
+  "services": {}
+ },
+ "progress_events": {}
+}
