@@ -446,8 +446,9 @@ class FioSeries(object):
     # -- 累加 ------------------------------------------------------------
     def _add_numeric(self, sec, value, bs, partial):
         self.iops_by_sec[sec] = self.iops_by_sec.get(sec, 0.0) + value
-        if bs:
-            self.bytes_by_sec[sec] = self.bytes_by_sec.get(sec, 0.0) + value * bs
+        # 不從 iops × bs 換算頻寬：真機的 iops log block-size 欄位是 0，
+        # 換算恆為 0。頻寬一律取自 fio 的 bw log（kind == "bw"）。
+        _ = bs
         if partial:
             self.partial_tail_secs.add(sec)
 
@@ -476,6 +477,8 @@ def load_fio_series(fio_dir, strict=False):
     series = FioSeries()
     numeric_raw = {}   # (client, seg, job, direction) -> dict[sec] = (value, bs)
     numeric_tail = {}  # (client, seg, job, direction) -> tail sec
+    bw_raw = {}        # (client, seg, job, direction) -> dict[sec] = bytes/s
+    bw_tail = {}       # (client, seg, job, direction) -> tail sec
     hist_raw = {}      # (client, seg, job, direction) -> dict[sec] = bins
     hist_tail = {}
 
@@ -484,8 +487,8 @@ def load_fio_series(fio_dir, strict=False):
         return series
 
     for path, client, seg, kind, job in _iter_log_files(fio_dir):
-        if kind in ("bw", "slat", "clat"):
-            continue  # 契約只用 iops / lat / clat_hist
+        if kind in ("slat", "clat"):
+            continue  # percentile 一律走 clat_hist
         series.files += 1
         series.clients.add(client)
         series.segments.add(seg)
@@ -512,6 +515,22 @@ def load_fio_series(fio_dir, strict=False):
                         continue
                     slot[sec] = bins
                     hist_tail[key] = sec
+            elif kind == "bw":
+                # fio 的 bw log 直接給 KiB/s；不能從 iops log 換算——它的
+                # block-size 欄位真機上是 0（`1785082328606, 695, 0, 0, 0`），
+                # 換算結果會恆為 0，頻寬在報告裡就永遠是空的。
+                rows = _parse_numeric_log(path)
+                for t_ms, val, direction, _bs in rows:
+                    if series.epoch_ms is None:
+                        series.epoch_ms = t_ms > 10 ** 12
+                    sec = t_ms // 1000
+                    key = (client, seg, job, direction)
+                    slot = bw_raw.setdefault(key, {})
+                    if sec in slot:
+                        series.duplicate_rows_dropped += 1
+                        continue
+                    slot[sec] = val * 1024.0      # KiB/s → bytes/s
+                    bw_tail[key] = sec
             elif kind == "iops":
                 rows = _parse_numeric_log(path)
                 for t_ms, val, direction, bs in rows:
@@ -552,6 +571,15 @@ def load_fio_series(fio_dir, strict=False):
                 series.duplicate_rows_dropped += 1
                 continue
             series._add_numeric(sec, val, bs, is_tail)
+
+    bw_cover = _coverage_by_stream(bw_raw)
+    for (client, seg, job, direction), slot in sorted(bw_raw.items()):
+        tail = bw_tail.get((client, seg, job, direction))
+        for sec in sorted(slot):
+            if sec == tail and len(bw_cover[(client, job, direction)][sec]) > 1:
+                series.duplicate_rows_dropped += 1
+                continue
+            series.bytes_by_sec[sec] = series.bytes_by_sec.get(sec, 0.0) + slot[sec]
 
     hist_cover = _coverage_by_stream(hist_raw)
     for (client, seg, job, direction), slot in sorted(hist_raw.items()):
@@ -733,12 +761,15 @@ def cmd_aggregate(args):
     exit_proof = read_json(os.path.join(bundle, "fio-exit-proof.json"), {}) or {}
     exited = [c.get("fio_exited_at") for c in (exit_proof.get("clients") or {}).values()]
     exited = [e for e in exited if isinstance(e, int)]
-    if exited and win_end is not None:
-        workload_end = max(exited)
-        if workload_end < win_end:
-            log("aggregate：窗尾自 %d 夾到 fio 實際結束的 %d（差 %ds 為偵測延遲）"
-                % (win_end, workload_end, win_end - workload_end))
-            win_end = workload_end
+    if exited and win_end is not None and obs_end is not None:
+        # 夾到**最後一筆實際樣本**，不是 fio_exited_at：後者是「fio 連 log 都寫完
+        # 才返回」的時刻，比最後一筆量測晚數秒（真機 9s），那幾秒同樣沒有 workload。
+        # fio_exited_at 在此只當「fio 是自行結束的」這個事實的證據——被我們 STOP
+        # 中止時它不存在，就不夾窗，尾端無 IO 才會如實記成 stall。
+        if obs_end < win_end:
+            log("aggregate：窗尾自 %d 夾到最後一筆樣本 %d（差 %ds 為 fio 收尾與偵測延遲）"
+                % (win_end, obs_end, win_end - obs_end))
+            win_end = obs_end
     if win_start is None or win_end is None:
         die("aggregate：找不到任何 fio 逐秒樣本，也沒有 coverage-proof 的窗口定義")
 
