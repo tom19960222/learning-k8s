@@ -168,7 +168,12 @@ admin 也要裝 `podman`（mon.a 會跑在 admin 上）。
 - [ ] osd-1..8：`fio --version` 正常；inventory 的 `nvme_device` 路徑存在且與 lsblk 相符。
 - [ ] 15 台：`iostat -V`（sysstat）、`iperf3 --version`、`sudo iptables -L -n` 皆正常。
 - [ ] attestation JSON 存在且欄位齊全（缺 = FAIL）。
-- [ ] client/osd 任兩台間 `ping` < 1ms 量級（同 subnet 內網通）。
+- [ ] client/osd 任兩台間 **背靠背** `ping`（`sudo ping -f`）avg < 2ms。
+      **量法很重要**（2026-07-26 真機實測）：每秒一發的 `ping -c 3` 量到 1.3–2.4 ms，
+      背靠背量到 0.87–0.99 ms，差 2–3 倍。**與 CPU C-state 無關**——發送端與接收端
+      各自壓滿 CPU 都不會改善；那是收端每封包的中斷聚合／排程喚醒成本，pipeline 化
+      之後被攤平。實驗跑的是高 queue depth 連續流量＝pipeline 情境，所以 gate 量背靠背；
+      間距版的數字仍會收成 covariate 進 environment snapshot（供報告引用），不當 gate。
 - [ ] admin 以外的 VM 從 internet 不可達（抽查 1 台 osd 無 public IP）。
 - [ ] Accelerated Networking：15 台 NIC 屬性 `enableAcceleratedNetworking=true`。
 - [ ] 全部資源帶 §1 tags；無 auto-shutdown 排程；VM priority = Regular（非 Spot）。

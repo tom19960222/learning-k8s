@@ -280,4 +280,42 @@ ok
 # 20) log 只走 stderr
 eq "$(log '這行應該在 stderr' 2>/dev/null)" "" "log 不得污染 stdout"
 
+
+# ============================================ ssh 不得吃掉呼叫端 stdin（迴歸）==
+# 真機交付時實際踩到：`while read ...; do node_ssh ...; done <<< "$list"` 會被 ssh 把
+# herestring 整個吸走，迴圈只跑第一圈。症狀是「15 台只 probe 到 1 台」與「N 個
+# prometheus query 只送出第一個」——後者是 best-effort、失敗只 log，會靜默少收資料。
+# 21) 靜態防線：整個 harness 不得再出現這個 pattern
+#     （不做 runtime 測試：要重現就得讓 fake ssh 也讀乾 stdin，而那會在 herestring
+#      以外的情境把測試卡死。靜態掃描已足以守住這個 bug class，且它就是抓出這兩處的手段。）
+# shellcheck disable=SC2016  # 單引號是刻意的：python 程式碼不可被 bash 展開
+_bad="$(cd "$root" && python3 -c '
+import re, glob
+loop = re.compile(r"^\s*while\s+.*\bread\b")
+done = re.compile(r"^\s*done\b")
+sshp = re.compile(r"\bnode_ssh(_to)?\b|(^|[^_\w])ssh\s")
+bad = 0
+for f in sorted(glob.glob("lib/*.sh") + glob.glob("run/*.sh") + glob.glob("azure/*.sh")):
+    # 先把反斜線續行併成邏輯行——`< /dev/null` 常落在續行上，逐實體行檢查會誤判
+    logical, buf = [], ""
+    for line in open(f):
+        line = line.rstrip("\n")
+        buf += line[:-1] + " " if line.endswith("\\") else line
+        if not line.endswith("\\"):
+            logical.append(buf); buf = ""
+    if buf:
+        logical.append(buf)
+    stack = []
+    for l in logical:
+        s = l.split("#")[0]
+        if loop.search(s):
+            stack.append(1)
+        elif done.match(s) and stack:
+            stack.pop()
+        elif stack and sshp.search(s) and "/dev/null" not in s and " -n " not in s:
+            bad += 1
+print(bad)
+')"
+eq "$_bad" "0" "harness 內不得有『ssh 在 read 迴圈內且未保護 stdin』的呼叫"
+
 printf 'test-common.sh: %d assertions passed\n' "$asserts"

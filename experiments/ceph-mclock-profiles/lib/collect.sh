@@ -1524,9 +1524,12 @@ _collect_prometheus() {
     case "$query" in
       *[[:space:]]*) die "prometheus query 不得含空白：${name}=${query}" ;;
     esac
+    # `< /dev/null` 不可省：ssh 未帶 -n 會吃掉下面 `done <<< "$COLLECT_PROM_QUERIES"`
+    # 的 herestring → 只送出第一個 query。這裡是 best-effort（失敗只 log 續行），
+    # 所以症狀是「靜默少收 N-1 個 metric」而不會有任何錯誤。
     node_ssh "$ADMIN_NAME" \
       "timeout ${COLLECT_CMD_TIMEOUT} curl -sS -G ${COLLECT_PROM_URL}/api/v1/query_range --data-urlencode query=${query} --data-urlencode start=${start} --data-urlencode end=${end} --data-urlencode step=${COLLECT_PROM_STEP}" \
-      > "${dir}/${name}.json" 2>/dev/null \
+      > "${dir}/${name}.json" 2>/dev/null < /dev/null \
       || log "prometheus query 失敗（續行）：${name}"
   done <<< "$COLLECT_PROM_QUERIES"
   COLLECT_PROM_URL="$COLLECT_PROM_URL" _collect_py prom-index "$dir" \

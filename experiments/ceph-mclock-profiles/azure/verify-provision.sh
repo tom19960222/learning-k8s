@@ -181,7 +181,12 @@ BLOCK
   if [ "$peer" != "-" ]; then
     cat <<EOF
 kv ping_peer "${peer}"
-kv ping_avg_ms "\$(t ping -c 3 -W 2 -q ${peer} 2>/dev/null | awk -F/ '/rtt|round-trip/ {print \$5}')"
+# 量「背靠背」而非「每秒一發」——實測（2026-07-26 真機）兩者差 2–3 倍，且與 CPU C-state
+# 無關（兩端各自壓滿 CPU 都不會改善），是收端每封包的中斷聚合／排程喚醒成本，pipeline
+# 化之後被攤平。實驗跑的是高 queue depth 連續流量＝pipeline 情境，所以 gate 要量這個；
+# 間距版另存 covariate 進 environment snapshot，不當 gate。
+kv ping_avg_ms "\$(t sudo -n ping -f -c 100 -W 2 -q ${peer} 2>/dev/null | awk -F/ '/rtt|round-trip/ {print \$5}')"
+kv ping_spaced_ms "\$(t ping -c 3 -W 2 -q ${peer} 2>/dev/null | awk -F/ '/rtt|round-trip/ {print \$5}')"
 EOF
   fi
 }
@@ -206,8 +211,11 @@ collect_probes() {
     if [ "$role" = "osd" ]; then nvme="$(inv_nvme "$n")"; fi
     peer="$(_peer_ip "$role")"
     rc=0
+    # `< /dev/null` 不可省：ssh 未帶 -n 會讀乾 stdin，把下面 `done <<< "$NODES_ALL"`
+    # 的 herestring 整個吸走 → 迴圈只跑第一圈，15 台只 probe 到 admin 一台，
+    # 其餘 14 台無資料而連帶 18 條檢查假性失敗（真機交付時實際踩到）。
     node_ssh "$n" "$(_probe_script "$n" "$role" "$nvme" "$peer")" \
-      > "$WORK/$n.out" 2> "$WORK/$n.err" || rc=$?
+      > "$WORK/$n.out" 2> "$WORK/$n.err" < /dev/null || rc=$?
     # 自產的 _rc 放最後一行：同名 key 後者覆蓋前者，遠端輸出偽造不了它
     printf '_rc=%s\n' "$rc" >> "$WORK/$n.out"
     _load_kv "_P_${n//[^A-Za-z0-9]/_}__" "$WORK/$n.out"
@@ -439,15 +447,19 @@ check_versions() {
 }
 
 check_network() {
-  local n bad_ping="" bad_pub="" rtt
+  local n bad_ping="" bad_pub="" rtt spaced spaced_note=""
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     pv "$n" ping_avg_ms; rtt="$_PV"
+    pv "$n" ping_spaced_ms; spaced="$_PV"
+    [ -n "$spaced" ] && spaced_note="${spaced_note} ${n}:${spaced}"
     if ! _lt "$rtt" "$PING_MAX_MS"; then
       pv "$n" ping_peer
       bad_ping="${bad_ping} ${n}->${_PV:-?}(${rtt:-無回應})"
     fi
   done <<< "$(printf '%s\n%s\n' "$NODES_OSD" "$NODES_CLIENT")"
+  # covariate（非 gate）：每秒一發的 RTT，供 environment snapshot 與報告引用
+  log "ping covariate（間距 1s，非 gate）：${spaced_note# }"
   emit intra-subnet-ping "osd/client 互 ping < ${PING_MAX_MS}ms" "${bad_ping# }"
 
   while IFS= read -r n; do
