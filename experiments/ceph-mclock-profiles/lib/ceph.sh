@@ -80,7 +80,11 @@ CEPH_BOOT_MARKERS="${CEPH_BOOT_MARKERS:-done with init, starting boot process|os
 _node_run() {
   [ $# -eq 3 ] || die "用法：_node_run <node> <secs> <cmd>"
   case "$2" in ''|*[!0-9]*) die "_node_run：secs 必須是整數秒（got=${2}）" ;; esac
-  node_ssh "$1" "timeout $2 $3"
+  # `< /dev/null` 在此結構性隔離 stdin：ceph_adm 這類包裝在 `while read` 迴圈裡被呼叫時，
+  # 底下的 ssh 會把迴圈的 herestring 吃光、只跑第一圈。真機上就是這樣造成
+  # `ceph_lock_capacity` 只鎖到 osd.0（其餘七顆的 skip_benchmark 沒設）。
+  # 指令一律以參數傳入、從不從 stdin 讀，所以這裡隔離永遠安全。
+  node_ssh "$1" "timeout $2 $3" < /dev/null
 }
 
 # _node_sh <node> <secs> <cmd>：多段指令（含 `;`／pipe）以 sh -c 整體包 timeout。
@@ -89,7 +93,7 @@ _node_sh() {
   [ $# -eq 3 ] || die "用法：_node_sh <node> <secs> <cmd>"
   case "$2" in ''|*[!0-9]*) die "_node_sh：secs 必須是整數秒（got=${2}）" ;; esac
   case "$3" in *"'"*) die "_node_sh：遠端指令不得含單引號" ;; esac
-  node_ssh "$1" "timeout $2 sh -c '$3'"
+  node_ssh "$1" "timeout $2 sh -c '$3'" < /dev/null  # 同 _node_run：結構性隔離 stdin
 }
 
 # ceph_adm <cmd...>：在 admin 上以 sudo 跑 ceph/rbd/cephadm 指令（有界）。

@@ -106,7 +106,12 @@ node_ssh() {
   local name="$1"; shift
   _require_inventory
   _node_ssh_argv "$name"
-  "${_SSH_ARGV[@]}" "$@"
+  # `< /dev/null` 是這個 bug class 的唯一根治點：ssh 未帶 -n 會讀乾 stdin，
+  # 在 `while read ...; do node_ssh ...; done <<< "$list"` 裡會把 herestring 整個
+  # 吸走、迴圈只跑第一圈。真機三度踩到（15 台只 probe 到 1 台／N 個 prometheus
+  # query 只送第一個／capacity 只鎖到 osd.0）。指令一律以參數傳入、從不從 stdin
+  # 讀，所以在此隔離永遠安全；tests/test-common.sh 有斷言守住「沒有呼叫端餵 stdin」。
+  "${_SSH_ARGV[@]}" "$@" < /dev/null
 }
 
 # node_ssh_to <secs> <name> <cmd...>：遠端包 coreutils timeout（Ubuntu 有；macOS 沒有，
@@ -124,7 +129,7 @@ node_ssh_to() {
   _node_ssh_argv "$name"
   outfile="$(mktemp "${TMPDIR:-/tmp}/mclock-ssh.XXXXXX")"
 
-  "${_SSH_ARGV[@]}" "$remote" >"$outfile" &
+  "${_SSH_ARGV[@]}" "$remote" >"$outfile" < /dev/null &
   pid=$!
   start=$SECONDS
   deadline=$((secs + NODE_SSH_KILL_GRACE))

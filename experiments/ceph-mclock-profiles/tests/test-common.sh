@@ -291,28 +291,25 @@ eq "$(log '這行應該在 stderr' 2>/dev/null)" "" "log 不得污染 stdout"
 # shellcheck disable=SC2016  # 單引號是刻意的：python 程式碼不可被 bash 展開
 _bad="$(cd "$root" && python3 -c '
 import re, glob
-loop = re.compile(r"^\s*while\s+.*\bread\b")
-done = re.compile(r"^\s*done\b")
-sshp = re.compile(r"\bnode_ssh(_to)?\b|(^|[^_\w])ssh\s")
+# 這個 bug class 已在 node_ssh 內部以 `< /dev/null` 根治（見 lib/common.sh）。
+# 這裡守兩件事：
+#   (1) node_ssh／node_ssh_to 的實作沒有把那道隔離拿掉
+#   (2) 沒有呼叫端把 stdin 餵給它們（那會被 /dev/null 靜默吃掉）
 bad = 0
+common = open("lib/common.sh").read()
+for fn in ("node_ssh()", "node_ssh_to()"):
+    i = common.index(fn)
+    body = common[i:common.index("\n}", i)]
+    # 必須看「實際的重導向」而非字面字串——註解裡就寫著 /dev/null，
+    # 不去掉註解會讓這道檢查在重導向被拿掉時仍然通過（第一版就是這樣空過的）。
+    code = "\n".join(l.split("#")[0] for l in body.split("\n"))
+    if not re.search(r"<\s*/dev/null", code):
+        bad += 1
+feed = re.compile(r"(\|\s*node_ssh(_to)?\b)|(\bnode_ssh(_to)?\b[^|#]*<[^<])")
 for f in sorted(glob.glob("lib/*.sh") + glob.glob("run/*.sh") + glob.glob("azure/*.sh")):
-    # 先把反斜線續行併成邏輯行——`< /dev/null` 常落在續行上，逐實體行檢查會誤判
-    logical, buf = [], ""
-    for line in open(f):
-        line = line.rstrip("\n")
-        buf += line[:-1] + " " if line.endswith("\\") else line
-        if not line.endswith("\\"):
-            logical.append(buf); buf = ""
-    if buf:
-        logical.append(buf)
-    stack = []
-    for l in logical:
-        s = l.split("#")[0]
-        if loop.search(s):
-            stack.append(1)
-        elif done.match(s) and stack:
-            stack.pop()
-        elif stack and sshp.search(s) and "/dev/null" not in s and " -n " not in s:
+    for l in open(f):
+        c = l.split("#")[0]
+        if "node_ssh" in c and feed.search(c) and "/dev/null" not in c:
             bad += 1
 print(bad)
 ')"

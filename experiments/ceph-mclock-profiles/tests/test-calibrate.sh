@@ -125,6 +125,7 @@ ceph_gen_campaign_key() { t "ceph_gen_campaign_key"; }
 ceph_bootstrap() { t "ceph_bootstrap"; }
 ceph_add_hosts() { t "ceph_add_hosts"; }
 ceph_apply_mons() { t "ceph_apply_mons"; }
+ceph_apply_mgrs() { t "ceph_apply_mgrs"; }
 ceph_apply_osds() { t "ceph_apply_osds"; return "${FAKE_APPLY_OSDS_RC:-0}"; }
 ceph_verify_versions() { t "ceph_verify_versions"; }
 ceph_setup_crush() { t "ceph_setup_crush"; }
@@ -149,9 +150,9 @@ import sys
 out, mode = sys.argv[1], sys.argv[2]
 # (bench_status, bench_iops)：五狀態決策表的四個「有出口」狀態 + 其餘 accepted
 mixed = [
-    ("accepted", 45000.0),                   # accepted-consistent（canary 要用 45000）
-    ("accepted", 5000.0),                    # accepted-inconsistent（比值出界）
-    ("rejected-out-of-range", 128000.0),     # 被 Ceph 丟棄
+    ("accepted", 45000.0),                   # accepted（canary 要用 45000）
+    ("accepted", 44800.0),                   # accepted
+    ("rejected-out-of-range", 128000.0),     # 被 Ceph 丟棄 → fio-derived
     ("skipped-existing-nondefault", 45000.0),
     ("accepted", 45500.0),
     ("accepted", 45600.0),
@@ -160,6 +161,9 @@ mixed = [
 ]
 if mode in ("failed", "no-result"):
     rows = [(mode, 0.0)] * 8
+elif mode == "bench-outlier":
+    # 鎖定值來自 bench，所以離散必須由 bench 呈現（新決策表語意）
+    rows = [("accepted", 45000.0)] * 7 + [("accepted", 12000.0)]
 else:
     rows = mixed
 osds = []
@@ -269,7 +273,8 @@ eq "$(grep -c 'fio_raw_nvme_baseline' "$TRACE" | tr -d ' ')" "8" "8 台 OSD node
 # 1c) 部署鏈順序（Task 5 序列）
 before "ceph_gen_campaign_key" "ceph_bootstrap" "keypair 先於 bootstrap"
 before "ceph_add_hosts" "ceph_apply_mons" "host 納管先於 mon"
-before "ceph_apply_mons" "ceph_apply_osds" "mon 先於 OSD"
+before "ceph_apply_mons" "ceph_apply_mgrs" "mon 先於 mgr"
+before "ceph_apply_mgrs" "ceph_apply_osds" "mgr placement 先於 OSD（避免 mgr 落在 OSD node）"
 before "ceph_apply_osds" "ceph_verify_versions" "versions gate 在 OSD 之後"
 before "ceph_verify_versions" "ceph_setup_crush" "CRUSH 在 versions gate 之後"
 before "ceph_setup_crush" "ceph_create_pool" "pool 在 CRUSH 之後"
@@ -304,10 +309,10 @@ eq "$(jget "$RESULTS_DIR/no-rebench-osd0.json" positive_control)" "True" "證據
 
 # 1f) capacity 五狀態決策表（真 ceph_capacity_decide 的輸出）
 lock="$RESULTS_DIR/capacity-lock.json"
-eq "$(jget "$lock" osds.0.decision)" "accepted-consistent" "狀態 1：bench 採用且比值合理"
+eq "$(jget "$lock" osds.0.decision)" "accepted" "狀態 1：bench 被採用"
 eq "$(jget "$lock" osds.0.locked_value)" "45000" "狀態 1 鎖 bench 值"
-eq "$(jget "$lock" osds.1.decision)" "accepted-inconsistent" "狀態 2：比值出界"
-eq "$(jget "$lock" osds.1.locked_source)" "fio-derived" "狀態 2 改用 raw fio"
+eq "$(jget "$lock" osds.1.decision)" "accepted" "狀態 2：同為 accepted"
+eq "$(jget "$lock" osds.1.locked_source)" "bench" "狀態 2 同樣鎖 bench（不再有比值判準）"
 eq "$(jget "$lock" osds.2.decision)" "rejected-out-of-range" "狀態 3：被 Ceph 丟棄"
 eq "$(jget "$lock" osds.2.locked_source)" "fio-derived" "狀態 3 改用 raw fio"
 eq "$(jget "$lock" osds.3.decision)" "skipped-existing-nondefault" "狀態 4：沿用既有值"
@@ -405,7 +410,7 @@ FAKE_PROV_MODE=mixed
 # ======================================== 6) 跨 8 顆 CoV gate（異質 NVMe 防線）==
 reset_state
 reset_ssh
-FAKE_RAW_OUTLIER_NODE="mclock-osd-8"
+FAKE_PROV_MODE=bench-outlier
 ( calibrate_main --yes-really-inject ) > "$OUTF" 2> "$ERRF" && fail "CoV 超標應 die"
 ok
 has "$ERRF" "capacity-dispersion-high" "CoV > 20% 要指名 capacity-dispersion-high"
@@ -413,7 +418,7 @@ hasnt "$TRACE" "ceph_lock_capacity" "dispersion 超標不得 lock"
 [ -f "$RESULTS_DIR/capacity-lock.json" ] && fail "dispersion 超標不得寫出 lock 檔"
 ok
 hasnt "$FAKE_SSH_LOG" "sudo reboot" "dispersion 超標不得進 reboot canary"
-FAKE_RAW_OUTLIER_NODE=""
+FAKE_PROV_MODE=mixed
 
 # ======================================================= 7) 注入 gate 與 flags ==
 reset_state
