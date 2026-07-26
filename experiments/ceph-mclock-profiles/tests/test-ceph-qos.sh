@@ -294,6 +294,15 @@ ok
 eq "$(jget "$tmp/prov-5.json" osds.0.bench_status)" "no-result" "無任何 bench 證據"
 
 # ========================================================== ceph_capacity_decide ==
+mk_raw() { # <outfile> <iops>：八顆同值的 raw NVMe 基線
+  python3 - "$1" "$2" <<'RAWPY'
+import json, sys
+outf, iops = sys.argv[1], float(sys.argv[2])
+with open(outf, "w") as fh:
+    json.dump({"mclock-osd-%d" % (i + 1): {"iops": iops} for i in range(8)}, fh)
+RAWPY
+}
+
 mk_prov() { # <outfile> <status> <bench-iops-list...>；raw fio 由 baseline fixture 提供
   local outf="$1" st="$2"; shift 2
   python3 - "$outf" "$st" "$@" <<'PY'
@@ -314,11 +323,12 @@ PY
 lockv() { jget "$1" "osds.$2.locked_value"; }
 lockd() { jget "$1" "osds.$2.decision"; }
 
-# 11) accepted-consistent：比值在 [0.5, 2] → 鎖 bench 值
+# 11) accepted → 一律鎖 bench 值（真機修正：bench 是 BlueStore 層、raw 是裸裝置，
+#     兩者本質差一個數量級以上，比值判準會把正確的 bench 誤判並改鎖過大的值）
 mk_prov "$tmp/d1.json" accepted 45282 44980 46001 45510 44720 45899 45120 45330
 ceph_capacity_decide "$tmp/d1.json" "$tmp/lock1.json" >/dev/null || fail "decide 應成功"
 ok
-eq "$(lockd "$tmp/lock1.json" 0)" "accepted-consistent" "accepted + 比值合理"
+eq "$(lockd "$tmp/lock1.json" 0)" "accepted" "accepted → 鎖 bench"
 eq "$(lockv "$tmp/lock1.json" 0)" "45282" "鎖 bench 值"
 eq "$(jget "$tmp/lock1.json" osds.0.locked_source)" "bench" "來源標記"
 
@@ -338,24 +348,26 @@ ok
 eq "$(lockv "$tmp/lock2.json" 0)" "21499" "偏移 1 IOPS"
 eq "$(jget "$tmp/lock2.json" osds.0.offset_from_default)" "True" "偏移要留紀錄"
 
-# 13) accepted-inconsistent：比值出界 → 鎖 min(raw_fio, 72000)、標 fio-derived
-mk_prov "$tmp/d3.json" accepted 5000 5100 5050 4980 5020 5090 5010 5060
-ceph_capacity_decide "$tmp/d3.json" "$tmp/lock3.json" >/dev/null || fail "decide（inconsistent）應成功"
+# 13) bench 遠低於 raw（真機就是這樣：6.4K vs 287K）→ 仍鎖 bench，不得改鎖 fio-derived
+#     這是整場實驗有效性的關鍵：鎖過大的值會讓 reservation 永遠達不到、
+#     mClock 不介入仲裁，三個 profile 表現一致 → 假的 null result。
+mk_prov "$tmp/d3.json" accepted 6646 6637 6507 6057 6566 6457 6226 6417
+mk_raw "$tmp/raw-real.json" 287000
+RAW_NVME_BASELINE_JSON="$tmp/raw-real.json" \
+  ceph_capacity_decide "$tmp/d3.json" "$tmp/lock3.json" >/dev/null \
+  || fail "decide（bench 遠低於 raw）應成功"
 ok
-eq "$(lockd "$tmp/lock3.json" 0)" "accepted-inconsistent" "比值出界"
-eq "$(lockv "$tmp/lock3.json" 0)" "48000" "鎖 raw fio 值"
-eq "$(jget "$tmp/lock3.json" osds.0.locked_source)" "fio-derived" "標記 fio-derived"
+eq "$(lockd "$tmp/lock3.json" 0)" "accepted" "bench 遠低於 raw 仍是 accepted"
+eq "$(lockv "$tmp/lock3.json" 0)" "6646" "鎖 bench 值（不是 fio-derived）"
+eq "$(jget "$tmp/lock3.json" osds.0.locked_source)" "bench" "來源必須是 bench"
 
-# 13b) fio 值超過 72000 → 取上限
-python3 - "$tmp/raw-high.json" <<'PY'
-import json, sys
-with open(sys.argv[1], "w") as fh:
-    json.dump({"mclock-osd-%d" % (i + 1): {"iops": 90000.0} for i in range(8)}, fh)
-PY
-RAW_NVME_BASELINE_JSON="$tmp/raw-high.json" \
-  ceph_capacity_decide "$tmp/d3.json" "$tmp/lock3b.json" >/dev/null || fail "decide（cap 72000）應成功"
+# 13b) 裸裝置 fio 低於 bench → 裝置疑似被 throttle / 指到錯的碟 → HUMAN-NEEDED
+mk_raw "$tmp/raw-broken.json" 100
+if ( RAW_NVME_BASELINE_JSON="$tmp/raw-broken.json" \
+     ceph_capacity_decide "$tmp/d3.json" "$tmp/lock3b.json" ) >/dev/null 2>&1; then
+  fail "裸裝置 fio 低於 bench 不該通過"
+fi
 ok
-eq "$(lockv "$tmp/lock3b.json" 0)" "72000" "fio-derived 上限 72000"
 
 # 14) rejected-out-of-range → fio-derived
 mk_prov "$tmp/d4.json" rejected-out-of-range 128000 128100 127900 128200 128000 128050 127950 128010
@@ -364,16 +376,20 @@ ok
 eq "$(lockd "$tmp/lock4.json" 0)" "rejected-out-of-range" "被 Ceph 丟棄"
 eq "$(jget "$tmp/lock4.json" osds.0.locked_source)" "fio-derived" "改用 fio 值"
 
-# 15) skipped-existing-nondefault：對 stored 值做同一比值檢查
+# 15) skipped-existing-nondefault：沿用既有值（同樣不與 raw 比值——量的是不同層）
 mk_prov "$tmp/d5.json" skipped-existing-nondefault 45000 44900 45100 45200 44800 45300 44950 45050
-ceph_capacity_decide "$tmp/d5.json" "$tmp/lock5.json" >/dev/null || fail "decide（skipped-consistent）應成功"
+ceph_capacity_decide "$tmp/d5.json" "$tmp/lock5.json" >/dev/null || fail "decide（skipped）應成功"
 ok
 eq "$(lockd "$tmp/lock5.json" 0)" "skipped-existing-nondefault" "沿用既有值的分支"
-eq "$(jget "$tmp/lock5.json" osds.0.locked_source)" "stored" "consistent → 鎖 stored"
-mk_prov "$tmp/d6.json" skipped-existing-nondefault 5000 5100 5050 4980 5020 5090 5010 5060
-ceph_capacity_decide "$tmp/d6.json" "$tmp/lock6.json" >/dev/null || fail "decide（skipped-inconsistent）應成功"
+eq "$(jget "$tmp/lock5.json" osds.0.locked_source)" "stored" "鎖 stored 值"
+# 既有值遠低於裸裝置（真機常態）仍沿用，不得改鎖 fio-derived
+mk_prov "$tmp/d6.json" skipped-existing-nondefault 6500 6600 6450 6550 6480 6520 6510 6490
+mk_raw "$tmp/raw-real2.json" 287000
+RAW_NVME_BASELINE_JSON="$tmp/raw-real2.json" \
+  ceph_capacity_decide "$tmp/d6.json" "$tmp/lock6.json" >/dev/null \
+  || fail "decide（stored 遠低於 raw）應成功"
 ok
-eq "$(jget "$tmp/lock6.json" osds.0.locked_source)" "fio-derived" "inconsistent → 改用 fio 值"
+eq "$(jget "$tmp/lock6.json" osds.0.locked_source)" "stored" "stored 遠低於 raw 仍沿用"
 
 # 16) failed / no-result → 一律 die（不得自動選值）
 mk_prov "$tmp/d7.json" failed 0 0 0 0 0 0 0 0
@@ -387,10 +403,12 @@ mk_prov "$tmp/d8.json" no-result 0 0 0 0 0 0 0 0
 ok
 
 # 17) 跨 8 顆 dispersion gate：CoV > 20% → die（異質 NVMe 防線）
-#     osd.7 的 raw NVMe 基線只有 12000 IOPS → bench/raw 比值出界 → 鎖 fio-derived
-#     12000，與其餘七顆的 ~45000 拉開離散度。
-mk_prov "$tmp/d9.json" accepted 45000 45100 44900 45200 44800 45300 44950 45350
-outerr="$( ( RAW_NVME_BASELINE_JSON="$fx/raw-nvme-baseline-outlier.json" \
+#     鎖的是 bench 值，所以離散要由 bench 呈現：七顆 ~45000、一顆 12000。
+#     （真機 8 顆 bench 的 CoV 是 3%，這道 gate 通過得很輕鬆；它防的是
+#      有顆碟明顯異常的情況。）
+mk_prov "$tmp/d9.json" accepted 45000 45100 44900 45200 44800 45300 44950 12000
+mk_raw "$tmp/raw-hi.json" 287000
+outerr="$( ( RAW_NVME_BASELINE_JSON="$tmp/raw-hi.json" \
              ceph_capacity_decide "$tmp/d9.json" "$tmp/lock9.json" ) 2>&1 )" \
   && fail "CoV 超標應 die"
 ok

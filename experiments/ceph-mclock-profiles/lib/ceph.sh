@@ -664,25 +664,35 @@ def cmd_capacity_decide(prov_path, raw_path, out_path, expect_n, cov_limit,
                     " 才能決策（bench_status=%s）" % (osd, status))
             return min(float(rawv), fio_cap), "fio-derived"
 
+
         if status == "accepted":
             if bench is None:
                 die("capacity-decide: HUMAN-NEEDED osd.%d 標為 accepted 卻沒有 bench 值" % osd)
-            ratio = (float(bench) / float(rawv)) if rawv else None
-            if ratio is not None and 0.5 <= ratio <= 2.0:
-                decision, (locked, source) = "accepted-consistent", (float(bench), "bench")
-            else:
-                decision, (locked, source) = "accepted-inconsistent", fio_derived()
+            # 不拿 bench 與 raw fio 比值當判準：bench 是 **BlueStore 層** 的 4K randwrite
+            # 能力，raw fio 是 **裸裝置** 能力，兩者本質相差一個數量級以上（BlueStore
+            # 寫放大／WAL／metadata／checksum／fsync 語意）。真機實測 bench 6.4K vs
+            # raw 287K（45×），而從叢集飽和點反推每顆 OSD 的實際寫入率是 ~7.0K——
+            # bench 才是對的。用比值判準會把正確的 bench 誤判成 inconsistent 而改鎖
+            # 一個過大的值，於是 reservation 永遠達不到、mClock 不介入仲裁、三個
+            # profile 表現一致，整場實驗得出假的 null result。
+            # raw fio 在此只剩一個把關角色：裝置健康下限。裸 NVMe 若連 BlueStore
+            # 層的 bench 都跑不贏，表示碟被 throttle／壞掉／指到錯的裝置——
+            # 那時 bench 值也不可信。（只在 bench 真的要被採用時才檢查；bench 被
+            # Ceph 判為 out-of-range 時那個值本來就不可信，比較沒有意義。）
+            if rawv is not None and float(rawv) < float(bench):
+                die("capacity-decide: HUMAN-NEEDED osd.%d 的裸裝置 fio（%.0f）低於"
+                    " BlueStore bench（%.0f）——裝置疑似被 throttle 或指到錯的碟"
+                    % (osd, float(rawv), float(bench)))
+            decision, (locked, source) = "accepted", (float(bench), "bench")
         elif status == "rejected-out-of-range":
             decision, (locked, source) = "rejected-out-of-range", fio_derived()
         elif status == "skipped-existing-nondefault":
             if storedv is None:
                 die("capacity-decide: HUMAN-NEEDED osd.%d 標為 skipped 卻讀不到現值" % osd)
-            ratio = (float(storedv) / float(rawv)) if rawv else None
+            # 同上：不與 raw fio 比值（量的是不同層）。現值直接採用，
+            # 是否合理由 Ceph 自己的接受區間（1000–80000）與跨 OSD 的 CoV gate 把關。
             decision = "skipped-existing-nondefault"
-            if ratio is not None and 0.5 <= ratio <= 2.0:
-                locked, source = float(storedv), "stored"
-            else:
-                locked, source = fio_derived()
+            locked, source = float(storedv), "stored"
         else:
             die("capacity-decide: HUMAN-NEEDED osd.%d 的 bench_status=%s"
                 "（bench 失敗或無證據時不得自動選值）" % (osd, status))
