@@ -169,6 +169,7 @@ done
 # ============================================================= ceph_add_hosts ==
 # 7) 先全部 orch host add，再逐台 cephadm check-host
 reset_ssh
+expect_ssh 'orch apply mon --unmanaged=true' 0 0 ""
 expect_ssh 'orch host ls' 0 0 "$fx/orch-host-ls-empty.json"
 for n in mon-1 mon-2 osd-1 osd-2 osd-3 osd-4 osd-5 osd-6 osd-7 osd-8; do
   expect_ssh "orch host add mclock-${n}" 0 0 ""
@@ -186,9 +187,17 @@ first_check="$(line_of "$FAKE_SSH_LOG" 'cephadm check-host')"
 [ "$last_add" -lt "$first_check" ] \
   || fail "順序錯：check-host 必須在全部 host add 之後（add=${last_add} check=${first_check}）"
 ok
+# 真機踩到：cephadm 在 host add 後會自動鋪 mon（預設 count:5），placement 收斂時留下
+# CEPHADM_STRAY_DAEMON，而 final_clean 只允許 noscrub/nodeep-scrub → safety gate 卡死。
+first_unmanaged="$(line_of "$FAKE_SSH_LOG" 'orch apply mon --unmanaged=true')"
+first_add="$(line_of "$FAKE_SSH_LOG" 'orch host add')"
+[ "$first_unmanaged" -lt "$first_add" ] \
+  || fail "順序錯：mon 必須先轉 unmanaged 才能 add host（unmanaged=${first_unmanaged} add=${first_add}）"
+ok
 
 # 8) 已納管 → 不重複 add，但仍 check-host
 reset_ssh
+expect_ssh 'orch apply mon --unmanaged=true' 0 0 ""
 expect_ssh 'orch host ls' 0 0 "$fx/orch-host-ls-full.json"
 for n in mon-1 mon-2 osd-1 osd-2 osd-3 osd-4 osd-5 osd-6 osd-7 osd-8; do
   expect_ssh "cephadm check-host mclock-${n}" 0 0 ""
@@ -196,6 +205,28 @@ done
 ceph_add_hosts || fail "ceph_add_hosts 冪等呼叫應成功"
 ok
 eq "$(count_of "$FAKE_SSH_LOG" 'orch host add')" "0" "已納管的 host 不得重複 add"
+
+# ============================================================= ceph_apply_mgrs ==
+# 真機踩到：cephadm 預設自己挑兩台鋪 mgr，實測落到 OSD node 上。故障注入要網路隔離
+# OSD node，隔到 active mgr 那台就會打掉 mgr → `ceph -s` 輪詢與 sampler 中斷。
+reset_ssh
+expect_ssh 'orch apply mgr --placement=mclock-admin,mclock-mon-1' 0 0 ""
+expect_ssh 'orch ps --daemon-type=mgr' 0 0 "$fx/orch-ps-mgr-ok.json"
+ceph_apply_mgrs || fail "ceph_apply_mgrs 應成功"
+ok
+has "$FAKE_SSH_LOG" "orch apply mgr --placement=mclock-admin,mclock-mon-1" \
+  "mgr placement 必須明列非 OSD node"
+
+# mgr 仍落在 OSD node → 必須不收斂（die）
+reset_ssh
+_saved_mqs="$MON_QUORUM_SECS"
+MON_QUORUM_SECS=1
+expect_ssh 'orch apply mgr' 0 0 ""
+expect_ssh 'orch ps --daemon-type=mgr' 0 0 "$fx/orch-ps-mgr-on-osd.json"
+expect_ssh 'orch ps --daemon-type=mgr' 0 0 "$fx/orch-ps-mgr-on-osd.json"
+if ( ceph_apply_mgrs ) >/dev/null 2>&1; then fail "mgr 落在 OSD node 上不該通過"; fi
+ok
+MON_QUORUM_SECS="$_saved_mqs"
 
 # ============================================================= ceph_apply_mons ==
 # 9) placement 明列三台 + quorum 恰為那三名

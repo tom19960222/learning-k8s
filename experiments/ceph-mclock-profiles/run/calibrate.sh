@@ -123,6 +123,7 @@ calib_deploy() {
   ceph_bootstrap || return 1
   ceph_add_hosts || return 1
   ceph_apply_mons || return 1
+  ceph_apply_mgrs || return 1
   ceph_apply_osds || return 1
   ceph_verify_versions || return 1
   ceph_setup_crush || return 1

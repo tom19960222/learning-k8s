@@ -332,25 +332,49 @@ def cmd_pgs_active():
 def cmd_versions_check(expect):
     doc = load_stdin()
     bad = []
+    seen = set()
     for section, entries in doc.items():
         for ver, count in entries.items():
             if expect not in ver:
                 bad.append("%s: %s (%s)" % (section, ver, count))
+            if section != "overall":
+                seen.add(ver)
     if bad:
         die("ceph versions 不是全部 %s：\n  %s" % (expect, "\n  ".join(bad)))
+    # 版本字串含 git commit hash，多於一種 = 同版號但不同 build 混在一起。
+    # 這是 image 一致性的權威判準（container image ref 因 tag/digest 混用不可靠）。
+    if len(seen) > 1:
+        die("ceph daemon 跑在同版號的不同 build 上：\n  %s" % "\n  ".join(sorted(seen)))
     print("ok")
 
 
 def cmd_orch_image_check(image):
+    """Ceph daemon 是否都跑同一份 ceph image。
+
+    不比對字面 tag：cephadm 拉完會把 image 正規化成 digest
+    （`quay.io/ceph/ceph@sha256:...`），而且 tag 是 multi-arch manifest list，
+    其 digest 與 amd64 image 的 digest 本來就不同——比 tag 永遠不會成立。
+    也不能把 monitoring stack（prometheus / grafana / alertmanager /
+    node-exporter）算進來，它們本來就用別的 image。
+    同一份 image 也可能同時被 tag 與 digest 引用（bootstrap 當下建的 daemon 記 tag、
+    之後拉過的記 digest），所以連「ref 字串一致」都不能要求。
+    **build 一致性由 `ceph versions` 把關**——它的版本字串含 git commit hash，
+    全部 daemon 歸在同一個 key 就證明是同一份 build（見 cmd_versions_check）。
+    這裡只確認 ceph daemon 都來自預期的 repo（抓「被指到別的 registry」）。
+    """
     doc = load_stdin()
+    repo = image.split("@")[0].rsplit(":", 1)[0]  # quay.io/ceph/ceph:v19.2.2 → quay.io/ceph/ceph
+    ceph_types = ("mon", "mgr", "osd", "mds", "rgw", "crash", "ceph-exporter")
     bad = []
     for daemon in doc:
+        if (daemon.get("daemon_type") or "") not in ceph_types:
+            continue
         name = daemon.get("container_image_name") or ""
-        if image not in name:
+        if not name.startswith(repo + "@") and not name.startswith(repo + ":"):
             bad.append("%s@%s: %s" % (daemon.get("daemon_name"),
                                       daemon.get("hostname"), name))
     if bad:
-        die("orch ps 的 image 與 %s 不符：\n  %s" % (image, "\n  ".join(bad)))
+        die("ceph daemon 的 image 不是來自 %s：\n  %s" % (repo, "\n  ".join(bad)))
     print("ok")
 
 
@@ -358,6 +382,18 @@ def cmd_host_names():
     doc = load_stdin()
     for host in doc:
         print(host.get("hostname", ""))
+
+
+def cmd_daemon_hosts():
+    """orch ps JSON → 每個 daemon 所在 host（一行一個，去重）。"""
+    doc = load_stdin()
+    seen = []
+    for daemon in doc:
+        h = daemon.get("hostname") or ""
+        if h and h not in seen:
+            seen.append(h)
+    for h in seen:
+        print(h)
 
 
 def cmd_osd_tree_hosts():
@@ -757,6 +793,7 @@ DISPATCH = {
     "versions-check": cmd_versions_check,
     "orch-image-check": cmd_orch_image_check,
     "host-names": cmd_host_names,
+    "daemon-hosts": cmd_daemon_hosts,
     "osd-tree-hosts": cmd_osd_tree_hosts,
     "osd-tree-ready": cmd_osd_tree_ready,
     "crush-racks": cmd_crush_racks,
@@ -895,6 +932,12 @@ ceph_bootstrap() {
 
 ceph_add_hosts() {
   local known host
+  # 先把 mon service 轉為 unmanaged，再加 host。否則 cephadm 會在每台新 host 上
+  # 自動鋪 mon（預設 placement count:5），等 ceph_apply_mons 把 placement 收斂到三台時，
+  # 多出來的那些會變成 `CEPHADM_STRAY_DAEMON` 警告——而 final_clean 只允許
+  # noscrub/nodeep-scrub，於是每個 replicate 的 safety gate 都會卡死。
+  ceph_adm "ceph orch apply mon --unmanaged=true" >&2 \
+    || die "無法把 mon service 轉為 unmanaged（避免 host add 觸發自動鋪 mon）"
   known="$(ceph_adm "ceph orch host ls --format json" | _ceph_py host-names)" \
     || die "取不到 orch host ls"
   for host in $(_ceph_managed_hosts); do
@@ -939,6 +982,32 @@ ceph_apply_mons() {
   with_deadline "$MON_QUORUM_SECS" _ceph_quorum_ok \
     || die "mon quorum 未收斂到指定三台（${placement}）"
   log "mon quorum = ${placement}"
+}
+
+# mgr 必須釘在非 OSD node（admin + mon-1）。cephadm 預設會自己挑兩台鋪 mgr，實測會落到
+# OSD node 上——而故障注入要網路隔離 OSD node，隔到 active mgr 那台就會連帶打掉 mgr，
+# 讓 `ceph -s` 輪詢與 sampler 中斷、量測窗出現假的 collector gap。
+ceph_apply_mgrs() {
+  local placement first_mon
+  first_mon="$(inv_names mon | head -1)"
+  placement="${ADMIN_NAME}${first_mon:+,${first_mon}}"
+  ceph_adm "ceph orch apply mgr --placement=${placement}" >&2 \
+    || die "orch apply mgr 失敗"
+  with_deadline "$MON_QUORUM_SECS" _ceph_mgr_off_osd \
+    || die "mgr 未收斂到非 OSD node（${placement}）"
+  log "mgr placement = ${placement}（避開 OSD node）"
+}
+
+# 所有 mgr daemon 都不在 OSD node 上才算收斂
+_ceph_mgr_off_osd() {
+  local hosts osd_hosts h
+  hosts="$(ceph_adm "ceph orch ps --daemon-type=mgr --format json" \
+    | _ceph_py daemon-hosts)" || return 1
+  osd_hosts="$(inv_names osd)"
+  for h in $hosts; do
+    printf '%s\n' "$osd_hosts" | grep -qx -- "$h" && return 1
+  done
+  [ -n "$hosts" ]
 }
 
 # 5) OSD（逐台指定裝置，禁 all-available-devices）------------------------------
