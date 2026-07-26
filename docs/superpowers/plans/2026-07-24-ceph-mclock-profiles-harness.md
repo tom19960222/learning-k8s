@@ -129,7 +129,7 @@ experiments/ceph-mclock-profiles/
 
 **Files:** Create `azure/verify-provision.sh`、`tests/test-verify-provision.sh`
 
-R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望值、費率>0、`generated_at` <24h、`subscription_id` 與 bastion `az account show` 一致（此為 campaign 前唯一的 az 唯讀呼叫之一，同時完成 watchdog 2b 的 az preflight：登入態/subscription/RG 權限）。工具檢查含 `nc`（netcat-openbsd）、`fping`。任一 FAIL exit 1；機器行 `verify-provision: PASS|FAIL <n>/<total>`。
+R §9 全部條目 + **attestation 驗值**（非驗存在）：boolean=期望值、費率>0、`generated_at` <24h、`subscription_id` 與 bastion `az account show` 一致（此為 campaign 前唯一的 az 唯讀呼叫之一，同時完成 watchdog 2b 的 az preflight：登入態/subscription/RG 權限）。工具檢查含 `nc`（netcat-openbsd）、`fping`。**OS/kernel 為硬 gate**（spec rev 9）：`os-version`（15 台 `/etc/os-release` 的 `VERSION_ID` = `22.04`）與 `kernel-version`（15 台 `uname -r` 前綴 = `6.8.`，jammy 預設的 5.15 GA kernel 直接 FAIL）——理由是 client IO 走 krbd，kernel 版本不對映生產就無法外推；期望值分別可用 `OS_VERSION_EXPECT` / `KERNEL_VERSION_EXPECT` 覆蓋。任一 FAIL exit 1；機器行 `verify-provision: PASS|FAIL <n>/<total>`。
 
 - [ ] Step 1: 測試先行（attestation 值不符 FAIL、時戳過期 FAIL、az preflight fixture）。
 - [ ] Step 2: 實作至 gate 綠。

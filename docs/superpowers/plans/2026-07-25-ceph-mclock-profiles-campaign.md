@@ -89,6 +89,7 @@
 
 - [ ] `bash experiments/ceph-mclock-profiles/tests/gate.sh` → `gate: PASS`
 - [ ] README §1.1–1.6 全部打勾（使用者刪舊 RG、IaC 交付、verify-provision PASS、HYPOTHESES gate、bastion 前置、harness gate）
+- [ ] **15 台 OS/kernel 對映生產**：`verify-provision.sh` 的 `os-version`（Ubuntu 22.04）與 `kernel-version`（`uname -r` = `6.8.*` HWE）皆 PASS。拿到 jammy 預設的 5.15 GA kernel 一律**退回 IaC 裝 `linux-generic-hwe-22.04` + reboot**，不可放行也不可改期望值繞過（krbd 是 kernel 內 client，版本不對映就不能外推——README §10.0）
 - [ ] 本 plan 已過使用者核可（= spec Phase 3 的 gate「說 go」）
 
 ---

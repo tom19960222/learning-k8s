@@ -29,6 +29,12 @@ ATTESTATION_JSON="${ATTESTATION_JSON:-$_ROOT/azure/attestation.json}"
 AZ_BIN="${AZ_BIN:-az}"
 AZ_RESOURCE_GROUP="${AZ_RESOURCE_GROUP:-ceph-mclock-profiles}"
 CEPH_VERSION_EXPECT="${CEPH_VERSION_EXPECT:-19.2.2}"
+# R §4/§5：生產是 Ubuntu 22.04 (jammy) + kernel 6.8 (HWE)。實驗用 krbd 打 client IO，
+# krbd 行為隨 kernel 版本改變 → lab 與生產 kernel 不一致，結論就無法外推。故這兩條是
+# 硬 gate，不是「有就好」。kernel 只比 major.minor 前綴（`6.8.*`）——ABI/patch 號會隨
+# 安全更新滾動，要求完整版號一致只會製造假失敗。
+OS_VERSION_EXPECT="${OS_VERSION_EXPECT:-22.04}"
+KERNEL_VERSION_EXPECT="${KERNEL_VERSION_EXPECT:-6.8}"
 # R §5：chrony offset < 100ms
 CHRONY_MAX_OFFSET_SEC="${CHRONY_MAX_OFFSET_SEC:-0.1}"
 # R §9：同 subnet「< 1ms 量級」——取一個數量級內的上界，避免把正常抖動判成失敗
@@ -110,6 +116,8 @@ have() { if command -v "\$1" >/dev/null 2>&1; then echo ok; else echo missing; f
 kv node "${name}"
 kv role "${role}"
 kv hostname "\$(hostname -s 2>/dev/null || true)"
+kv os_version_id "\$(grep -m1 '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d '[:space:]')"
+kv kernel_release "\$(uname -r 2>/dev/null | tr -d '[:space:]')"
 if t sudo -n true >/dev/null 2>&1; then kv sudo ok; else kv sudo fail; fi
 _bad=""
 for _e in ${pairs}; do
@@ -293,6 +301,29 @@ check_hostname_and_hosts() {
   done <<< "$NODES_ALL"
   emit hostname "主機名與 inventory 相符" "${bad_h# }"
   emit etc-hosts "/etc/hosts 可解出全部 15 台的 private IP" "${bad_r# }"
+}
+
+# R §9：OS = Ubuntu 22.04、kernel = 6.8.*（HWE）。兩條都是生產對映的硬需求——jammy 的
+# 預設 GA kernel 是 5.15，IaC 若漏裝 `linux-generic-hwe-22.04` 就會拿到它，而 krbd 的
+# 行為（sysfs 介面、blk-mq 路徑、congestion 處理）在 5.15 與 6.8 之間有差，量到的數字
+# 外推不到生產。不放行、不降級。
+check_os_and_kernel() {
+  local n bad_os="" bad_kern=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    pv "$n" os_version_id
+    [ "$_PV" = "$OS_VERSION_EXPECT" ] || bad_os="${bad_os} ${n}(VERSION_ID=${_PV:--})"
+    pv "$n" kernel_release
+    # 只比 major.minor 前綴：ABI/patch 號隨安全更新滾動，要求完整一致只會製造假失敗。
+    # 前綴後面那個 `.` 是刻意的——沒有它，`6.80.1` 會被誤判成合格。
+    case "$_PV" in
+      "$KERNEL_VERSION_EXPECT"|"$KERNEL_VERSION_EXPECT".*) ;;
+      *) bad_kern="${bad_kern} ${n}(uname -r=${_PV:--})" ;;
+    esac
+  done <<< "$NODES_ALL"
+  emit os-version "15 台 OS = Ubuntu ${OS_VERSION_EXPECT}" "${bad_os# }"
+  emit kernel-version \
+    "15 台 kernel = ${KERNEL_VERSION_EXPECT}.*（HWE；生產 krbd 對映）" "${bad_kern# }"
 }
 
 check_apt_timers() {
@@ -665,6 +696,7 @@ load_attestation
 
 check_ssh_and_sudo
 check_hostname_and_hosts
+check_os_and_kernel
 check_apt_timers
 check_chrony
 check_swap

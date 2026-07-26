@@ -53,6 +53,8 @@ bash experiments/ceph-mclock-profiles/azure/verify-provision.sh
 # 機器行：verify-provision: PASS <n>/<total>   （FAIL 即 exit 1）
 ```
 
+其中 `os-version` / `kernel-version` 兩條是**生產對映的硬 gate**：15 台必須是 **Ubuntu 22.04 (jammy)**（`VERSION_ID="22.04"`）且 `uname -r` 為 `6.8.*`（`linux-generic-hwe-22.04`，不是 `linux-azure`）。client IO 走 krbd = kernel 內的 RBD client，kernel 版本不對映生產，profile 對照的結論就外推不到生產。期望值可用 `OS_VERSION_EXPECT` / `KERNEL_VERSION_EXPECT` 覆蓋，但**改期望值等於改實驗前提**，要在報告的 limitations 交代。
+
 這支同時完成 **campaign 前唯一的 az preflight**：`az account show` 的登入態、subscription 與 attestation 一致、RG 權限——也就是 watchdog 2b（`az vm restart`）的救援憑證預檢。attestation 是**驗值**不是驗存在：boolean 要等於期望值、費率 > 0、`generated_at` 在 24h 內。
 
 任一條 FAIL → **退回 IaC agent**，不要自己在 VM 上手動補。手動補過的環境無法被 attestation 覆蓋，等於整場 campaign 的環境前提失去單一 SoT。
@@ -585,6 +587,7 @@ descoped 的 executions 也**不計入 `queue_progress` 的分母**（`steady: P
 
 按「最可能絆倒你」排序：
 
+0. **IaC 交付的是 5.15 kernel**（jammy 的**預設 GA kernel**，也就是「照 image 開機、沒裝 HWE」的預設結果）——`verify-provision.sh` 的 `kernel-version` check 會 FAIL。處置：**退回 IaC**，在 15 台裝 `linux-generic-hwe-22.04` → **reboot** → 重驗 `uname -r` 為 `6.8.*`，通過才准往下。**不可放行、不可用 `KERNEL_VERSION_EXPECT=5.15` 繞過**：client IO 走 krbd，5.15 與 6.8 的 kernel RBD datapath 不同，量出來的 client latency 尾巴會混入與 mClock profile 無關的成分，整場對照失去外推價值。同理 `os-version` FAIL（拿到 24.04）也一律退回重開機器——24.04 還會連帶裝不到官方 `ceph-common` 19.2.2（`download.ceph.com/debian-19.2.2/dists/` 沒有 `noble`）。
 1. **profile 切換的第一次真跑**（§1.7 已補）——`ceph_set_profile` 在 preflight 下 `ceph config set osd osd_mclock_profile`，接著由 qos gate 驗八顆同時收斂。第一個非 `balanced` 的 cell 是這條路徑的首次真機驗證：若 gate 逾時，先看 `set-profile: SET <old> <new>` 這行有沒有出現、再看是不是九參數沒跟著換。
 2. **`fio_calibrate` 依賴編譯預設即 balanced**（§4.9）——若 die，人工裁決，**不可**用 `ceph config set` 繞過。
 3. **fio parser 對真機輸出的一次性校正**：`fio_smoke_real` 會跑 60s 真 fio、把 raw 三個 log 存成 golden，再用 `verdict.py aggregate --validate-schema` 驗過才放行。**如果這裡失敗，代表本機 fio 版本的 log 格式與 parser 假設不符**（常見：hist log 的 bin 數 / 單位是 ns 還是 us、windowed log 的重複 timestamp、不完整的尾窗）。修 parser，不要修 golden。

@@ -32,7 +32,7 @@ export ATTESTATION_JSON="$tmp/attestation.json"
 export RESULTS_DIR="$tmp/results"
 export POLL_INTERVAL=0.1
 
-TOTAL_CHECKS=25
+TOTAL_CHECKS=27
 SUB_ID="11111111-2222-3333-4444-555555555555"
 NVME_SIZE=1920383410176
 
@@ -52,6 +52,9 @@ probe_base() { # <name>
     printf 'hostname=%s\n' "$n"
     printf 'sudo=ok\n'
     printf 'hosts_bad=\n'
+    # 生產對映：Ubuntu 22.04 (jammy) + kernel 6.8 HWE
+    printf 'os_version_id=22.04\n'
+    printf 'kernel_release=6.8.0-52-generic\n'
     printf 'timer_apt_daily=masked\n'
     printf 'timer_apt_daily_upgrade=masked\n'
     printf 'chrony_active=active\n'
@@ -248,7 +251,8 @@ eq "$V_RC" "0" "全綠時 exit 0（stderr 見 $tmp/err）"
 want_line PASS "$TOTAL_CHECKS"
 
 # R §9 每一條都要有對應 check id（缺一不可）
-for id in ssh-reachable passwordless-sudo hostname etc-hosts apt-timers-masked \
+for id in ssh-reachable passwordless-sudo hostname etc-hosts os-version kernel-version \
+          apt-timers-masked \
           chrony-offset swap-empty base-tools nvme-raw nvme-device-match osd-fio \
           admin-ceph-version podman client-ceph-version client-fio \
           client-modprobe-rbd intra-subnet-ping no-public-ip \
@@ -301,6 +305,12 @@ for probe_node in mclock-admin mclock-mon-1 mclock-osd-3 mclock-client-2; do
   ok
   grep -qF 'mclock-osd-8:10.60.1.28' "$tmp/probe-render.sh" \
     || fail "${probe_node}：probe 應帶全部 15 台的 name:ip 對照"
+  ok
+  # OS / kernel 是生產對映的硬需求（krbd 行為隨 kernel 變）——15 台都要問，不是抽查
+  grep -qF '/etc/os-release' "$tmp/probe-render.sh" \
+    || fail "${probe_node}：probe 應讀 /etc/os-release 取 VERSION_ID"
+  ok
+  grep -qF 'uname -r' "$tmp/probe-render.sh" || fail "${probe_node}：probe 應取 uname -r"
   ok
 done
 
@@ -411,6 +421,59 @@ att_patch 'doc["tags_applied"] = False'
 att_patch 'doc["generated_at"] = "上週三"'
 run_v
 expect_fails "批次 E（tags/時戳格式）" attestation-booleans attestation-freshness
+
+# 批次 F：OS/kernel 對不上生產（krbd 行為隨 kernel 變 → 結論無法外推，硬 FAIL）
+# 5.15 是 jammy 預設 GA kernel，也就是「IaC 忘了裝 HWE」時最可能拿到的東西。
+setup_all
+set_key mclock-osd-2 os_version_id 24.04
+set_key mclock-client-3 kernel_release 5.15.0-91-generic
+run_v
+expect_fails "批次 F（24.04 / 5.15 GA kernel）" os-version kernel-version
+grep -qE '^FAIL[[:space:]]+os-version.*mclock-osd-2' "$tmp/err" \
+  || fail "os-version FAIL 明細應指名 mclock-osd-2"
+ok
+grep -qE '^FAIL[[:space:]]+kernel-version.*mclock-client-3' "$tmp/err" \
+  || fail "kernel-version FAIL 明細應指名 mclock-client-3"
+ok
+
+# 批次 G：probe 拿不到值（缺 VERSION_ID / uname -r 失敗）不得被當成合格
+setup_all
+del_key mclock-mon-1 os_version_id
+del_key mclock-osd-5 kernel_release
+run_v
+expect_fails "批次 G（OS/kernel 缺值）" os-version kernel-version
+grep -qE '^FAIL[[:space:]]+os-version.*mclock-mon-1' "$tmp/err" \
+  || fail "缺 VERSION_ID 應指名 mclock-mon-1"
+ok
+grep -qE '^FAIL[[:space:]]+kernel-version.*mclock-osd-5' "$tmp/err" \
+  || fail "缺 uname -r 應指名 mclock-osd-5"
+ok
+
+# 6.8 的完整版號不必一致（只比 major.minor 前綴），但 6.80 這種相近字串不得誤判為通過
+setup_all
+set_key mclock-osd-1 kernel_release 6.8.0-79-generic
+set_key mclock-osd-2 kernel_release 6.80.1-1-generic
+run_v
+expect_fails "kernel 前綴比對（6.8.0-79 過、6.80.1 不過）" kernel-version
+grep -qE '^FAIL[[:space:]]+kernel-version.*mclock-osd-2' "$tmp/err" \
+  || fail "6.80.1 應被判為不符 6.8.*"
+ok
+if grep -qE '^FAIL[[:space:]]+kernel-version.*mclock-osd-1' "$tmp/err"; then
+  fail "6.8.0-79-generic 是合格 kernel，不該被列為失敗"
+fi
+ok
+
+# OS_VERSION_EXPECT / KERNEL_VERSION_EXPECT 可覆蓋（預設 22.04 / 6.8）
+setup_all
+n=""
+while IFS= read -r n; do
+  set_key "$n" os_version_id 24.04
+  set_key "$n" kernel_release 6.11.0-9-generic
+done <<< "$(node_list)"
+V_OUT="$(OS_VERSION_EXPECT=24.04 KERNEL_VERSION_EXPECT=6.11 bash "$script" 2>"$tmp/err")"
+V_RC=$?
+eq "$V_RC" "0" "覆蓋期望值後應全綠（stderr 見 $tmp/err）"
+want_line PASS "$TOTAL_CHECKS"
 
 # accelerated networking：attestation 說全開、guest 一台 VF 都看不到 → 出警告但不 gate
 # （VF 可能在 servicing 期間短暫 revoke，誤擋一整晚 campaign 的代價太高）

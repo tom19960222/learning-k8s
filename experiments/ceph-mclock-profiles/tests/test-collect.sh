@@ -641,14 +641,14 @@ mk_prov_blob() {
 6.8.0-45-generic
 ##osrelease
 NAME="Ubuntu"
-VERSION_ID="24.04"
+VERSION_ID="22.04"
 ID=ubuntu
 ##packages
 fio	3.36-1build1
 fping	5.1-1
-sysstat	12.6.1-2
-python3	3.12.3-0ubuntu2
-ceph-common	19.2.2-1noble
+sysstat	12.5.2-2ubuntu0.2
+python3	3.10.6-1~22.04
+ceph-common	19.2.2-1jammy
 ##fio
 fio-3.36
 ##nproc

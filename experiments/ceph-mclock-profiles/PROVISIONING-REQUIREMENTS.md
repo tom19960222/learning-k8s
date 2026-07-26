@@ -47,7 +47,7 @@ LSv3 quota 上限 65、本次要用 64——**只剩 1 vCPU 餘裕**，8 台 L8s
 
 ## 4. OS 與帳號（全部 15 台一致）
 
-- Image：**Ubuntu 24.04 LTS**（`Canonical:ubuntu-24_04-lts:server:latest`），x86_64。
+- Image：**Ubuntu 22.04 LTS**（`Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest`），x86_64。**必須是 22.04，不可用 24.04**——理由見下方 kernel 條目。
 - 帳號：`ikaros`，passwordless sudo（`NOPASSWD:ALL`）。
 - SSH authorized key（全部 VM 都裝這把）：
 
@@ -65,27 +65,45 @@ LSv3 quota 上限 65、本次要用 64——**只剩 1 vCPU 餘裕**，8 台 L8s
 2. **時間同步**：`chrony` 安裝並啟用（Ceph mon 對 clock skew 敏感）；`systemd-timesyncd` 停用（避免兩套並存）。
 3. **swap 關閉**（無 swap 分割/檔案）。
 4. **OSD node 的 local NVMe 保持 raw**：`/dev/nvme*n1`（1.92TB 那顆）**不得**分割、不得建立檔案系統、不得掛載、不得進 fstab、不得被 cloud-init 的 disk_setup/mounts 碰到。Ceph OSD 要直接吃 raw block device。（L8s_v3 另有一顆 SCSI resource disk `/dev/sdb`，cloud-init 預設會掛在 `/mnt`——那顆隨意，不影響。）
-5. kernel 保持 distro stock（記錄版本即可）；client node 需確認 `rbd` kernel module 可載入（Ubuntu 24.04 內建；`modprobe rbd` 成功）。
-6. 不做任何 sysctl / IO scheduler / CPU governor 調整（實驗 harness 自己管；IaC 動了反而引入未記錄變因）。
+5. **kernel 必須是 6.8（HWE），15 台一致**——這是**對映生產環境的硬需求**，不是「有就好」：實驗用 krbd（kernel RBD）打 client IO，krbd 行為隨 kernel 版本改變，lab 與生產（Ubuntu 22.04 + kernel 6.8）不一致的話結論無法外推。
+   - jammy 的**預設 GA kernel 是 5.15**，必須顯式安裝 HWE：`apt install linux-generic-hwe-22.04` → **reboot** → 確認 `uname -r` 是 `6.8.*`。
+   - 不要裝 Azure 專用 kernel（`linux-azure`）——生產不是那個。
+   - 交付前請自行 `uname -r` 抽查 15 台皆為 `6.8.*`；驗收腳本會逐台查（`kernel-version` check）。
+   - 參考：repo 的 `linux` submodule 已 pin 在 `6.8.0-52.53_22.04.1`，即此 kernel 系列。
+6. client node 需確認 `rbd` kernel module 可載入（`sudo modprobe rbd` 成功）。
+7. 不做任何 sysctl / IO scheduler / CPU governor 調整（實驗 harness 自己管；IaC 動了反而引入未記錄變因）。
 
 ## 6. 套件安裝（apt）
 
-**全部 15 台**：`chrony curl jq python3 lvm2 sysstat iperf3 nvme-cli netcat-openbsd fping`（另確認 `iptables` 指令存在——Ubuntu 24.04 預設有，驗收會查）
+**全部 15 台**：`chrony curl jq python3 lvm2 sysstat iperf3 nvme-cli netcat-openbsd fping`（另確認 `iptables` 指令存在——jammy 預設有，驗收會查）
 
 **osd-1..8 另加**：`fio`（Phase 0 要在 OSD 建立前對 raw NVMe 跑基線量測）
 
 **Ceph 套件——版本必須 pin 19.2.2（squid）**，用 Ceph 官方 apt repo（不要用 Ubuntu distro 的 ceph 版本）：
 
 ```
-repo: deb https://download.ceph.com/debian-19.2.2/ noble main
+repo: deb https://download.ceph.com/debian-19.2.2/ jammy main
 （含 https://download.ceph.com/keys/release.asc 金鑰）
 ```
+
+> **必須用「按版號」的 repo，不可用滾動的 `debian-squid/`**（2026-07-26 實查）：
+> - `debian-19.2.2/dists/` = `bookworm` + `jammy`，`binary-amd64/Packages.gz` 內確有 `ceph-common 19.2.2-1jammy` ✓
+> - `debian-squid/` 目前已滾到 **19.2.5**，pool 內**沒有任何 19.2.2 的 deb** → 對它下 `apt install ceph-common=19.2.2-1jammy` 會失敗
+> - 兩個 repo 都**沒有 `noble`**（HTTP 404）。加上 Ceph 官方 Squid OS 支援矩陣把 **Ubuntu 22.04 列為 tier A**、24.04 根本不在表上——22.04 才是受支援平台。
+> - 相依性已逐條解析：19.2.2-1jammy 的 28 個外部相依在 jammy archive **全部存在且版本約束全滿足**（`libc6>=2.34`、`libstdc++6>=12`、`libssl3`、`libicu70`、`libthrift-0.16.0` 皆為 jammy 原生版本，證明是針對 jammy 建的）。
+>
+> **兩個容易漏的 apt 設定**：
+> 1. **`universe` 必須啟用**——相依的 `librdkafka1`、`libthrift-0.16.0` 在 universe（cloud image 預設開，仍請明確確認）。
+> 2. **加 apt pin 指向 `download.ceph.com`**——`jammy-updates` 自帶 `ceph-common 17.2.9`（Quincy），沒 pin 好日後 `apt upgrade` 會打架。
 
 | 目標 | 套件 |
 |---|---|
 | admin | `cephadm ceph-common`（19.2.2） |
 | mon-1/2、osd-1..8 | `podman`（cephadm 的 container runtime；ceph daemon 本體由 harness 用 cephadm 拉 `quay.io/ceph/ceph:v19.2.2` container，IaC 不裝） |
-| client-1..4 | `ceph-common`（19.2.2，提供 `rbd` CLI）+ `fio`（Ubuntu 24.04 distro 版即可，記錄版本） |
+| client-1..4 | `ceph-common`（19.2.2，提供 `rbd` CLI）+ `fio`（jammy distro 版即可，記錄版本） |
+
+> **版本查證（2026-07-26 實查）**：jammy 的 distro `fio` = **3.28**，已確認支援 harness 用到的全部 time-series 選項（`log_avg_msec` / `log_unix_epoch` / `log_hist_msec` / `write_iops_log` / `write_lat_log` / `write_hist_log`）——**不是 blocker**。
+> jammy 的 distro `ceph-common` = 17.2（quincy），**這正是必須掛 Ceph 官方 19.2.2 repo 的原因**；裝完請確認 `ceph --version` 顯示 19.2.2 而非 17.2（apt pin/優先序沒設好會裝到 distro 版）。
 
 admin 也要裝 `podman`（mon.a 會跑在 admin 上）。
 
@@ -138,6 +156,8 @@ admin 也要裝 `podman`（mon.a 會跑在 admin 上）。
 - [ ] 15 台全部 ssh 可達（`ikaros@` + 上述 key；14 台經 admin ProxyJump）。
 - [ ] `sudo -n true` 全部成功（passwordless sudo）。
 - [ ] 全部主機名正確；任一台 `getent hosts mclock-osd-8` 等 15 個名字皆可解出正確 private IP。
+- [ ] **15 台 OS = Ubuntu 22.04**（`/etc/os-release` 的 `VERSION_ID="22.04"`）。
+- [ ] **15 台 `uname -r` = `6.8.*`**（HWE kernel；生產對映的硬需求，5.15 即 FAIL）。
 - [ ] osd-1..8：`lsblk` 可見 ~1.92TB（1.75TiB）NVMe 裝置，**無分割、無檔案系統、未掛載**。
 - [ ] `systemctl is-enabled apt-daily.timer apt-daily-upgrade.timer` → masked/disabled（15 台）。
 - [ ] `chronyc tracking` 正常、offset < 100ms（15 台）。
