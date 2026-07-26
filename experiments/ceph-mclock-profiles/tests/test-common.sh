@@ -176,6 +176,18 @@ reset_ssh
 expect_ssh '/run/mclock/sampler-1.pid' 0 0 ""
 remote_bg_stop mclock-admin sampler-1 || fail "remote_bg_stop 應成功"
 ok
+# 只能用純 pid kill：實測 `sudo kill -TERM -<pgid>` 會連帶終止自己的 ssh session
+# （ssh 回 255 → stop 被判失敗 → 背景程序留下 → 下一個 replicate 的 start 撞
+#  "registry 有活著的 pid" 而 die）。children 用 `pkill -P` 收，只打指定 parent 的子代。
+_stop_cmd="$(sed -n "s/.*printf %s '\([A-Za-z0-9+/=]*\)'.*/\1/p" "$FAKE_SSH_LOG" \
+  | while IFS= read -r b; do printf '%s' "$b" | base64 --decode 2>/dev/null; printf '\n'; done)"
+_stop_all="$(cat "$FAKE_SSH_LOG")"
+# shellcheck disable=SC2016  # 刻意比對字面字串，不要展開
+case "${_stop_cmd}${_stop_all}" in
+  *'kill -TERM -"$_pid"'*|*'kill -KILL -"$_pid"'*)
+    fail "remote_bg_stop 不得用 -pgid 形式 kill（會殺掉自己的 ssh session）" ;;
+esac
+ok
 has "$FAKE_SSH_LOG" "kill" "stop 會 kill"
 reset_ssh
 expect_ssh '/run/mclock/sampler-1.pid' 0 0 ""
