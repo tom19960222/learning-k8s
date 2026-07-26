@@ -123,6 +123,33 @@ out="$(python3 "$V" aggregate "$B1")"
 contains "$out" "aggregate: OK" "aggregate 機器行"
 A="$B1/aggregate.json"
 
+# --- 窗尾夾到 fio 實際結束（真機：偵測延遲 34s 被算成 stall）-------------------
+BW="$tmp/bw"; mkdir -p "$BW"
+python3 "$GEN" --out "$BW/fio/c1" --seg seg01 --start "$T0" --seconds 60 >/dev/null
+# coverage 窗比 fio 資料多 40 秒（模擬「偵測 fio 結束」的輪詢延遲）
+wj "$BW/coverage-proof.json" \
+  "{\"window\":{\"start\":${T0},\"end\":$((T0 + 99))},\"gaps\":[],\"tainted\":false}"
+# fio 自行結束 → 必須夾窗，尾端 40 秒不得算成 stall
+wj "$BW/fio-exit-proof.json" \
+  "{\"all_ok\":true,\"clients\":{\"c1\":{\"exit_code\":0,\"fio_exited_at\":$((T0 + 59))}}}"
+python3 "$V" aggregate "$BW" >/dev/null 2>&1 || fail "aggregate（夾窗）應成功"
+ok
+eq "$(jget "$BW/aggregate.json" endpoints.max_stall_seconds)" "0" \
+  "fio 自行結束後的偵測延遲不得算成 stall"
+
+# 反面：fio 被我們 STOP 中止（沒有 fio_exited_at）→ 尾端沒 IO 是真 stall，不得夾掉
+BW2="$tmp/bw2"; mkdir -p "$BW2"
+python3 "$GEN" --out "$BW2/fio/c1" --seg seg01 --start "$T0" --seconds 60 >/dev/null
+wj "$BW2/coverage-proof.json" \
+  "{\"window\":{\"start\":${T0},\"end\":$((T0 + 99))},\"gaps\":[],\"tainted\":false}"
+wj "$BW2/fio-exit-proof.json" \
+  "{\"all_ok\":true,\"clients\":{\"c1\":{\"exit_code\":0,\"fio_exited_at\":null}}}"
+python3 "$V" aggregate "$BW2" >/dev/null 2>&1 || fail "aggregate（不夾窗）應成功"
+ok
+[ "$(jget "$BW2/aggregate.json" endpoints.max_stall_seconds)" -ge 30 ] \
+  || fail "被中止時尾端無 IO 必須算成 stall（client 全黑正是故障實驗要抓的）"
+ok
+
 # 1) 段界 stall 續接：seg01 的尾窗 T+60 被 seg02 覆蓋 → 丟尾窗、留 seg02
 #    → stall = T+58, T+59, T+60, T+61 共 4 秒連續
 eq "$(jget "$A" windows.full.max_stall_seconds)" "4" "跨 segment 的連續 stall 要接得起來"

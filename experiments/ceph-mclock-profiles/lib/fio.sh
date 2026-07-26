@@ -534,7 +534,7 @@ def cmd_exit_proof(argv):
     clients = {}
     failed = []
     for row in read_tsv(tsv):
-        name, code, hb, now, segs = (row + ["", "", "", "", ""])[:5]
+        name, code, hb, now, segs, exitat = (row + [""] * 6)[:6]
         try:
             age = int(now) - int(hb)
         except ValueError:
@@ -547,6 +547,9 @@ def cmd_exit_proof(argv):
             "exit_code": rc,
             "exit_raw": code,
             "heartbeat_epoch": int(hb) if hb.isdigit() else None,
+            # fio 進程自己結束的時刻（穩態跑滿 runtime 就自行結束）。量測窗尾端要夾
+            # 到這裡，否則「偵測 fio 結束」的輪詢延遲會被算成 stall。
+            "fio_exited_at": int(exitat) if exitat.isdigit() else None,
             "heartbeat_age_s": age,
             "segments": int(segs) if segs.isdigit() else None,
         }
@@ -854,6 +857,7 @@ log_hist_msec=1000
 log_hist_coarseness=0
 log_unix_epoch=1
 per_job_logs=1
+write_bw_log=__SEGPREFIX__
 write_iops_log=__SEGPREFIX__
 write_lat_log=__SEGPREFIX__
 write_hist_log=__SEGPREFIX__
@@ -926,6 +930,10 @@ while :; do
   fio --output-format=json --output="\$D/\$seg.json" "\$D/\$seg.fio"
   rc=\$?
   echo "\$rc" > "\$D/exit-code.\$seg"
+  # fio 自己跑完的時刻：穩態的 fio 跑滿 runtime 就自行結束，而 runner 的心跳會
+  # 一直跳到我們送 STOP 為止。少了這個時戳，量測窗尾端會多算「偵測 fio 結束」
+  # 的輪詢延遲（真機實測 34s），那段沒有 IO 就被誤判成 stall。
+  date +%s > "\$D/fio-exited-at.tmp" && mv "\$D/fio-exited-at.tmp" "\$D/fio-exited-at"
   [ "\$rc" -eq 0 ] || break
   [ "$4" = "1" ] || break
   [ -e "\$D/STOP" ] && break
@@ -1154,14 +1162,16 @@ while [ \$i -lt ${FIO_STOP_WAIT_SECS} ] && [ ! -s "\$D/exit-code" ]; do sleep 1;
 if [ -s "\$D/exit-code" ]; then echo "EXIT \$(cat "\$D/exit-code")"; else echo "EXIT TIMEOUT"; fi
 if [ -s "\$D/heartbeat" ]; then echo "HB \$(cat "\$D/heartbeat")"; else echo "HB -"; fi
 echo "SEG \$(ls "\$D"/exit-code.seg* 2>/dev/null | wc -l | tr -d ' ')"
+if [ -s "\$D/fio-exited-at" ]; then echo "EXITAT \$(cat "\$D/fio-exited-at")"; else echo "EXITAT -"; fi
 echo "NOW \$(date +%s)"
 EOF
 )")" || die "fio 停止指令失敗：${c}"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$c" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$c" \
       "$(printf '%s\n' "$out" | awk '$1 == "EXIT" {print $2}')" \
       "$(printf '%s\n' "$out" | awk '$1 == "HB" {print $2}')" \
       "$(printf '%s\n' "$out" | awk '$1 == "NOW" {print $2}')" \
-      "$(printf '%s\n' "$out" | awk '$1 == "SEG" {print $2}')" >> "$tsv"
+      "$(printf '%s\n' "$out" | awk '$1 == "SEG" {print $2}')" \
+      "$(printf '%s\n' "$out" | awk '$1 == "EXITAT" {print $2}')" >> "$tsv"
     remote_bg_stop "$c" "$runid" >/dev/null || log "remote_bg_stop 失敗（續行）：${c}"
     # 取樣器是無窮迴圈，不會自己結束——沒停掉的話 registry 會留活著的 pid，
     # 下一個 replicate 的 fio_start_bg 會因「拒絕覆蓋」而 die。

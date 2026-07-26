@@ -724,6 +724,21 @@ def cmd_aggregate(args):
     obs_start, obs_end = series.span()
     win_start = _as_int(cov_window.get("start"), obs_start)
     win_end = _as_int(cov_window.get("end"), obs_end)
+
+    # fio 若是自己跑完（穩態跑滿 runtime 就結束），窗尾要夾到它結束的時刻：
+    # pipeline 記的 win_end 是「偵測到 fio 結束」的時間，比實際晚一個輪詢週期
+    # （真機實測 34s），那段沒有 workload、自然沒有 IO，不夾就會被算成 stall。
+    # **只夾 fio 自行結束的情形**——被我們 STOP 中止時，尾端沒有 IO 是真的 stall
+    # （client 全黑到最後正是故障實驗要抓的東西），夾掉就等於把它抹掉。
+    exit_proof = read_json(os.path.join(bundle, "fio-exit-proof.json"), {}) or {}
+    exited = [c.get("fio_exited_at") for c in (exit_proof.get("clients") or {}).values()]
+    exited = [e for e in exited if isinstance(e, int)]
+    if exited and win_end is not None:
+        workload_end = max(exited)
+        if workload_end < win_end:
+            log("aggregate：窗尾自 %d 夾到 fio 實際結束的 %d（差 %ds 為偵測延遲）"
+                % (win_end, workload_end, win_end - workload_end))
+            win_end = workload_end
     if win_start is None or win_end is None:
         die("aggregate：找不到任何 fio 逐秒樣本，也沒有 coverage-proof 的窗口定義")
 
