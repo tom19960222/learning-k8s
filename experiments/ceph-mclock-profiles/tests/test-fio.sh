@@ -226,6 +226,23 @@ eq "$(jget "$MAPJSON" clients.mclock-client-1.device)" "/dev/rbd0" "記錄 /dev/
 eq "$(jget "$MAPJSON" clients.mclock-client-3.image)" "fio-c3" "記錄 image 對應"
 has "$MAPJSON" "map_options" "必須記錄 map options（環境快照的一部分）"
 has "$MAPJSON" "device_list" "必須留 rbd device list 原始輸出"
+# 真機首跑踩到：`rbd device list|unmap` 是系統層操作，帶 `-p` 會 unrecognised option。
+# 指令是 base64 過線的，log 裡看不到明文，也因此 fake ssh 的子字串比對守不住——
+# 必須把 argv 裡的 base64 解出來對真正送出去的指令斷言。
+_decoded_cmds="$(sed -n "s/.*printf %s '\([A-Za-z0-9+/=]*\)'.*/\1/p" "$FAKE_SSH_LOG" \
+  | while IFS= read -r b; do printf '%s' "$b" | base64 --decode 2>/dev/null; printf '\n'; done)"
+if printf '%s\n' "$_decoded_cmds" | grep -F 'device list' | grep -qF -- '-p '; then
+  fail "rbd device list 不得帶 -p（pool 選項只有 pool 層子命令吃）"
+fi
+ok
+if printf '%s\n' "$_decoded_cmds" | grep -F 'device unmap' | grep -qF -- '-p '; then
+  fail "rbd device unmap 不得帶 -p"
+fi
+ok
+# 反向自證：解碼真的有抓到指令（否則上面兩條又是空過）
+printf '%s\n' "$_decoded_cmds" | grep -qF 'device list' \
+  || fail "解碼後應看得到 device list 指令（斷言不得空過）"
+ok
 eq "$(fio_device mclock-client-2)" "/dev/rbd1" "fio_device 由 map 記錄查裝置"
 
 # 11) 已 map 即不重複 map（冪等）

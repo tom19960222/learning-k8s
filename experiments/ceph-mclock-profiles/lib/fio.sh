@@ -597,6 +597,11 @@ _fio_nclients() { _fio_clients | wc -l | tr -d ' '; }
 
 _fio_rbd() { printf 'rbd -p %s --id %s' "$CEPH_POOL" "$CEPH_CLIENT_ID"; }
 
+# `rbd device list|unmap` 是系統層操作（列出／解除本機所有 map），**不吃 `-p`**——
+# 帶了會 `rbd: unrecognised option '-p'`。只有 pool 層子命令（ls/create/info/map）
+# 才接受。真機首跑踩到。
+_fio_rbd_dev() { printf 'rbd --id %s' "$CEPH_CLIENT_ID"; }
+
 _fio_scratch() { _ceph_scratch; }
 
 # _fio_image_for <client-index>
@@ -637,7 +642,7 @@ fio_map_all() { # [outfile]
   for c in $(_fio_clients); do
     img="$(_fio_image_for "$idx")"
     dl="$(_fio_scratch)/devlist.${c}.json"
-    _fio_run_script "$c" 120 maplist "${rbd_c} device list --format json" > "$dl" \
+    _fio_run_script "$c" 120 maplist "$(_fio_rbd_dev) device list --format json" > "$dl" \
       || die "rbd device list 失敗：${c}"
     dev="$(_fio_py devlist-device "$img" < "$dl")"
     if [ -z "$dev" ]; then
@@ -646,7 +651,7 @@ fio_map_all() { # [outfile]
       dev="$(_fio_run_script "$c" 300 map "$mapcmd" | tr -d ' \r' | tail -1)" \
         || die "rbd map 失敗：${img}（${c}）"
       [ -n "$dev" ] || die "rbd map 沒有回傳裝置路徑：${c}"
-      _fio_run_script "$c" 120 maplist2 "${rbd_c} device list --format json" > "$dl" \
+      _fio_run_script "$c" 120 maplist2 "$(_fio_rbd_dev) device list --format json" > "$dl" \
         || die "map 後 rbd device list 失敗：${c}"
       [ "$(_fio_py devlist-device "$img" < "$dl")" = "$dev" ] \
         || die "map 後 device list 與 map 回傳的裝置不一致：${c}"
@@ -669,11 +674,11 @@ fio_unmap_all() {
   for c in $(_fio_clients); do
     img="$(_fio_image_for "$idx")"
     dl="$(_fio_scratch)/devlist-unmap.${c}.json"
-    _fio_run_script "$c" 120 maplist "${rbd_c} device list --format json" > "$dl" \
+    _fio_run_script "$c" 120 maplist "$(_fio_rbd_dev) device list --format json" > "$dl" \
       || die "rbd device list 失敗：${c}"
     dev="$(_fio_py devlist-device "$img" < "$dl")"
     if [ -n "$dev" ]; then
-      _fio_run_script "$c" 300 unmap "${rbd_c} device unmap ${img}" >&2 \
+      _fio_run_script "$c" 300 unmap "$(_fio_rbd_dev) device unmap ${CEPH_POOL}/${img}" >&2 \
         || die "rbd unmap 失敗：${img}（${c}）"
       n=$((n + 1))
     fi
