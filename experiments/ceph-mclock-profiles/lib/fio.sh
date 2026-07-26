@@ -225,25 +225,37 @@ def cmd_tuning_values(argv):
 # -------------------------------------------------------------------- readiness --
 
 def _iops_by_sec(path):
-    secs = {}
+    """裝置統計取樣檔 → {epoch: 該秒的 IOPS}（相鄰取樣做差分）。
+
+    每行 = `<epoch> <reads_completed> <writes_completed>`（/sys/block/<dev>/stat
+    的第 1、5 欄，累計值）。fio 的逐秒 log 在跑完才落地，執行中讀不到，所以
+    readiness 一律以裝置層統計判定。
+    """
+    rows = []
     try:
         fh = open(path)
     except OSError:
-        return secs
+        return {}
     with fh:
         for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p.strip() for p in line.split(",")]
+            parts = line.split()
             if len(parts) < 3:
                 continue
             try:
-                sec = int(float(parts[0])) // 1000
-                val = float(parts[1])
+                rows.append((int(parts[0]), int(parts[1]) + int(parts[2])))
             except ValueError:
                 continue
-            secs[sec] = secs.get(sec, 0.0) + val
+    rows.sort()
+    secs = {}
+    for i in range(1, len(rows)):
+        t0, c0 = rows[i - 1]
+        t1, c1 = rows[i]
+        dt = t1 - t0
+        if dt <= 0 or c1 < c0:      # 時鐘倒退或計數器重置 → 丟棄該區間
+            continue
+        rate = (c1 - c0) / float(dt)
+        for sec in range(t0 + 1, t1 + 1):   # 區間內每秒都記為平均速率
+            secs[sec] = rate
     return secs
 
 
@@ -943,6 +955,12 @@ fio_start_bg() { # <bundle> <mode> <shape> <rate>
     remote_bg_start "$c" "$runid" \
       "$(_fio_runner_script "$wd" "$jb64" "$dev" "$loop")" >/dev/null \
       || die "fio 背景啟動失敗：${c}"
+    # 與 fio 併行的逐秒裝置取樣器：readiness 需要「執行中」的吞吐，而 fio 的逐秒
+    # log 要等跑完才落地（真機首跑因此讀不到、量測窗變成空窗）。這個取樣器寫的是
+    # 持續增長的檔案，readiness 只要 cat 它即可。
+    remote_bg_start "$c" "${runid}-devstat" \
+      "$(_fio_devstat_script "$wd" "$dev")" >/dev/null \
+      || die "devstat 取樣器啟動失敗：${c}"
     printf '%s\t%s\t%s\n' "$c" "$runid" "$wd" >> "$tsv"
     n=$((n + 1))
   done
@@ -990,14 +1008,36 @@ _fio_require_run() { # <bundle>
 
 # --- 6) readiness barrier ----------------------------------------------------
 
+# 取樣點：**裝置層** /sys/block/<dev>/stat，不是 fio 的逐秒 log。
+# fio 預設把 log 緩衝在記憶體、**跑完才一次寫檔**，所以執行中去 cat log 永遠讀不到
+# 當下的吞吐——真機首跑就是這樣：readiness 一路 PENDING 到 fio 結束才通過，
+# 量測窗變成 fio 之後的 15 秒空窗，整個 cell 的 endpoint 全為 null。
+# 裝置統計是連續可讀的，與 fio 的寫檔時機無關。
+# （p99 baseline 分母不受影響：它在 aggregate 階段從落地後的 fio log 依
+#  readiness 窗的時戳回算，不需要即時取得。）
+_fio_devstat_script() { # <workdir> <dev> → 逐秒把 /sys/block/<dev>/stat 追加到 devstat.log
+  local wd="$1" blk
+  blk="$(basename "$2")"
+  cat <<EOF
+set -u
+mkdir -p ${wd}
+while :; do
+  printf '%s ' \$(date +%s) >> ${wd}/devstat.log
+  awk '{print \$1, \$5}' /sys/block/${blk}/stat >> ${wd}/devstat.log
+  sleep 1
+done
+EOF
+}
+
+
 _fio_readiness_once() {
   local bundle="$_FIO_RB_BUNDLE" c wd f args
   args=""
   for c in $(_fio_clients); do
     wd="$(_fio_workdir_of "$bundle" "$c")"
     [ -n "$wd" ] || return 1
-    f="$(_fio_scratch)/readlog.${c}.log"
-    _fio_run_script "$c" 60 readlogs "cat ${wd}/*_iops.*.log 2>/dev/null" > "$f" \
+    f="$(_fio_scratch)/devstat.${c}.log"
+    _fio_run_script "$c" 30 devstat "cat ${wd}/devstat.log 2>/dev/null" > "$f" \
       || return 1
     args="${args} ${c}=${f}"
   done

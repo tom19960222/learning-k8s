@@ -360,6 +360,8 @@ expect_start() { # <mode>
   wf "$tmp/pid.txt" "4242"
   for c in $CLIENTS; do
     expect_ssh "fio-${1}-${c}.pid" 0 0 "$tmp/pid.txt"
+    # 與 fio 併行啟動的逐秒裝置取樣器（readiness 的資料來源）
+    expect_ssh "fio-${1}-${c}-devstat.pid" 0 0 "$tmp/pid.txt"
   done
 }
 expect_wait_done() {
@@ -380,14 +382,17 @@ expect_stop() { # <mode> <tar> [exit-code]
   done
 }
 expect_readiness() { # <seconds> <iops>
-  local c d
-  d="$tmp/rl.$$"
-  rm -rf "$d"; mkdir -p "$d"
-  python3 "$GEN_LOGS" --out "$d" --seg seg01 --job 1 --start 1800000000 \
-    --seconds "$1" --iops "$2" --directions 0 >/dev/null
-  cp "$d/seg01_iops.1.log" "$tmp/readlog.txt"
+  # readiness 讀的是與 fio 併行的逐秒裝置取樣器寫出的 devstat.log（累計計數），
+  # 不是 fio 的逐秒 log——後者跑完才落地，執行中讀不到（真機首跑就栽在這）。
+  local c i
+  : > "$tmp/devstat.txt"
+  i=0
+  while [ "$i" -le "$1" ]; do
+    printf '%s %s 0\n' "$((1800000000 + i))" "$((i * $2))" >> "$tmp/devstat.txt"
+    i=$((i + 1))
+  done
   for c in $CLIENTS; do
-    expect_ssh "mclock-readlogs-${c};" 0 0 "$tmp/readlog.txt"
+    expect_ssh "mclock-devstat-${c};" 0 0 "$tmp/devstat.txt"
   done
 }
 
@@ -416,6 +421,7 @@ RB="$RESULTS_DIR/c07/r1/attempts/20260725T031000Z"
 mkdir -p "$RB"
 for c in $CLIENTS; do
   expect_ssh "fio-c07-r1-20260725T031000Z-${c}.pid" 0 0 "$tmp/pid.txt"
+  expect_ssh "fio-c07-r1-20260725T031000Z-${c}-devstat.pid" 0 0 "$tmp/pid.txt"
 done
 fio_start_bg "$RB" segment 4k 20000 >/dev/null || fail "replicate bundle 的 start 應成功"
 ok
@@ -432,6 +438,18 @@ out="$(fio_readiness_barrier "$B1")" || fail "穩定的 workload 應通過 readi
 ok
 case "$out" in "fio-readiness: PASS"*) ok ;; *) fail "readiness 機器行不符：${out}" ;; esac
 [ -s "$B1/readiness.json" ] || fail "readiness.json 未寫入"
+# readiness 必須讀「與 fio 併行的取樣器」寫的 devstat.log，不得讀 fio 自己的逐秒 log
+# ——後者跑完才落地，執行中讀不到，真機首跑因此量測窗全空、endpoint 全 null。
+# fake ssh 以 tag 比對，分辨不出讀的是哪個檔，所以要解 base64 對真正送出的指令斷言。
+_rb_cmds="$(sed -n "s/.*printf %s '\([A-Za-z0-9+/=]*\)'.*/\1/p" "$FAKE_SSH_LOG" \
+  | while IFS= read -r b; do printf '%s' "$b" | base64 --decode 2>/dev/null; printf '\n'; done)"
+printf '%s\n' "$_rb_cmds" | grep -qF 'devstat.log' \
+  || fail "readiness 必須讀 devstat.log（與 fio 併行的取樣器輸出）"
+ok
+if printf '%s\n' "$_rb_cmds" | grep -F 'mclock-devstat' | grep -qF '_iops.'; then
+  fail "readiness 不得讀 fio 自己的逐秒 log（跑完才落地）"
+fi
+ok
 ok
 eq "$(jget "$B1/readiness.json" stable_seconds)" "60" "穩定窗固定 60s"
 S="$(jget "$B1/readiness.json" window.start)"
