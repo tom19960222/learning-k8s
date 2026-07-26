@@ -1163,6 +1163,10 @@ EOF
       "$(printf '%s\n' "$out" | awk '$1 == "NOW" {print $2}')" \
       "$(printf '%s\n' "$out" | awk '$1 == "SEG" {print $2}')" >> "$tsv"
     remote_bg_stop "$c" "$runid" >/dev/null || log "remote_bg_stop 失敗（續行）：${c}"
+    # 取樣器是無窮迴圈，不會自己結束——沒停掉的話 registry 會留活著的 pid，
+    # 下一個 replicate 的 fio_start_bg 會因「拒絕覆蓋」而 die。
+    remote_bg_stop "$c" "${runid}-devstat" >/dev/null \
+      || log "devstat 取樣器停止失敗（續行）：${c}"
     _fio_fetch "$bundle" "$mode" "$c" "$wd"
   done
   nfail="$(_fio_py exit-proof "$tsv" "$bundle/fio-exit-proof.json" "$mode")" \

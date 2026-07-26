@@ -378,6 +378,8 @@ expect_stop() { # <mode> <tar> [exit-code]
   for c in $CLIENTS; do
     expect_ssh "mclock-stop-${c};" 0 0 "$tmp/stopout.txt"
     expect_ssh "fio-${1}-${c}.pid" 0 0 ""
+    # 取樣器是無窮迴圈，不停掉會讓下一個 replicate 的 start 因 registry 有活 pid 而 die
+    expect_ssh "fio-${1}-${c}-devstat.pid" 0 0 ""
     expect_ssh "mclock-fetch-${c};" 0 0 "$2"
   done
 }
@@ -522,6 +524,11 @@ expect_stop segment "$TAR_OK"
 out="$(fio_stop "$B1")" || fail "fio_stop 應成功"
 ok
 eq "$out" "fio-stop: PASS 4" "fio_stop 機器行"
+# 取樣器是無窮迴圈：沒被停掉的話 registry 會留活著的 pid，下一個 replicate 的
+# fio_start_bg 會因「拒絕覆蓋」而 die（真機第一個 cell 收尾時就是這樣卡住）。
+# expect_ssh 只是「允許」該呼叫，不保證發生——要對 log 斷言才守得住。
+eq "$(grep -c -- '-devstat.pid' "$FAKE_SSH_LOG")" "4" \
+  "fio_stop 必須一併停掉 4 台的 devstat 取樣器"
 [ -s "$B1/fio-exit-proof.json" ] || fail "fio-exit-proof.json 未寫入"
 ok
 eq "$(jget "$B1/fio-exit-proof.json" clients.mclock-client-1.exit_code)" "0" "收 exit code"
