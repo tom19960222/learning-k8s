@@ -104,7 +104,9 @@ ok
 b1="$tmp/b1"; mkdir -p "$b1"
 reset_ssh
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd out 3' 0 0 ""
@@ -114,7 +116,7 @@ case "$out" in
   "osd-down: OK osd.3 "*) ok ;;
   *) fail "fault_osd_down 機器行格式（got=[$out]）" ;;
 esac
-before "$FAKE_SSH_LOG" "orch daemon stop osd.3" "osd out 3" "必須 down 之後才 out"
+before "$FAKE_SSH_LOG" "systemctl stop" "osd out 3" "必須 down 之後才 out"
 eq "$(jget "$b1/fault-timeline.json" down_map_epoch)" "200" "down_map_epoch = OSDMap down_at"
 [ -n "$(jget "$b1/fault-timeline.json" down_epoch_t)" ] || fail "缺 down_epoch_t"
 ok
@@ -127,13 +129,14 @@ has "$b1/inject-active.tsv" "osd-down" "active registry 要登記 osd-down"
 
 # 3) recover：start → 等 up → osd in
 reset_ssh
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd in 3' 0 0 ""
 fault_osd_down_recover 3 "$b1" >/dev/null || fail "fault_osd_down_recover 應成功"
 ok
-before "$FAKE_SSH_LOG" "orch daemon start osd.3" "osd in 3" "必須 up 之後才 in"
+before "$FAKE_SSH_LOG" "systemctl start" "osd in 3" "必須 up 之後才 in"
 eq "$(grep -c . "$b1/inject-active.tsv")" "0" "recover 後 active registry 必須清空"
 has "$b1/inject-events.jsonl" '"event": "osd-down-recover"' "recover 要留事件"
 
@@ -141,20 +144,23 @@ has "$b1/inject-events.jsonl" '"event": "osd-down-recover"' "recover 要留事�
 b2="$tmp/b2"; mkdir -p "$b2"
 reset_ssh
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd out 3' 0 0 ""
 fault_osd_down 3 "$b2" >/dev/null || fail "fault_osd_down 應成功"
 ok
 reset_ssh
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd in 3' 0 0 ""
 inject_rollback_all "$b2" >/dev/null || fail "inject_rollback_all 應成功"
 ok
-has "$FAKE_SSH_LOG" "orch daemon start osd.3" "rollback 要把 daemon 拉回來"
+has "$FAKE_SSH_LOG" "systemctl start" "rollback 要把 daemon 拉回來"
 has "$FAKE_SSH_LOG" "osd in 3" "rollback 要把 OSD in 回去"
 eq "$(grep -c . "$b2/inject-active.tsv")" "0" "rollback 後 registry 清空"
 # 冪等：registry 空了就不再打 ssh
@@ -171,32 +177,38 @@ reset_ssh
 expect_ssh 'osd set noout' 0 0 ""
 # cycle 1
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-active.json"
 expect_ssh 'osd dump' 0 0 "$up1"
-# cycle 2
+# cycle 2（host 已快取 → 不再查 osd tree；unit 存在性每次 stop 仍驗）
 expect_ssh 'osd dump' 0 0 "$up1"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn2"
 expect_ssh 'osd dump' 0 0 "$dn2"
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up2"
 expect_ssh 'osd dump' 0 0 "$up2"
 expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-active.json"
+expect_ssh 'osd dump' 0 0 "$up2"
+# 解除 noout 前先確認 OSD 已回到 up（否則 auto-out 會啟動非計畫 backfill）
 expect_ssh 'osd dump' 0 0 "$up2"
 expect_ssh 'osd unset noout' 0 0 ""
 out="$(fault_flapping 3 "$b3")" || fail "fault_flapping 應成功"
 ok
 eq "$out" "flapping: OK osd.3 cycles=2" "flapping 機器行"
-before "$FAKE_SSH_LOG" "osd set noout" "orch daemon stop osd.3" "noout 必須在第一次 stop 之前"
-before "$FAKE_SSH_LOG" "orch daemon start osd.3" "osd unset noout" "unset noout 在最後"
+before "$FAKE_SSH_LOG" "osd set noout" "systemctl stop" "noout 必須在第一次 stop 之前"
+before "$FAKE_SSH_LOG" "systemctl start" "osd unset noout" "unset noout 在最後"
 hasnt "$FAKE_SSH_LOG" "osd out 3" "flapping 全程不得 out"
-eq "$(count_of "$FAKE_SSH_LOG" 'orch daemon stop osd.3')" "2" "跑滿設定的輪數"
+eq "$(count_of "$FAKE_SSH_LOG" 'systemctl stop')" "2" "跑滿設定的輪數"
 eq "$(count_of "$FAKE_SSH_LOG" 'pg ls-by-osd 3')" "2" "每輪都要過 PG active gate"
 eq "$(count_of "$FAKE_SSH_LOG" 'osd unset noout')" "1" "unset noout 恰一次"
 # laggy 逐輪記錄（covariate，不 gate）
@@ -212,12 +224,15 @@ b4="$tmp/b4"; mkdir -p "$b4"
 reset_ssh
 expect_ssh 'osd set noout' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up0"          # 還沒判 down（grace 用完）
 expect_ssh 'osd down 3' 0 0 ""            # 顯式標記
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-active.json"
@@ -226,7 +241,7 @@ expect_ssh 'osd unset noout' 0 0 ""
 FLAP_CYCLES=1 fault_flapping 3 "$b4" >/dev/null || fail "顯式 osd down 後應續行"
 ok
 has "$FAKE_SSH_LOG" "osd down 3" "超 grace 要顯式 ceph osd down"
-before "$FAKE_SSH_LOG" "orch daemon stop osd.3" "osd down 3" "先 stop 再顯式標記"
+before "$FAKE_SSH_LOG" "systemctl stop" "osd down 3" "先 stop 再顯式標記"
 # noout 的對稱 unset 必須也在 cleanup stack（abort path 也要解）——上面這次呼叫沒有走
 # command substitution，cleanup_push 才留得在本 shell 的 stack 裡。
 printf '%s\n' "${_CLEANUP_STACK[@]+"${_CLEANUP_STACK[@]}"}" > "$tmp/stack.txt"
@@ -237,13 +252,18 @@ b5="$tmp/b5"; mkdir -p "$b5"
 reset_ssh
 expect_ssh 'osd set noout' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$outed"
 expect_ssh 'osd dump' 0 0 "$outed"
 expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-active.json"
+expect_ssh 'osd dump' 0 0 "$outed"
+# 解除 noout 前的「確認已 up」檢查（osd 已 up，不需要拉起）
 expect_ssh 'osd dump' 0 0 "$outed"
 expect_ssh 'osd unset noout' 0 0 ""
 set +e
@@ -256,7 +276,7 @@ case "$out" in
   *) fail "taint 機器行格式（got=[$out]）" ;;
 esac
 has "$b5/inject-taint.json" "out" "taint 原因要落檔"
-eq "$(count_of "$FAKE_SSH_LOG" 'orch daemon stop osd.3')" "1" "taint 後不得續跑下一輪"
+eq "$(count_of "$FAKE_SSH_LOG" 'systemctl stop')" "1" "taint 後不得續跑下一輪"
 has "$FAKE_SSH_LOG" "osd unset noout" "taint 也要 unset noout"
 
 # 8) PG gate 沒過也算 taint（每輪 gate 是硬條件）
@@ -264,10 +284,13 @@ b6="$tmp/b6"; mkdir -p "$b6"
 reset_ssh
 expect_ssh 'osd set noout' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up0"
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn1"
 expect_ssh 'osd dump' 0 0 "$dn1"
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'osd dump' 0 0 "$up1"
 expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-peering.json"

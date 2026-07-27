@@ -1539,14 +1539,45 @@ ceph_wait_pgs_active_for_osd() {
 }
 
 # daemon 控制一律走 orchestrator（不猜 systemd unit 名）
+# OSD daemon 的起停一律走 **目標 host 的 systemd**，不用 `ceph orch daemon`：
+# 本 lab 的 OSD 是逐台 `orch daemon add osd` 建的，`ceph orch ls` 顯示該 service 是
+# **unmanaged**，而 cephadm 的協調迴圈不碰 unmanaged service——`orch daemon start`
+# 只會回「Scheduled to start」然後**永遠不執行**。真機 flapping 第一輪就卡在這：
+# stop 生效、start 沒生效，osd.2 等了 300s 沒回來，attempt taint。
+# unit 名不是猜的：cephadm 的固定命名 `ceph-<fsid>@osd.<id>.service`，fsid 取自
+# `ceph_fsid`（部署時就驗過），且下指令前先以 `systemctl list-units` 確認該 unit 存在。
+_ceph_osd_unit() { # <osd-id> → ceph-<fsid>@osd.<id>.service
+  printf 'ceph-%s@osd.%s.service' "$(ceph_fsid)" "$1"
+}
+
+# 用既有的 osd tree（測試已有 fixture、部署鏈也已在用）反查 host，不另打 `osd find`。
+# 設 `_CEPH_OSD_HOST` 而非印出：呼叫端若用 `$(...)` 取值，快取寫在子 shell 裡
+# 一離開就消失（flapping 有 10 輪 stop/start，等於每輪都重查 osd tree）。
+_ceph_osd_host_set() { # <osd-id> → 設 _CEPH_OSD_HOST
+  local cached
+  eval "cached=\"\${_CEPH_OSDHOST_$1:-}\""
+  if [ -n "$cached" ]; then _CEPH_OSD_HOST="$cached"; return 0; fi
+  _CEPH_OSD_HOST="$(ceph_adm "ceph osd tree --format json" | _ceph_py osd-tree-hosts \
+    | awk -v id="$1" '{n=split($3,a,","); for(i=1;i<=n;i++) if(a[i]==id){print $1; exit}}')"
+  [ -n "$_CEPH_OSD_HOST" ] || die "osd tree 裡找不到 osd.$1 的 host"
+  eval "_CEPH_OSDHOST_$1=\"\$_CEPH_OSD_HOST\""
+}
+
 ceph_daemon_stop() { # <osd-id>
   [ $# -eq 1 ] || die "用法：ceph_daemon_stop <osd-id>"
-  ceph_adm_to 300 "ceph orch daemon stop osd.$1" >&2
+  local unit
+  _ceph_osd_host_set "$1"; unit="$(_ceph_osd_unit "$1")"
+  _node_run "$_CEPH_OSD_HOST" 300 \
+    "systemctl list-units --all --type=service --no-legend '${unit}' | grep -q ." \
+    || die "osd.$1 的 systemd unit 不存在：${unit}（host=${_CEPH_OSD_HOST}）"
+  _node_run "$_CEPH_OSD_HOST" 300 "sudo systemctl stop ${unit}" >&2
 }
 
 ceph_daemon_start() { # <osd-id>
   [ $# -eq 1 ] || die "用法：ceph_daemon_start <osd-id>"
-  ceph_adm_to 300 "ceph orch daemon start osd.$1" >&2
+  local unit
+  _ceph_osd_host_set "$1"; unit="$(_ceph_osd_unit "$1")"
+  _node_run "$_CEPH_OSD_HOST" 300 "sudo systemctl start ${unit}" >&2
 }
 
 ceph_osd_out() { # <osd-id...>（rack 場景一次兩顆 → backfill 起點單一）

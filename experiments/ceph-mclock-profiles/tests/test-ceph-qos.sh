@@ -635,16 +635,28 @@ expect_ssh 'pg ls-by-osd 3' 0 0 "$fx/pg-ls-by-osd-empty.json"
 ceph_wait_pgs_active_for_osd 3 30 || fail "沒有 PG 的 OSD 視為通過"
 ok
 
-# 38) daemon stop/start 走 orch，不猜 systemd unit 名
+# 38) daemon stop/start 走目標 host 的 systemd（不是 orch）
+#     真機推翻了原本「一律用 orch」的設計：OSD 是逐台 `orch daemon add osd` 建的，
+#     該 service 是 unmanaged，而 cephadm 不協調 unmanaged service——`orch daemon
+#     start` 只回「Scheduled to start」然後永不執行，flapping 第一輪就卡死。
+#     unit 名不是猜的：cephadm 固定命名 + 取自 ceph_fsid，且 stop 前先驗 unit 存在。
 reset_ssh
-expect_ssh 'orch daemon stop osd.3' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 ceph_daemon_stop 3 || fail "ceph_daemon_stop 應成功"
 ok
-expect_ssh 'orch daemon start osd.3' 0 0 ""
+has "$FAKE_SSH_LOG" "systemctl stop ceph-${CEPH_FSID}@osd.3.service" \
+  "stop 用 fsid 組出的 unit 名"
+has "$FAKE_SSH_LOG" "list-units" "動手前必須先驗 unit 存在（不是盲猜）"
+expect_ssh 'systemctl start' 0 0 ""
 ceph_daemon_start 3 || fail "ceph_daemon_start 應成功"
 ok
-hasnt "$FAKE_SSH_LOG" "systemctl" "不得直接操作 systemd unit"
-hasnt "$FAKE_SSH_LOG" "ceph-osd@" "不得猜 systemd unit 名"
+has "$FAKE_SSH_LOG" "systemctl start ceph-${CEPH_FSID}@osd.3.service" \
+  "start 用同一個 unit 名"
+hasnt "$FAKE_SSH_LOG" "orch daemon start" \
+  "不得用 orch daemon start（unmanaged service 下不會執行）"
+eq "$(count_of "$FAKE_SSH_LOG" 'osd tree')" "1" "host 對應要快取（不得每次重查）"
 
 # 39) out/in 支援一次多顆（rack 場景 backfill 起點要單一）
 reset_ssh

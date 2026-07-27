@@ -752,6 +752,15 @@ fault_flapping() {
       down_map_epoch="${down_at:-0}" up_map_epoch="${up_from:-0}"
     i=$((i + 1))
   done
+  # 解除 noout 之前必須確認 OSD 已回到 up：失敗路徑（某輪 start 逾時）下 OSD 還是
+  # down，一解除 noout，mon 就會在 mon_osd_down_out_interval（600s）後把它 auto-out
+  # 並啟動非計畫 backfill——真機第一次跑 flapping 就是這樣，osd.2 taint 之後被 out。
+  if ! _inject_osd_is_up_now "$id"; then
+    log "osd.${id} 仍為 down：先嘗試拉起再解除 noout（避免 auto-out 觸發非計畫 backfill）"
+    ceph_daemon_start "$id" >&2 || log "拉起 osd.${id} 失敗（noout 仍會解除，改由 reconcile 收拾）"
+    with_deadline "$FLAP_UP_SECS" _inject_osd_is_up_now "$id" \
+      || log "osd.${id} 未在期限內回到 up——解除 noout 後可能被 auto-out，reconcile 會處理"
+  fi
   _inject_unset_noout || log "unset noout 失敗（cleanup stack 會再試一次）"
   if [ "$rc" -ne 0 ]; then
     inject_taint "$b" "flapping ${reason}"

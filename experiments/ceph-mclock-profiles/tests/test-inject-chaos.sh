@@ -218,7 +218,9 @@ inject_cache_reset
 reset_ssh
 # osd-stop
 expect_ssh 'osd dump' 0 0 "$up2"
-expect_ssh 'orch daemon stop osd.2' 0 0 ""
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$dn2"
 expect_ssh 'osd dump' 0 0 "$dn2"
 # node-isolate（chaos 不 out）
@@ -239,7 +241,7 @@ expect_ssh 'nc -z' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$rj3"
 expect_ssh 'osd dump' 0 0 "$rj3"
 # osd-start
-expect_ssh 'orch daemon start osd.2' 0 0 ""
+expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$rj2"
 expect_ssh 'osd dump' 0 0 "$rj2"
 out="$(chaos_run 4242 60 "$b1")" || fail "chaos_run 應成功"
