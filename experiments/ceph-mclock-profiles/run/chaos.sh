@@ -34,7 +34,10 @@ _chaos_after_exec() { # <exec-json>
   printf 'chaos: SEED %s %s duration=%s\n' "$QUEUE_LAST_KEY" "$seed" "$duration"
 }
 
-require_inject_flag "$@"
+# inject_confirm（不是 require_inject_flag）：後者只檢查旗標，前者還會設下
+# INJECT_CONFIRMED，注入函式靠它把關。測試全域 export 了該變數，所以只有真機
+# 會發現差別——第一次跑故障 pilot 就在注入前被擋下。
+inject_confirm "$@"
 
 for arg in "$@"; do
   case "$arg" in

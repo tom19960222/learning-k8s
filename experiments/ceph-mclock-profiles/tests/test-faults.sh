@@ -50,7 +50,11 @@ rt_manifest '{"fault":2}' 'osd-down'
 az_script 0 40
 rt_run "$sb" faults.sh
 rt_eq "$RT_RC" "1" "缺 --yes-really-inject 應 die"
-rt_eq "$(wc -l < "$RT_TRACE" | tr -d ' ')" "0" "拒跑時不得碰下游"
+# inject_confirm 本身是「閘門」不是下游動作——它被記進 trace 是正確的，
+# 排除它之後才是真正的「下游未被碰」。
+# shellcheck disable=SC2126  # grep -c 在計數 0 時回傳非零，會讓 $(...) 取到空值
+rt_eq "$(grep -v 'inject_confirm' "$RT_TRACE" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+  "拒跑時不得碰下游"
 
 # =============================================================================
 # 2. margins.json 是 faults 的硬前置（非 pilot 模式）
@@ -197,5 +201,13 @@ rt_eq "$(grep -c 'pipeline_run_execution' "$RT_TRACE")" "1" "停佇列後不得�
 # 9. 靜態斷言：薄入口不得繞過 pipeline
 # =============================================================================
 rt_assert_thin "$RT_ROOT/run/faults.sh"
+
+# 會注入的入口必須呼叫 inject_confirm（不是只檢查旗標的 require_inject_flag）——
+# 只有前者會設下 INJECT_CONFIRMED，注入函式靠它把關。真機第一次跑故障 pilot 時，
+# fio 都起來了才在注入前被擋下，白跑一輪。
+rt_eq "$(grep -l '^inject_confirm "\$@"' \
+  "$RT_ROOT/run/faults.sh" "$RT_ROOT/run/chaos.sh" "$RT_ROOT/run/all.sh" \
+  2>/dev/null | wc -l | tr -d ' ')" "3" \
+  "faults/chaos/all 三個會注入的入口都要呼叫 inject_confirm"
 
 printf 'test-faults: %d asserts passed\n' "$RT_ASSERTS"

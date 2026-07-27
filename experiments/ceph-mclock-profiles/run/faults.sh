@@ -167,7 +167,10 @@ _faults_pilot_estimate() { # <resume 0|1>
 
 # --- 主流程 -------------------------------------------------------------------
 
-require_inject_flag "$@"
+# inject_confirm（不是 require_inject_flag）：後者只檢查旗標，前者還會設下
+# INJECT_CONFIRMED，注入函式靠它把關。測試全域 export 了該變數，所以只有真機
+# 會發現差別——第一次跑故障 pilot 就在注入前被擋下。
+inject_confirm "$@"
 
 pilot=0
 resume=0

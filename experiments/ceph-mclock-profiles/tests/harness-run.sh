@@ -218,6 +218,16 @@ MCLOCK_PIPELINE_LOADED=1
 # shellcheck source=./common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+# inject_confirm 真品在 lib/inject.sh，而沙箱只放 common.sh + pipeline stub。
+# 少了它，入口的 `inject_confirm "$@"` 會是 command not found——沒有 set -e 就
+# **繼續往下跑**，於是「拒跑時不得碰下游」的斷言看到 inventory_load 而失敗，
+# 卻完全沒指出真正的原因。行為與真品一致：檢查旗標並設下確認狀態。
+inject_confirm() {
+  require_inject_flag "$@"
+  INJECT_CONFIRMED=1
+  export INJECT_CONFIRMED
+}
+
 MANIFEST_PY="${MANIFEST_PY:-$MCLOCK_LIB/manifest.py}"
 RUNNER_ID="${RUNNER_ID:-runner-test}"
 

@@ -30,7 +30,10 @@ RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./queue.sh
 . "$RUN_DIR/queue.sh"
 
-require_inject_flag "$@"
+# inject_confirm（不是 require_inject_flag）：後者只檢查旗標，前者還會設下
+# INJECT_CONFIRMED，注入函式靠它把關。測試全域 export 了該變數，所以只有真機
+# 會發現差別——第一次跑故障 pilot 就在注入前被擋下。
+inject_confirm "$@"
 
 resume=0
 for arg in "$@"; do
