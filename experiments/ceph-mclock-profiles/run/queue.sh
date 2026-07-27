@@ -97,10 +97,14 @@ def main(argv):
     doc = json.load(sys.stdin)
     if cmd == "progress":
         kind = argv[1]
-        # descoped（§7.3 的成本決策）已裁決不跑 → 不計入分母，否則 done/total 永遠
-        # 到不了，run/steady.sh 的「全數完成才產 margins」判準會被卡死。
+        # descoped（§7.3 的成本決策）與 needs-human（taint 預算耗盡、佇列已跳過）
+        # 都是**已裁決不再跑**的 execution → 不計入分母，否則 done/total 永遠到不了，
+        # run/steady.sh 的「全數完成才產 margins」會被卡死。真機就發生過：
+        # 71 done + 1 needs-human = 72，佇列已空卻因 71≠72 而死在 margins 前。
+        # 兩者都會出現在 audit 的缺件清單，不會被靜默吞掉。
+        skip = ("descoped", "needs-human", "needs_human")
         execs = [e for e in doc.get("executions", [])
-                 if e.get("kind") == kind and e.get("status") != "descoped"]
+                 if e.get("kind") == kind and e.get("status") not in skip]
         done = sum(1 for e in execs if e.get("status") == "done")
         sys.stdout.write("%d %d\n" % (done, len(execs)))
         return 0

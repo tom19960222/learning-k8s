@@ -508,3 +508,36 @@
 | **P2** | H-003、H-019、H-021、H-022 | 研究線與加強型證據；H-021 明確為 S3 選配，時間不足即留 backlog。 |
 
 **驗收（spec §11.5）**：所有 P0/P1 條目在 Phase 5 收官時必須離開 `proposed`（confirmed / violated / indistinguishable(equivalent|underpowered) / killed 四選一）。
+
+### H-024：seq/high 的 taint 高度集中在 client reservation 最低的 profile
+
+**狀態**：proposed（穩態階段實測觀察，待故障階段交叉驗證）
+
+**觀察**（2026-07-27 穩態，`seq` 形態 × `high` 壓力，每 cell 3 replicate）：
+
+| cell | coverage taint 次數 |
+|---|---|
+| `seq-high+high_client_ops`（client res 60%） | 0（三個 replicate 一次過） |
+| `seq-high+balanced`（client res 50%） | 1 |
+| `seq-high+high_recovery_ops`（client res 30%） | **8**（r1 三次全 taint → needs-human） |
+
+taint 的成因是 fio 逐秒 log 與 heartbeat 同時出現 50–86 秒缺口；查證 r1 最後一次 attempt，
+宣稱缺口的 86 秒內 fio 只有 36 秒有資料——**workload 真的中斷，不是純粹的觀測失效**。
+
+**為什麼這與預期相反**：穩態沒有 recovery 競爭，而三個 profile 的 client limit 都是 max
+（H-001），照理 client 可借滿全部 capacity、profile 不該有差別。穩態原本被定位為
+negative control。
+
+**可能機制**（待驗）：capacity 鎖在 4K randwrite 導出的 ~6,439，而 1M IO 的 mClock cost
+是 4K 的 **17.9 倍**（H-004）。seq/high 目標約 1,900 MiB/s，換算成 cost 需求遠高於
+capacity；此時 reservation 是否 binding 就取決於是否有其他 class 在動（BlueStore 內部、
+pg stats、snap trim 等）。若成立，代表 **profile 在「大 IO + 高壓」下即使沒有 recovery
+也會產生實質差異**，穩態不再是乾淨的 negative control。
+
+**證偽方式**：故障階段的 seq-contention cells（1M × OSD down × 中/極端壓）已在矩陣內；
+若該處三 profile 的 client 表現差異與此處的 taint 分佈同向，則本假說獲得支持。
+另可在報告中以 `results/none-seq-high+*/` 的 coverage-proof 佐證。
+
+**注意**：`n=3` 且 taint 具時間相關性的可能（8 次 taint 集中在同一時段）尚未排除，
+不足以單獨支撐結論——列為待查，不寫進主結論。
+
