@@ -171,7 +171,10 @@ def cmd_state(path, op, *rest):
         reason = positional[0].strip() if positional else ""
         if not reason:
             die("unhalt 需要理由（留痕）：state <path> unhalt <理由> [--clear-counts]")
-        if not doc.get("halted"):
+        # 未 halted 時仍要讓 --clear-counts 生效：誤報的成因修掉後，殘留的
+        # drift_streak / counts 會讓下一個訊號立刻再停。否則就只能手改 JSON——
+        # 而這支工具存在的目的正是取代手改。
+        if not doc.get("halted") and not clear:
             print("unhalt: NOOP")
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

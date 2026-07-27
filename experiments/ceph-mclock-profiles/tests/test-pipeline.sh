@@ -817,6 +817,17 @@ eq "$out" "unhalt: NOOP" "本來就沒停 → NOOP"
 eq "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["unhalt_log"]))' "$W")" \
   "2" "NOOP 不寫留痕"
 
+# 18e) 未停佇列時 --clear-counts 仍要生效：誤報成因修掉後，殘留的 drift_streak
+#      會讓下一個訊號立刻再停；否則就只能手改 JSON，而這支工具就是為了取代手改。
+_pipeline_py state "$W" drift-bump >/dev/null
+_pipeline_py state "$W" drift-bump >/dev/null
+eq "$(jget "$W" drift_streak)" "2" "前置：drift_streak 已累積"
+out="$(_pipeline_py state "$W" unhalt "成因已修，清計數" --clear-counts)" \
+  || fail "未停佇列時的 --clear-counts 應成功"
+ok
+eq "$out" "unhalt: OK cleared-counts" "--clear-counts 不得回 NOOP"
+eq "$(jget "$W" drift_streak)" "0" "drift_streak 必須歸零"
+
 # 18e) pipeline_unhalt：shell 層薄包裝（run/unhalt.sh 用）
 _pipeline_halt_queue "第三次停"
 out="$(pipeline_unhalt "節點已換掉")" || fail "pipeline_unhalt 應成功"
