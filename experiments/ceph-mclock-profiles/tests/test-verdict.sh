@@ -129,7 +129,7 @@ A="$B1/aggregate.json"
 # ——實際就停過一次佇列，而同期吞吐是校準天花板的 109–111%，叢集根本沒變慢。
 DR="$tmp/drift"; mkdir -p "$DR"
 wj "$DR/calibration.json" \
-  '{"shapes":{"4k":{"ceiling_iops":1000,"rates":{"high":800},"reference_p99_ns":10000000}}}'
+  '{"shapes":{"4k":{"ceiling_iops":1000,"rates":{"high":800},"reference_p99_ns":{"high":10000000}}}}'
 _mkbase() { # <cell> <rep> <p99_ns>
   local d="$DR/$1/$2/attempts/a1"; mkdir -p "$d"
   wj "$d/baseline.json" \
@@ -147,6 +147,24 @@ eq "$(jget "$B7/baseline-check.json" reference_source | cut -d'(' -f1)" "campaig
   "有足夠樣本時必須用 campaign 中位數當參考"
 eq "$(jget "$B7/baseline-check.json" drift_signals)" "[]" \
   "系統性偏移不得誤判成漂移"
+
+# 樣本不足（退回校準值）時不得判漂移：量到的是條件差異不是時間漂移。
+# 真機實測：seq/mid 的前三個 replicate 一致 +32%（供給達成率 1.00），停了佇列；
+# 每個新的 (形態,壓力) 組合都會經歷這個視窗，不排除就會反覆假停。
+DR2="$tmp/drift2"; mkdir -p "$DR2"
+wj "$DR2/calibration.json" \
+  '{"shapes":{"4k":{"ceiling_iops":1000,"rates":{"mid":500},"reference_p99_ns":{"mid":10000000}}}}'
+_mk2() { local d="$DR2/$1/r1/attempts/a1"; mkdir -p "$d"
+  wj "$d/baseline.json" \
+    "{\"shape\":\"4k\",\"pressure\":\"mid\",\"target_iops\":500,\"achieved_iops\":500,\"p99_ns\":$2}"
+  printf '%s\n' "$d"; }
+B9="$(_mk2 n1 13500000)"   # 相對校準 10ms 是 +35%，但只有這一筆樣本
+python3 "$V" baseline-check "$B9" --results "$DR2" >/dev/null 2>&1 \
+  || fail "樣本不足時 baseline-check 應通過"
+ok
+eq "$(jget "$B9/baseline-check.json" reference_source)" "calibration" "樣本不足 → 退回校準值"
+eq "$(jget "$B9/baseline-check.json" drift_signals)" "[]" \
+  "非同條件參考不得判漂移（否則每個新 shape/pressure 都會假停）"
 
 # 真漂移仍要抓到：相對 campaign 中位數大幅劣化
 B8="$(_mkbase c8 r1 20000000)"
@@ -528,11 +546,20 @@ esac
 # ============================================================== baseline-check ==
 CAL='{"schema_version":1,"rho":0.7,"shapes":{"4k-randrw":{"ceiling_iops":40000,"rates":{"low":10000,"mid":20000,"high":32000},"reference_p99_ns":{"low":900000,"mid":1500000,"high":4000000,"extreme":20000000}}}}'
 
-bcheck() { # bcheck <name> <pressure> <achieved> <p99> ; 印機器行
-  local name="$1" pressure="$2" achieved="$3" p99="$4" dir
+bcheck() { # bcheck <name> <pressure> <achieved> <p99> [prior-p99] ; 印機器行
+  local name="$1" pressure="$2" achieved="$3" p99="$4" prior="${5:-}" dir i
   dir="$tmp/bc-$name"
   mkdir -p "$dir/results" "$dir/b"
   wj "$dir/results/calibration.json" "$CAL"
+  # p99 漂移只在「同條件」參考下才判定，所以要測 p99 訊號就得先鋪 campaign 樣本
+  # （樣本不足會退回校準值，那是條件差異不是時間漂移——見下方測試）。
+  if [ -n "$prior" ]; then
+    for i in 1 2 3; do
+      mkdir -p "$dir/results/prior$i/r1/attempts/a1"
+      wj "$dir/results/prior$i/r1/attempts/a1/baseline.json" \
+        "{\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\",\"achieved_iops\":${achieved},\"p99_ns\":${prior}}"
+    done
+  fi
   wj "$dir/b/baseline.json" \
     "{\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\",\"achieved_iops\":${achieved},\"p99_ns\":${p99},\"duration_s\":60}"
   wj "$dir/b/prediction.json" \
@@ -552,8 +579,8 @@ out="$(bcheck slow mid 15000 1550000)"
 contains "$out" "baseline-drift achieve-ratio" "供給達成率 < 85% → 漂移徵兆"
 contains "$out" "baseline-check: DRIFT" "單次漂移記為 covariate"
 
-out="$(bcheck lat mid 19500 2000000)"
-contains "$out" "baseline-drift baseline-p99" "baseline p99 偏移 > ±15% → 漂移徵兆"
+out="$(bcheck lat mid 19500 2000000 1550000)"
+contains "$out" "baseline-drift baseline-p99" "相對同條件中位數偏移 > ±15% → 漂移徵兆"
 
 # 連續 3 個 replicate 超標 → 佇列暫停（HUMAN gate）
 BCD="$tmp/bc-consec"

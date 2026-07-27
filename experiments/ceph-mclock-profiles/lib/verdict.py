@@ -1653,6 +1653,10 @@ def _calibration_target(cal, shape, pressure):
 def _reference_p99(cal, shape, pressure):
     entry = (cal.get("shapes") or {}).get(shape) or {}
     refs = entry.get("reference_p99_ns") or entry.get("ref_p99_ns") or {}
+    if not isinstance(refs, dict):
+        # calibration.json 的 reference_p99_ns 應是「壓力 → p99」的 dict。
+        # 格式不符時明確報錯，不要讓 AttributeError 冒到最上層。
+        return None
     val = refs.get(pressure)
     return float(val) if val is not None else None
 
@@ -1733,8 +1737,14 @@ def cmd_baseline_check(args):
     p99_shift = None
     if p99 is not None and ref_p99:
         p99_shift = (float(p99) - ref_p99) / ref_p99
-        if abs(p99_shift) > BASELINE_P99_TOLERANCE:
-            signals.append(("baseline-p99", p99_shift * 100.0))
+        # 只有在「同條件」的參考下才判漂移。樣本不足而退回校準值時，量到的是
+        # 條件差異（校準無 sampler/collector 併行）而非隨時間的漂移——實測 seq/mid
+        # 的前三個 replicate 就這樣一致 +32% 而停了佇列，但供給達成率是 1.00。
+        # 每個新的 (形態,壓力) 組合都會經歷這個「前三個」視窗，不排除就會反覆假停。
+        # 值仍記為 covariate，只是不觸發訊號。
+        if ref_source.startswith("campaign-median"):
+            if abs(p99_shift) > BASELINE_P99_TOLERANCE:
+                signals.append(("baseline-p99", p99_shift * 100.0))
 
     state_path = os.path.join(results_dir, "baseline-drift-state.json")
     state = read_json(state_path, {"consecutive": 0, "recent": []}) or {
