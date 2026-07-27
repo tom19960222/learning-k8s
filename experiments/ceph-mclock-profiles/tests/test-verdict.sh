@@ -123,6 +123,38 @@ out="$(python3 "$V" aggregate "$B1")"
 contains "$out" "aggregate: OK" "aggregate 機器行"
 A="$B1/aggregate.json"
 
+# --- drift 參考：同條件的 campaign 中位數，不是校準值 -------------------------
+# 真機實測：所有 baseline 對校準值都是正偏移（+5.6%～+17.1%，系統性），因為校準跑在
+# precondition 剛結束、且沒有 sampler/collector 併行。拿條件不同的兩者比會誤判成漂移
+# ——實際就停過一次佇列，而同期吞吐是校準天花板的 109–111%，叢集根本沒變慢。
+DR="$tmp/drift"; mkdir -p "$DR"
+wj "$DR/calibration.json" \
+  '{"shapes":{"4k":{"ceiling_iops":1000,"rates":{"high":800},"reference_p99_ns":10000000}}}'
+_mkbase() { # <cell> <rep> <p99_ns>
+  local d="$DR/$1/$2/attempts/a1"; mkdir -p "$d"
+  wj "$d/baseline.json" \
+    "{\"shape\":\"4k\",\"pressure\":\"high\",\"target_iops\":800,\"achieved_iops\":800,\"p99_ns\":$3}"
+  printf '%s\n' "$d"
+}
+# 先前 6 個 replicate 的 baseline 都在 ~12ms（相對校準 10ms 是 +20% 的系統性偏移）
+for i in 1 2 3 4 5 6; do _mkbase "c$i" r1 12000000 >/dev/null; done
+# 受測 replicate 也在 ~12ms：對校準值是 +20%（會誤報），對 campaign 中位數是 0%
+B7="$(_mkbase c7 r1 12100000)"
+python3 "$V" baseline-check "$B7" --results "$DR" >/dev/null 2>&1 \
+  || fail "baseline-check（同條件比較）應通過"
+ok
+eq "$(jget "$B7/baseline-check.json" reference_source | cut -d'(' -f1)" "campaign-median" \
+  "有足夠樣本時必須用 campaign 中位數當參考"
+eq "$(jget "$B7/baseline-check.json" drift_signals)" "[]" \
+  "系統性偏移不得誤判成漂移"
+
+# 真漂移仍要抓到：相對 campaign 中位數大幅劣化
+B8="$(_mkbase c8 r1 20000000)"
+python3 "$V" baseline-check "$B8" --results "$DR" >/dev/null 2>&1
+grep -q 'baseline-p99' "$B8/baseline-check.json" \
+  || fail "相對同條件中位數的真劣化必須觸發 drift 訊號"
+ok
+
 # --- 窗尾夾到 fio 實際結束（真機：偵測延遲 34s 被算成 stall）-------------------
 BW="$tmp/bw"; mkdir -p "$BW"
 python3 "$GEN" --out "$BW/fio/c1" --seg seg01 --start "$T0" --seconds 60 >/dev/null

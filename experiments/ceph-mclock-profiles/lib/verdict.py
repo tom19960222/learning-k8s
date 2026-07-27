@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+import glob
 import statistics
 import sys
 
@@ -1656,6 +1657,25 @@ def _reference_p99(cal, shape, pressure):
     return float(val) if val is not None else None
 
 
+BASELINE_REF_MIN_SAMPLES = 3
+
+
+def _prior_baselines(results_dir, shape, pressure, exclude=None):
+    """同 (shape, pressure) 先前所有 replicate 的 baseline p99（升冪）。"""
+    out = []
+    pat = os.path.join(results_dir, "*", "r*", "attempts", "*", "baseline.json")
+    for path in sorted(glob.glob(pat)):
+        if exclude and os.path.dirname(path) == exclude.rstrip("/"):
+            continue
+        doc = read_json(path, {}) or {}
+        if doc.get("shape") != shape or doc.get("pressure") != pressure:
+            continue
+        v = doc.get("p99_ns")
+        if isinstance(v, (int, float)) and v > 0:
+            out.append(float(v))
+    return sorted(out)
+
+
 def cmd_baseline_check(args):
     bundle = os.path.abspath(args.bundle)
     results_dir = os.path.abspath(args.results or DEFAULT_RESULTS)
@@ -1690,7 +1710,19 @@ def cmd_baseline_check(args):
 
     achieved = baseline.get("achieved_iops")
     p99 = baseline.get("p99_ns")
-    ref_p99 = _reference_p99(cal, shape, pressure)
+    # 參考 p99 優先取 **campaign 自己先前同 (shape, pressure) 的 baseline 中位數**，
+    # 不是校準值。真機實測：所有 baseline 對校準值都是正偏移（+5.6%～+17.1%，均值
+    # 約 13%），呈系統性而非隨機——校準跑在 precondition 剛結束、且當時沒有 sampler／
+    # collector 在跑，條件與 campaign 期間不同。拿條件不同的兩者比，會把固定落差誤判
+    # 成漂移（實際就觸發了 3 連續超標而停佇列，但同期吞吐是校準天花板的 109–111%，
+    # 叢集根本沒有變慢）。同條件比較才問得出「叢集有沒有隨時間漂移」。
+    prior = _prior_baselines(results_dir, shape, pressure, exclude=bundle)
+    if len(prior) >= BASELINE_REF_MIN_SAMPLES:
+        ref_p99 = statistics.median(prior)
+        ref_source = "campaign-median(n=%d)" % len(prior)
+    else:
+        ref_p99 = _reference_p99(cal, shape, pressure)
+        ref_source = "calibration"
 
     signals = []
     achieve_ratio = None
@@ -1729,6 +1761,7 @@ def cmd_baseline_check(args):
         "achieve_ratio_min": BASELINE_ACHIEVE_MIN,
         "baseline_p99_ns": p99,
         "reference_p99_ns": ref_p99,
+        "reference_source": ref_source,
         "p99_shift": p99_shift,
         "p99_tolerance": BASELINE_P99_TOLERANCE,
         "drift_signals": [s[0] for s in signals],
