@@ -376,6 +376,9 @@ expect_stop() { # <mode> <tar> [exit-code]
   wf "$tmp/stopout.txt" \
     "$(printf 'EXIT %s\nHB 1800000060\nSEG 1\nNOW 1800000062' "${3:-0}")"
   for c in $CLIENTS; do
+    expect_ssh "mclock-signal-${c};" 0 0 ""
+  done
+  for c in $CLIENTS; do
     expect_ssh "mclock-stop-${c};" 0 0 "$tmp/stopout.txt"
     expect_ssh "fio-${1}-${c}.pid" 0 0 ""
     # 取樣器是無窮迴圈，不停掉會讓下一個 replicate 的 start 因 registry 有活 pid 而 die
@@ -529,6 +532,22 @@ eq "$out" "fio-stop: PASS 4" "fio_stop 機器行"
 # expect_ssh 只是「允許」該呼叫，不保證發生——要對 log 斷言才守得住。
 eq "$(grep -c -- '-devstat.pid' "$FAKE_SSH_LOG")" "4" \
   "fio_stop 必須一併停掉 4 台的 devstat 取樣器"
+
+# STOP 必須先廣播給全部 4 台，再回頭逐台等待。邊送邊等的話，末台會比首台晚好
+# 幾分鐘才看到 STOP——真機實測末台多跑了兩個 segment，期間仍在全速打 IO。
+eq "$(grep -c -- 'mclock-signal-' "$FAKE_SSH_LOG")" "4" "STOP 廣播給 4 台"
+last_signal="$(grep -n -- 'mclock-signal-' "$FAKE_SSH_LOG" | tail -1 | cut -d: -f1)"
+first_wait="$(grep -n -- 'mclock-stop-' "$FAKE_SSH_LOG" | head -1 | cut -d: -f1)"
+[ -n "$last_signal" ] && [ -n "$first_wait" ] && [ "$last_signal" -lt "$first_wait" ] \
+  || fail "末台的 STOP 廣播 (${last_signal}) 必須早於首台的等待迴圈 (${first_wait})"
+ok
+# 指令是 base64 過線的：比對明文永遠不匹配 = 空過的測試，必須先解碼再比。
+decode_all > "$tmp/stoppayload.txt"
+has "$tmp/stoppayload.txt" "/STOP" "廣播的內容確實是 touch STOP（已解碼比對）"
+# STOP 只在 segment 邊界生效，等待若短於一整段，能否乾淨收工純看運氣。
+[ "$FIO_STOP_WAIT_SECS" -gt $((FIO_STEADY_SECS + FIO_RAMP_SECS)) ] \
+  || fail "FIO_STOP_WAIT_SECS (${FIO_STOP_WAIT_SECS}) 必須涵蓋 segment 全長 ($((FIO_STEADY_SECS + FIO_RAMP_SECS)))"
+ok
 [ -s "$B1/fio-exit-proof.json" ] || fail "fio-exit-proof.json 未寫入"
 ok
 eq "$(jget "$B1/fio-exit-proof.json" clients.mclock-client-1.exit_code)" "0" "收 exit code"
@@ -759,4 +778,27 @@ expect_stop smoke "$TAR_NOHIST"
 ( fio_smoke_real "$B6" ) >/dev/null 2>&1 && fail "schema 不過應 die"
 ok
 
+# --- summary：沒跑完的尾段 JSON 跳過、跑完的壞 JSON 仍然 die ------------------
+# runner 在 fio 回來後才寫 exit-code.<seg>，那個檔就是「這段有正常結束」的憑證。
+sd="$tmp/segskip"; mkdir -p "$sd/mclock-client-1"
+printf '%s' '{"jobs":[{"job_runtime":300000,"read":{"iops":100.0,"bw_bytes":409600,"clat_ns":{"percentile":{"99.000000":900000}}},"write":{"iops":0.0}}]}' \
+  > "$sd/mclock-client-1/seg01.json"
+printf '%s' '{"jobs":[{"job_run' > "$sd/mclock-client-1/seg02.json"
+_fio_py summary "$sd/out.json" 4k segment 0 \
+  "$sd/mclock-client-1/seg01.json" "$sd/mclock-client-1/seg02.json" >/dev/null 2>&1 \
+  || fail "尾段沒有 exit-code.seg02 憑證時應跳過而非 die"
+ok
+has "$sd/out.json" "seg02.json" "跳過的段落必須記進 incomplete_segments（不可靜靜丟掉）"
+eq "$(jget "$sd/out.json" segments)" "1" "不完整的段落不計入 segments"
+echo 0 > "$sd/mclock-client-1/exit-code.seg02"
+_fio_py summary "$sd/out.json" 4k segment 0 \
+  "$sd/mclock-client-1/seg01.json" "$sd/mclock-client-1/seg02.json" >/dev/null 2>&1 \
+  && fail "有 exit-code.seg02 憑證卻解不開 = 真損毀，必須 die"
+ok
+rm -f "$sd/mclock-client-1/seg01.json" "$sd/mclock-client-1/exit-code.seg02"
+_fio_py summary "$sd/out.json" 4k segment 0 "$sd/mclock-client-1/seg02.json" >/dev/null 2>&1 \
+  && fail "全部段落都不完整時不可產出空殼 summary"
+ok
+
 printf 'test-fio: %d assertions passed\n' "$asserts"
+

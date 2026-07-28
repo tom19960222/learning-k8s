@@ -60,7 +60,10 @@ FIO_STABLE_COV="${FIO_STABLE_COV:-0.10}"
 FIO_READINESS_SECS="${FIO_READINESS_SECS:-900}"
 FIO_HEARTBEAT_MAX_AGE="${FIO_HEARTBEAT_MAX_AGE:-30}"
 FIO_WORKDIR_BASE="${FIO_WORKDIR_BASE:-/var/tmp/mclock-fio}"
-FIO_STOP_WAIT_SECS="${FIO_STOP_WAIT_SECS:-120}"
+# STOP 只在 segment 邊界生效（fio 跑到一半沒辦法保住 JSON 輸出），所以這個等待
+# 必須涵蓋「一整段 segment」，否則能不能乾淨收工全看 STOP 剛好落在段內哪個位置。
+# 因此改成由 segment 長度推導，不寫死常數——調 FIO_STEADY_SECS 時不會忘了跟著調。
+FIO_STOP_WAIT_SECS="${FIO_STOP_WAIT_SECS:-$((FIO_STEADY_SECS + FIO_RAMP_SECS + 60))}"
 FIO_RUN_SLACK_SECS="${FIO_RUN_SLACK_SECS:-300}"
 FIO_PRECOND_SECS="${FIO_PRECOND_SECS:-21600}"
 FIO_PRECOND_MIN_PCT="${FIO_PRECOND_MIN_PCT:-20}"
@@ -348,10 +351,20 @@ def cmd_summary(argv):
     read_iops = write_iops = bw = 0.0
     p99 = p50 = p999 = None
     duration = 0
+    incomplete = []
     for path in files:
         doc = read_json(path)
         if doc is None:
-            die("summary：fio JSON 無法解析：%s" % path)
+            # runner 在 fio 回來之後才寫 exit-code.<seg>，所以那個檔就是「這段有
+            # 正常結束」的憑證。沒有它 = fio 是被殺在寫 JSON 的半路上（撞
+            # measurement deadline 或收尾 kill），那一段本來就不是資料，跳過。
+            # 有它卻解不開 = 真的損毀，照舊 die，不能被這條路徑掩蓋掉。
+            seg = os.path.basename(path)[:-len(".json")]
+            proof = os.path.join(os.path.dirname(path), "exit-code.%s" % seg)
+            if os.path.exists(proof):
+                die("summary：fio JSON 無法解析：%s" % path)
+            incomplete.append(path)
+            continue
         client = os.path.basename(os.path.dirname(path))
         slot = clients.setdefault(client, {"read_iops": 0.0, "write_iops": 0.0,
                                            "bw_bytes_per_sec": 0.0, "segments": 0})
@@ -378,6 +391,8 @@ def cmd_summary(argv):
                 if "p999_ns" in pcts:
                     p999 = pcts["p999_ns"] if p999 is None else max(p999, pcts["p999_ns"])
 
+    if not clients:
+        die("summary：所有 fio segment 都不完整（%d 段），沒有可用資料" % len(incomplete))
     doc = {
         "schema_version": 1,
         "shape": shape,
@@ -393,6 +408,9 @@ def cmd_summary(argv):
         "p999_ns": p999,
         "duration_s": duration / 1000.0 if duration else None,
         "segments": sum(c["segments"] for c in clients.values()),
+        # 跳過的段落一律記進產物：靜靜丟掉資料跟沒發生過長得一模一樣。
+        "incomplete_segments": sorted(os.path.basename(os.path.dirname(x)) + "/"
+                                      + os.path.basename(x) for x in incomplete),
         "clients": clients,
     }
     write_json(out, doc)
@@ -1150,6 +1168,14 @@ fio_stop() { # <bundle>
   mode="$(_fio_mode_of "$bundle")"
   tsv="$(_fio_scratch)/exit.tsv"
   : > "$tsv"
+  # 先把 STOP 廣播給每一台，再回頭逐台等待。若邊送邊等，最後一台會比第一台
+  # 晚好幾分鐘才看到 STOP——那段期間它仍在全速打 IO（真機實測 client 之間
+  # 差了兩個 segment），既污染收尾也讓各 client 的量測長度不一致。
+  for c in $(_fio_clients); do
+    wd="$(_fio_workdir_of "$bundle" "$c")"
+    _fio_run_script "$c" 120 signal "touch ${wd}/STOP" >/dev/null \
+      || die "fio STOP 送出失敗：${c}"
+  done
   for c in $(_fio_clients); do
     runid="$(_fio_runid_of "$bundle" "$c")"
     wd="$(_fio_workdir_of "$bundle" "$c")"

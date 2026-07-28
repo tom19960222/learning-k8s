@@ -573,3 +573,35 @@ OSD 就此保持 down 直到人工介入。這是一個容易被忽略的失效�
 在 `ceph orch ls` 中是 **unmanaged**，而 cephadm 不協調 unmanaged service——
 `ceph orch daemon start` 只會回 `Scheduled to start` 然後**永不執行**。本實驗因此改走
 目標 host 的 systemd（unit 名由 cephadm 固定命名 + 已驗證的 fsid 組出，動手前先確認存在）。
+
+### H-026：STOP 的粒度是 segment，不是秒——收尾設計必須以「一整段」為單位
+
+**狀態**：confirmed（真機實測，2026-07-28 flapping pilot）
+
+故障模式的 fio 是 back-to-back segment 迴圈，runner 只在**每段結束後**才檢查 STOP
+（fio 跑到一半被中斷就保不住 JSON 輸出）。原本的收尾有兩個獨立缺陷，疊在一起讓
+整個 cell 報廢：
+
+1. **等待時間短於一整段**：`FIO_STOP_WAIT_SECS=120` vs segment 全長 330s
+   （`FIO_STEADY_SECS=300` + `FIO_RAMP_SECS=30`）。STOP 能不能在等待內生效，
+   完全取決於它剛好落在段內哪個位置——**是擲骰子，不是設計**。
+2. **STOP 是逐台依序送的**：首台停下來後，末台還要等好幾分鐘才收到 STOP。
+   實測首台跑 6 段、末台跑 8 段，期間末台仍在全速打 IO。
+
+**連鎖後果**：等待逾時 → `remote_bg_stop` 把 fio 殺在寫 JSON 的半路 → 尾段 JSON
+截斷 → summary parser 直接 FATAL → 連帶 post-fault baseline 也寫不出來 → cell 失敗。
+4 台裡有 3 台中招（`fio-stop: FAIL 3`）。
+
+**修法（三處，缺一不可）**：
+- 等待時間**由 segment 長度推導**（`FIO_STEADY_SECS + FIO_RAMP_SECS + 60`），
+  不寫死常數；否則日後調 segment 長度會忘了跟著調。
+- STOP **先廣播給全部 client，再回頭逐台等待**。因為各 client 同時起跑、段長相同，
+  廣播後它們會在幾乎同一時刻抵達段邊界，總等待是「共用的一段餘量」而非 4 倍。
+- summary parser 對**沒跑完的尾段**寬容：runner 是在 fio 回來後才寫
+  `exit-code.<seg>`，那個檔就是「這段有正常結束」的憑證。沒憑證又解不開 = 本來就
+  不是資料，跳過並把段名記進 `incomplete_segments`（**絕不靜靜丟掉**）；
+  有憑證卻解不開 = 真損毀，照舊 die。全部段落都不完整時不可產出空殼 summary。
+
+**可複用的原則**：對「以區塊為單位產出資料」的量測工具下停止訊號時，逾時上限必須
+≥ 一個區塊，而且訊號要先廣播再收割。否則逾時殺掉的不是「多餘的尾巴」，而是
+**正在落地的那份資料**。
