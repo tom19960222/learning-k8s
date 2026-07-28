@@ -468,6 +468,7 @@ inject_rollback_all() {
     case "$kind" in
       osd-down)      fault_osd_down_recover "$target" "$b" >/dev/null || true ;;
       chaos-osd-stop) _inject_osd_start_only "$target" "$b" >/dev/null || true ;;
+      flapping)      _inject_osd_start_only "$target" "$b" >/dev/null || true ;;
       node-isolate)  fault_node_heal "$target" "$b" >/dev/null || true ;;
       chaos-isolate) _inject_node_rollback "$target" "$b" || true ;;
       rack-isolate)
@@ -678,8 +679,15 @@ _inject_ssh_alive() { # <node>
 
 # 回歸判準用「現在是 up」（up=1 且最後一個事件是 up），而不是嚴格的 epoch 前進——
 # barrier 失敗回退時目標可能根本沒 down 過，嚴格判準會空等到逾時。
-_inject_osd_is_up_now() {
+# 參數可省略：with_deadline 會反覆無參呼叫它，所以目標 id 存在 _INJECT_UP_ID。
+# 但直接呼叫時**一定要帶 id**——原本的簽章完全吃不到參數，`_inject_osd_is_up_now "$id"`
+# 會靜靜地去查上一次殘留在全域裡的那顆 OSD。fault_flapping 解除 noout 前的「確認
+# 已 up」防護就是這樣失效的：它本來就是為了擋 auto-out 而寫，卻從沒真的擋過
+# （真機實測 osd.2 被留在 down，noout 照解，600s 後被 auto-out）。
+_inject_osd_is_up_now() { # [<osd-id>]
   local now up up_from down_at
+  [ $# -eq 0 ] || _INJECT_UP_ID="$1"
+  [ -n "${_INJECT_UP_ID:-}" ] || die "_inject_osd_is_up_now：沒有目標 osd id"
   now="$(ceph_osd_state "$_INJECT_UP_ID")" || return 1
   up="$(_ceph_state_field "$now" up)"
   up_from="$(_ceph_state_field "$now" up_from)"
@@ -722,6 +730,12 @@ fault_flapping() {
   # 非計畫 backfill 讓整個 attempt 變質（plan v4.2/F5-8）。
   ceph_adm "ceph osd set noout" >&2 || die "設定 noout 失敗"
   cleanup_push "ceph_adm 'ceph osd unset noout' >/dev/null 2>&1 || true"
+  # flapping 也必須進 active registry：中斷在某輪的 down 相位時，registry 是空的話
+  # inject_rollback_all 會直接回報 CLEAN，而 cleanup stack 照樣解除 noout——OSD 就這樣
+  # 被留在無保護的 down，600s 後 mon auto-out 觸發非計畫 backfill（真機實測）。
+  # cleanup stack 是 LIFO：這個 push 排在 unset noout 之後，所以「先拉起 OSD、再解 noout」。
+  _inject_active_add "$b" flapping "$id" "$id"
+  _inject_push_rollback "$b"
   while [ "$i" -le "$FLAP_CYCLES" ]; do
     pre="$(ceph_osd_state "$id")" || die "取不到 osd.${id} 狀態"
     ceph_daemon_stop "$id"
@@ -755,11 +769,21 @@ fault_flapping() {
   # 解除 noout 之前必須確認 OSD 已回到 up：失敗路徑（某輪 start 逾時）下 OSD 還是
   # down，一解除 noout，mon 就會在 mon_osd_down_out_interval（600s）後把它 auto-out
   # 並啟動非計畫 backfill——真機第一次跑 flapping 就是這樣，osd.2 taint 之後被 out。
+  local up_ok=1
   if ! _inject_osd_is_up_now "$id"; then
     log "osd.${id} 仍為 down：先嘗試拉起再解除 noout（避免 auto-out 觸發非計畫 backfill）"
     ceph_daemon_start "$id" >&2 || log "拉起 osd.${id} 失敗（noout 仍會解除，改由 reconcile 收拾）"
-    with_deadline "$FLAP_UP_SECS" _inject_osd_is_up_now "$id" \
-      || log "osd.${id} 未在期限內回到 up——解除 noout 後可能被 auto-out，reconcile 會處理"
+    if ! with_deadline "$FLAP_UP_SECS" _inject_osd_is_up_now "$id"; then
+      up_ok=0
+      log "osd.${id} 未在期限內回到 up——解除 noout 後可能被 auto-out，reconcile 會處理"
+    fi
+  fi
+  # 只有確認 OSD 真的回到 up 才撤掉 registry 條目。還是 down 就留著，讓 cleanup
+  # stack 的 inject_rollback_all（和之後的 reconcile）還有一次補救機會。
+  if [ "$up_ok" -eq 1 ]; then
+    _inject_active_del "$b" flapping "$id"
+  else
+    log "osd.${id} 仍為 down：保留 registry 條目讓 rollback／reconcile 續行補救"
   fi
   _inject_unset_noout || log "unset noout 失敗（cleanup stack 會再試一次）"
   if [ "$rc" -ne 0 ]; then

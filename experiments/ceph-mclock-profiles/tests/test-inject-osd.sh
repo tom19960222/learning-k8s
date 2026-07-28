@@ -171,6 +171,65 @@ inject_rollback_all "$b2" >/dev/null || fail "inject_rollback_all 應冪等"
 ok
 eq "$(cat "$FAKE_SSH_STATE/count" 2>/dev/null || echo 0)" "0" "空 registry 不得打 ssh"
 
+# --- _inject_osd_is_up_now 必須認參數，不能沿用全域殘留 ---------------------
+# 原簽章完全吃不到參數，只讀 _INJECT_UP_ID（僅 _inject_wait_up_now 會設）。於是
+# `_inject_osd_is_up_now "$id"` 會去查上一次殘留的那顆 OSD——fault_flapping 解除
+# noout 前的「確認已 up」防護就是這樣從未生效的。
+b_up="$tmp/b-upid"; mkdir -p "$b_up"
+reset_ssh
+mixed="$tmp/mixed.json"; mk_dump "$mixed" 3 0 1 15 700   # osd.3 down，其餘 up
+expect_ssh 'osd dump' 0 0 "$mixed"
+_INJECT_UP_ID=5                                          # 全域殘留成另一顆（是 up 的）
+if _inject_osd_is_up_now 3; then
+  fail "帶了 osd.3 卻回報 up：參數被忽略、查到全域殘留的 osd.5"
+fi
+ok
+reset_ssh
+expect_ssh 'osd dump' 0 0 "$mixed"
+_inject_osd_is_up_now 5 || fail "osd.5 確實是 up，應回報 up"
+ok
+
+# --- OSD 留在 down 時，registry 條目必須存在且保留 ---------------------------
+# 這是 rollback 唯一的線索來源：沒有這筆，inject_rollback_all 會回報 CLEAN 就走人。
+b_dn="$tmp/b-downleft"; mkdir -p "$b_dn"
+reset_ssh
+expect_ssh 'osd set noout' 0 0 ""
+expect_ssh 'osd dump' 0 0 "$up0"
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'systemctl stop' 0 0 ""
+expect_ssh 'osd dump' 0 0 "$dn1"
+expect_ssh 'osd dump' 0 0 "$dn1"
+expect_ssh 'reset-failed' 0 0 ""
+expect_ssh 'systemctl start' 0 0 ""
+expect_ssh 'osd dump' 0 0 "$dn1"
+expect_ssh 'osd dump' 0 0 "$dn1"
+expect_ssh 'reset-failed' 0 0 ""
+expect_ssh 'systemctl start' 0 0 ""
+expect_ssh 'osd dump' 0 0 "$dn1"
+expect_ssh 'osd unset noout' 0 0 ""
+set +e
+fault_flapping 3 "$b_dn" >/dev/null 2>&1
+set -e
+has "$b_dn/inject-active.tsv" "flapping" \
+  "OSD 沒回到 up 時，registry 必須留著 flapping 條目（rollback 的唯一線索）"
+
+# --- 中斷在 down 相位時，rollback 必須把 OSD 拉回來 --------------------------
+# fault_flapping 原本沒登記進 active registry：中斷時 inject_rollback_all 看到空
+# registry 直接回報 CLEAN，而 cleanup stack 照樣解除 noout——OSD 就被留在無保護的
+# down，600s 後 mon auto-out 觸發非計畫 backfill（真機實測 osd.2 就是這樣）。
+b_rb="$tmp/b-rb"; mkdir -p "$b_rb"
+printf 'flapping\t3\t3\t\n' > "$b_rb/inject-active.tsv"
+reset_ssh
+expect_ssh 'osd tree' 0 0 "$fx/osd-tree-8up.json"
+expect_ssh 'list-units' 0 0 'x'
+expect_ssh 'reset-failed' 0 0 ""
+expect_ssh 'systemctl start' 0 0 ""
+expect_ssh 'osd dump' 0 0 "$fx/../up0.json" 2>/dev/null || true
+inject_rollback_all "$b_rb" >/dev/null 2>&1 || true
+has "$FAKE_SSH_LOG" "systemctl start" \
+  "registry 有 flapping 條目時，rollback 必須真的去拉起 OSD（不能回報 CLEAN 就走）"
+
 # ========================================================= fault_flapping ==
 # 5) attempt 開始設 noout、結束 unset；10 輪（測試 2 輪）stop/down/start/up/PG gate；
 #    全程不得 out。
@@ -207,6 +266,10 @@ expect_ssh 'osd dump' 0 0 "$up2"
 expect_ssh 'osd dump' 0 0 "$up2"
 expect_ssh 'osd unset noout' 0 0 ""
 out="$(fault_flapping 3 "$b3")" || fail "fault_flapping 應成功"
+# flapping 期間必須在 active registry 裡：中斷在 down 相位時，registry 是空的話
+# inject_rollback_all 會回報 CLEAN 直接放行，而 cleanup stack 照樣解除 noout——
+# OSD 就被留在無保護的 down，600s 後 mon auto-out 觸發非計畫 backfill（真機實測）。
+has "$FAKE_SSH_LOG" "osd unset noout" "成功路徑仍要 unset noout"
 ok
 eq "$out" "flapping: OK osd.3 cycles=2" "flapping 機器行"
 before "$FAKE_SSH_LOG" "osd set noout" "systemctl stop" "noout 必須在第一次 stop 之前"
@@ -282,6 +345,9 @@ case "$out" in
   *) fail "taint 機器行格式（got=[$out]）" ;;
 esac
 has "$b5/inject-taint.json" "out" "taint 原因要落檔"
+[ ! -s "$b5/inject-active.tsv" ] \
+  || fail "OSD 已回到 up 的 taint 路徑不該留下 registry 條目（會多做一次無謂的 start）"
+ok
 eq "$(count_of "$FAKE_SSH_LOG" 'systemctl stop')" "1" "taint 後不得續跑下一輪"
 has "$FAKE_SSH_LOG" "osd unset noout" "taint 也要 unset noout"
 

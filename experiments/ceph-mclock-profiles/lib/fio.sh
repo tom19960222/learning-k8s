@@ -934,7 +934,13 @@ _fio_runner_script() { # <workdir> <job-b64> <device> <loop 0|1>
 set -u
 D=$1
 mkdir -p "\$D"
-rm -f "\$D"/STOP "\$D"/exit-code "\$D"/heartbeat
+# workdir 是「同一個 replicate attempt」共用的（runid 不含 mode），所以量測跑完
+# 之後的 baseline 會落在同一個目錄。只清 STOP/exit-code/heartbeat 的話，上一輪的
+# seg*.json 會留下來被 baseline 的 fetch 一起撈走，再被 summary 的 seg*.json glob
+# 摺進 baseline——而 baseline 正是劣化比的分母。故障模式一輪產 6-7 段，必中。
+# runner 比 devstat 取樣器早啟動，所以在這裡清 devstat.log 是安全的（它是 >> 累加）。
+rm -f "\$D"/STOP "\$D"/exit-code "\$D"/heartbeat "\$D"/fio-exited-at "\$D"/devstat.log
+rm -f "\$D"/seg* "\$D"/exit-code.seg*
 printf %s '$2' | base64 --decode > "\$D/job.tmpl"
 ( while :; do date +%s > "\$D/heartbeat.tmp" && mv "\$D/heartbeat.tmp" "\$D/heartbeat"; sleep 5; done ) &
 HB=\$!

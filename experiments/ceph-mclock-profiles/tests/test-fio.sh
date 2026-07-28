@@ -417,6 +417,15 @@ decode_all > "$tmp/startpayload.txt"
 has "$tmp/startpayload.txt" "randseed=4242" "job 檔真的送到遠端"
 has "$tmp/startpayload.txt" "/dev/rbd0" "device 由 rbd-map.json 帶入"
 has "$tmp/startpayload.txt" "heartbeat" "背景 runner 必須有 heartbeat（exit proof 的前置）"
+# 同一個 replicate attempt 的量測與 baseline 共用 workdir（runid 不含 mode）。
+# runner 沒把上一輪的 seg*.json 清掉的話，baseline 的 fetch 會把量測期的段落
+# 一起撈走，再被 summary 摺進 baseline——而 baseline 是劣化比的分母。
+# shellcheck disable=SC2016
+# 這裡刻意用單引號：比對的是遠端腳本裡「未展開」的 $D 字面，展開反而對不上。
+has "$tmp/startpayload.txt" 'rm -f "$D"/seg* "$D"/exit-code.seg*' \
+  "runner 啟動時必須清掉上一輪的 segment 產物"
+has "$tmp/startpayload.txt" "devstat.log" \
+  "devstat.log 是 >> 累加，同樣要清（runner 比取樣器早啟動，清了才安全）"
 hasnt "$root/lib/fio.sh" "node_ssh_to" "背景 fio 不得走 node_ssh_to（非串流且會等待）"
 
 # 17b) replicate bundle 的 run-id 必須與 lib/collect.sh 的 collect_fio_run_id 逐字一致

@@ -605,3 +605,59 @@ OSD 就此保持 down 直到人工介入。這是一個容易被忽略的失效�
 **可複用的原則**：對「以區塊為單位產出資料」的量測工具下停止訊號時，逾時上限必須
 ≥ 一個區塊，而且訊號要先廣播再收割。否則逾時殺掉的不是「多餘的尾巴」，而是
 **正在落地的那份資料**。
+
+### H-027：為真機事故寫的防護，本身從未生效（簽章不吃參數）
+
+**狀態**：confirmed（真機實測，2026-07-28）
+
+`fault_flapping` 在解除 `noout` 之前有一段防護，註解明白寫著它是為了擋掉先前真機上
+「OSD 還 down 就解 noout → 600s 後 mon auto-out → 非計畫 backfill」的事故：
+
+```bash
+if ! _inject_osd_is_up_now "$id"; then ... 先拉起再解 noout ... fi
+```
+
+但 `_inject_osd_is_up_now` **的簽章根本不吃參數**——它讀全域 `_INJECT_UP_ID`，
+而該全域只有 `_inject_wait_up_now` 會設。所以這行傳進去的 `$id` 被靜靜丟掉，
+實際查的是「上一次殘留在全域裡的那顆 OSD」。防護寫了、看起來合理、也有註解說明
+它擋的是什麼事故，**卻從第一天起就沒擋過任何東西**。
+
+真機重現：pilot 被中斷在第 7 輪的 down 相位，osd.2 留在 down，`noout` 照樣解除。
+
+**兩個獨立缺陷疊加才造成後果**：
+1. 上述 up-check 失效（查錯 OSD）。
+2. `fault_flapping` **從未把自己登記進 active registry**（其他故障型都有
+   `_inject_active_add` + `_inject_push_rollback`），所以中斷時
+   `inject_rollback_all` 看到空 registry → 回報 `CLEAN` → 什麼都沒做，
+   而 cleanup stack 裡的 `unset noout` 照跑。**回報 CLEAN 的同時叢集其實是壞的。**
+
+**修法**：`_inject_osd_is_up_now [<osd-id>]` 收參數（省略時才沿用全域，供
+`with_deadline` 反覆呼叫）；`fault_flapping` 登記進 registry，且因為 cleanup stack
+是 LIFO，登記要排在 `unset noout` 的 push **之後**（→ 先拉起 OSD、再解 noout）；
+只有確認 OSD 真的回到 up 才撤掉 registry 條目，否則留著讓 rollback／reconcile 補救。
+
+**可複用的原則**：bash 沒有 arity 檢查，多傳的參數會被靜靜吃掉。**「呼叫端看起來
+有傳參數」不等於「被呼叫端有用到」**——helper 若靠全域傳值，任何帶參數的呼叫都是
+騙人的。這類缺陷對 review 幾乎隱形（程式碼讀起來完全正確），只有 mutation 測試
+或真機事故會揭露。
+
+### H-028：同一個 attempt 的量測與 baseline 共用遠端 workdir
+
+**狀態**：confirmed（真機實測，2026-07-28）
+
+`_fio_runid` 對 replicate bundle（`*/attempts/*`）的命名**完全不含 mode**，所以
+故障量測與其後的 post-fault baseline 落在同一個遠端 workdir。runner 啟動時只清
+`STOP`/`exit-code`/`heartbeat`，不清 `seg*.json`——於是 baseline 的 fetch 會把量測期
+的 6–7 段一起撈回來，再被 summary 的 `seg*.json` glob 摺進 baseline。
+**而 baseline 正是劣化比的分母。**
+
+`devstat.log` 是 `>>` 累加、從不截斷，同樣跨輪殘留。
+
+**穩態為何逃過一劫**：穩態每輪只產一段，baseline 的 `seg01.json` 直接覆蓋掉舊的，
+而量測資料在 baseline 開跑前就已經 fetch 走了。78 個穩態 baseline 實測全乾淨——
+**是巧合，不是設計**。故障模式一輪產 6–7 段，必中。
+
+**修法**：runner 啟動時清掉上一輪的全部產物（`seg*`、`exit-code.seg*`、
+`fio-exited-at`、`devstat.log`）。runner 比 devstat 取樣器早啟動，所以在 runner 裡
+清 `devstat.log` 是安全的。這同時也涵蓋「同一個 attempt 重試」的情境——改 runid
+命名則不會。
