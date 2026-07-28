@@ -797,3 +797,37 @@ endpoints，72 個故障 cell 跑完才會發現整個故障階段沒有可比�
 
 **附帶**：這輪又抓到一個空過的測試——`jget` 對 `None` 印的是 `"null"` 而不是
 `"None"`，我的斷言寫成 `!= "None"` 於是永遠成立。mutation 一跑就現形。
+
+### H-032：安全網 guard 的「已觸發」標記會誤判，成因是我自己先前的修正
+
+**狀態**：confirmed（真機 rack-isolation pilot，2026-07-28）
+
+隔離型故障（node / rack）在套規則之前會先在目標節點武裝一支 guard：
+`sleep N; iptables -F; date +%s > <guard>.fired`。`.fired` 存在 = 安全網先於正常
+heal 動作 = attempt 作廢（taint）。
+
+真機上 rack-isolation 在 heal 當下被判 `guard-fired`——**距真正的 guard 期限還有
+1582 秒**。若不修，每個 node-isolation 與 rack-isolation cell 都會被誤 taint，
+也就是 72 個故障 cell 裡的 36 個。
+
+**成因（是我自己種下的迴歸）**：正常 heal 會先 `remote_bg_stop` 殺掉 guard。而我先前
+為了修「`kill -TERM -<pgid>` 會連帶殺掉自己的 ssh session」而改寫的 `remote_bg_stop`，
+順序是**先 `pkill -P`（殺子代）再 `kill`（殺父）**。對 guard 這種
+「前景 sleep + 後續動作」的腳本，殺掉前景的 `sleep` 等於**放行**——父 shell 立刻
+執行下一行，flush 並寫下 `.fired`。於是 heal 把自己 kill guard 的動作，
+誤讀成安全網先觸發。
+
+**兩處修正**：
+1. `.fired` 只在 **sleep 真的睡滿**時才寫：`if sleep N; then ... fi`。
+   sleep 被殺 → 非 0 回傳 → 不留標記。這條才是真正的不變條件，與誰先被殺無關。
+2. `remote_bg_stop` 改成**先父後子**。非互動 bash 收到 TERM 時會在前景子程序結束後
+   才處理，因而直接終止、不會再往下走一行。
+
+**可複用的原則**：修一個 bug 時改動的是**共用的 chokepoint**，就要把所有依賴它的
+語意重新過一遍。`remote_bg_stop` 原本的 pgid 殺法對 fio 是錯的、對 guard 是對的；
+我只驗了 fio。**「這個修正在我測的那條路徑上是對的」不等於「它在所有路徑上都是對的」。**
+
+**附帶（第二個空過的測試）**：我為此寫的行為測試同時殺了 sleep 與父 shell，
+而本機上父 shell 幾乎總是先死，marker 自然不出現——測試永遠會過。
+改成**只殺 sleep**、讓父 shell 活著跑完，才真的驗到那條不變條件。
+mutation 一跑就現形：修正前後差別在此。

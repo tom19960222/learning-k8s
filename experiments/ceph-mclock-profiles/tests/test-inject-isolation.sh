@@ -162,6 +162,25 @@ guard_cmd "guard-mclock-osd-4" > "$tmp/guard.txt"
 has "$tmp/guard.txt" "sleep 3300" "guard deadline = measurement_cap + 600"
 has "$tmp/guard.txt" "iptables -F MCLOCK-ISO" "guard 動作 = flush 專用 chain"
 has "$tmp/guard.txt" "guard-mclock-osd-4.fired" "guard 觸發要留 marker（taint 判定用）"
+# marker 的語意必須是「真的睡滿了」。若 sleep 被 kill 掉仍往下寫 marker，正常 heal
+# 就會把自己 kill guard 的動作誤讀成安全網先觸發——真機實測 rack-isolation 在距真正
+# 期限還有 1582s 時被誤判 guard-fired，等於每個 isolation cell 都會被誤 taint。
+has "$tmp/guard.txt" "if sleep 3300; then" \
+  "marker 只能在 sleep 正常結束時寫（sleep 被 kill 就不算 guard 觸發）"
+# 實際驗行為：把 guard 指令跑起來、殺掉它的 sleep，marker 不得出現
+gsh="$tmp/guardrun.sh"; gdir="$tmp/gdir"; mkdir -p "$gdir"
+sed -e 's|iptables -F [A-Z-]*|true|' -e "s|${BG_REGISTRY_DIR}|${gdir}|" \
+    -e 's|sleep 3300|sleep 30|' "$tmp/guard.txt" > "$gsh"
+bash "$gsh" & gpid=$!
+sleep 1
+# **只殺 sleep**，讓父 shell 活著跑完。同時殺父 shell 的話，本機上父 shell 幾乎
+# 總是先死，marker 自然不會出現——測試就變成永遠會過的空測試（實測如此）。
+# 這裡要驗的不變條件是：「sleep 沒睡滿 → 不得留下 marker」，與誰先被殺無關。
+pkill -TERM -P "$gpid" 2>/dev/null || true
+wait "$gpid" 2>/dev/null || true
+[ ! -f "$gdir/guard-mclock-osd-4.fired" ] \
+  || fail "sleep 被 kill 之後不得留下 fired marker（會讓 heal 誤判成 guard 先觸發）"
+ok
 # 規則以 iptables-restore --noflush 原子套用
 has "$FAKE_SSH_LOG" "iptables-restore --noflush" "chain 必須原子套用"
 has "$FAKE_SSH_LOG" "-s 10.60.1.0/24 -j DROP" "實際送出的規則含 subnet DROP"

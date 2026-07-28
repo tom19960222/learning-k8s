@@ -599,10 +599,15 @@ inject_guard_secs() {
 # inject_guard_script <run-id> <secs>：遠端背景 guard 的指令（純函式）。
 inject_guard_script() {
   [ $# -eq 2 ] || die "用法：inject_guard_script <run-id> <secs>"
+  # `.fired` 的語意必須是「我真的睡滿了才自動 flush」，而不是「我的 sleep 以某種
+  # 方式結束了」。正常 heal 會先 kill 掉這支 guard——若 sleep 被殺掉後仍往下寫標記，
+  # heal 就會把自己的動作誤讀成安全網先觸發，把好好的 attempt 標成 taint。
+  # 真機實測：rack-isolation 在 heal 當下被誤判 guard-fired（距真正期限還有 1582s）。
   cat <<EOF
-sleep ${2}
-iptables -F ${INJECT_CHAIN} 2>/dev/null || true
-date +%s > ${BG_REGISTRY_DIR}/${1}.fired
+if sleep ${2}; then
+  iptables -F ${INJECT_CHAIN} 2>/dev/null || true
+  date +%s > ${BG_REGISTRY_DIR}/${1}.fired
+fi
 EOF
 }
 

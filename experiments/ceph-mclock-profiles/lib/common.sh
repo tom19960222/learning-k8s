@@ -220,8 +220,12 @@ if [ -s "\$_p" ]; then
   # ssh session（ssh 回 255、stop 被判失敗），於是背景程序留了下來，下一個
   # replicate 的 start 因 registry 有活 pid 而 die。純 pid kill 則乾淨且安全。
   # children（例如迴圈裡的 sleep）另外用 -P 收，那隻旗標只會打到指定 parent 的子代。
-  sudo pkill -TERM -P "\$_pid" 2>/dev/null || true
+  # **順序是 parent 先、children 後**：反過來的話，殺掉前景的 sleep 等於「放行」，
+  # 父 shell 會立刻執行腳本的下一行。真機實測 guard（sleep N; flush; 寫標記）就是
+  # 這樣被誤觸發的。先送 TERM 給父 shell，非互動 bash 會在前景子程序結束後才處理
+  # 該訊號並直接終止，不會再往下走一行。
   sudo kill -TERM "\$_pid" 2>/dev/null || true
+  sudo pkill -TERM -P "\$_pid" 2>/dev/null || true
   _i=0
   while [ \$_i -lt 20 ] && sudo kill -0 "\$_pid" 2>/dev/null; do sleep 0.5; _i=\$((_i+1)); done
   sudo pkill -KILL -P "\$_pid" 2>/dev/null || true
