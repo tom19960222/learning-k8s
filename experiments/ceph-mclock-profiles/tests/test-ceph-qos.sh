@@ -649,11 +649,16 @@ ok
 has "$FAKE_SSH_LOG" "systemctl stop ceph-${CEPH_FSID}@osd.3.service" \
   "stop 用 fsid 組出的 unit 名"
 has "$FAKE_SSH_LOG" "list-units" "動手前必須先驗 unit 存在（不是盲猜）"
+expect_ssh 'reset-failed' 0 0 ""
 expect_ssh 'systemctl start' 0 0 ""
 ceph_daemon_start 3 || fail "ceph_daemon_start 應成功"
 ok
 has "$FAKE_SSH_LOG" "systemctl start ceph-${CEPH_FSID}@osd.3.service" \
   "start 用同一個 unit 名"
+# cephadm 的 unit 設 StartLimitBurst=5/30min，flapping 要 10 輪 → 第 5 輪起會被
+# systemd 以 start-limit-hit 拒絕。reset-failed 清掉計數器，不改系統設定。
+has "$FAKE_SSH_LOG" "reset-failed ceph-${CEPH_FSID}@osd.3.service" \
+  "start 前必須 reset-failed（否則 flapping 第 5 輪起會撞 systemd 啟動速率限制）"
 hasnt "$FAKE_SSH_LOG" "orch daemon start" \
   "不得用 orch daemon start（unmanaged service 下不會執行）"
 eq "$(count_of "$FAKE_SSH_LOG" 'osd tree')" "1" "host 對應要快取（不得每次重查）"

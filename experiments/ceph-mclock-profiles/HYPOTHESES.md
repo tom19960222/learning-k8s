@@ -541,3 +541,35 @@ pg stats、snap trim 等）。若成立，代表 **profile 在「大 IO + 高壓
 **注意**：`n=3` 且 taint 具時間相關性的可能（8 次 taint 集中在同一時段）尚未排除，
 不足以單獨支撐結論——列為待查，不寫進主結論。
 
+
+### H-025：cephadm 的 systemd unit 有啟動速率限制，OSD flapping 實驗必然撞上
+
+**狀態**：confirmed（真機實測，2026-07-27）
+
+cephadm 產生的 OSD unit 模板（`/etc/systemd/system/ceph-<fsid>@.service`）帶有：
+
+```
+StartLimitInterval=30min
+StartLimitBurst=5
+```
+
+**後果**：任何在 30 分鐘內重啟同一顆 OSD 超過 5 次的實驗，第 5 次之後 systemd 會直接拒絕
+啟動並把 unit 標成 `failed (Result: start-limit-hit)`。本實驗的 flapping 場景設計為 10 輪
+stop/start，必然觸發。
+
+**診斷特徵**（容易誤判成 OSD 本身壞掉）：`systemctl status` 顯示所有 `Exec*` 步驟都是
+`code=exited, status=0/SUCCESS`——**stop 是成功的**，只有重新啟動被速率限制擋下。
+若只看「OSD 起不來」會往 BlueStore／裝置方向查，方向完全錯誤。
+
+**處置**：每次 `systemctl start` 之前先 `systemctl reset-failed <unit>`，清掉失敗狀態與
+計數器。這是 systemd 為此情境提供的標準機制，不需要改動 unit 設定（改設定會讓 lab 與
+生產環境產生未記錄的差異）。
+
+**對生產的意涵**：真實環境若遇到 OSD 反覆 flapping，**systemd 會在第 5 次後停止嘗試重啟**，
+OSD 就此保持 down 直到人工介入。這是一個容易被忽略的失效放大路徑——監控只看到「OSD down」，
+但根因是速率限制而非 OSD 本身。值得寫進報告的營運建議。
+
+**另一個前提陷阱**（同時發現）：以 `ceph orch daemon add osd` 逐台建立的 OSD，其 service
+在 `ceph orch ls` 中是 **unmanaged**，而 cephadm 不協調 unmanaged service——
+`ceph orch daemon start` 只會回 `Scheduled to start` 然後**永不執行**。本實驗因此改走
+目標 host 的 systemd（unit 名由 cephadm 固定命名 + 已驗證的 fsid 組出，動手前先確認存在）。

@@ -1577,6 +1577,13 @@ ceph_daemon_start() { # <osd-id>
   [ $# -eq 1 ] || die "用法：ceph_daemon_start <osd-id>"
   local unit
   _ceph_osd_host_set "$1"; unit="$(_ceph_osd_unit "$1")"
+  # `reset-failed` 不可省：cephadm 的 unit 模板設 StartLimitBurst=5 /
+  # StartLimitInterval=30min，而 flapping 要跑 10 輪——第 5 輪起 systemd 會以
+  # `start-limit-hit` 拒絕啟動並把 unit 標成 failed（stop 本身是成功的，所有
+  # Exec 步驟都回 0，只有速率限制擋下重啟）。reset-failed 清掉失敗狀態與計數器，
+  # 是這個情境的標準解法，不需要改動系統設定。
+  _node_run "$_CEPH_OSD_HOST" 300 "sudo systemctl reset-failed ${unit}" >&2 \
+    || log "reset-failed 失敗（續行）：osd.$1"
   _node_run "$_CEPH_OSD_HOST" 300 "sudo systemctl start ${unit}" >&2
 }
 

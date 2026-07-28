@@ -241,6 +241,7 @@ expect_ssh 'nc -z' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$rj3"
 expect_ssh 'osd dump' 0 0 "$rj3"
 # osd-start
+expect_ssh 'reset-failed' 0 0 ""
 expect_ssh 'systemctl start' 0 0 ""
 expect_ssh 'osd dump' 0 0 "$rj2"
 expect_ssh 'osd dump' 0 0 "$rj2"
