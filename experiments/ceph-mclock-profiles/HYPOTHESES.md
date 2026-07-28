@@ -763,3 +763,37 @@ backfill 進度打掉重來，**比不修還糟**，而且正好會發生在這�
 **可複用的原則**：自動修復的**目標選擇**和修復動作本身一樣需要被檢驗。
 「找不到目標就拿第一個」在測試裡永遠看不出問題（測試都會先安排一顆壞掉的 OSD），
 但在真機上它會去動一台完全無辜的機器——**破壞性動作配上猜測的目標，是最糟的組合**。
+
+### H-031：故障 cell 的主指標本來會全部是 null（baseline 窗被 coverage 窗夾成零寬）
+
+**狀態**：confirmed（真機第一個完成的故障 cell，2026-07-28）
+
+`osd-down-4k-extreme+high_client_ops` 是第一個完整走完的故障 cell。verdict 產出後，
+兩個關鍵 endpoint 是 `null`：
+
+- `p99_degradation_ratio` ——**跨 profile 比較的主指標**
+- `time_to_recovery_complete_s` ——恢復速度，故障階段的另一根支柱
+
+**成因一（主指標）**：aggregate 用 coverage-proof 的窗當 `win_start`，而 pipeline 把
+coverage 窗的起點設成 `fault_t0`（supervisor 從注入那刻才開始打卡，對覆蓋證明是對的）。
+故障前 baseline 窗算的是 `max(win_start, fault_t0 - 60) .. fault_t0 - 1`，
+於是變成 `start > end` 的**零寬窗**——而 fio 序列裡明明有 54 秒的故障前資料
+（readiness barrier 期間就在跑）。coverage 窗證明的是「量測窗無缺口」，
+**不該拿來界定參考基線**。改用實際觀測序列的起點 `obs_start` 為下界後，
+baseline 窗補回 54 秒，主指標算出 **1.093**（故障期間 p99 惡化 9.3%）。
+
+**成因二（恢復時間）**：`ceph_wait_recovery_complete` 會印
+`recovery-complete: reached <epoch>`，但呼叫端只把它 `>&2` 丟掉、**只用回傳碼**，
+時間戳從未寫進 `fault-timeline.json`。於是 `recovery_complete_t` 永遠不存在，
+即使 `censor-status.json` 已判定 `censored=false`（恢復確實完成了）。
+修法：呼叫端捕捉 stdout，`reached` 時把時間戳寫進 timeline；另加一條 fallback——
+未被 censor 的 cell 用 `observed_end - fault_t0` 推導（量測迴圈就是等到 recovery
+完成才跳出、跳出後立刻記 win_end，差在秒級輪詢），既有 bundle 因此也算得出來。
+
+**為什麼值得記**：這兩個都不會讓任何東西報錯。pipeline 全綠、`verdict: RECORDED`、
+`censored=0`，一切看起來成功——只是**主指標是空的**。若沒在第一個 cell 就逐欄看
+endpoints，72 個故障 cell 跑完才會發現整個故障階段沒有可比較的數據。
+**「跑完了」和「量到了」是兩件事，要分開驗。**
+
+**附帶**：這輪又抓到一個空過的測試——`jget` 對 `None` 印的是 `"null"` 而不是
+`"None"`，我的斷言寫成 `!= "None"` 於是永遠成立。mutation 一跑就現形。

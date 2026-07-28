@@ -861,7 +861,7 @@ reconcile() {
 # 量測窗的 supervisor：每一輪都做 coverage / sampler 檢查，再判停止條件。
 # stop-fn 的契約由 fio_wait_segments 定義（rc 0 = 停止條件成立）。
 _pipeline_measure_tick() {
-  local now slice
+  local now slice _pipe_rcout _pipe_rcrc
   now="$(date +%s)"
   _claim_touch "$_PIPE_CELL" "$_PIPE_REP"
   _pipeline_coverage_tick "$now"
@@ -871,7 +871,20 @@ _pipeline_measure_tick() {
       # 把「等 recovery_complete」切成 cadence 大小的片段，coverage supervisor 才跑得到
       slice=$((now + PIPELINE_TICK_SECS))
       [ "$slice" -gt "$_PIPE_DEADLINE" ] && slice="$_PIPE_DEADLINE"
-      ceph_wait_recovery_complete "$slice" >&2
+      # 時間戳一定要落進 timeline：原本只把 `recovery-complete: reached <epoch>`
+      # 印到 stderr 就丟掉，於是 fault-timeline.json 永遠沒有 recovery_complete_t，
+      # time_to_recovery_complete_s 這個 endpoint 每個故障 cell 都是 null——
+      # 明明 censor-status 已經判定 censored=false（recovery 確實完成了）。
+      _pipe_rcout="$(ceph_wait_recovery_complete "$slice")"
+      _pipe_rcrc=$?
+      printf '%s\n' "$_pipe_rcout" >&2
+      case "$_pipe_rcout" in
+        "recovery-complete: reached "*)
+          inject_timeline_set "$_PIPE_BUNDLE" \
+            recovery_complete_t="${_pipe_rcout##* }" >&2
+          ;;
+      esac
+      return "$_pipe_rcrc"
       ;;
     *)
       _FIO_WD_BUNDLE="$_PIPE_BUNDLE"

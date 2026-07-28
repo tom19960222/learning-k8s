@@ -793,9 +793,19 @@ def cmd_aggregate(args):
     windows["full"] = window_stats(series, gap_secs, win_start, win_end, brownout_ns)
 
     if fault_t0 is not None:
-        base_start = max(win_start, fault_t0 - 60)
+        # 故障前 baseline 的界線要用**實際觀測到的序列**（obs_start），不能用 coverage
+        # 窗的 win_start——後者刻意等於 fault_t0（coverage supervisor 從注入那刻才開始
+        # 打卡），拿它當下界會把 readiness barrier 期間那 50-60s 的 fio 資料整個擋掉，
+        # baseline 窗變成零寬，p99_degradation_ratio（跨 profile 比較的主指標）
+        # 於是每一個故障 cell 都是 null。coverage 窗證明的是「量測窗無缺口」，
+        # 不該拿來界定參考基線。
+        base_start = max(obs_start, fault_t0 - 60) if obs_start is not None \
+            else fault_t0 - 60
         windows["baseline"] = window_stats(
             series, gap_secs, base_start, fault_t0 - 1, brownout_ns)
+        if windows["baseline"].get("p99_ns") is None:
+            log("aggregate：故障前 baseline 窗沒有樣本（obs_start=%s fault_t0=%s）——"
+                "p99_degradation_ratio 將是 null" % (obs_start, fault_t0))
         windows["measurement_t0"] = window_stats(
             series, gap_secs, fault_t0, meas_end, brownout_ns)
         if down_epoch_t is not None:
@@ -839,6 +849,16 @@ def cmd_aggregate(args):
         ttr = recovery_complete_t - fault_t0
     if ttr is None and censored and fault_t0 is not None and deadline is not None:
         ttr = deadline - fault_t0
+    # 未被 censor 的故障 cell：量測迴圈是「等到 recovery_complete 才跳出」，跳出後
+    # 立刻記 win_end，所以 observed_end 就是 recovery 完成的時刻（差在秒級的輪詢）。
+    # 這條 fallback 讓 recovery_complete_t 尚未落檔的既有 bundle 也算得出這個 endpoint，
+    # 但精確值仍以 timeline 的 recovery_complete_t 為準（上面先取）。
+    if ttr is None and not censored and fault_t0 is not None:
+        obs_end_t = _as_int(censor.get("observed_end"), None)
+        if obs_end_t is not None:
+            ttr = obs_end_t - fault_t0
+            log("verdict：recovery_complete_t 未落檔，改用 observed_end 推導 "
+                "time_to_recovery_complete_s=%d（秒級輪詢誤差）" % ttr)
     endpoints["time_to_recovery_complete_s"] = ttr
 
     cap = censor.get("measurement_cap", timeline.get("measurement_cap"))

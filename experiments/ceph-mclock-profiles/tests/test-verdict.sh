@@ -123,6 +123,34 @@ out="$(python3 "$V" aggregate "$B1")"
 contains "$out" "aggregate: OK" "aggregate 機器行"
 A="$B1/aggregate.json"
 
+# --- 故障前 baseline 窗要用「實際觀測序列」為界，不是 coverage 窗 ---------------
+# coverage 窗刻意以 fault_t0 為起點（supervisor 從注入那刻才打卡）。若拿它當
+# baseline 的下界，readiness barrier 期間那 50-60s 的 fio 資料會被整個擋掉，
+# baseline 窗變零寬 → p99_degradation_ratio（跨 profile 比較的主指標）每個故障
+# cell 都是 null。真機第一個故障 cell 就是這樣（osd-down/extreme）。
+BF="$tmp/bfault"; mkdir -p "$BF"
+mkb "$BF"
+# fio 序列從 T0 起，故障注在 T0+60 → 應有 60s 故障前資料可當 baseline
+wj "$BF/coverage-proof.json" \
+  "{\"window\":{\"start\":$((T0 + 60)),\"end\":$((T0 + 119))},\"gaps\":[],\"tainted\":false}"
+wj "$BF/fault-timeline.json" \
+  "{\"fault\":\"osd-down\",\"fault_t0\":$((T0 + 60)),\"measurement_cap\":2700,\"measurement_deadline\":$((T0 + 2760))}"
+wj "$BF/censor-status.json" \
+  "{\"censored\":false,\"censor_basis\":\"recovery_complete\",\"fault_t0\":$((T0 + 60)),\"observed_end\":$((T0 + 119)),\"measurement_cap\":2700}"
+python3 "$V" aggregate "$BF" >/dev/null 2>&1 || fail "故障 aggregate 應成功"
+# 注意 jget 對 None 印的是 "null" 不是 "None"——寫錯會變成永遠成立的空測試。
+[ "$(jget "$BF/aggregate.json" windows.baseline.p99_ns)" != "null" ] \
+  || fail "故障前 baseline 窗必須有樣本（否則主指標全 null）"
+ok
+eq "$(jget "$BF/aggregate.json" windows.baseline.start)" "$T0" \
+  "baseline 窗下界 = 實際觀測序列起點，不是 coverage 窗起點"
+[ "$(jget "$BF/aggregate.json" endpoints.p99_degradation_ratio)" != "null" ] \
+  || fail "p99_degradation_ratio 不得是 null——它是跨 profile 比較的主指標"
+ok
+# recovery_complete_t 尚未落檔時，未被 censor 的 cell 要用 observed_end 推導
+eq "$(jget "$BF/aggregate.json" endpoints.time_to_recovery_complete_s)" "59" \
+  "未 censor 且缺 recovery_complete_t 時，用 observed_end - fault_t0 推導"
+
 # --- drift 參考：同條件的 campaign 中位數，不是校準值 -------------------------
 # 真機實測：所有 baseline 對校準值都是正偏移（+5.6%～+17.1%，系統性），因為校準跑在
 # precondition 剛結束、且沒有 sampler/collector 併行。拿條件不同的兩者比會誤判成漂移
