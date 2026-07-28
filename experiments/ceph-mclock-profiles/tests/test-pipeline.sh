@@ -421,6 +421,24 @@ _pipeline_reset_runtime_state
 eq "$(watchdog_count collector-heartbeat)" "3" "resume 後計數從 state 檔恢復（不重置）"
 if watchdog_halted; then ok; else fail "resume 後仍應維持停佇列"; fi
 
+# 4c-1) repeer 的候選只能是「卡在 peering/recovery」的 PG
+# 真機實測：一次 osd-down 期間有 46 個 PG 在 backfill_wait/backfilling——那是合法的
+# 大量資料搬移，對它們 repeer 會把已完成的進度打掉重來，比不修還糟。
+pgfx="$tmp/pgls.json"
+cat > "$pgfx" <<'PGEOF'
+{"pg_stats":[
+ {"pgid":"2.1a","state":"active+recovering+undersized+degraded+remapped","acting":[4,1],"acting_primary":4},
+ {"pgid":"2.20","state":"active+undersized+degraded+remapped+backfill_wait","acting":[0,3],"acting_primary":0},
+ {"pgid":"2.21","state":"active+undersized+degraded+remapped+backfilling","acting":[5,7],"acting_primary":5},
+ {"pgid":"2.22","state":"active+clean+scrubbing+deep","acting":[6,1],"acting_primary":6},
+ {"pgid":"2.23","state":"peering","acting":[2,4],"acting_primary":2}
+]}
+PGEOF
+eq "$(_ceph_py pgs-not-clean < "$pgfx" 2>/dev/null | tr '\n' ' ')" "2.1a 2.23 " \
+  "只挑 recovering/peering，backfill 與 scrub 一律不碰"
+eq "$(_ceph_py pgs-not-clean < "$pgfx" 2>&1 >/dev/null | grep -c '略過')" "1" \
+  "被略過的 PG 數量必須講出來（靜靜跳過與「沒有這些 PG」在輸出上無法區分）"
+
 # 4c-2) 沒有任何 OSD down/out 時，stuck node 不可盲選 inventory 第一台
 # 真機實測：八顆全部 up+in，卡的是一個 PG 的 recovery，於是原本的 fallback
 # 回傳了 mclock-osd-1，watchdog 就重開了一台跟問題完全無關的健康節點。
@@ -552,7 +570,7 @@ FAKE_OSD_UP=1; FAKE_OSD_IN=1; FAKE_BG_LIST=""
 # reconcile 的 final_clean 零進展 → 交 watchdog
 reset_state
 FAKE_FINAL_CLEAN_RC=3
-FAKE_CEPH_ADM_OUT='[{"pgid":"3.7","state":"active+degraded","acting":[2,5],"acting_primary":2}]' 
+FAKE_CEPH_ADM_OUT='[{"pgid":"3.7","state":"active+recovering+degraded","acting":[2,5],"acting_primary":2}]' 
 reconcile >/dev/null 2>&1 || true
 has "$TRACE" "ceph pg repeer" "reconcile 的 final_clean 零進展交 watchdog（第一段 = repeer）"
 runner_lock_release >/dev/null 2>&1 || true

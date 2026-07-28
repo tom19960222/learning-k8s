@@ -333,14 +333,30 @@ def cmd_pgs_active():
     print("%d %d" % (len(stats), active))
 
 
+# repeer 只對「卡在 peering/recovery」的 PG 有意義。backfill 是合法的大量資料搬移，
+# 對它下 repeer 會把已完成的進度打掉重來——真機實測一次 osd-down 期間有 46 個 PG
+# 處於 backfill_wait/backfilling，全部 repeer 等於自傷。所以用 allowlist 而非
+# blocklist：只挑重新 peering 確實是已知解法的狀態，其餘一律不碰。
+_REPEER_STATES = ("recovering", "peering", "activating", "stale",
+                  "incomplete", "down", "unknown")
+
+
 def _pgs_not_clean(doc):
     stats = doc if isinstance(doc, list) else doc.get("pg_stats", [])
     out = []
+    skipped = 0
     for pg in stats:
         st = str(pg.get("state", "")).split("+")
         if "active" in st and "clean" in st:
             continue
-        out.append(pg)
+        if any(x in st for x in _REPEER_STATES):
+            out.append(pg)
+        else:
+            skipped += 1
+    # 略過的一定要講：靜靜跳過跟「沒有這些 PG」在輸出上完全一樣。
+    if skipped:
+        sys.stderr.write("pgs-not-clean：略過 %d 個非 clean 但非卡住的 PG"
+                         "（backfill/scrub 等，repeer 會打掉進度）\n" % skipped)
     return out
 
 

@@ -752,6 +752,14 @@ H-029 的情境裡**八顆全部 up+in**（卡的是 PG recovery，不是任何�
 2. fallback 不可盲猜：先問「卡住的 PG 的 primary 是誰」（`acting_primary`），
    由它反查 node；真的問不出來才退回第一台，**並在 log 明講這是猜測**。
 
+**修 H-030 的過程中差點自己種下更糟的缺陷**：第一版的 repeer 對「所有非 active+clean
+的 PG」下手。拿真機資料一驗才發現，一次 osd-down 期間有 **46 個 PG 處於
+`backfill_wait`/`backfilling`**——那是合法的大量資料搬移，對它們 repeer 會把已完成的
+backfill 進度打掉重來，**比不修還糟**，而且正好會發生在這個實驗要跑的每一個故障型上。
+合成 fixture 完全測不出來（我的 fixture 裡只有 recovering）。改成 allowlist：
+只挑 `recovering`/`peering`/`activating`/`stale`/`incomplete`/`down`/`unknown`，
+其餘一律不碰，並把略過的數量寫進 stderr（靜靜跳過與「沒有這些 PG」在輸出上無法區分）。
+
 **可複用的原則**：自動修復的**目標選擇**和修復動作本身一樣需要被檢驗。
 「找不到目標就拿第一個」在測試裡永遠看不出問題（測試都會先安排一顆壞掉的 OSD），
 但在真機上它會去動一台完全無辜的機器——**破壞性動作配上猜測的目標，是最糟的組合**。
