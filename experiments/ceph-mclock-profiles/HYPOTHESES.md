@@ -661,3 +661,35 @@ if ! _inject_osd_is_up_now "$id"; then ... 先拉起再解 noout ... fi
 `fio-exited-at`、`devstat.log`）。runner 比 devstat 取樣器早啟動，所以在 runner 裡
 清 `devstat.log` 是安全的。這同時也涵蓋「同一個 attempt 重試」的情境——改 runid
 命名則不會。
+
+### H-024（結案）：seq/high 的 taint 集中在 high_recovery_ops，是 harness 競態不是 profile 行為
+
+**狀態**：refuted as a profile effect（分析日 2026-07-28）
+
+原始觀察：穩態 7 個 taint 裡有 5 個落在 `none-seq-high+high_recovery_ops`
+（balanced 1、high_client_ops 0），與「穩態是 negative control」的預期相反。
+
+**判準**：把每個 attempt 的「coverage supervisor 最後一次檢查時刻 − fio 自報結束時刻」
+（以下稱 lag）與 taint 對照，結果是乾淨的一刀兩斷：
+
+| lag | 結果 |
+|---|---|
+| 正（最後一次檢查落在 fio 結束**之後**） | 全部 taint（14, 7, 1, 16, 2, 14, 8） |
+| 負（落在結束**之前**） | 全部乾淨 |
+
+成因：fio 結束後 runner 的心跳自然停止，若 supervisor 的 30s cadence 又多打了一次
+檢查，那段「結束後到窗尾」就被記成 heartbeat gap → 超過容忍 → taint。
+**這是量測窗尾端的競態，與 mClock 的排程行為無關。**
+
+**為什麼看起來集中在一格**：taint 會觸發 retry，retry 又是一次擲骰子——
+`high_recovery_ops` 因此累積了 7 個 attempt（其他兩個 profile 各 3–4 個），
+**先中的那一格會被回饋迴圈放大**。這是「重試會放大偏差」的典型陷阱：
+統計「哪一格 taint 最多」時，分母不是固定的。
+
+**次要觀察（僅記錄，不作結論）**：`none-seq-high+high_recovery_ops` 的 lag 分布
+確實偏正（−40 ~ +16），而同壓力的 `high_client_ops` 緊緊落在 −12 ~ −16。
+可能與該 profile 下背景類別保留較多、收尾偵測的 ssh 往返變慢有關，但與 retry
+回饋迴圈完全混淆，**證據不足以支持任何因果宣稱**，報告中不得寫成 profile 差異。
+
+**待辦**：coverage supervisor 應比照 aggregate 的做法，用 `fio-exited-at` 把窗尾
+夾掉，別把「fio 結束之後」算成心跳缺口——這個假 taint 每次都要多燒一輪重試。
