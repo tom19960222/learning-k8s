@@ -421,23 +421,51 @@ _pipeline_reset_runtime_state
 eq "$(watchdog_count collector-heartbeat)" "3" "resume 後計數從 state 檔恢復（不重置）"
 if watchdog_halted; then ok; else fail "resume 後仍應維持停佇列"; fi
 
-# 4d) PG 零進展 → 走 OSD 修復路徑（restart daemon），不碰 collector
+# 4c-2) 沒有任何 OSD down/out 時，stuck node 不可盲選 inventory 第一台
+# 真機實測：八顆全部 up+in，卡的是一個 PG 的 recovery，於是原本的 fallback
+# 回傳了 mclock-osd-1，watchdog 就重開了一台跟問題完全無關的健康節點。
+FAKE_OSD_UP=1; FAKE_OSD_IN=1
+FAKE_CEPH_ADM_OUT='[{"pgid":"2.1a","state":"active+recovering+degraded","acting":[4,1],"acting_primary":4}]'
+_INJECT_TREE_CACHE="mclock-osd-1 rack1 0
+mclock-osd-5 rack3 4"
+eq "$(_pipeline_stuck_node)" "mclock-osd-5" \
+  "無 down/out 的 OSD 時，目標取自卡住的 PG 的 primary（osd.4 → mclock-osd-5）"
+unset FAKE_CEPH_ADM_OUT _INJECT_TREE_CACHE
+
+# 4d) PG 零進展 → 第一段必須是 pg repeer（不動 daemon、不重開機）
+# 真機實測：flapping 會讓 PG 的 recovering 清單卡住兩個物件永不完成（被 flap 的
+# OSD 進得了 up 卻進不了 acting），client 對那些物件的 read 永遠停在 waiting for
+# rw locks。`ceph pg repeer` 一下就解，而重開 node 完全沒用——問題不在任何機器上。
 reset_state
 FAKE_FINAL_CLEAN_RC=0
+FAKE_CEPH_ADM_OUT='[{"pgid":"2.1a","state":"active+recovering+degraded","acting":[4,1],"acting_primary":4}]'
 out="$(watchdog_handle pg-no-progress mclock-osd-3)" || fail "pg-no-progress 修復應成功"
-has "$TRACE" "orch daemon restart osd.3" "pg-no-progress 會 restart 相關 OSD"
+has "$TRACE" "ceph pg repeer 2.1a" "pg-no-progress 第一段是對卡住的 PG repeer"
+hasnt "$TRACE" "orch daemon restart" "第一段不得動 daemon（repeer 便宜且精準）"
+hasnt "$TRACE" "sudo reboot" "第一段更不得重開機"
 has "$TRACE" "ceph_wait_final_clean" "pg-no-progress 的成功判準是 final_clean"
 hasnt "$TRACE" "bg_collect_ensure" "pg-no-progress 不該去動 collector"
 eq "$out" "watchdog: REPAIRED pg-no-progress" "pg-no-progress 修復機器行"
+
+# 4d-2) repeer 沒解決 → 才升級到 restart OSD
+reset_state
+FAKE_FINAL_CLEAN_RC=1
+watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
+reset_trace
+FAKE_FINAL_CLEAN_RC=0
+watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
+has "$TRACE" "orch daemon restart osd.3" "repeer 失敗後才 restart 相關 OSD"
 
 # 4e) pg-no-progress 連續失敗 → 升級到 node reboot（2a），而不是直接叫人
 reset_state
 FAKE_FINAL_CLEAN_RC=1
 watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
 watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
+watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
 reset_trace
 watchdog_handle pg-no-progress mclock-osd-3 >/dev/null 2>&1 || true
 has "$TRACE" "sudo reboot" "pg-no-progress 上限後升級到 2a（ssh reboot）"
+unset FAKE_CEPH_ADM_OUT
 
 # 4f) 2a 失敗 → 2b（az vm restart，唯一 az 例外），且**不得** deallocate
 reset_state
@@ -524,8 +552,9 @@ FAKE_OSD_UP=1; FAKE_OSD_IN=1; FAKE_BG_LIST=""
 # reconcile 的 final_clean 零進展 → 交 watchdog
 reset_state
 FAKE_FINAL_CLEAN_RC=3
+FAKE_CEPH_ADM_OUT='[{"pgid":"3.7","state":"active+degraded","acting":[2,5],"acting_primary":2}]' 
 reconcile >/dev/null 2>&1 || true
-has "$TRACE" "orch daemon restart" "reconcile 的 final_clean 零進展交 watchdog（OSD 修復路徑）"
+has "$TRACE" "ceph pg repeer" "reconcile 的 final_clean 零進展交 watchdog（第一段 = repeer）"
 runner_lock_release >/dev/null 2>&1 || true
 
 # ============================================ 7. fault execution：順序與不變條件 ==

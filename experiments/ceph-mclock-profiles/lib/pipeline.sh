@@ -529,9 +529,14 @@ _watchdog_layer() {
     fio-heartbeat)       [ "$2" -lt 1 ] && { printf 'fio\n'; return 0; } ;;
     mon-quorum)          [ "$2" -lt 1 ] && { printf 'mon\n'; return 0; } ;;
     pg-no-progress)
-      [ "$2" -lt 2 ] && { printf 'osd\n'; return 0; }
-      [ "$2" -lt 4 ] && { printf 'node-reboot\n'; return 0; }
-      [ "$2" -lt 5 ] && { printf 'az-restart\n'; return 0; }
+      # 第一段一定是 repeer：真機實測 flapping 會讓 PG 的 recovering 清單卡住兩個
+      # 物件永不完成（被 flap 的 OSD 進得了 up 卻進不了 acting），client 對那些
+      # 物件的 read 就永遠停在 waiting for rw locks。`ceph pg repeer` 一下就解，
+      # 而重開 node 完全沒用——問題不在任何一台機器上。
+      [ "$2" -lt 1 ] && { printf 'pg-repeer\n'; return 0; }
+      [ "$2" -lt 3 ] && { printf 'osd\n'; return 0; }
+      [ "$2" -lt 5 ] && { printf 'node-reboot\n'; return 0; }
+      [ "$2" -lt 6 ] && { printf 'az-restart\n'; return 0; }
       ;;
     node-ssh-lost)
       [ "$2" -lt 2 ] && { printf 'node-reboot\n'; return 0; }
@@ -563,6 +568,7 @@ watchdog_handle() {
     fio)         _watchdog_repair_fio "$ctx" || rc=$? ;;
     mon)         _watchdog_repair_mon "$ctx" || rc=$? ;;
     osd)         _watchdog_repair_osd "$ctx" || rc=$? ;;
+    pg-repeer)   _watchdog_repair_pg_repeer || rc=$? ;;
     node-reboot) _watchdog_repair_node_reboot "$ctx" || rc=$? ;;
     az-restart)  _watchdog_repair_az "$ctx" || rc=$? ;;
     *) die "內部錯誤：未知的 watchdog 動作 ${layer}" ;;
@@ -625,6 +631,21 @@ _watchdog_repair_osd() {
   id="$(_pipeline_osd_for_node "$node")" || { log "查不到 ${node} 的 OSD id"; return 1; }
   ceph_adm_to "$WATCHDOG_DAEMON_SECS" "ceph orch daemon restart osd.${id}" >&2 \
     || log "osd.${id} restart 指令失敗（續行判定 final_clean）"
+  ceph_wait_final_clean "$PIPELINE_PROGRESS_SECS" >&2
+}
+
+# pg-repeer：對每個非 active+clean 的 PG 下 repeer，重啟它的 peering/recovery
+# 狀態機。不動任何 daemon、不重開機，是這個 trigger 最該先試的一段。
+_watchdog_repair_pg_repeer() {
+  local pgs pg n=0
+  pgs="$(ceph_adm "ceph pg ls --format json" 2>/dev/null \
+         | _ceph_py pgs-not-clean 2>/dev/null)" || pgs=""
+  [ -n "$pgs" ] || { log "pg-repeer：查不到非 clean 的 PG（改由後續層級處理）"; return 1; }
+  for pg in $pgs; do
+    ceph_adm "ceph pg repeer ${pg}" >&2 || log "repeer 失敗（續行）：${pg}"
+    n=$((n + 1))
+  done
+  log "pg-repeer：已對 ${n} 個 PG 下 repeer"
   ceph_wait_final_clean "$PIPELINE_PROGRESS_SECS" >&2
 }
 
@@ -788,7 +809,26 @@ _pipeline_stuck_node() {
       return 0
     fi
   done
+  # 沒有任何 OSD 是 down/out 時，卡住的原因不在某台機器上（真機實測：八顆全部
+  # up+in，卡的是一個 PG 的 recovery）。原本這裡直接回傳 inventory 第一台，
+  # watchdog 於是重開了一台跟問題完全無關的健康節點。改成先問「卡住的 PG 的
+  # primary 是誰」，問不出來才退回第一台並明講這是猜的。
+  node="$(_pipeline_stuck_pg_primary_node)" || node=""
+  if [ -n "$node" ]; then
+    printf '%s\n' "$node"
+    return 0
+  fi
+  log "_pipeline_stuck_node：無 down/out 的 OSD 也找不到卡住的 PG primary，退回第一台（此為猜測）"
   inv_names osd | head -1
+}
+
+# 卡住的 PG 的 primary 所在的 node（找不到就回非 0）。
+_pipeline_stuck_pg_primary_node() {
+  local id
+  id="$(ceph_adm "ceph pg ls --format json" 2>/dev/null \
+        | _ceph_py pgs-not-clean-primary 2>/dev/null | head -1)" || return 1
+  [ -n "$id" ] || return 1
+  printf '%s\n' "$(printf '%s\n' "${_INJECT_TREE_CACHE:-}" | awk -v i="$id" '$3 == i {print $1}')"
 }
 
 reconcile() {

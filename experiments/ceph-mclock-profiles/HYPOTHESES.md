@@ -693,3 +693,65 @@ if ! _inject_osd_is_up_now "$id"; then ... 先拉起再解 noout ... fi
 
 **待辦**：coverage supervisor 應比照 aggregate 的做法，用 `fio-exited-at` 把窗尾
 夾掉，別把「fio 結束之後」算成心跳缺口——這個假 taint 每次都要多燒一輪重試。
+
+### H-029：OSD flapping 會讓 PG 的物件永久卡在 recovering，client IO 無限期阻塞
+
+**狀態**：confirmed（真機實測，2026-07-28）
+
+10 輪 flapping（osd.2）跑完、`flapping: OK` 之後，叢集看起來幾乎是健康的：
+
+```
+Degraded data redundancy: 2/921651 objects degraded (0.000%), 1 pg degraded
+24 slow ops, oldest one blocked for 6489 sec, osd.4 has slow ops
+```
+
+實際狀態：PG 2.1a `active+recovering+undersized+degraded+remapped`，**卡了 115 分鐘**。
+`ceph pg 2.1a query` 顯示關鍵矛盾：
+
+- `up: [4, 1, 2]` 但 `acting: [4, 1]` ——**被 flap 的 osd.2 進得了 up，卻始終進不了 acting**
+- primary 的 `recovery_progress.recovering` 清單裡固定卡著兩個物件，永不完成
+- `might_have_unfound` 兩個 peer 都是 `already probed`（不是 unfound）
+
+而 `ceph tell osd.4 dump_blocked_ops` 顯示阻塞的是 **client read**，
+`flag_point: "waiting for rw locks"`，age 5413 秒，目標物件正是 recovering 清單裡那顆
+（`rbd_data.5f8cfe291ffd.000000000000b755:head`）。也就是說：
+**recovery 卡住 → 該物件的 rw lock 永遠不放 → 打到那顆物件的 client IO 無限期 hang。**
+
+**為什麼監控幾乎看不到**：
+- degraded 比例 **0.000%**（2 / 921,651），任何以「degraded 百分比」為門檻的告警都不會響。
+- `HEALTH_WARN` 只有一行 `PG_DEGRADED`，看起來像即將自癒的小事。
+- 唯一大聲的訊號是 `SLOW_OPS`，而它點名的是 **osd.4（PG 的 primary）**，
+  不是 osd.2（真正 flap、真正肇因的那顆）。與先前 slow-ops SP 的 H-025「SLOW_OPS
+  怪錯人」是同一個機制的不同案例。
+
+**處置**：`ceph pg repeer <pgid>` —— 瞬間解決（state 立刻回 `active+clean`、
+acting 補回 osd.2、slow ops 全消）。不需要重啟任何 daemon，不需要重開機。
+
+**營運建議（報告用）**：
+1. 告警不能只看 degraded 百分比；要有「PG 非 active+clean 持續 N 分鐘」這條，
+   否則本案完全靜默。
+2. `SLOW_OPS` 點名的 OSD 是**受害者（PG primary）**，排查要從卡住的 PG 的
+   `up`/`acting` 差異回推肇因，而不是直接去修被點名的那顆。
+3. 遇到 recovery 停滯，**先試 `ceph pg repeer`**——它便宜、精準、不破壞；
+   重啟 OSD 或重開機都是更重的手段，而且在本案完全無效（問題不在任何一台機器上）。
+
+### H-030：watchdog 在沒有 OSD down 時會盲選節點，重開了無關的健康機器
+
+**狀態**：confirmed（真機實測，2026-07-28）
+
+`_pipeline_stuck_node` 的邏輯是「找第一顆不是 up+in 的 OSD，回傳它的 node」。
+H-029 的情境裡**八顆全部 up+in**（卡的是 PG recovery，不是任何一台機器），
+於是迴圈找不到目標，直接掉到 fallback `inv_names osd | head -1` ——
+**回傳 inventory 的第一台**。watchdog 因此 `sudo reboot` 了 `mclock-osd-1`，
+一台跟問題毫無關係的健康節點。重開當然無效，再失敗一次就把 cell 標成 needs-human。
+
+**兩個修正**：
+1. `pg-no-progress` 的升級階梯**第一段改成 `pg-repeer`**（原本第一段就是 restart
+   OSD）。repeer 便宜、精準、不動 daemon，而且在 H-029 裡是唯一有效的手段。
+   階梯變成 repeer → osd restart → node reboot → az restart → human。
+2. fallback 不可盲猜：先問「卡住的 PG 的 primary 是誰」（`acting_primary`），
+   由它反查 node；真的問不出來才退回第一台，**並在 log 明講這是猜測**。
+
+**可複用的原則**：自動修復的**目標選擇**和修復動作本身一樣需要被檢驗。
+「找不到目標就拿第一個」在測試裡永遠看不出問題（測試都會先安排一顆壞掉的 OSD），
+但在真機上它會去動一台完全無辜的機器——**破壞性動作配上猜測的目標，是最糟的組合**。

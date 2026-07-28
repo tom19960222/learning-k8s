@@ -333,6 +333,36 @@ def cmd_pgs_active():
     print("%d %d" % (len(stats), active))
 
 
+def _pgs_not_clean(doc):
+    stats = doc if isinstance(doc, list) else doc.get("pg_stats", [])
+    out = []
+    for pg in stats:
+        st = str(pg.get("state", "")).split("+")
+        if "active" in st and "clean" in st:
+            continue
+        out.append(pg)
+    return out
+
+
+def cmd_pgs_not_clean():
+    # stdout 只放 pgid，一行一個（watchdog 要逐個 repeer）。
+    for pg in _pgs_not_clean(load_stdin()):
+        pgid = pg.get("pgid")
+        if pgid:
+            print(pgid)
+
+
+def cmd_pgs_not_clean_primary():
+    # 卡住的 PG 的 primary OSD id；acting_primary 缺就退回 acting[0]。
+    for pg in _pgs_not_clean(load_stdin()):
+        pri = pg.get("acting_primary")
+        if pri is None:
+            acting = pg.get("acting") or []
+            pri = acting[0] if acting else None
+        if pri is not None:
+            print(int(pri))
+
+
 def cmd_versions_check(expect):
     doc = load_stdin()
     bad = []
@@ -804,6 +834,8 @@ DISPATCH = {
     "osds-in": cmd_osds_in,
     "laggy": cmd_laggy,
     "pgs-active": cmd_pgs_active,
+    "pgs-not-clean": cmd_pgs_not_clean,
+    "pgs-not-clean-primary": cmd_pgs_not_clean_primary,
     "versions-check": cmd_versions_check,
     "orch-image-check": cmd_orch_image_check,
     "host-names": cmd_host_names,
