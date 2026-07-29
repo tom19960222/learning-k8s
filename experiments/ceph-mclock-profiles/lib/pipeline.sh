@@ -1071,8 +1071,18 @@ _pipeline_attempt() {
   # 從窗一開始就讓 supervisor 打卡——注入期間（flapping 要 9 分鐘）量測迴圈還沒
   # 開始跑，少了這個覆寫，那整段都會被記成「supervisor 中斷」而作廢。
   # shellcheck disable=SC2329
-  # 間接呼叫：with_deadline 在每輪輪詢會叫 progress_tick（common.sh 的預設 no-op 覆寫點）。
-  progress_tick() { _pipeline_coverage_tick "$(date +%s)"; _pipeline_sampler_tick; }
+  # 間接呼叫：with_deadline 每輪、以及注入的 daemon 起停前後會叫 progress_tick
+  # （common.sh 的預設 no-op 覆寫點）。
+  # re-entrancy guard：coverage/sampler tick 自己也會走 ssh，而那些路徑同樣可能
+  # 經過 with_deadline——沒有這道閘會無限遞迴。
+  _PIPE_IN_TICK=0
+  progress_tick() {
+    [ "${_PIPE_IN_TICK:-0}" = "0" ] || return 0
+    _PIPE_IN_TICK=1
+    _pipeline_coverage_tick "$(date +%s)" || true
+    _pipeline_sampler_tick || true
+    _PIPE_IN_TICK=0
+  }
 
   case "$_PIPE_KIND" in
     fault)

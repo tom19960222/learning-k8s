@@ -171,12 +171,14 @@ with_deadline() {
   case "$secs" in ''|*[!0-9]*) die "with_deadline：secs 必須是整數秒（got=${secs}）" ;; esac
   local start=$SECONDS
   while :; do
+    # 打卡要放在**判定之前**：第一輪就成功的等待（flapping 的多數等待都是）否則
+    # 完全不會打卡。真機實測修正前後第一次打卡仍落在窗起點後 484s。
+    progress_tick
     if "$@"; then return 0; fi
     if [ $((SECONDS - start)) -ge "$secs" ]; then
       log "with_deadline：${1} 在 ${secs}s 內未達成"
       return 124
     fi
-    progress_tick
     sleep "$POLL_INTERVAL"
   done
 }

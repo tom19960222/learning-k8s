@@ -743,7 +743,11 @@ fault_flapping() {
   _inject_push_rollback "$b"
   while [ "$i" -le "$FLAP_CYCLES" ]; do
     pre="$(ceph_osd_state "$id")" || die "取不到 osd.${id} 狀態"
+    # daemon 的起停各要 10-20s（systemctl 走 ssh），而且不是輪詢等待、不經過
+    # with_deadline——注入 9 分鐘裡的大半時間都在這裡，不顯式打卡就會留下大洞。
+    progress_tick
     ceph_daemon_stop "$id"
+    progress_tick
     if ! ceph_wait_osd_down "$id" "$pre" "$FLAP_DOWN_GRACE_SECS"; then
       log "flapping：osd.${id} 超過 grace 仍未判 down，顯式 ceph osd down"
       ceph_adm "ceph osd down $id" >&2 || log "顯式 ceph osd down 失敗（續行判定）"
@@ -754,6 +758,7 @@ fault_flapping() {
     st="$(ceph_osd_state "$id")" || die "取不到 osd.${id} 狀態"
     down_at="$(_ceph_state_field "$st" down_at)"
     ceph_daemon_start "$id"
+    progress_tick
     if ! ceph_wait_osd_up "$id" "$st" "$FLAP_UP_SECS"; then
       reason="cycle-${i}-up-timeout"; rc=4; break
     fi

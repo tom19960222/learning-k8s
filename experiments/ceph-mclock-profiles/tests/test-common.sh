@@ -340,6 +340,12 @@ POLL_INTERVAL=0.01 with_deadline 1 _never >/dev/null 2>&1
 [ "$_tick_n" -ge 2 ] \
   || fail "with_deadline 每輪輪詢都要呼叫 progress_tick（實際 ${_tick_n} 次）"
 ok
+# 打卡必須在**判定之前**：第一輪就成功的等待（flapping 的多數等待都是）否則完全
+# 不會打卡——真機實測就是這樣讓第一次打卡落在窗起點後 484s。
+_tick_n=0
+_always() { return 0; }
+POLL_INTERVAL=0.01 with_deadline 1 _always >/dev/null 2>&1
+eq "$_tick_n" "1" "第一輪就成功的等待也要打卡（tick 必須排在判定之前）"
 # 預設必須是 no-op（不得強迫所有呼叫端都有 supervisor）
 unset -f progress_tick
 progress_tick() { :; }
