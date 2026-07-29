@@ -953,3 +953,41 @@ osd-down / node-isolation 的注入只要幾秒到幾十秒，所以從沒暴露
 **真實但非決定性**的因素（supervisor 確實會抖），修了它、現象沒消失，才逼出真因。
 教訓：**修完要回頭確認現象真的消失**；沒消失就代表歸因還沒到位，不能只因為
 「我修的東西確實是個問題」就收工。
+
+### H-036：函式覆寫是全域的，跨 execution 殘留會在下一輪的錯誤時機觸發
+
+**狀態**：confirmed（真機故障佇列，2026-07-29）
+
+H-035 的修法是在量測窗開始時把 `progress_tick`（common.sh 的預設 no-op 覆寫點）
+換成「打 coverage + sampler 卡」。**bash 的函式覆寫是全域且永久的**——不還原的話，
+下一個 execution 的早期階段也會觸發它，而那時 sampler 還沒啟動：
+
+```
+[21:01:47] execution 開始：flapping-4k-low+high_client_ops/r2 ...
+[21:01:48] set-profile: SET high_recovery_ops high_client_ops
+[21:01:48] FATAL: coverage_check：sampler 尚未啟動（缺 .../sampler/run.json）
+```
+
+第一個 execution 完全正常、第二個一開始就 FATAL——整個 runner 死掉。
+
+**修法**：`_pipeline_reset_runtime_state` 與每個 execution 起頭都把 `progress_tick`
+還原成 no-op。
+
+**H-035 修正本身確認有效**（重啟後的 coverage-proof，用時間戳過濾確保是修正後的產物）：
+
+| | 修正前 | 修正後 |
+|---|---|---|
+| 第一次打卡距窗起點 | 560s / 484s | **6s** |
+| gaps | 7–9 | **0** |
+| evidence_seconds | 484–560 | **10** |
+| tainted | True | **False** |
+
+**這是第四次「修正本身造成迴歸」**（前三次：H-032 殺 process 順序、H-034 錯誤歸因、
+progress_tick 放在判定之後）。共同結構都是**改動共用的東西時只驗證了自己在意的那條
+路徑**：
+- H-032：`remote_bg_stop` 的殺法對 fio 是對的，對 guard 是錯的
+- H-036：`progress_tick` 在量測窗內是對的，在 execution 早期是錯的
+
+**可複用的原則**：共用機制的改動要問兩個問題——「**誰還會走到它**」以及
+「**它的生命週期到哪裡結束**」。前者是 H-032，後者是 H-036。只問「我要的那條路徑
+對不對」永遠會漏掉另一半。

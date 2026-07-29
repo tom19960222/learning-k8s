@@ -421,6 +421,18 @@ _pipeline_reset_runtime_state
 eq "$(watchdog_count collector-heartbeat)" "3" "resume 後計數從 state 檔恢復（不重置）"
 if watchdog_halted; then ok; else fail "resume 後仍應維持停佇列"; fi
 
+# 4b-2) progress_tick 的覆寫不得跨 execution 殘留
+# 函式覆寫是全域的：量測窗裡裝上的 progress_tick 若不還原，下一個 execution 的早期
+# 階段（設 profile、qos gate——都在 sampler 啟動之前）也會觸發它，而 coverage_check
+# 要求 sampler 已就緒 → die。真機實測第二個 execution 一開始就 FATAL。
+_leak_n=0
+# shellcheck disable=SC2329
+# 間接呼叫：模擬「上一個 execution 留下的覆寫」。
+progress_tick() { _leak_n=$((_leak_n + 1)); }
+_pipeline_reset_runtime_state
+progress_tick
+eq "$_leak_n" "0" "reset 之後 progress_tick 必須回到 no-op（不得沿用上一輪的覆寫）"
+
 # 4c-1) repeer 的候選只能是「卡在 peering/recovery」的 PG
 # 真機實測：一次 osd-down 期間有 46 個 PG 在 backfill_wait/backfilling——那是合法的
 # 大量資料搬移，對它們 repeer 會把已完成的進度打掉重來，比不修還糟。

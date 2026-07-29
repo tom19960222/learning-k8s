@@ -459,6 +459,14 @@ _pipeline_reset_runtime_state() {
   _PIPE_LAST_COV=0
   _PIPE_TAINTED=0
   _PIPE_REASON=""
+  _PIPE_IN_TICK=0
+  # **函式覆寫是全域且跨 execution 殘留的**：量測窗裡裝上的 progress_tick 若不還原，
+  # 下一個 execution 的早期階段（設 profile、qos gate——都在 sampler 啟動之前）
+  # 也會觸發它，而 coverage_check 要求 sampler 已就緒 → die。真機實測第二個
+  # execution 一開始就 FATAL。每個 execution 起頭一律還原成 no-op。
+  # shellcheck disable=SC2329
+  # 間接呼叫：with_deadline 每輪與注入的 daemon 起停前後會叫它。
+  progress_tick() { :; }
   inject_cache_reset
 }
 _pipeline_reset_runtime_state
@@ -1250,6 +1258,14 @@ pipeline_run_execution() { # <execution-json>
   _PIPE_DEADLINE=0
   _PIPE_WIN_START=0
   _PIPE_WIN_END=0
+  _PIPE_IN_TICK=0
+  # 函式覆寫是全域且跨 execution 殘留的：上一個 execution 在量測窗裡裝的
+  # progress_tick 若不還原，這一個 execution 的早期階段（設 profile、qos gate——
+  # 都在 sampler 啟動之前）也會觸發它，而 coverage_check 要求 sampler 已就緒 → die。
+  # 真機實測：第二個 execution 一開始就 FATAL。
+  # shellcheck disable=SC2329
+  # 間接呼叫：with_deadline 每輪與注入的 daemon 起停前後會叫它。
+  progress_tick() { :; }
   log "execution 開始：${key} kind=${_PIPE_KIND} profile=${_PIPE_PROFILE} bundle=${_PIPE_BUNDLE}"
 
   _pipeline_attempt || rc=$?
