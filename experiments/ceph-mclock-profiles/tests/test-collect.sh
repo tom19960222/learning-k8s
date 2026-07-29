@@ -413,6 +413,29 @@ out="$(coverage_finalize "$CB4" 1785000000 1785000299)" || fail "<10s 缺口不�
 eq "$(jget "$CB4/coverage-proof.json" tainted)" "False" "單點小缺口容忍"
 eq "$(jget "$CB4/coverage-proof.json" gaps.0.tolerated)" "True" "小缺口標 tolerated"
 
+# 22b) fio 沒資料、但 devstat 逐秒有紀錄 → 那些秒不算盲區
+# devstat 與 fio 各自獨立、IO 為零也照記，證明的是「那一秒儀器活著在量」。
+# 少了這條，client 被故障卡住那幾秒（fio 不產 log）會同時滿足「supervisor 沒檢查」
+# 與「沒有 fio 樣本」而被記成盲區——真機 flapping 每個 cell 都會中。
+CB4B="$tmp/cov-devstat"
+rm -rf "$CB4B"; mkdir -p "$CB4B/coverage" "$CB4B/sampler" "$CB4B/fio/mclock-client-1"
+python3 "$here/fixtures/gen-samples.py" --out "$CB4B/sampler/samples.jsonl" \
+  --start 1785000000 --count 60 --interval 5 >/dev/null
+omitb="$(python3 -c 'print(",".join(str(s) for s in range(100, 140)))')"
+python3 "$here/fixtures/gen-fio-logs.py" --out "$CB4B/fio/mclock-client-1" \
+  --seg seg01 --start 1785000000 --seconds 300 --omit-secs "$omitb" >/dev/null
+# devstat 逐秒覆蓋整個窗（含 fio 缺的那 40 秒）
+python3 -c "
+import sys
+with open('$CB4B/fio/mclock-client-1/devstat.log','w') as fh:
+    for i in range(300):
+        fh.write('%d 0 0\\n' % (1785000000 + i))
+"
+mk_checks "$CB4B" 1785000000 1785000300 30 1785000100 1785000140 fio:mclock-client-1
+coverage_finalize "$CB4B" 1785000000 1785000299 >/dev/null 2>&1 || true
+eq "$(jget "$CB4B/coverage-proof.json" gap_seconds)" "0" \
+  "devstat 逐秒有紀錄的秒不得被記成盲區（它證明儀器活著在量）"
+
 # 23) supervisor 自己失聯（checks 稀疏）→ 該區間也算證據不足
 CB5="$tmp/cov-blind"
 mk_cov_bundle "$CB5" 1785000000 300

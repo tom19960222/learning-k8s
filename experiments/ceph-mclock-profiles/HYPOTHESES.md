@@ -907,3 +907,49 @@ taint 的**不是** client 卡住（那是 H-033，只寫 log 不 taint），而
 
 **方法論**：這條的價值在診斷順序——最顯眼的症狀（`fio-stop: FAIL`）不是肇因。
 先確認「誰真的讓 cell 失效」（taint reason），再量那個量的分布，最後才動手。
+
+### H-035（修正 H-034 的診斷）：flapping coverage taint 的真因是「注入期間沒人打卡」
+
+**狀態**：confirmed（真機故障佇列，2026-07-29）
+
+H-034 把 flapping 的 coverage taint 歸因於 supervisor 抖動（實際檢查間隔 38-40s
+vs cadence 30s）。**那個歸因是錯的**——它是真實現象，但不是這些 cell 被作廢的原因。
+
+修掉抖動的一部分之後（40.0s → 38.2s）cell 仍然 taint，才看到真正的理由：
+
+```
+taint_reasons = ['supervisor 中斷 560s（>= 容忍值 25s）',
+                 '量測工具中斷總量 560s > 30s']
+evidence = [{'duration_s': 560, 'reason': 'no-check', 'source': 'supervisor',
+             'start': <窗起點>, 'end': <窗起點+559>}]
+```
+
+**coverage 窗從 `fault_t0` 起算，但 supervisor 的第一次打卡在 560 秒之後。**
+那 560 秒正是 flapping 注入本身的時間（10 輪 stop/start + 每輪 PG gate ≈ 9 分鐘）：
+注入是同步執行的，量測迴圈要等它回來才開始 tick，**所以注入全程沒有任何人在打卡**。
+osd-down / node-isolation 的注入只要幾秒到幾十秒，所以從沒暴露；flapping 必然中招。
+
+**修法**：在 `with_deadline`（全 harness 共用的輪詢等待點）加一個預設 no-op 的覆寫點
+`progress_tick`，pipeline 在量測窗一開始就把它覆寫成「打 coverage + sampler 卡」。
+於是注入期間的每一次輪詢等待都會讓 supervisor 繼續打卡。
+
+**配套（各自獨立驗證）**：
+1. **devstat 逐秒紀錄算進「有量測證據的秒」**。它與 fio 獨立、IO 為零也照記，
+   證明的是「那一秒儀器活著在量」而非「那一秒有 IO」，所以只消除假盲區、
+   不會遮蔽 stall（stall 仍由 fio 逐秒資料判定）。真機那 12 秒「盲區」裡，
+   四台 client 的 devstat 各有 12/12 筆樣本——證據一直都在，只是判定沒用它。
+2. 故障模式的 `COVERAGE_GAP_TOLERANCE_SECS` 由實測解析度定為 25s（穩態維持 10s）。
+   一個監督週期的成本是「coverage + sampler + 一次 ceph -s」全走 ssh，受壓叢集上
+   實測 13-19s，10s 從來就達不到。**只放寬故障模式、只放寬 supervisor 的量級**；
+   sampler / fio 心跳的判定完全不動。
+
+**中途差點犯的錯（值得記）**：我一度把 taint 判定從原始 `evidence` 改成精煉的
+`gaps`（中斷 ∩ 該秒無資料）。跑測試才發現 test 20 與 test 23 明確斷言
+「sampler 中斷 40s 但 fio 還在寫 → 仍要 taint」「supervisor 稀疏 → 證據不足」——
+**那是刻意的 gate，我差點為了讓 cell 過關而把它弱化**。已退回，改成只修真因。
+測試在這裡發揮了它該有的作用：擋住作者本人的便宜行事。
+
+**方法論**：H-034 → H-035 是一次「歸因錯誤」的完整記錄。第一次診斷找到的是
+**真實但非決定性**的因素（supervisor 確實會抖），修了它、現象沒消失，才逼出真因。
+教訓：**修完要回頭確認現象真的消失**；沒消失就代表歸因還沒到位，不能只因為
+「我修的東西確實是個問題」就收工。

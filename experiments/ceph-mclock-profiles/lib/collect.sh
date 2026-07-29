@@ -533,6 +533,42 @@ def cmd_coverage_check(checks_path, epoch, max_age, *pairs):
 
 # ----------------------------------------------------- coverage finalize ----
 
+def _devstat_seconds(fio_dir):
+    """每個 client 的 devstat 取樣器落在哪些秒（第一欄是 epoch 秒）。
+
+    這支取樣器與 fio 各自獨立、逐秒讀 /sys/block/<dev>/stat，**IO 為零時照樣記一筆**。
+    它證明的是「那一秒儀器活著並且在量」，不是「那一秒有 IO」——正好是 coverage
+    需要的非盲證據。把它算進 data_secs 只會消掉假盲區，不會遮蔽 stall：
+    stall 仍舊由 fio 的逐秒資料判定，完全不變。
+
+    沒有它的話，client 被故障卡住那幾秒（fio 不產 log）就同時滿足「supervisor 沒
+    檢查」與「沒有 fio 樣本」，被記成盲區而 taint——真機實測那 12 秒裡四台 client
+    的 devstat 各有 12/12 筆樣本，證據其實一直都在。
+    """
+    per_client = {}
+    if not os.path.isdir(fio_dir):
+        return per_client
+    for client in sorted(os.listdir(fio_dir)):
+        cdir = os.path.join(fio_dir, client)
+        if not os.path.isdir(cdir):
+            continue
+        secs = set()
+        for path in sorted(glob.glob(os.path.join(cdir, "devstat.log")) +
+                           glob.glob(os.path.join(cdir, "*", "devstat.log"))):
+            try:
+                fh = open(path)
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    val = as_int(line.split(None, 1)[0].strip() if line.strip() else None)
+                    if val is not None:
+                        secs.add(val)
+        if secs:
+            per_client[client] = secs
+    return per_client
+
+
 def _fio_seconds(fio_dir):
     """每個 client 的 fio 逐秒樣本落在哪些秒（log_unix_epoch=1 → 第一欄是 ms）。"""
     per_client = {}
@@ -679,6 +715,10 @@ def cmd_coverage_finalize(bundle, out_path, cadence, tolerance, max_total,
     per_client = _fio_seconds(os.path.join(bundle, "fio"))
     data_secs = set()
     for secs in per_client.values():
+        data_secs |= secs
+    # devstat 是與 fio 獨立的逐秒儀器，IO 為零也會記——把它算進「有量測證據的秒」，
+    # 假盲區才不會把「client 被故障卡住」誤判成「我們沒在看」。
+    for secs in _devstat_seconds(os.path.join(bundle, "fio")).values():
         data_secs |= secs
 
     evidence = []

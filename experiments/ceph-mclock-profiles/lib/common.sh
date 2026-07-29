@@ -156,6 +156,15 @@ node_ssh_to() {
 }
 
 # with_deadline <secs> <fn> [args...]：輪詢直到 fn 成功或逾時（回 124）。
+# 量測期間的**覆寫點**：任何輪詢等待都應該讓 coverage supervisor 繼續打卡。
+# 預設 no-op，只有 pipeline 在量測窗內會覆寫它。
+#
+# 為什麼需要：coverage 窗從 fault_t0 起算，但注入本身可能很久（flapping 要跑 10 輪
+# stop/start + PG gate ≈ 9 分鐘），而量測迴圈要等注入回來才開始 tick——真機實測
+# 第一次打卡落在窗開始後 560s，直接判 supervisor 中斷 560s。osd-down 注入很快
+# 所以看不出來，flapping 必然中招。
+progress_tick() { :; }
+
 with_deadline() {
   [ $# -ge 2 ] || die "用法：with_deadline <secs> <fn> [args...]"
   local secs="$1"; shift
@@ -167,6 +176,7 @@ with_deadline() {
       log "with_deadline：${1} 在 ${secs}s 內未達成"
       return 124
     fi
+    progress_tick
     sleep "$POLL_INTERVAL"
   done
 }

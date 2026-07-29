@@ -76,6 +76,17 @@ PIPELINE_DRIFT_LIMIT="${PIPELINE_DRIFT_LIMIT:-3}"
 PIPELINE_PROGRESS_SECS="${PIPELINE_PROGRESS_SECS:-600}"
 # 量測窗每一輪的最短切片（讓 coverage supervisor 有機會在 cadence 上跑）
 PIPELINE_TICK_SECS="${PIPELINE_TICK_SECS:-5}"
+
+# 故障模式的 coverage 容忍值：門檻要反映**儀器自己的時間解析度**，不是我們希望的值。
+# 一個監督週期的成本是「coverage 檢查 + sampler 檢查 + 一次 ceph -s」，全都是 ssh
+# 往返；叢集受壓時 `ceph -s` 明顯變慢，實測一輪要 13-19s。於是 30s 的 cadence 只能
+# 落在 38-40s（真機量到 38.2/40.0），每次檢查都帶 8-10s 的「盲」餘量——10s 的容忍值
+# 在故障模式下**從來就達不到**，穩態則幾乎不會踩到（79 個 attempt 只出現過 1 次 13s）。
+#
+# 這與「為了讓測試過而放寬門檻」不同：這裡是把門檻對齊到儀器能達到的解析度，
+# 並且**只放寬故障模式**、只放寬 supervisor 這一項的量級，sampler / fio 心跳的判定
+# 完全不動。實測分布（故障）：中位數 1s、p90 17s、最大 19s → 取 25s。
+COVERAGE_GAP_TOLERANCE_FAULT_SECS="${COVERAGE_GAP_TOLERANCE_FAULT_SECS:-25}"
 WATCHDOG_DAEMON_SECS="${WATCHDOG_DAEMON_SECS:-300}"
 WATCHDOG_SSH_SECS="${WATCHDOG_SSH_SECS:-30}"
 WATCHDOG_SSH_WAIT_SECS="${WATCHDOG_SSH_WAIT_SECS:-900}"
@@ -893,6 +904,26 @@ _pipeline_measure_tick() {
   esac
 }
 
+# _pipeline_fio_crashed <bundle>：exit proof 裡有沒有「非 0 且非 TIMEOUT」的 client。
+# TIMEOUT 代表被故障卡住（有效觀測）；非 0 exit code 才是工具自己崩了。
+_pipeline_fio_crashed() {
+  local proof="$1/fio-exit-proof.json"
+  [ -s "$proof" ] || return 1
+  python3 - "$proof" <<'PY'
+import json
+import sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+for info in (doc.get("clients") or {}).values():
+    rc = info.get("exit_code")
+    if rc is not None and int(rc) != 0:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 _pipeline_taint_attempt() { # <reason>
   [ "$_PIPE_TAINTED" = "1" ] && return 0
   _PIPE_TAINTED=1
@@ -1037,6 +1068,11 @@ _pipeline_attempt() {
   t0="$(date +%s)"
   _PIPE_T0="$t0"
   _PIPE_WIN_START="$t0"
+  # 從窗一開始就讓 supervisor 打卡——注入期間（flapping 要 9 分鐘）量測迴圈還沒
+  # 開始跑，少了這個覆寫，那整段都會被記成「supervisor 中斷」而作廢。
+  # shellcheck disable=SC2329
+  # 間接呼叫：with_deadline 在每輪輪詢會叫 progress_tick（common.sh 的預設 no-op 覆寫點）。
+  progress_tick() { _pipeline_coverage_tick "$(date +%s)"; _pipeline_sampler_tick; }
 
   case "$_PIPE_KIND" in
     fault)
@@ -1100,7 +1136,16 @@ _pipeline_attempt() {
   esac
 
   # --- 停 fio（收 exit proof）---
+  # fio 收尾異常分兩種，後果完全不同：
+  #   * 非 0 exit code = fio 自己崩了 → 那段沒有資料是**工具壞掉**，attempt 作廢。
+  #   * TIMEOUT 但心跳仍活 = fio 被故障卡在 D-state（H-033）→ 那正是要量的現象，
+  #     是有效觀測，不作廢（devstat 逐秒仍在記，coverage 有證據）。
+  # 這個區分在 coverage 改用 gaps 判定之後尤其重要：少了它，崩掉的 fio 會被 devstat
+  # 的覆蓋蓋過去，變成「一段很長的 stall」被當成真實現象記進報告。
   fio_stop "$b" >&2 || log "fio 非正常結束（exit proof 見 bundle）"
+  if _pipeline_fio_crashed "$b"; then
+    _pipeline_taint_attempt "fio 以非 0 exit code 結束（crash，非故障造成的卡住）"
+  fi
   : > "${b}/.fio-stopped"
 
   # --- 回歸 + safety gate（H-008：記回歸開始與 final_clean 兩時戳）---
@@ -1128,6 +1173,8 @@ _pipeline_attempt() {
   : > "${b}/.sampler-stopped"
   collect_cell "$b" "$_PIPE_KIND" "$_PIPE_WIN_START" "$_PIPE_WIN_END" >&2 \
     || { _PIPE_REASON="collect-cell"; return 1; }
+  [ "$_PIPE_KIND" = "steady" ] \
+    || COVERAGE_GAP_TOLERANCE_SECS="$COVERAGE_GAP_TOLERANCE_FAULT_SECS"
   coverage_finalize "$b" "$_PIPE_WIN_START" "$_PIPE_WIN_END" >&2 \
     || _pipeline_taint_attempt "coverage-proof 標記 tainted"
   if [ "$_PIPE_KIND" != "steady" ]; then

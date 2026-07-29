@@ -327,4 +327,24 @@ print(bad)
 ')"
 eq "$_bad" "0" "harness 內不得有『ssh 在 read 迴圈內且未保護 stdin』的呼叫"
 
+# --- progress_tick：輪詢等待期間必須讓 supervisor 繼續打卡 --------------------
+# coverage 窗從 fault_t0 起算，但注入本身可能很久（flapping 要 10 輪 stop/start
+# ≈ 9 分鐘），量測迴圈要等注入回來才開始 tick——真機實測第一次打卡落在窗開始後
+# 560s，直接被判「supervisor 中斷 560s」而作廢。
+_tick_n=0
+# shellcheck disable=SC2329
+# 間接呼叫：with_deadline 每輪輪詢會叫 progress_tick（common.sh 的 no-op 覆寫點）。
+progress_tick() { _tick_n=$((_tick_n + 1)); }
+_never() { return 1; }
+POLL_INTERVAL=0.01 with_deadline 1 _never >/dev/null 2>&1
+[ "$_tick_n" -ge 2 ] \
+  || fail "with_deadline 每輪輪詢都要呼叫 progress_tick（實際 ${_tick_n} 次）"
+ok
+# 預設必須是 no-op（不得強迫所有呼叫端都有 supervisor）
+unset -f progress_tick
+progress_tick() { :; }
+_tick_n=0
+POLL_INTERVAL=0.01 with_deadline 1 _never >/dev/null 2>&1
+eq "$_tick_n" "0" "預設 progress_tick 是 no-op"
+
 printf 'test-common.sh: %d assertions passed\n' "$asserts"
