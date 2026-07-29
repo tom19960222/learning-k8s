@@ -542,6 +542,25 @@ out="$(ceph_wait_recovery_complete "$((now - 1))")" || rc=$?
 eq "$rc" "124" "撞 measurement cap 回 124"
 case "$out" in "recovery-complete: censored"*) ok ;; *) fail "censored 機器行不符：${out}" ;; esac
 
+# 27b) 不得為了睡滿一輪而超過 deadline，也不得超時後又多打一次 ceph -s
+# 呼叫端把等待切成 5s 的 slice，好讓 coverage supervisor 跑得到。每個 slice 若多睡
+# 一整輪 POLL_INTERVAL、再多一次 ssh 往返才發現超時，coverage 檢查就會遲到十幾秒
+# ——真機實測 supervisor 缺口 p90=17s 而容忍值 10s，好好的 attempt 被判 tainted。
+reset_ssh
+expect_ssh 'ceph -s' 0 0 "$fx/ceph-s-recovering.json"
+now="$(date +%s)"
+t_before="$(date +%s)"
+rc=0
+( POLL_INTERVAL=30 ceph_wait_recovery_complete "$((now + 2))" ) >/dev/null 2>&1 || rc=$?
+t_after="$(date +%s)"
+eq "$rc" "124" "撞 deadline 回 124"
+[ "$((t_after - t_before))" -le 6 ] \
+  || fail "睡眠必須夾到 deadline（POLL_INTERVAL=30、deadline 2s，實耗 $((t_after - t_before))s）"
+ok
+# 超時之後不得再打一次 ceph -s（只該有第一次那一發）
+eq "$(grep -c -- 'ceph -s' "$FAKE_SSH_LOG")" "1" \
+  "撞 deadline 後不得再多打一次 ceph -s（那是遲到的主因）"
+
 # ======================================================== ceph_wait_final_clean ==
 # 28) OSD 全 up+in + PG clean + 只剩自設 flags → PASS
 reset_ssh

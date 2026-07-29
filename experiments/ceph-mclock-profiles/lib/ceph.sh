@@ -1482,7 +1482,7 @@ _ceph_status_json() { ceph_adm "ceph -s --format json"; }
 #   撞 deadline 回 124 並印 censored——right-censored 是有效觀測，不是失敗。
 ceph_wait_recovery_complete() {
   [ $# -eq 1 ] || die "用法：ceph_wait_recovery_complete <deadline-epoch>"
-  local deadline="$1" out ok now
+  local deadline="$1" out ok now _rc_rem
   case "$deadline" in ''|*[!0-9]*) die "deadline 必須是絕對 epoch 秒（got=${deadline}）" ;; esac
   while :; do
     out="$(_ceph_status_json | _ceph_py pgs-clean 2>/dev/null)" || out=""
@@ -1496,7 +1496,20 @@ ceph_wait_recovery_complete() {
       printf 'recovery-complete: censored %s\n' "$deadline"
       return 124
     fi
-    sleep "$POLL_INTERVAL"
+    # 睡到 deadline 就好，別睡滿一整輪再多打一次 `ceph -s` 才發現超時。
+    # 呼叫端把等待切成 PIPELINE_TICK_SECS（5s）的 slice，好讓 coverage supervisor
+    # 跑得到；每個 slice 若多睡 5s 又多一次 ssh 往返（故障期間 ceph -s 會變慢），
+    # 檢查就會遲到十幾秒——真機實測 supervisor 缺口 p90=17s，而容忍值是 10s，
+    # 於是好好的 attempt 被判 coverage tainted。這是量測儀器自己的抖動，不是叢集行為。
+    # POLL_INTERVAL 在測試環境是小數（0.05），所以取 min 要用 awk 不能用 `[ -gt ]`。
+    _rc_rem="$(awk -v a="$POLL_INTERVAL" -v b="$((deadline - now))" \
+      'BEGIN { print (a < b) ? a : b }')"
+    sleep "$_rc_rem"
+    now="$(date +%s)"
+    if [ "$now" -ge "$deadline" ]; then
+      printf 'recovery-complete: censored %s\n' "$deadline"
+      return 124
+    fi
   done
 }
 

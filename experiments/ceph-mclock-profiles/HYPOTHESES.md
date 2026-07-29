@@ -870,3 +870,40 @@ H-029（flapping 讓 PG 的物件永久卡在 recovering）**不是一次性巧�
 `pg-repeer`（H-030），且 allowlist 只挑 `recovering` 一類、**不碰 `recovery_wait`**——
 本案正好只需 repeer 那 1 個真正卡住的 PG，其餘 46 個會自己跟上。這條修正的正確性
 在這裡得到獨立驗證。
+
+### H-034：coverage supervisor 在故障期間系統性遲到，10s 容忍值本來就達不到
+
+**狀態**：confirmed（真機故障佇列，2026-07-29）
+
+故障佇列的前兩個 flapping cell 連續被判 `coverage-proof 標記 tainted`。追下去發現
+taint 的**不是** client 卡住（那是 H-033，只寫 log 不 taint），而是
+**單一一個 14 秒的 supervisor 缺口**超過 `COVERAGE_GAP_TOLERANCE_SECS=10`。
+
+**先量再修**（不是直接放寬門檻）：
+
+| | supervisor 缺口 |
+|---|---|
+| 穩態（79 個 attempt） | 只出現過 1 次、13s |
+| 故障 | n=19，中位數 1s、**p90 17s**、最大 19s，**15.8% 超過 10s** |
+
+再看檢查間隔本身：故障 attempt 的**實際平均檢查間隔是 40.0s**（範圍 32.7–43.6），
+而 cadence 設定是 30s——**系統性慢了三分之一**。也就是說 10s 的容忍值在故障模式下
+本來就達不到，這是量測儀器自己的抖動，不是被測系統的行為。
+
+**成因（結構性）**：量測迴圈每個 tick 依序做 coverage 檢查 → sampler 檢查 →
+`ceph_wait_recovery_complete <slice>`，而該函式
+（a）**先查詢、後檢查期限**，
+（b）超時前還會**睡滿一整輪 `POLL_INTERVAL`**，醒來再多打一次 `ceph -s` 才發現超時。
+呼叫端把等待切成 5s 的 slice 正是為了讓 coverage 跑得到，結果每個 slice 多花
+「一次 ssh 往返 + 一輪睡眠」——故障期間 `ceph -s` 變慢，檢查就遲到十幾秒。
+
+**修法（修因不調門檻）**：睡眠夾到 deadline（`min(POLL_INTERVAL, 剩餘)`，因為測試
+環境的 `POLL_INTERVAL` 是小數 0.05，取 min 要用 `awk` 不能用 `[ -gt ]`），
+且超時後**不再多打一次查詢**。這移除了每個 tick 多出的一整次 ceph 查詢。
+
+**若殘餘仍超過容忍值**：那就代表 30s cadence 在故障模式下確實達不到，
+屆時應**依實測抖動**重新指定故障模式的容忍值並在報告中說明，
+而不是假裝 10s 是可達的。門檻要反映儀器的真實能力，這與「為了讓測試過而放寬」不同。
+
+**方法論**：這條的價值在診斷順序——最顯眼的症狀（`fio-stop: FAIL`）不是肇因。
+先確認「誰真的讓 cell 失效」（taint reason），再量那個量的分布，最後才動手。
