@@ -831,3 +831,42 @@ heal 動作 = attempt 作廢（taint）。
 而本機上父 shell 幾乎總是先死，marker 自然不出現——測試永遠會過。
 改成**只殺 sleep**、讓父 shell 活著跑完，才真的驗到那條不變條件。
 mutation 一跑就現形：修正前後差別在此。
+
+### H-033：H-029 可重現，且嚴重到會拖垮 client 工作負載本身
+
+**狀態**：confirmed（真機故障佇列第一個 flapping cell，2026-07-29）
+
+H-029（flapping 讓 PG 的物件永久卡在 recovering）**不是一次性巧合**。完整故障佇列
+跑的第一個 flapping cell（`flapping-4k-low+balanced/r1`）重現了完全相同的結構，
+而且後果更嚴重。證據存於 `results/evidence/H033-*`：
+
+- PG 2.6d `active+recovering+undersized+degraded+remapped`，
+  **`up=[7,4,0]` 但 `acting=[7,4]`**——被 flap 的 osd.0 進得了 up、進不了 acting
+- primary（osd.7）的 `recovering` 清單卡著 3 個物件，`backfill_targets` 空、
+  `might_have_unfound` 兩個 peer 都 `already probed`（不是 unfound）
+- osd.7 有 **23 個 client op 阻塞 2796 秒**，`flag_point: waiting for rw locks`，
+  目標物件正是 `recovering` 清單裡的第一個
+- 另有 46 個 PG 排在 `recovery_wait`——**全部被那一個卡住的 PG 擋住**
+
+**比 H-029 更嚴重的兩點**：
+
+1. **client 工作負載本身被拖垮**：`mclock-client-3` 的 fio 在第 3 段之後就再也沒完成
+   任何一段（其餘三台完成 9 段），卡了 28 分鐘，STOP 因此收不到、exit-code 寫不出來
+   → `fio-stop: FAIL 1`。fio 不是「變慢」，是**整個 hang 在半路**（krbd 的 IO 落在
+   那顆卡住的物件上，D-state 無限期等待）。
+2. **recovery 從頭到尾沒完成過**：整個量測窗都是 `recovery-complete: censored`，
+   最後撞上 measurement cap。也就是說在這個 cell 裡，**flapping 造成的不是「恢復變慢」，
+   而是「恢復永遠不會結束」**——除非人工 `ceph pg repeer`。
+
+**對報告的意涵**：這已經不是 mClock profile 的比較問題，而是**flapping 這個故障型
+本身的一個 Ceph 行為**：反覆 stop/start 同一顆 OSD 有機率讓某個 PG 進入
+「up 有它、acting 沒有它、recovering 清單卡死」的狀態，此後
+（a）打到那些物件的 client IO 無限期 hang，
+（b）該 PG 後面的 recovery 佇列全部停擺，
+（c）叢集層面只顯示極小的 degraded 百分比 + 一行 SLOW_OPS，而 SLOW_OPS 點名的是
+     PG primary（受害者），不是被 flap 的那顆。
+
+**與 campaign 的關係**：harness 的 watchdog 已在 `pg-no-progress` 的第一段加了
+`pg-repeer`（H-030），且 allowlist 只挑 `recovering` 一類、**不碰 `recovery_wait`**——
+本案正好只需 repeer 那 1 個真正卡住的 PG，其餘 46 個會自己跟上。這條修正的正確性
+在這裡得到獨立驗證。
