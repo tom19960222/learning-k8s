@@ -1161,8 +1161,13 @@ _fio_fetch() { # <bundle> <mode> <client> <workdir>
   dest="$(_fio_data_root "$bundle" "$mode")/$c"
   mkdir -p "$dest"
   tarf="$(_fio_scratch)/fetch.${c}.tar"
-  _fio_run_script "$c" 900 fetch "cd ${wd} && tar cf - ." > "$tarf" \
-    || die "fio 輸出回收失敗：${c}"
+  # tar 的 rc 1 = 「檔案在讀取中被改動」，archive 仍然完整；rc >= 2 才是真錯誤。
+  # 被 H-033 卡住的 fio 停不下來、會持續寫 log，於是 tar 幾乎必然回 1——把它當致命
+  # 錯誤等於「因為量到了要量的現象，所以把該次量測丟掉」。真機實測一個 cell 就這樣
+  # 在收尾階段 FATAL。rc 1 要記進 log（不可靜靜接受），但不作廢。
+  _fio_run_script "$c" 900 fetch \
+    "cd ${wd} && { tar cf - . ; _t=\$?; [ \"\$_t\" -le 1 ] || exit \"\$_t\"; }" \
+    > "$tarf" || die "fio 輸出回收失敗：${c}"
   [ -s "$tarf" ] || die "fio 輸出回收到空的 tar：${c}"
   tar -C "$dest" -xf "$tarf" || die "fio 輸出解開失敗：${c}"
 }

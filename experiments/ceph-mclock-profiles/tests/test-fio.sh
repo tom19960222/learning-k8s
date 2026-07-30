@@ -552,6 +552,10 @@ first_wait="$(grep -n -- 'mclock-stop-' "$FAKE_SSH_LOG" | head -1 | cut -d: -f1)
 ok
 # 指令是 base64 過線的：比對明文永遠不匹配 = 空過的測試，必須先解碼再比。
 decode_all > "$tmp/stoppayload.txt"
+# tar 的 rc 1 =「檔案在讀取中被改動」，archive 仍完整；rc >= 2 才是真錯誤。
+# 被 H-033 卡住的 fio 停不下來、會持續寫 log，tar 幾乎必然回 1——當成致命錯誤等於
+# 「因為量到了要量的現象，所以把該次量測丟掉」。真機一個 cell 就這樣在收尾 FATAL。
+has "$tmp/stoppayload.txt" '-le 1' "fetch 必須容忍 tar 的 rc 1（檔案讀取中被改動）"
 has "$tmp/stoppayload.txt" "/STOP" "廣播的內容確實是 touch STOP（已解碼比對）"
 # STOP 只在 segment 邊界生效，等待若短於一整段，能否乾淨收工純看運氣。
 [ "$FIO_STOP_WAIT_SECS" -gt $((FIO_STEADY_SECS + FIO_RAMP_SECS)) ] \
