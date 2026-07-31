@@ -778,6 +778,29 @@ for _i in 2 3; do
 done
 eq "$(pipeline_drift_streak)" "3" "連續 3 次 drift"
 if watchdog_halted; then ok; else fail "連續 3 次 drift 必須停佇列要求 recalibrate 裁決"; fi
+
+# 14b) covariate-only（參考池不可比 → 這格根本沒開 p99 偵測）不得清掉 drift streak：
+# 「量不了」≠「沒漂移」。佇列成塊執行，跨 group 邊界必然出現數格 covariate-only，
+# 若在那裡歸零，先前累積的漂移證據會被反覆抹掉。
+reset_state
+FAKE_BASELINE_LINE="baseline-drift baseline-p99 22.0"
+for _i in 1 2; do
+  rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
+  pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+done
+eq "$(pipeline_drift_streak)" "2" "前置：drift streak 已累積 2"
+FAKE_BASELINE_LINE="baseline-check: OK covariate-only class=backfill n=2"
+rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
+pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+eq "$(pipeline_drift_streak)" "2" "covariate-only 要維持 streak（不 bump 也不 clear）"
+watchdog_halted && fail "covariate-only 不得自己觸發停佇列"
+ok
+# 真的量到而且乾淨，才可以清掉
+FAKE_BASELINE_LINE="baseline-check: OK"
+rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
+pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+eq "$(pipeline_drift_streak)" "0" "量到且在容忍內才歸零 drift streak"
+
 FAKE_BASELINE_LINE="baseline-check: OK"
 
 # ==================================== 15. --emit-amend 建議必須轉譯成 manifest amend ==

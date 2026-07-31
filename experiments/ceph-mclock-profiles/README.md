@@ -323,7 +323,32 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
 ### 4.6 baseline drift 連續 3 次（佇列停，`recalibrate` 裁決）
 
-**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對校準時**同壓力參考值**偏移 > ±15%。單次只印 `baseline-drift <metric> <pct>` 並記 covariate；**連續 3 個 replicate** 超標才停佇列（`PIPELINE_DRIFT_LIMIT`）。
+**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對**同條件參考中位數**偏移 > ±15%。單次只印 `baseline-drift <metric> <pct>` 並記 covariate；**連續 3 個 replicate** 超標才停佇列（`PIPELINE_DRIFT_LIMIT`）。
+
+**「同條件」= 同 (形態, 壓力, backfill 類別)**：這個 baseline 是「注入 → 回復 → final_clean 之後」的復測，量到的是**善後成本**。真機實測（DONE 且未 tainted 的 attempt，單位 ms）：
+
+| shape/pressure | none | flapping | osd-down | node-isolation |
+|---|---|---|---|---|
+| 4k/low | 2.834 (n=9) | 3.015 (n=4) | **4.284 (n=6)** | — |
+| 4k/mid | 3.523 (n=9) | 3.654 (n=6) | **5.210 (n=3)** | **4.817 (n=1)** |
+
+**分界不是故障型，是「有沒有觸發 backfill」**：flapping 與穩態只差 3.7%（4k/mid）與 6.4%（4k/low），因為 flapping 全程 `noout`、OSD 從未被標 out；真正把復測拉高的是被 `ceph osd out` 之後的 backfill。所以參考池按二元類別配對，判準**從 manifest 已宣告的 `fault_params` 推導**（不硬編故障型清單）：
+
+| `fault_params` | 故障型 | 類別 |
+|---|---|---|
+| `manual_out: true` | osd-down / node-isolation / rack-isolation / **seq-contention**（它的機制就是 osd-down） | backfill |
+| `no_out: true` / `{}` | flapping / none | 非 backfill |
+| （皆無） | chaos | **保守歸 backfill**（見下） |
+
+> chaos 的注入路徑（`lib/inject.sh` 的 `chaos_run`）只 `ceph_daemon_stop` + `_inject_osd_start_only` / `_inject_node_rollback`，**沒有任何 manual out**（`ceph_osd_out` 只在 `fault_osd_down` / `fault_node_isolate` 兩個包裝函式裡，chaos 走的是 `_inject_node_isolate_core`，繞過它）；單一事件 hold ≤ `CHAOS_HOLD_MAX=180s` < `mon_osd_down_out_interval=600s`（實測 config-show）。**但** chaos 與 flapping 不同，全程沒有設 `noout`，也沒有「被 out 就作廢」的斷言，只要有一次 `osd-start` 失敗（`chaos_run` 對失敗只記 log 續跑），OSD 留在 down 超過 600s 就會被 auto-out 而觸發 backfill。判不定 → 保守歸 backfill。
+
+參考值取 campaign 內先前**同條件、已 finalize（有 `DONE`）且未 tainted** 的 replicate 中位數（`reference_source = campaign-median-backfill(n=N)` 或 `campaign-median-nobackfill(n=N)`）。tainted 的 attempt 是 harness 自己判定「不得作為有效 replicate」的量測，不得當基準（實測 117 個 attempt 裡有 18 個是這種）。
+
+**量不到就明講**：同條件樣本 < 3（含 `prediction.json` 損毀或判不出類別）時退回校準值（`reference_source = calibration`），stdout 印 `baseline-check: OK covariate-only class=<類別> n=<樣本數>`，**值仍記進 `baseline-check.json`（`p99_shift` / `baseline_p99_ns` / `measured: false`）當 covariate，但不判漂移**。連續計數**維持不變**（不是歸零）——「量不了」≠「沒漂移」，佇列成塊執行，跨 group 邊界必然出現數格 covariate-only，在那裡歸零會把先前累積的證據反覆抹掉。`baseline-drift-state.json` 逐軸記（`axes.achieve-ratio` / `axes.baseline-p99`），因為兩條軸「量得到與否」不同步；`consecutive` = 兩軸最大值，門檻仍是連續 3 次，且**只有本次真的量到且超標**才會升級成 `HUMAN-NEEDED`（殘留計數不會讓一格「量不了」的 cell 停佇列）。
+
+**已知盲區（實測，剩餘 55 格排程）**：按此二元分組還有 **6/55 格（11%）** 拿不到 ≥3 個同條件樣本而只能 covariate-only——`seq-contention-seq-mid` 3 格、`seq-contention-seq-extreme` 2 格（seq 形態下完全沒有其他 backfill 類別的先前樣本）、`osd-down-4k-extreme` 1 格；最長連續盲窗 3 格。（若改按故障型分組則是 20/55 格、36%，含 `chaos-4k-extreme` 3/3 全盲。）另外每個新的 (形態, 壓力, 類別) 組合的**前 3 個** replicate 必然盲（`BASELINE_REF_MIN_SAMPLES=3` 且排除自己）。
+
+**結構性限制**：參考池由 campaign 自身產生，所以對**漸進式**劣化靈敏（中位數落後於當前值），對**階梯式**劣化靈敏度低——階梯發生後三個 replicate 就會把新水位寫進參考池，之後的偏移量會回落到容忍帶內。要抓階梯式劣化得靠 `covariate` 欄位事後回看（`reference_p99_ns` 的時間序列），不能只依賴這個 gate。
 
 **要判什麼**：72h 內 Azure 鄰居效應、NVMe 溫度 / GC、BlueStore compaction 都可能讓基準漂走。決策樹：
 
@@ -333,7 +358,7 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 - 漂移**來回抖動**（同一 cell 有時超標有時不超）→ 噪音升高而非漂移。接受並續跑，但把該時段標進 covariate，report 的 noise margin 要用含這段的資料重算。
 - 漂移只出現在**單一 client**（看 `fio/` 各 client 的 per-client log）→ 那台 client VM 的問題，不是叢集漂移。重做該 client 的 unmap/map + smoke。
 
-裁決後要恢復佇列，見 §4.7 的解除步驟——重新校準後用 `bash run/unhalt.sh "<理由>" --clear-counts`（drift streak 要一併歸零，否則下一次 drift 立刻又停）。
+裁決後要恢復佇列，見 §4.7 的解除步驟。**注意 drift 的連續計數有兩個檔、`unhalt.sh` 只清得掉其中一個**，兩個都要處理（§4.7 步驟 4）。
 
 ### 4.7 `watchdog: HUMAN-NEEDED <trigger> <ctx>`（佇列停，exit 3）
 
@@ -364,6 +389,26 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
    ※ `--clear-counts` 會同時歸零 `counts`（各 trigger 的失敗累積）與 `drift_streak`。不帶旗標時兩者都保留——沒排除的累積不該憑空歸零。
    ※ 佇列本來就沒停時回 `unhalt: NOOP`（不寫留痕）。
+
+   ⚠️ **drift 的連續計數有兩個檔，`unhalt.sh --clear-counts` 只清得掉一個**：
+
+   | 檔 | 誰維護 | `--clear-counts` 清得掉？ |
+   |---|---|---|
+   | `results/watchdog-state.json` 的 `drift_streak` | `lib/pipeline.sh` 的 `_pipeline_baseline_gate` | ✅ |
+   | `results/baseline-drift-state.json` 的 `consecutive` / `axes` | `verdict.py baseline-check` 自己 | ❌ **完全不碰** |
+
+   後者是 `baseline-check` 判 `HUMAN-NEEDED recalibrate` 的依據。因為連續計數現在會跨 covariate-only 的 execution **維持**（見 §4.6），假警報造成的殘留不會自己消失——確認是誤報、或重新校準完之後，要**手動歸零**（目前沒有 CLI 入口，這是唯一需要手改的狀態檔）：
+
+   ```bash
+   # 先看現況（recent 會列出造成累積的那幾個 bundle，先確認它們確實是誤報）
+   python3 -m json.tool results/baseline-drift-state.json
+
+   # 確認後歸零（沿用 verdict.py 寫入的 schema）
+   printf '{"axes":{"achieve-ratio":0,"baseline-p99":0},"consecutive":0,"recent":[]}\n' \
+     > results/baseline-drift-state.json
+   ```
+
+   不歸零的後果：計數停在門檻邊緣，下一個「真的量到且超標」的 replicate 會立刻把它推過 3 而再次停佇列——那不是連續 3 次漂移，是拿舊帳停人。（反過來說，沒有訊號的 execution 已經不會因為殘留計數而停佇列，所以這件事不緊急，但報告前一定要清乾淨，否則 `consecutive_drift` 這個 covariate 欄位會是假的。）
 
    把「做了什麼、為什麼」寫進 journal 留痕：
 
@@ -658,6 +703,7 @@ experiments/ceph-mclock-profiles/
 | `faults: AZ-LOGIN-STALE` | 2b 救援憑證失效 | bastion 重新 `az login` |
 | `budget-warning: cost_usd=...` | 逼近天花板 | 通知使用者，評估 descope（§7.3） |
 | `baseline-drift <metric> <pct>` | 單次漂移 | 記 covariate，續跑；連 3 次才停 |
+| `baseline-check: OK covariate-only class=<c> n=<k>` | 這格**沒有**可比參考，p99 漂移偵測沒開 | 正常續跑；盲區規模見 §4.6 |
 | `watchdog: HUMAN-NEEDED <t> <ctx>` | 佇列停（exit 3） | §4.7，**別 deallocate** |
 | `taint-budget: NEEDS-HUMAN <k> <n>` | 該 replicate 被跳過 | §4.8，續跑其餘 cells |
 | `queue: STUCK <kind> <key>` | 同一 key 連續回鍋 5 次無進展 | 查該 cell 的 attempts，通常伴隨 taint |

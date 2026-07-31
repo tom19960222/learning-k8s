@@ -1019,6 +1019,12 @@ _pipeline_baseline_gate() {
         _pipeline_halt_queue "baseline drift 連續 ${streak} 次——需要 recalibrate 裁決"
       fi
       ;;
+    *covariate-only*)
+      # 參考池不可比／樣本不足 → 這格根本沒開 p99 漂移偵測。「量不了」≠「沒漂移」，
+      # 所以 streak 維持不變（不 bump 也不 clear）。佇列成塊執行，跨 group 邊界必然
+      # 出現數格 covariate-only，若在那裡歸零，先前累積的漂移證據會被反覆抹掉。
+      log "baseline-check covariate-only：這格沒有可比參考，drift streak 維持不變"
+      ;;
     *)
       _pipeline_py state "$(watchdog_state_path)" drift-clear >/dev/null || true
       ;;

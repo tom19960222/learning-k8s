@@ -1684,20 +1684,168 @@ def _reference_p99(cal, shape, pressure):
 BASELINE_REF_MIN_SAMPLES = 3
 
 
-def _prior_baselines(results_dir, shape, pressure, exclude=None):
-    """同 (shape, pressure) 先前所有 replicate 的 baseline p99（升冪）。"""
+BACKFILL_CLASS = "backfill"
+NOBACKFILL_CLASS = "nobackfill"
+# 有量到（= 同條件參考成立）的 ref_source 前綴。判漂移與否只認這個前綴，
+# 退回路徑（"calibration"）刻意不以它開頭。
+REF_MEASURED_PREFIX = "campaign-median"
+
+
+def _read_json_soft(path):
+    """讀 JSON，任何失敗（不存在／截斷／權限）都回 None，**不 die**。
+
+    參考池會掃過全 campaign 上百個 prior bundle，只要其中一個檔壞掉就讓
+    baseline-check 以 rc=1 死掉的話，`_pipeline_baseline_gate`（pipeline.sh）
+    只認 rc=4 與 stdout 的 `baseline-drift`，rc=1 會被靜默吞掉、還會順手
+    drift-clear——drift gate 就此永久靜默失效（「偵測失效偽裝成通過」）。
+    而 `prediction.json` 正是全 bundle 唯一非 atomic 的寫入（freeze_prediction
+    直接 open().write()），最可能留下截斷檔。所以這條路徑一律「讀不到就當分類
+    不明」，讓那個 prior 不進池，而不是把整個 gate 拖死。
+    """
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except (ValueError, IOError, OSError):
+        return None
+
+
+def _backfill_class(fault, params):
+    """故障型 → 復測是否經歷 backfill 的二元類別；判不出來回 None。
+
+    判準**從 manifest 已宣告的 `fault_params` 推導**，不硬編故障型名稱清單
+    （新增故障型時不必回來改這裡；漏改的話會落到 None = 不配對，是安全側）：
+
+    - `manual_out: true` → 注入流程會 `ceph osd out`（osd-down / node-isolation /
+      rack-isolation / seq-contention）→ **backfill**。注意 seq-contention 的
+      fault_params 是 `{"fault":"osd-down","manual_out":true,...}`，機制就是
+      osd-down，必須歸 backfill。
+    - `no_out: true`（flapping）與 `none` → 不 out → **非 backfill**。
+    - `chaos`：原始碼（lib/inject.sh `chaos_run`）只 `ceph_daemon_stop` 與
+      `_inject_osd_start_only`／`_inject_node_rollback`（兩者註解都寫明「不 osd in」，
+      因為從沒 out 過），**沒有任何 manual out**；`ceph_osd_out` 只在
+      `fault_node_isolate` / `fault_osd_down` 這兩個包裝函式裡，chaos 走的是
+      `_inject_node_isolate_core`，繞過它。單一事件 hold 上限
+      `CHAOS_HOLD_MAX=180s` < `mon_osd_down_out_interval=600s`（實測 config-show），
+      所以照計畫跑不會 auto-out。**但** chaos 與 flapping 不同，全程**沒有設 noout**，
+      也沒有 flapping 那種「被 out 就作廢」的斷言；只要有一次 osd-start 失敗
+      （chaos_run 對失敗只記 log 續跑），OSD 留在 down 超過 600s 就會被 mon
+      auto-out 而觸發 backfill。判不定 → **保守歸 backfill**（寧可跟成本較高的
+      那組比，也不要把 backfill 的復測拿去跟穩態比而假報漂移）。
+
+    真機實測支持這個分界（DONE 且未 tainted 的 attempt）：4k/mid 的 none
+    3.523ms(n=9) 與 flapping 3.654ms(n=6) 只差 3.7%，而 osd-down 是 5.210ms(n=3)、
+    node-isolation 4.817ms(n=1)；4k/low 的 none 2.834ms(n=9) 與 flapping
+    3.015ms(n=4) 差 6.4%，osd-down 是 4.284ms(n=6)。**分界不是故障型，是 backfill。**
+    """
+    if not isinstance(fault, str) or not fault.strip():
+        return None
+    fault = fault.strip()
+    if not isinstance(params, dict):
+        params = {}
+    if params.get("manual_out"):
+        return BACKFILL_CLASS
+    if fault == "chaos":
+        return BACKFILL_CLASS
+    if params.get("no_out") or fault == "none":
+        return NOBACKFILL_CLASS
+    return None
+
+
+def _bundle_fault_class(bundle_dir):
+    """一個 attempt bundle 的 (故障型, backfill 類別)；判不出來的欄位回 None。
+
+    來源是 `prediction.json` 的 `fault` / `fault_params`——manifest 產生 execution
+    時就寫死的明確欄位，且 prediction.json 是三種 kind 共同的必備檔（見 SCHEMAS）。
+    **刻意不從 cell_id 反推**：故障型名稱本身含連字號（osd-down、rack-isolation、
+    seq-contention、node-isolation），用前綴切字串很脆弱，多一個故障型就會錯。
+    """
+    pred = _read_json_soft(os.path.join(bundle_dir, "prediction.json"))
+    if not isinstance(pred, dict):
+        return (None, None)
+    fault = pred.get("fault")
+    fault = fault.strip() if isinstance(fault, str) and fault.strip() else None
+    return (fault, _backfill_class(fault, pred.get("fault_params")))
+
+
+def _prior_baselines(results_dir, shape, pressure, klass, exclude=None):
+    """同 (shape, pressure, backfill 類別) 先前有效 replicate 的 baseline p99（升冪）。
+
+    **必須同 backfill 類別**：這裡的 baseline.json 不是注入前的 baseline，而是
+    「注入 → 回復 → final_clean 之後」的 60s 復測，量到的是善後成本，而善後成本的
+    分界是「有沒有把 OSD 標 out 而觸發 backfill」（見 `_backfill_class` 的實測數字）。
+    拿非 backfill 的池子去評判 backfill 的復測，實測產生 +42.6% 的假漂移而停佇列
+    （「參考基準不可比」缺陷的第三次；前兩次見 watchdog-state.json 的 unhalt_log）。
+
+    只收「已 finalize（有 DONE）且 coverage-proof 未 tainted」的 attempt：tainted
+    是 harness 自己判定「不得作為有效 replicate」的量測，拿它當基準等於用已知無效
+    的資料判定漂移（實測 117 個 attempt 裡有 18 個是這種）。
+
+    類別判不出來時回空清單 → 呼叫端會因樣本不足退回 covariate-only，寧可不判漂移，
+    也不要拿條件不可比的池子當基準。
+    """
     out = []
+    if not klass:
+        return out
     pat = os.path.join(results_dir, "*", "r*", "attempts", "*", "baseline.json")
     for path in sorted(glob.glob(pat)):
-        if exclude and os.path.dirname(path) == exclude.rstrip("/"):
+        att = os.path.dirname(path)
+        if exclude and att == exclude.rstrip("/"):
             continue
-        doc = read_json(path, {}) or {}
+        if not os.path.isfile(os.path.join(att, "DONE")):
+            continue
+        proof = _read_json_soft(os.path.join(att, "coverage-proof.json")) or {}
+        if proof.get("tainted"):
+            continue
+        doc = _read_json_soft(path) or {}
         if doc.get("shape") != shape or doc.get("pressure") != pressure:
+            continue
+        if _bundle_fault_class(att)[1] != klass:
             continue
         v = doc.get("p99_ns")
         if isinstance(v, (int, float)) and v > 0:
             out.append(float(v))
     return sorted(out)
+
+
+DRIFT_AXES = ("achieve-ratio", "baseline-p99")
+
+
+def _update_drift_state(state, measured_axes, signal_axes, bundle):
+    """漂移連續計數的三態更新（就地改 state）。
+
+    - 量到了、超標   → 該軸 +1
+    - 量到了、在容忍內 → 該軸歸零
+    - **量不了 → 該軸維持不變**（「量不了」≠「沒漂移」）
+
+    為什麼逐軸記：兩條軸「量得到與否」不同步——achieve-ratio 只要有 target 就量得到，
+    baseline-p99 得有同條件參考池才算量到。共用一個計數器的話，p99 盲的那些 cell 會被
+    achieve-ratio 的乾淨結果把 p99 已累積的漂移證據抹掉。而佇列是成塊執行的
+    （manifest 依 (group_index, replicate_n, latin_position) 排序），每跨一個 group
+    邊界就會有數格因同類別樣本不足而退回 covariate-only，抹掉的機會很多。
+
+    對外仍以 `consecutive`（= 各軸最大值）當停佇列判準，門檻不變（連續 3 次）。
+    """
+    axes = state.get("axes")
+    if not isinstance(axes, dict):
+        # 舊格式（只有 consecutive）：兩軸都先繼承那個值，之後各自照三態演進
+        legacy = int(state.get("consecutive", 0) or 0)
+        axes = dict((a, legacy) for a in DRIFT_AXES)
+    new_axes = {}
+    for axis in DRIFT_AXES:
+        n = int(axes.get(axis, 0) or 0)
+        if axis in signal_axes:
+            n += 1
+        elif axis in measured_axes:
+            n = 0
+        new_axes[axis] = n
+    state["axes"] = new_axes
+    state["consecutive"] = max(new_axes.values())
+    if signal_axes:
+        state["recent"] = (state.get("recent") or [])[-4:] + [bundle]
+    elif state["consecutive"] == 0:
+        state["recent"] = []
+    state["updated_at"] = utc_now()
+    return state
 
 
 def cmd_baseline_check(args):
@@ -1711,7 +1859,9 @@ def cmd_baseline_check(args):
     if cal is None:
         die("baseline-check：找不到 calibration.json（%s）" % cal_path)
 
-    pred = read_json(os.path.join(bundle, "prediction.json"), {}) or {}
+    # 這裡也走 soft 讀：自己的 prediction.json 截斷時，gate 應該退回 covariate-only
+    # 而不是以 rc=1 死掉——pipeline 會把 rc=1 靜默吞掉（見 _read_json_soft）。
+    pred = _read_json_soft(os.path.join(bundle, "prediction.json")) or {}
     shape = baseline.get("shape") or pred.get("shape")
     pressure = baseline.get("pressure") or pred.get("pressure")
     cell_id = pred.get("cell_id")
@@ -1740,13 +1890,18 @@ def cmd_baseline_check(args):
     # collector 在跑，條件與 campaign 期間不同。拿條件不同的兩者比，會把固定落差誤判
     # 成漂移（實際就觸發了 3 連續超標而停佇列，但同期吞吐是校準天花板的 109–111%，
     # 叢集根本沒有變慢）。同條件比較才問得出「叢集有沒有隨時間漂移」。
-    prior = _prior_baselines(results_dir, shape, pressure, exclude=bundle)
+    # 而且必須是**同 backfill 類別**的先前 baseline：baseline.json 是故障回復後的
+    # 復測，善後成本的分界是「有沒有觸發 backfill」（見 _backfill_class 的實測數字）。
+    fault, klass = _bundle_fault_class(bundle)
+    prior = _prior_baselines(results_dir, shape, pressure, klass, exclude=bundle)
     if len(prior) >= BASELINE_REF_MIN_SAMPLES:
         ref_p99 = statistics.median(prior)
-        ref_source = "campaign-median(n=%d)" % len(prior)
+        ref_source = "%s-%s(n=%d)" % (REF_MEASURED_PREFIX, klass, len(prior))
     else:
         ref_p99 = _reference_p99(cal, shape, pressure)
         ref_source = "calibration"
+    # measured = 「p99 這條軸這次真的量到了」——同條件參考成立才算。
+    measured = ref_source.startswith(REF_MEASURED_PREFIX)
 
     signals = []
     achieve_ratio = None
@@ -1762,20 +1917,20 @@ def cmd_baseline_check(args):
         # 的前三個 replicate 就這樣一致 +32% 而停了佇列，但供給達成率是 1.00。
         # 每個新的 (形態,壓力) 組合都會經歷這個「前三個」視窗，不排除就會反覆假停。
         # 值仍記為 covariate，只是不觸發訊號。
-        if ref_source.startswith("campaign-median"):
-            if abs(p99_shift) > BASELINE_P99_TOLERANCE:
-                signals.append(("baseline-p99", p99_shift * 100.0))
+        # 同類別樣本不足（含分類判不出來）時走的是同一條退回路徑：ref_source 是
+        # "calibration"、不以 REF_MEASURED_PREFIX 開頭，因此一樣只記值不判漂移。
+        if measured and abs(p99_shift) > BASELINE_P99_TOLERANCE:
+            signals.append(("baseline-p99", p99_shift * 100.0))
 
     state_path = os.path.join(results_dir, "baseline-drift-state.json")
     state = read_json(state_path, {"consecutive": 0, "recent": []}) or {
         "consecutive": 0, "recent": []}
-    if signals:
-        state["consecutive"] = int(state.get("consecutive", 0)) + 1
-        state["recent"] = (state.get("recent") or [])[-4:] + [bundle]
-    else:
-        state["consecutive"] = 0
-        state["recent"] = []
-    state["updated_at"] = utc_now()
+    measured_axes = set()
+    if achieve_ratio is not None:
+        measured_axes.add("achieve-ratio")
+    if measured and p99_shift is not None:
+        measured_axes.add("baseline-p99")
+    _update_drift_state(state, measured_axes, set(s[0] for s in signals), bundle)
     write_json(state_path, state)
 
     out = {
@@ -1785,6 +1940,10 @@ def cmd_baseline_check(args):
         "cell_id": cell_id,
         "shape": shape,
         "pressure": pressure,
+        "fault": fault,
+        "backfill_class": klass,
+        "measured": measured,
+        "reference_n": len(prior),
         "target_iops": target,
         "achieved_iops": achieved,
         "achieve_ratio": achieve_ratio,
@@ -1803,11 +1962,20 @@ def cmd_baseline_check(args):
 
     for metric, pct in signals:
         emit("baseline-drift %s %.2f" % (metric, pct))
-    if state["consecutive"] >= 3:
+    # HUMAN-NEEDED 只在「這次真的量到而且超標」時才發。consecutive 現在會跨
+    # covariate-only 的 execution 維持，若不加 signals 這個條件，殘留的計數會讓
+    # 下一格「量不了」的 cell 直接停佇列——那不是連續 3 次漂移，是拿舊帳停人。
+    # 門檻本身（連續 3 次）不變；這條只是還原「停佇列必由本次訊號觸發」的原契約。
+    if signals and state["consecutive"] >= 3:
         emit("baseline-check: HUMAN-NEEDED recalibrate %d" % state["consecutive"])
         return 4
     if signals:
         emit("baseline-check: DRIFT %d covariate" % len(signals))
+        return 0
+    if not measured:
+        # operator 從 stdout 就要看得出「這格其實沒開 p99 漂移偵測」
+        emit("baseline-check: OK covariate-only class=%s n=%d"
+             % (klass or "unknown", len(prior)))
         return 0
     emit("baseline-check: OK")
     return 0

@@ -162,6 +162,11 @@ _mkbase() { # <cell> <rep> <p99_ns>
   local d="$DR/$1/$2/attempts/a1"; mkdir -p "$d"
   wj "$d/baseline.json" \
     "{\"shape\":\"4k\",\"pressure\":\"high\",\"target_iops\":800,\"achieved_iops\":800,\"p99_ns\":$3}"
+  # 參考池按 backfill 類別配對、且只收 DONE 且未 tainted 的 attempt，所以 fixture
+  # 要跟真實 bundle 一樣帶 prediction.json 與 DONE
+  wj "$d/prediction.json" \
+    "{\"cell_id\":\"$1\",\"fault\":\"none\",\"fault_params\":{},\"shape\":\"4k\",\"pressure\":\"high\"}"
+  : > "$d/DONE"
   printf '%s\n' "$d"
 }
 # 先前 6 個 replicate 的 baseline 都在 ~12ms（相對校準 10ms 是 +20% 的系統性偏移）
@@ -171,8 +176,8 @@ B7="$(_mkbase c7 r1 12100000)"
 python3 "$V" baseline-check "$B7" --results "$DR" >/dev/null 2>&1 \
   || fail "baseline-check（同條件比較）應通過"
 ok
-eq "$(jget "$B7/baseline-check.json" reference_source | cut -d'(' -f1)" "campaign-median" \
-  "有足夠樣本時必須用 campaign 中位數當參考"
+eq "$(jget "$B7/baseline-check.json" reference_source | cut -d'(' -f1)" "campaign-median-nobackfill" \
+  "有足夠樣本時必須用 campaign 同條件（含同 backfill 類別）中位數當參考"
 eq "$(jget "$B7/baseline-check.json" drift_signals)" "[]" \
   "系統性偏移不得誤判成漂移"
 
@@ -185,6 +190,9 @@ wj "$DR2/calibration.json" \
 _mk2() { local d="$DR2/$1/r1/attempts/a1"; mkdir -p "$d"
   wj "$d/baseline.json" \
     "{\"shape\":\"4k\",\"pressure\":\"mid\",\"target_iops\":500,\"achieved_iops\":500,\"p99_ns\":$2}"
+  wj "$d/prediction.json" \
+    "{\"cell_id\":\"$1\",\"fault\":\"none\",\"fault_params\":{},\"shape\":\"4k\",\"pressure\":\"mid\"}"
+  : > "$d/DONE"
   printf '%s\n' "$d"; }
 B9="$(_mk2 n1 13500000)"   # 相對校準 10ms 是 +35%，但只有這一筆樣本
 python3 "$V" baseline-check "$B9" --results "$DR2" >/dev/null 2>&1 \
@@ -586,12 +594,17 @@ bcheck() { # bcheck <name> <pressure> <achieved> <p99> [prior-p99] ; 印機器�
       mkdir -p "$dir/results/prior$i/r1/attempts/a1"
       wj "$dir/results/prior$i/r1/attempts/a1/baseline.json" \
         "{\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\",\"achieved_iops\":${achieved},\"p99_ns\":${prior}}"
+      # 參考池按 backfill 類別配對 → prior 要有 prediction.json 的 fault/fault_params
+      # 與 DONE（未 finalize 的 attempt 不進池）
+      wj "$dir/results/prior$i/r1/attempts/a1/prediction.json" \
+        "{\"cell_id\":\"prior$i\",\"fault\":\"osd-down\",\"fault_params\":{\"manual_out\":true},\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\"}"
+      : > "$dir/results/prior$i/r1/attempts/a1/DONE"
     done
   fi
   wj "$dir/b/baseline.json" \
     "{\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\",\"achieved_iops\":${achieved},\"p99_ns\":${p99},\"duration_s\":60}"
   wj "$dir/b/prediction.json" \
-    "{\"cell_id\":\"bc-${name}\",\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\"}"
+    "{\"cell_id\":\"bc-${name}\",\"fault\":\"osd-down\",\"fault_params\":{\"manual_out\":true},\"shape\":\"4k-randrw\",\"pressure\":\"${pressure}\"}"
   python3 "$V" baseline-check "$dir/b" --results "$dir/results" 2>/dev/null
 }
 
@@ -643,6 +656,201 @@ wj "$BCB/b/prediction.json" '{"cell_id":"bad","shape":"4k-randrw","pressure":"mi
 out="$(python3 "$V" baseline-check "$BCB/b" --results "$BCB/results" 2>/dev/null)" \
   && fail "禁止的比較基準應非 0 退出"
 contains "$out" "baseline-check: BAD-TARGET" "擋掉「固定速率 achieved 比 ceiling」的假陽性來源"
+
+# --- drift 參考池必須「同 backfill 類別」（「參考基準不可比」缺陷第三次）--------
+# baseline.json 不是注入前的 baseline，而是「注入 → 回復 → final_clean 之後」的 60s
+# 復測，量到的是**善後成本**。真機實測（DONE 且未 tainted 的 attempt，4k）：
+#   4k/mid  none 3.523ms(n=9)、flapping 3.654ms(n=6)、osd-down 5.210ms(n=3)、
+#           node-isolation 4.817ms(n=1)
+#   4k/low  none 2.834ms(n=9)、flapping 3.015ms(n=4)、osd-down 4.284ms(n=6)
+# 分界**不是故障型**：flapping 與 none 差 3.2%/7.0%（全 attempt 子集，容忍度內），
+# 因為 flapping 全程 noout、不 out；真正拉開的是「有沒有把 OSD 標 out 而觸發
+# backfill」。所以參考池按二元 backfill 類別配對，判準從 manifest 已宣告的
+# fault_params 推導（manual_out → backfill；no_out / none → 非 backfill）。
+BCF="$tmp/bc-class"
+BCF_CAL='{"shapes":{"4k":{"ceiling_iops":40000,"rates":{"mid":20000},"reference_p99_ns":{"mid":3600000}}}}'
+FP_OSD_DOWN='{"manual_out":true,"measurement_cap":2700}'
+FP_NODE_ISO='{"nodes":1,"manual_out":true}'
+FP_SEQ_CONT='{"fault":"osd-down","manual_out":true}'
+FP_FLAPPING='{"cycles":10,"no_out":true}'
+FP_CHAOS='{"seed":4242,"duration":1800}'
+_mkb() { # _mkb <results> <cell> <fault> <fault_params> <p99_ns> [done|no-done|tainted|corrupt]
+  local r="$1" cell="$2" fault="$3" fp="$4" p99="$5" flag="${6:-done}"
+  local d="$r/$cell/r1/attempts/a1"
+  wj "$d/baseline.json" \
+    "{\"shape\":\"4k\",\"pressure\":\"mid\",\"target_iops\":20000,\"achieved_iops\":20000,\"p99_ns\":${p99}}"
+  wj "$d/prediction.json" \
+    "{\"cell_id\":\"${cell}\",\"fault\":\"${fault}\",\"fault_params\":${fp},\"shape\":\"4k\",\"pressure\":\"mid\"}"
+  case "$flag" in
+    no-done) ;;                                     # 未 finalize
+    tainted) : > "$d/DONE"; wj "$d/coverage-proof.json" '{"tainted":true}' ;;
+    corrupt) : > "$d/DONE"; printf '{"cell_id":"%s","fault":' "$cell" > "$d/prediction.json" ;;
+    *)       : > "$d/DONE" ;;
+  esac
+  printf '%s\n' "$d"
+}
+_mkb_pool() { # _mkb_pool <results>：6 個非 backfill(3.654ms) + 2 個 backfill(5.210ms)
+  local r="$1" i
+  wj "$r/calibration.json" "$BCF_CAL"
+  for i in 1 2 3 4 5 6; do
+    _mkb "$r" "flapping-4k-mid+p$i" flapping "$FP_FLAPPING" 3654000 >/dev/null
+  done
+  for i in 1 2; do
+    _mkb "$r" "osd-down-4k-mid+p$i" osd-down "$FP_OSD_DOWN" 5210000 >/dev/null
+  done
+}
+
+# (1) 同類別樣本不足（backfill 只有 2 個）→ 不得拿非 backfill 的池子當參考。
+# 且「量不了」≠「沒漂移」：consecutive 必須**維持**，不得歸零也不得累加。
+BCF1="$BCF/mixed"; mkdir -p "$BCF1"; _mkb_pool "$BCF1"
+wj "$BCF1/baseline-drift-state.json" '{"consecutive":2,"recent":["earlier"]}'
+BF1="$(_mkb "$BCF1" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
+out="$(python3 "$V" baseline-check "$BF1" --results "$BCF1" 2>/dev/null)"
+contains "$out" "baseline-check: OK covariate-only" \
+  "退回時 stdout 要能看出「這格沒開偵測」，不能和正常通過同一行"
+lacks "$out" "baseline-drift" "混類別中位數造成的假漂移必須消失"
+lacks "$out" "HUMAN-NEEDED" "殘留的 consecutive 不得讓沒有訊號的 execution 停佇列"
+eq "$(jget "$BF1/baseline-check.json" reference_source)" "calibration" \
+  "同類別樣本 <3 → 退回 covariate-only（參考值仍記錄）"
+eq "$(jget "$BF1/baseline-check.json" drift_signals)" "[]" "退回時不得產生 drift signal"
+eq "$(jget "$BF1/baseline-check.json" measured)" "False" "退回時要標明 p99 軸沒有量到"
+# 退回 = 不判漂移，但值一定要留著（之後人工回看才有得比）
+[ "$(jget "$BF1/baseline-check.json" p99_shift)" != "null" ] \
+  || fail "退回 covariate-only 時仍要記下 p99_shift"
+ok
+eq "$(jnum "$BF1/baseline-check.json" baseline_p99_ns)" "5210000" "退回時仍要記下這次的復測 p99"
+eq "$(jget "$BCF1/baseline-drift-state.json" consecutive)" "2" \
+  "量不了時 consecutive 必須維持（歸零會把跨 group 邊界前的漂移證據抹掉）"
+eq "$(jget "$BCF1/baseline-drift-state.json" recent.0)" "earlier" "維持時 recent 也不得被清掉"
+
+# (2) 同類別 >=3 → 參考值 = 同類別中位數；node-isolation 與 osd-down 同池（二元分組）
+BCF2="$BCF/paired"; mkdir -p "$BCF2"; _mkb_pool "$BCF2"
+_mkb "$BCF2" "node-isolation-4k-mid+p1" node-isolation "$FP_NODE_ISO" 5210000 >/dev/null
+wj "$BCF2/baseline-drift-state.json" '{"consecutive":2,"recent":["earlier"]}'
+BF2="$(_mkb "$BCF2" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5400000)"
+out="$(python3 "$V" baseline-check "$BF2" --results "$BCF2" 2>/dev/null)"
+contains "$out" "baseline-check: OK" "同類別比較下的正常復測不得判漂移"
+lacks "$out" "covariate-only" "有量到就不該標 covariate-only"
+eq "$(jget "$BF2/baseline-check.json" reference_source)" "campaign-median-backfill(n=3)" \
+  "ref_source 要看得出是同 backfill 類別配對（含樣本數）"
+eq "$(jnum "$BF2/baseline-check.json" reference_p99_ns)" "5210000" \
+  "參考值 = 同類別中位數（混類別會拿到 3654000）"
+eq "$(jget "$BF2/baseline-check.json" backfill_class)" "backfill" \
+  "manual_out 的故障（osd-down / node-isolation）歸 backfill 組"
+eq "$(jget "$BF2/baseline-check.json" measured)" "True" "有同類別參考 = p99 軸有量到"
+eq "$(jget "$BF2/baseline-check.json" drift_signals)" "[]" "同類別比較下的正常復測不得判漂移"
+eq "$(jget "$BCF2/baseline-drift-state.json" consecutive)" "0" \
+  "量到了且在容忍內 → consecutive 歸零"
+
+# (3) flapping 與 none 同屬非 backfill 組（真機：兩者差 3.2%/7.0%，在容忍度內）
+BCF5="$BCF/nobackfill"; mkdir -p "$BCF5"; _mkb_pool "$BCF5"
+BF6="$(_mkb "$BCF5" "none-4k-mid+cur" none '{}' 3600000)"
+out="$(python3 "$V" baseline-check "$BF6" --results "$BCF5" 2>/dev/null)"
+eq "$(jget "$BF6/baseline-check.json" backfill_class)" "nobackfill" \
+  "none 與 flapping（no_out）同屬非 backfill 組"
+eq "$(jget "$BF6/baseline-check.json" reference_source)" "campaign-median-nobackfill(n=6)" \
+  "穩態要拿得到 flapping 的參考（否則每個新 group 開頭都盲）"
+eq "$(jget "$BF6/baseline-check.json" drift_signals)" "[]" "非 backfill 組內的正常復測不得判漂移"
+
+# (4) 同類別的真漂移仍要抓到，且 consecutive 要累加
+BF3="$(_mkb "$BCF2" "osd-down-4k-mid+cur2" osd-down "$FP_OSD_DOWN" 7500000)"
+out="$(python3 "$V" baseline-check "$BF3" --results "$BCF2" 2>/dev/null)"
+contains "$out" "baseline-drift baseline-p99" "同類別下的真劣化必須觸發 drift 訊號"
+contains "$(jget "$BF3/baseline-check.json" reference_source)" "campaign-median-backfill" \
+  "真漂移判定必須建立在同類別配對的參考上"
+eq "$(jget "$BCF2/baseline-drift-state.json" consecutive)" "1" "量到且超標 → consecutive 累加"
+
+# (5) seq-contention 的機制就是 osd-down（fault_params 帶 manual_out）→ 必須歸 backfill
+BCF6="$BCF/seqcont"; mkdir -p "$BCF6"; _mkb_pool "$BCF6"
+_mkb "$BCF6" "osd-down-4k-mid+p3" osd-down "$FP_OSD_DOWN" 5210000 >/dev/null
+BF7="$(_mkb "$BCF6" "seq-contention-4k-mid+cur" seq-contention "$FP_SEQ_CONT" 5210000)"
+python3 "$V" baseline-check "$BF7" --results "$BCF6" >/dev/null 2>&1
+eq "$(jget "$BF7/baseline-check.json" backfill_class)" "backfill" \
+  "seq-contention 的實際機制是 osd-down（manual_out）→ 歸 backfill 組"
+
+# (6) chaos：原始碼沒有 manual out，但也沒有 noout 保護 → 保守歸 backfill
+BCF7="$BCF/chaos"; mkdir -p "$BCF7"; _mkb_pool "$BCF7"
+BF8="$(_mkb "$BCF7" "chaos-4k-mid+cur" chaos "$FP_CHAOS" 5210000)"
+python3 "$V" baseline-check "$BF8" --results "$BCF7" >/dev/null 2>&1
+eq "$(jget "$BF8/baseline-check.json" backfill_class)" "backfill" \
+  "chaos 無 noout 保護、可能被 auto-out → 保守歸 backfill"
+
+# (7) 分類不明（未知故障型、prediction 缺 fault）→ 不配對、退回 covariate-only。
+# 池子裡刻意也放 3 個分類不明的舊 bundle：「不明」不是一個類別，不得互相配對。
+BCF3="$BCF/unknown"; mkdir -p "$BCF3"; _mkb_pool "$BCF3"
+for i in 1 2 3; do
+  d="$BCF3/legacy-4k-mid+p$i/r1/attempts/a1"
+  wj "$d/baseline.json" \
+    '{"shape":"4k","pressure":"mid","target_iops":20000,"achieved_iops":20000,"p99_ns":3000000}'
+  : > "$d/DONE"
+done
+BF4="$(_mkb "$BCF3" "brandnew-4k-mid+cur" brand-new-fault '{}' 5210000)"
+out="$(python3 "$V" baseline-check "$BF4" --results "$BCF3" 2>/dev/null)"
+eq "$(jget "$BF4/baseline-check.json" backfill_class)" "null" \
+  "未知故障型（沒宣告 manual_out/no_out）要如實記 null，不得亂猜"
+eq "$(jget "$BF4/baseline-check.json" reference_source)" "calibration" \
+  "分類不明 → 不配對、退回 covariate-only"
+eq "$(jget "$BF4/baseline-check.json" drift_signals)" "[]" "分類不明時不得判漂移"
+
+# (8) 沒有 prediction.json 的舊 bundle 不算同類別樣本
+BCF4="$BCF/legacy"; mkdir -p "$BCF4"; _mkb_pool "$BCF4"
+for i in 1 2 3; do
+  d="$BCF4/legacy-4k-mid+p$i/r1/attempts/a1"
+  wj "$d/baseline.json" \
+    '{"shape":"4k","pressure":"mid","target_iops":20000,"achieved_iops":20000,"p99_ns":5210000}'
+  : > "$d/DONE"
+done
+BF5="$(_mkb "$BCF4" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
+python3 "$V" baseline-check "$BF5" --results "$BCF4" >/dev/null 2>&1
+eq "$(jget "$BF5/baseline-check.json" reference_source)" "calibration" \
+  "分類不明的舊 bundle 不得被算成同類別樣本"
+
+# (9) 損毀的 prior prediction.json 不得讓整個 gate 死掉。
+# pipeline 只認 rc=4 與 stdout 的 baseline-drift，rc=1 會被靜默吞掉還順手 drift-clear
+# → 漂移偵測從此永久靜默失效。而 prediction.json 正是全 bundle 唯一非 atomic 的寫入。
+BCF8="$BCF/corrupt"; mkdir -p "$BCF8"; _mkb_pool "$BCF8"
+for i in 3 4 5; do
+  _mkb "$BCF8" "osd-down-4k-mid+p$i" osd-down "$FP_OSD_DOWN" 5210000 >/dev/null
+done
+_mkb "$BCF8" "osd-down-4k-mid+broken" osd-down "$FP_OSD_DOWN" 9999000 corrupt >/dev/null
+BF9="$(_mkb "$BCF8" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
+out="$(python3 "$V" baseline-check "$BF9" --results "$BCF8" 2>/dev/null)" \
+  || fail "prior 的 prediction.json 損毀不得讓 baseline-check 非 0 退出"
+ok
+eq "$(jget "$BF9/baseline-check.json" reference_source)" "campaign-median-backfill(n=5)" \
+  "損毀的 prior 只是不進池（n=5 而非 6），其餘照常比較"
+
+# (10) 當前 bundle 自己的 prediction.json 損毀 → 也不得死掉，退回 covariate-only
+BCF9="$BCF/corrupt-self"; mkdir -p "$BCF9"; _mkb_pool "$BCF9"
+BF10="$(_mkb "$BCF9" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000 corrupt)"
+out="$(python3 "$V" baseline-check "$BF10" --results "$BCF9" 2>/dev/null)" \
+  || fail "當前 bundle 的 prediction.json 損毀不得讓 baseline-check 非 0 退出"
+ok
+contains "$out" "covariate-only" "自己的分類讀不到 → 退回 covariate-only"
+eq "$(jget "$BF10/baseline-check.json" backfill_class)" "null" "讀不到就記 null，不猜"
+
+# (11) 參考池只收「DONE 且未 tainted」的 attempt（harness 自己判定無效的不得當基準）
+BCF10="$BCF/invalid"; mkdir -p "$BCF10"; _mkb_pool "$BCF10"
+_mkb "$BCF10" "osd-down-4k-mid+p3" osd-down "$FP_OSD_DOWN" 5210000 >/dev/null
+_mkb "$BCF10" "osd-down-4k-mid+nodone" osd-down "$FP_OSD_DOWN" 20000000 no-done >/dev/null
+_mkb "$BCF10" "osd-down-4k-mid+taint" osd-down "$FP_OSD_DOWN" 20000000 tainted >/dev/null
+BF11="$(_mkb "$BCF10" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
+python3 "$V" baseline-check "$BF11" --results "$BCF10" >/dev/null 2>&1
+eq "$(jget "$BF11/baseline-check.json" reference_source)" "campaign-median-backfill(n=3)" \
+  "未 finalize（無 DONE）與 tainted 的 attempt 都不得進參考池"
+eq "$(jnum "$BF11/baseline-check.json" reference_p99_ns)" "5210000" \
+  "無效樣本若進池會把中位數拉到 5.21/20ms 之間"
+
+# (12) HUMAN-NEEDED 只在「這次真的量到且超標」時才發：殘留的 consecutive 不得讓
+# 一格「量不了」的 cell 直接停佇列（維持語意與停佇列判定的交互作用）。
+BCF11="$BCF/stale"; mkdir -p "$BCF11"; _mkb_pool "$BCF11"
+wj "$BCF11/baseline-drift-state.json" '{"consecutive":3,"recent":[]}'
+BF12="$(_mkb "$BCF11" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
+out="$(python3 "$V" baseline-check "$BF12" --results "$BCF11" 2>/dev/null)" \
+  || fail "殘留 consecutive=3 + 量不了 → 不得非 0 退出（rc=4 會停佇列）"
+ok
+lacks "$out" "HUMAN-NEEDED" "沒有訊號的 execution 不得因為殘留計數而停佇列"
+eq "$(jget "$BCF11/baseline-drift-state.json" consecutive)" "3" "殘留計數維持不變（要人工清）"
 
 # =========================================================== schedule-estimate ==
 SRES="$tmp/sres"
