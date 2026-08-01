@@ -45,6 +45,16 @@ print(int(round(float(d))))
 PY
 }
 
+jr() { # jr <json-file> <dotted.path> <小數位>；印四捨五入後的小數（門檻類斷言用）
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."):
+    d = d[int(k)] if isinstance(d, list) else d[k]
+print(("%%.%df" % int(sys.argv[3])) % float(d))
+PY
+}
+
 flt() { # flt <a> <b>：a < b 為真
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -851,6 +861,112 @@ out="$(python3 "$V" baseline-check "$BF12" --results "$BCF11" 2>/dev/null)" \
 ok
 lacks "$out" "HUMAN-NEEDED" "沒有訊號的 execution 不得因為殘留計數而停佇列"
 eq "$(jget "$BCF11/baseline-drift-state.json" consecutive)" "3" "殘留計數維持不變（要人工清）"
+eq "$(jget "$BF12/baseline-check.json" p99_tolerance_source)" "floor" \
+  "退回 covariate-only 時沒有套用任何放寬，門檻欄位要如實記下限"
+eq "$(jget "$BF12/baseline-check.json" reference_mad_pct)" "null" \
+  "沒有可比參考池就沒有離散度可言，不得填 0 混充「很穩」"
+
+# --- 門檻依「每個 (形態,壓力,backfill 類別) 的實測離散度」校準 ------------------
+# 起因（真機 2026-08-01 停佇列）：三筆訊號 +203.61% / +129.25% / **−31.55%**，
+# 第三筆是「比參考基準**快**」——劣化不會產生這種讀數。查證後全 campaign 逐組合的
+# 善後復測離散度（DONE 且未 tainted）差了一個量級：
+#   4k/low/backfill  MAD 29.2%（全距 4.3×）、4k/mid/backfill MAD 5.2%
+#   其餘 9 個組合     MAD 1.8–10.3%
+# 15% 對那 9 個組合是準確的（不該全域放寬），對 4k/low/backfill 則低於儀器自己的
+# 抖動——那個組合的復測是雙峰的（backfill 排乾 ≈2.9–4.1ms／沒排乾 ≈9.5–12.4ms）。
+# 因此門檻改為 **max(15%, C × MAD_pct(該組合參考池))**：下限不動、只在實測離散度
+# 高於下限時按比例放寬，且參考池沿用同一份 `_prior_baselines` 結果。
+# C = 3 的兩條界（見 README §4.6）：
+#   下界 全 campaign robust-z（|x−median|/MAD）的 p90 = 2.50 → C ≥ 2.5 才蓋得住
+#        九成的組內正常變異；
+#   上界 最寬的組合（MAD 29.2%）要留住 ×2 劣化的偵測力 → C × 0.292 < 1.0 → C < 3.42。
+BCT="$tmp/bc-tol"
+_mkb_wide() { # _mkb_wide <results> <cell 前綴> <fault> <fault_params> <值...>
+  local r="$1" prefix="$2" fault="$3" fp="$4" i=0 v
+  shift 4
+  for v in "$@"; do
+    i=$((i + 1))
+    _mkb "$r" "${prefix}${i}" "$fault" "$fp" "$v" >/dev/null
+  done
+}
+# 真機 4k/low/backfill 的前 8 筆（ns）→ median 4.0795ms、MAD 25.51%、門檻 76.52%
+HEAVY="5145000 4424000 2900000 4145000 10813000 3064000 2900000 4014000"
+
+# (13) 重尾組合：−28.1% 是該組合的常態抖動（1.1 個 MAD），不得判成漂移
+BCT1="$BCT/heavy"; mkdir -p "$BCT1"; wj "$BCT1/calibration.json" "$BCF_CAL"
+# shellcheck disable=SC2086  # 刻意讓 HEAVY 分詞成多個參數（bash 3.2 沒有 nameref）
+_mkb_wide "$BCT1" "osd-down-4k-mid+h" osd-down "$FP_OSD_DOWN" $HEAVY
+BT1="$(_mkb "$BCT1" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 2933000)"
+out="$(python3 "$V" baseline-check "$BT1" --results "$BCT1" 2>/dev/null)"
+lacks "$out" "baseline-drift" \
+  "偏離只有 1.1 個 MAD（比基準快 28%）不得判漂移——劣化不會讓復測變快"
+contains "$out" "p99-tol=76.52%" \
+  "stdout 要讓 operator 看得出這格生效的門檻不是 15%（門檻不可以悄悄變動）"
+contains "$out" "mad 25.51%" "stdout 要一併印出推導門檻用的實測離散度"
+eq "$(jr "$BT1/baseline-check.json" p99_tolerance 4)" "0.7652" \
+  "生效門檻 = C × MAD_pct（C=3；MAD 25.506%）"
+eq "$(jr "$BT1/baseline-check.json" reference_mad_pct 4)" "0.2551" \
+  "baseline-check.json 要記下該組合參考池的實測 MAD 比例"
+eq "$(jget "$BT1/baseline-check.json" p99_tolerance_source)" "mad" \
+  "要標明這次的門檻是被實測離散度放寬的，不是下限"
+eq "$(jr "$BT1/baseline-check.json" p99_tolerance_floor 2)" "0.15" \
+  "下限本身要留在輸出裡（之後回看才知道放寬了多少）"
+eq "$(jr "$BT1/baseline-check.json" p99_mad_multiplier 1)" "3.0" "C 要記進輸出"
+
+# (14) 緊的組合：門檻**永不低於** 15% 下限（9 個健康組合維持現狀）
+BCT2="$BCT/tight"; mkdir -p "$BCT2"; wj "$BCT2/calibration.json" "$BCF_CAL"
+# MAD 只有 0.19% → C×MAD = 0.58%，沒有下限的話 +10% 會被誤判成漂移
+_mkb_wide "$BCT2" "osd-down-4k-mid+t" osd-down "$FP_OSD_DOWN" \
+  5150000 5200000 5210000 5220000 5210000 5260000
+BT2="$(_mkb "$BCT2" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5731000)"
+out="$(python3 "$V" baseline-check "$BT2" --results "$BCT2" 2>/dev/null)"
+lacks "$out" "baseline-drift" "+10% 在 15% 下限內 → 不得判漂移（門檻不得因 MAD 小而變嚴）"
+eq "$(jr "$BT2/baseline-check.json" p99_tolerance 2)" "0.15" "MAD 小於下限時門檻 = 15%"
+eq "$(jget "$BT2/baseline-check.json" p99_tolerance_source)" "floor" "要標明門檻來自下限"
+contains "$out" "p99-tol=15.00%" "門檻等於下限時 stdout 一樣要印出來"
+BT3="$(_mkb "$BCT2" "osd-down-4k-mid+cur2" osd-down "$FP_OSD_DOWN" 6043600)"
+out="$(python3 "$V" baseline-check "$BT3" --results "$BCT2" 2>/dev/null)"
+contains "$out" "baseline-drift baseline-p99" "緊的組合 +16% 仍必須判漂移（偵測力不得被稀釋）"
+
+# (15) 合成劣化：重尾組合被放寬後，×2 的真劣化仍要抓得到（C 的上界就是這條）
+BCT3="$BCT/degraded"; mkdir -p "$BCT3"; wj "$BCT3/calibration.json" "$BCF_CAL"
+# shellcheck disable=SC2086  # 同上，刻意分詞
+_mkb_wide "$BCT3" "osd-down-4k-mid+h" osd-down "$FP_OSD_DOWN" $HEAVY
+BT4="$(_mkb "$BCT3" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 8159000)"
+out="$(python3 "$V" baseline-check "$BT4" --results "$BCT3" 2>/dev/null)"
+contains "$out" "baseline-drift baseline-p99" \
+  "×2 劣化（+100%）> 76.52% 門檻 → 最寬的組合也必須抓得到"
+contains "$out" "tol=76.52%" "漂移訊號要一併印出當下生效的門檻"
+eq "$(jget "$BCT3/baseline-drift-state.json" consecutive)" "1" "抓到的劣化要照常累加連續計數"
+
+# (16) 離散度必須用 MAD（對離群值穩健），不是標準差：
+# 池子 = 5 個 3.0ms + 1 個 12.0ms → MAD = 0（門檻落回 15% 下限），標準差則是 122%。
+# 用標準差的話門檻會變成 367%，孤立離群值一手把整個組合的偵測力關掉。
+BCT4="$BCT/robust"; mkdir -p "$BCT4"; wj "$BCT4/calibration.json" "$BCF_CAL"
+_mkb_wide "$BCT4" "osd-down-4k-mid+s" osd-down "$FP_OSD_DOWN" \
+  3000000 3000000 3000000 3000000 3000000 12000000
+BT5="$(_mkb "$BCT4" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 3600000)"
+out="$(python3 "$V" baseline-check "$BT5" --results "$BCT4" 2>/dev/null)"
+eq "$(jr "$BT5/baseline-check.json" reference_mad_pct 4)" "0.0000" \
+  "單一離群值不得抬高 MAD（標準差會給 1.22）"
+eq "$(jr "$BT5/baseline-check.json" p99_tolerance 2)" "0.15" "MAD=0 → 門檻回到 15% 下限"
+contains "$out" "baseline-drift baseline-p99" \
+  "+20% 必須判漂移——用標準差推門檻的話這裡會靜默放過"
+
+# (17) 門檻要算在**這一格自己的 (形態,壓力,backfill 類別)** 上，不是整個 results
+BCT5="$BCT/perclass"; mkdir -p "$BCT5"; wj "$BCT5/calibration.json" "$BCF_CAL"
+# 非 backfill 組刻意鋪成重尾（MAD 55.6%）；backfill 組是 3 筆一致值（MAD 0）
+_mkb_wide "$BCT5" "flapping-4k-mid+w" flapping "$FP_FLAPPING" \
+  2900000 4424000 10813000 3064000 12386000 9503000
+_mkb_wide "$BCT5" "osd-down-4k-mid+t" osd-down "$FP_OSD_DOWN" 5210000 5210000 5210000
+BT6="$(_mkb "$BCT5" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 7294000)"
+out="$(python3 "$V" baseline-check "$BT6" --results "$BCT5" 2>/dev/null)"
+eq "$(jr "$BT6/baseline-check.json" reference_mad_pct 4)" "0.0000" \
+  "MAD 要取自同類別的參考池（拿到非 backfill 組的會是 0.5564）"
+eq "$(jr "$BT6/baseline-check.json" p99_tolerance 2)" "0.15" \
+  "自己組合很穩就維持 15%——別組的重尾不得放寬這一格"
+contains "$out" "baseline-drift baseline-p99" \
+  "+40% 在自己組合的門檻下必須判漂移（用錯組合的門檻會靜默放過）"
 
 # =========================================================== schedule-estimate ==
 SRES="$tmp/sres"

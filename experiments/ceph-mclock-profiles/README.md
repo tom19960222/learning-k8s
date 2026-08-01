@@ -323,7 +323,7 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
 ### 4.6 baseline drift 連續 3 次（佇列停，`recalibrate` 裁決）
 
-**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對**同條件參考中位數**偏移 > ±15%。單次只印 `baseline-drift <metric> <pct>` 並記 covariate；**連續 3 個 replicate** 超標才停佇列（`PIPELINE_DRIFT_LIMIT`）。
+**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對**同條件參考中位數**的偏移超過**該組合自己的容忍值**（`max(15%, 3 × MAD)`，見下方「門檻依實測解析度逐組合校準」）。單次只印 `baseline-drift <metric> <pct> tol=...` 並記 covariate；**連續 3 個 replicate** 超標才停佇列（`PIPELINE_DRIFT_LIMIT`）。
 
 **「同條件」= 同 (形態, 壓力, backfill 類別)**：這個 baseline 是「注入 → 回復 → final_clean 之後」的復測，量到的是**善後成本**。真機實測（DONE 且未 tainted 的 attempt，單位 ms）：
 
@@ -347,6 +347,49 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 **量不到就明講**：同條件樣本 < 3（含 `prediction.json` 損毀或判不出類別）時退回校準值（`reference_source = calibration`），stdout 印 `baseline-check: OK covariate-only class=<類別> n=<樣本數>`，**值仍記進 `baseline-check.json`（`p99_shift` / `baseline_p99_ns` / `measured: false`）當 covariate，但不判漂移**。連續計數**維持不變**（不是歸零）——「量不了」≠「沒漂移」，佇列成塊執行，跨 group 邊界必然出現數格 covariate-only，在那裡歸零會把先前累積的證據反覆抹掉。`baseline-drift-state.json` 逐軸記（`axes.achieve-ratio` / `axes.baseline-p99`），因為兩條軸「量得到與否」不同步；`consecutive` = 兩軸最大值，門檻仍是連續 3 次，且**只有本次真的量到且超標**才會升級成 `HUMAN-NEEDED`（殘留計數不會讓一格「量不了」的 cell 停佇列）。
 
 **已知盲區（實測，剩餘 55 格排程）**：按此二元分組還有 **6/55 格（11%）** 拿不到 ≥3 個同條件樣本而只能 covariate-only——`seq-contention-seq-mid` 3 格、`seq-contention-seq-extreme` 2 格（seq 形態下完全沒有其他 backfill 類別的先前樣本）、`osd-down-4k-extreme` 1 格；最長連續盲窗 3 格。（若改按故障型分組則是 20/55 格、36%，含 `chaos-4k-extreme` 3/3 全盲。）另外每個新的 (形態, 壓力, 類別) 組合的**前 3 個** replicate 必然盲（`BASELINE_REF_MIN_SAMPLES=3` 且排除自己）。
+
+**門檻依實測解析度逐組合校準**（`max(15%, C × MAD)`，`C = 3`）：15% 這個全域常數對 11 個 (形態, 壓力, backfill 類別) 組合裡的 **9 個就是實測解析度**，但對其餘幾個低於儀器自己的抖動。2026-08-01 的假停佇列即由此而來——三筆訊號是 `+203.61%` / `+129.25%` / **`−31.55%`**，第三筆比參考基準**快**，劣化不會產生這種讀數。逐組合量離散度（DONE 且未 tainted 的 attempt，`MAD_pct = median(|x − median|) ÷ median`）後改為：
+
+```
+容忍值(組合) = max(0.15, 3 × MAD_pct(該組合的參考池))
+```
+
+參考池沿用同一份 `_prior_baselines` 結果（不另外取樣），下限 0.15 **永不下降**，所以這個改動只會在「該組合自己量到的抖動大於 15%」時放寬，方向單一，**已完成的 112 格資料一格都不受影響**（主指標 `p99_degradation_ratio` 的分母是**注入前**窗，實測 MAD 1.1–9.5%，本來就穩定）。各組合實際生效的容忍值：
+
+| 組合 | n | 善後復測 MAD | 生效容忍值 | 來源 | 抓得到的最小劣化倍數 |
+|---|---|---|---|---|---|
+| 4k/extreme/backfill | 7 | 7.2% | **21.5%** | MAD | ×1.22 |
+| 4k/extreme/nobackfill | 14 | 2.0% | 15.0% | 下限 | ×1.15 |
+| 4k/high/nobackfill | 9 | 2.0% | 15.0% | 下限 | ×1.15 |
+| **4k/low/backfill** | 11 | **29.2%** | **87.7%** | MAD | **×1.88** |
+| 4k/low/nobackfill | 13 | 3.4% | 15.0% | 下限 | ×1.15 |
+| 4k/mid/backfill | 7 | 5.2% | **15.5%** | MAD | ×1.15 |
+| 4k/mid/nobackfill | 15 | 1.8% | 15.0% | 下限 | ×1.15 |
+| seq/extreme/nobackfill | 9 | 2.0% | 15.0% | 下限 | ×1.15 |
+| seq/high/nobackfill | 8 | 3.4% | 15.0% | 下限 | ×1.15 |
+| seq/low/nobackfill | 9 | 2.6% | 15.0% | 下限 | ×1.15 |
+| **seq/mid/nobackfill** | 9 | 10.3% | **31.0%** | MAD | ×1.31 |
+
+**C = 3 是被資料夾出來的，不是挑出來的**——兩條界都來自這份 campaign：
+
+- **下界 2.5**：全 campaign 的 robust-z（`|x − median| / MAD`，n=111）p90 = **2.50**、p95 = 4.42。取 `C ≥ 2.5` 才蓋得住九成的組內正常變異。假停佇列那三筆的 z 是 1.04 / 4.95 / 8.00——`−31.55%` 只離中位數 **1.04 個 MAD**，本來就不該是訊號。
+- **上界 3.42**：最寬的組合（MAD 29.2%）要留住 ×2 劣化的偵測力 → `C × 0.292 < 1.0` → `C < 3.42`。`C = 4.45`（robust 3σ）在那個組合的門檻是 130%，×2 劣化就抓不到了。
+- 取整數 3（也正好是慣用的 robust 2σ：`2 × 1.4826 = 2.97`）。
+
+全 campaign 依時序回放（131 個 attempt、真 CLI、`/tmp` 沙箱）：
+
+| C | 全 campaign 訊號次數 | 停佇列次數 |
+|---|---|---|
+| 0（= 現況全域 15%） | 10 | **1**（即這次的假停機） |
+| 1.4826 | 8 | 0 |
+| 2.0 | 7 | 0 |
+| **3.0（採用）** | **7** | **0**（最長連續 2 次） |
+| 4.4478 | 7 | 0 |
+| 6.0 | 6 | 0 |
+
+`C = 3` 保留了 7 個訊號（含 `+203.61%`、`+129.25%`、`+100.00%` 這些真的離群的讀數）——**孤立離群值本來就該記訊號**，連續 3 次才停佇列。合成劣化驗證（沙箱內把 campaign 中段之後的所有復測乘上劣化倍數再回放）：×1.5 與 ×2 在 `C = 3` 都仍會停佇列，且**首次停佇列的時間點與 C=0 完全相同**（例如劣化起於 07-30 → 兩者都停在 `20260730T033747Z`）。
+
+> **已知限制：重尾組合的偵測力本質上較低。** `4k/low/backfill` 的善後復測是**雙峰**的——backfill 排乾 ≈2.9–4.1 ms、沒排乾 ≈9.5–12.4 ms（全距 4.3×），這是真實的物理變異不是量測噪音（按故障型再細分也沒有變窄：osd-down 子集 MAD 24%、rack-isolation 子集 27.7%，反而樣本不足）。它的生效門檻 87.7% 代表**要 ×1.9 以上的劣化才抓得到**，×1.5 抓不到。這不是被這次改動弄壞的——15% 門檻在那個組合的訊號率是 **73%**（11 筆有 8 筆超標），等於擲硬幣，那種「偵測」不帶任何資訊、而且保證遲早湊成連續 3 次假停機。叢集層級的劣化仍由其餘 10 個緊的組合負責偵測。若這個組合日後又反覆送訊號，正確的下一步是**把它改記 covariate-only**（承認那個組合沒有偵測力），而不是再把 C 調大——調大會連 ×2 劣化都放過。
 
 **結構性限制**：參考池由 campaign 自身產生，所以對**漸進式**劣化靈敏（中位數落後於當前值），對**階梯式**劣化靈敏度低——階梯發生後三個 replicate 就會把新水位寫進參考池，之後的偏移量會回落到容忍帶內。要抓階梯式劣化得靠 `covariate` 欄位事後回看（`reference_p99_ns` 的時間序列），不能只依賴這個 gate。
 
@@ -702,7 +745,8 @@ experiments/ceph-mclock-profiles/
 | `faults: PILOT-CENSORED <f>` | 需 cap 裁示（exit 11） | §4.3，先落 cap-update amendment |
 | `faults: AZ-LOGIN-STALE` | 2b 救援憑證失效 | bastion 重新 `az login` |
 | `budget-warning: cost_usd=...` | 逼近天花板 | 通知使用者，評估 descope（§7.3） |
-| `baseline-drift <metric> <pct>` | 單次漂移 | 記 covariate，續跑；連 3 次才停 |
+| `baseline-drift <metric> <pct> [tol=...]` | 單次漂移（p99 軸會一併印生效門檻） | 記 covariate，續跑；連 3 次才停 |
+| `baseline-check: OK p99-tol=<x>% (<來源>, mad <y>% x3.0, n=<k>)` | 正常通過，且**明示這格生效的門檻**（`floor` = 15% 下限／`mad` = 被該組合實測離散度放寬） | 正常續跑；門檻怎麼推導見 §4.6 |
 | `baseline-check: OK covariate-only class=<c> n=<k>` | 這格**沒有**可比參考，p99 漂移偵測沒開 | 正常續跑；盲區規模見 §4.6 |
 | `watchdog: HUMAN-NEEDED <t> <ctx>` | 佇列停（exit 3） | §4.7，**別 deallocate** |
 | `taint-budget: NEEDS-HUMAN <k> <n>` | 該 replicate 被跳過 | §4.8，續跑其餘 cells |

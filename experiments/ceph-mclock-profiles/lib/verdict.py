@@ -1642,7 +1642,11 @@ def _finish_need_more_n(results_dir, args, decision):
 # ============================================================== baseline-check ==
 
 BASELINE_ACHIEVE_MIN = 0.85
+# p99 漂移門檻的**下限**：對 11 個 (形態,壓力,backfill 類別) 組合裡的 9 個，這個值
+# 就是實測解析度，永不低於它（見 `_p99_tolerance`）。
 BASELINE_P99_TOLERANCE = 0.15
+# 門檻放寬倍數 C：實際門檻 = max(下限, C × 該組合參考池的 MAD 比例)。見 `_p99_tolerance`。
+BASELINE_P99_MAD_MULTIPLIER = 3.0
 FIXED_RATE_PRESSURES = ("low", "mid", "high")
 
 
@@ -1807,6 +1811,82 @@ def _prior_baselines(results_dir, shape, pressure, klass, exclude=None):
     return sorted(out)
 
 
+def _mad_pct(values, center):
+    """參考池的相對離散度：median(|x − center|) ÷ center；算不出來回 None。
+
+    **用 MAD 不用標準差**：這些池子帶著真實的重尾（4k/low/backfill 的善後復測是雙峰
+    的——backfill 排乾 ≈2.9–4.1ms、沒排乾 ≈9.5–12.4ms），單一離群值會把標準差整個
+    拉走。實測 4k/mid/backfill：MAD 5.2%，標準差 40%——後者會讓那個組合的門檻變成
+    120%，等於一顆離群值就把整組的偵測力關掉。MAD 對離群值穩健，孤立離群值因此
+    **仍會**被記成訊號（單次訊號本來就只記 covariate，連續 3 次才停佇列）。
+
+    center 固定用呼叫端當作參考基準的那個中位數，讓「偏移量」與「離散度」是同一個
+    原點量出來的，不會出現偏移用 A、門檻用 B 的錯配。
+    """
+    if not values or len(values) < 2:
+        return None
+    if not center or float(center) <= 0:
+        return None
+    center = float(center)
+    return statistics.median([abs(float(v) - center) for v in values]) / center
+
+
+def _p99_tolerance(prior, ref_p99):
+    """(生效門檻, MAD 比例, 來源) — 逐 (形態,壓力,backfill 類別) 依實測離散度推導。
+
+    `門檻 = max(BASELINE_P99_TOLERANCE, C × MAD_pct(參考池))`
+
+    為什麼不是單一全域常數（真機 2026-08-01 的第四次假停佇列）：三筆訊號是
+    +203.61% / +129.25% / **−31.55%**，第三筆比參考基準**快**——劣化不會產生這種
+    讀數。逐組合量離散度（DONE 且未 tainted 的 attempt）才看出量級差異：
+
+    | 組合 | n | 善後復測 MAD | 全距 |
+    |---|---|---|---|
+    | 4k/low/backfill | 11 | **29.2%** | **4.3×** |
+    | 4k/mid/backfill | 7 | 5.2% | 2.3× |
+    | seq/mid/nobackfill | 9 | 10.3% | 1.35× |
+    | 其餘 8 個組合 | 7–15 | 1.8–3.4% | 1.1–1.24× |
+
+    也就是 15% 對 11 個組合裡的 9 個**就是**實測解析度（所以是下限、不動它），
+    只有少數幾個組合的儀器抖動本來就大於它。這是「門檻對齊儀器解析度」，不是
+    「為了讓它過而調」——**門檻只會被放寬到該組合自己量到的抖動為止**，永遠不會
+    比現況更鬆以外的方向改變，已完成的 112 格資料一格都不受影響。
+
+    C = 3 的兩條界都來自這份資料：
+    - **下界**：全 campaign 的 robust-z（`|x − median| / MAD`，n=111）p90 = 2.50、
+      p95 = 4.42。取 C ≥ 2.5 才蓋得住九成的組內正常變異；假停佇列那三筆的 z 分別是
+      1.04 / 4.95 / 8.00，C=3 讓 z=1.04 那筆（−31.55%）不再是訊號，另兩筆仍是。
+    - **上界**：最寬的組合（MAD 29.2%）要留住 ×2 劣化的偵測力 →
+      C × 0.292 < 1.0 → C < 3.42。C=4.45（robust 3σ）就抓不到 ×2 了。
+    兩條界夾出 [2.5, 3.42)，取整數 3（也正好是慣用的 robust 2σ：2 × 1.4826 = 2.97）。
+
+    **已知限制**：重尾組合的偵測力本質上較低——4k/low/backfill 的生效門檻約 88%，
+    要 ×1.9 以上的劣化才抓得到；×1.5 在那個組合抓不到。那是那個組合的儀器解析度
+    本來就只有這樣（15% 門檻在它上面的訊號率 73%，等於擲硬幣，那種「偵測」不帶
+    任何資訊）。叢集層級的劣化仍由其餘 10 個緊的組合負責偵測。
+    """
+    mad = _mad_pct(prior, ref_p99)
+    if mad is None:
+        return (BASELINE_P99_TOLERANCE, None, "floor")
+    scaled = BASELINE_P99_MAD_MULTIPLIER * mad
+    if scaled > BASELINE_P99_TOLERANCE:
+        return (scaled, mad, "mad")
+    return (BASELINE_P99_TOLERANCE, mad, "floor")
+
+
+def _tol_note(tol, mad, source, n):
+    """stdout 用的門檻註記——門檻**不可以悄悄變動而看不出來**。
+
+    每次量得到 p99 軸都會印，operator 從那一行就知道這格用的是不是 15%、放寬的話
+    是被哪個實測離散度放寬的、池子多大。刻意全部用 ASCII（pipeline.sh 與測試都靠
+    子字串比對這幾行）。
+    """
+    if mad is None:
+        return "tol=%.2f%% (floor)" % (tol * 100.0)
+    return "tol=%.2f%% (%s, mad %.2f%% x%.1f, n=%d)" % (
+        tol * 100.0, source, mad * 100.0, BASELINE_P99_MAD_MULTIPLIER, n)
+
+
 DRIFT_AXES = ("achieve-ratio", "baseline-p99")
 
 
@@ -1903,12 +1983,20 @@ def cmd_baseline_check(args):
     # measured = 「p99 這條軸這次真的量到了」——同條件參考成立才算。
     measured = ref_source.startswith(REF_MEASURED_PREFIX)
 
+    # 門檻逐組合依實測離散度推導（沿用同一份參考池，不另外取樣）。量不到同條件參考
+    # （measured=False）時沒有池子可量離散度，門檻欄位如實記下限、MAD 記 None——
+    # 那條路徑本來就不判漂移，填 0 會被誤讀成「這個組合很穩」。
+    if measured:
+        p99_tolerance, ref_mad, tol_source = _p99_tolerance(prior, ref_p99)
+    else:
+        p99_tolerance, ref_mad, tol_source = (BASELINE_P99_TOLERANCE, None, "floor")
+
     signals = []
     achieve_ratio = None
     if achieved is not None and target:
         achieve_ratio = float(achieved) / float(target)
         if achieve_ratio < BASELINE_ACHIEVE_MIN:
-            signals.append(("achieve-ratio", (achieve_ratio - 1.0) * 100.0))
+            signals.append(("achieve-ratio", (achieve_ratio - 1.0) * 100.0, ""))
     p99_shift = None
     if p99 is not None and ref_p99:
         p99_shift = (float(p99) - ref_p99) / ref_p99
@@ -1919,8 +2007,9 @@ def cmd_baseline_check(args):
         # 值仍記為 covariate，只是不觸發訊號。
         # 同類別樣本不足（含分類判不出來）時走的是同一條退回路徑：ref_source 是
         # "calibration"、不以 REF_MEASURED_PREFIX 開頭，因此一樣只記值不判漂移。
-        if measured and abs(p99_shift) > BASELINE_P99_TOLERANCE:
-            signals.append(("baseline-p99", p99_shift * 100.0))
+        if measured and abs(p99_shift) > p99_tolerance:
+            signals.append(("baseline-p99", p99_shift * 100.0,
+                            " " + _tol_note(p99_tolerance, ref_mad, tol_source, len(prior))))
 
     state_path = os.path.join(results_dir, "baseline-drift-state.json")
     state = read_json(state_path, {"consecutive": 0, "recent": []}) or {
@@ -1952,7 +2041,13 @@ def cmd_baseline_check(args):
         "reference_p99_ns": ref_p99,
         "reference_source": ref_source,
         "p99_shift": p99_shift,
-        "p99_tolerance": BASELINE_P99_TOLERANCE,
+        # p99_tolerance = **這次實際生效**的門檻（逐組合），另外三個欄位讓人回頭看得出
+        # 它是怎麼來的：下限、C、以及該組合參考池的實測 MAD 比例。
+        "p99_tolerance": p99_tolerance,
+        "p99_tolerance_floor": BASELINE_P99_TOLERANCE,
+        "p99_tolerance_source": tol_source,
+        "p99_mad_multiplier": BASELINE_P99_MAD_MULTIPLIER,
+        "reference_mad_pct": ref_mad,
         "drift_signals": [s[0] for s in signals],
         "consecutive_drift": state["consecutive"],
         "covariate": True,
@@ -1960,8 +2055,8 @@ def cmd_baseline_check(args):
     }
     write_json(os.path.join(bundle, "baseline-check.json"), out)
 
-    for metric, pct in signals:
-        emit("baseline-drift %s %.2f" % (metric, pct))
+    for metric, pct, note in signals:
+        emit("baseline-drift %s %.2f%s" % (metric, pct, note))
     # HUMAN-NEEDED 只在「這次真的量到而且超標」時才發。consecutive 現在會跨
     # covariate-only 的 execution 維持，若不加 signals 這個條件，殘留的計數會讓
     # 下一格「量不了」的 cell 直接停佇列——那不是連續 3 次漂移，是拿舊帳停人。
@@ -1977,7 +2072,9 @@ def cmd_baseline_check(args):
         emit("baseline-check: OK covariate-only class=%s n=%d"
              % (klass or "unknown", len(prior)))
         return 0
-    emit("baseline-check: OK")
+    # 量到了就一定把生效門檻印出來（逐組合會變動，不印的話 operator 無從察覺）
+    emit("baseline-check: OK p99-%s"
+         % _tol_note(p99_tolerance, ref_mad, tol_source, len(prior)))
     return 0
 
 
