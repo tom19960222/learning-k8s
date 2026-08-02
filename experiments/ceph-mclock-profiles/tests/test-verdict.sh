@@ -713,7 +713,8 @@ _mkb_pool() { # _mkb_pool <results>：6 個非 backfill(3.654ms) + 2 個 backfil
 # (1) 同類別樣本不足（backfill 只有 2 個）→ 不得拿非 backfill 的池子當參考。
 # 且「量不了」≠「沒漂移」：consecutive 必須**維持**，不得歸零也不得累加。
 BCF1="$BCF/mixed"; mkdir -p "$BCF1"; _mkb_pool "$BCF1"
-wj "$BCF1/baseline-drift-state.json" '{"consecutive":2,"recent":["earlier"]}'
+wj "$BCF1/baseline-drift-state.json" \
+  '{"combos":{"4k/mid/backfill":{"axes":{"achieve-ratio":2,"baseline-p99":2},"consecutive":2,"recent":["earlier"]}}}'
 BF1="$(_mkb "$BCF1" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
 out="$(python3 "$V" baseline-check "$BF1" --results "$BCF1" 2>/dev/null)"
 contains "$out" "baseline-check: OK covariate-only" \
@@ -736,7 +737,8 @@ eq "$(jget "$BCF1/baseline-drift-state.json" recent.0)" "earlier" "維持時 rec
 # (2) 同類別 >=3 → 參考值 = 同類別中位數；node-isolation 與 osd-down 同池（二元分組）
 BCF2="$BCF/paired"; mkdir -p "$BCF2"; _mkb_pool "$BCF2"
 _mkb "$BCF2" "node-isolation-4k-mid+p1" node-isolation "$FP_NODE_ISO" 5210000 >/dev/null
-wj "$BCF2/baseline-drift-state.json" '{"consecutive":2,"recent":["earlier"]}'
+wj "$BCF2/baseline-drift-state.json" \
+  '{"combos":{"4k/mid/backfill":{"axes":{"achieve-ratio":2,"baseline-p99":2},"consecutive":2,"recent":["earlier"]}}}'
 BF2="$(_mkb "$BCF2" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5400000)"
 out="$(python3 "$V" baseline-check "$BF2" --results "$BCF2" 2>/dev/null)"
 contains "$out" "baseline-check: OK" "同類別比較下的正常復測不得判漂移"
@@ -854,7 +856,8 @@ eq "$(jnum "$BF11/baseline-check.json" reference_p99_ns)" "5210000" \
 # (12) HUMAN-NEEDED 只在「這次真的量到且超標」時才發：殘留的 consecutive 不得讓
 # 一格「量不了」的 cell 直接停佇列（維持語意與停佇列判定的交互作用）。
 BCF11="$BCF/stale"; mkdir -p "$BCF11"; _mkb_pool "$BCF11"
-wj "$BCF11/baseline-drift-state.json" '{"consecutive":3,"recent":[]}'
+wj "$BCF11/baseline-drift-state.json" \
+  '{"combos":{"4k/mid/backfill":{"axes":{"achieve-ratio":3,"baseline-p99":3},"consecutive":3,"recent":[]}}}'
 BF12="$(_mkb "$BCF11" "osd-down-4k-mid+cur" osd-down "$FP_OSD_DOWN" 5210000)"
 out="$(python3 "$V" baseline-check "$BF12" --results "$BCF11" 2>/dev/null)" \
   || fail "殘留 consecutive=3 + 量不了 → 不得非 0 退出（rc=4 會停佇列）"
@@ -967,6 +970,207 @@ eq "$(jr "$BT6/baseline-check.json" p99_tolerance 2)" "0.15" \
   "自己組合很穩就維持 15%——別組的重尾不得放寬這一格"
 contains "$out" "baseline-drift baseline-p99" \
   "+40% 在自己組合的門檻下必須判漂移（用錯組合的門檻會靜默放過）"
+
+# --- 連續計數的母體 = (形態,壓力,backfill 類別)，不是整個 campaign --------------
+# 起因（真機 2026-08-02 的第五次假停佇列）：門檻已經逐組合校準（上面 13-17），
+# 但「連續 N 次」的計數器還是全域的。造成停機的三筆跨了**兩個不同母體**：
+#   rack-isolation-4k-low  low/backfill +243.08%（該組合門檻 87.75%）
+#   rack-isolation-4k-mid  mid/backfill  +41.29%（該組合門檻 15.48%）
+#   rack-isolation-4k-mid  mid/backfill +498.73%（該組合門檻 17.20%）
+# 「連續 3 次漂移」的語意是「**同一個量測母體**連續 3 次偏離」，不是「三個互不相干的
+# 母體各出現一次離群值」。佇列是 Latin square 輪替執行，各組合本來就交錯出現，
+# 全域計數必然把獨立事件串成假的「連續」。
+# 決定性反證：4k/mid/backfill 的注入前窗（主指標分母）跨 5 天 9 個 attempt 是
+# 3.228–3.424ms（全距 6%），叢集完全正常；那筆 30.8ms 的復測對應的注入前窗是 3.391ms。
+BCS="$tmp/bc-streak"
+BCS_CAL='{"shapes":{"4k":{"ceiling_iops":40000,"rates":{"low":10000,"mid":20000},"reference_p99_ns":{"low":3000000,"mid":5210000}}}}'
+BCS_OUT=""; BCS_RC=0; BCS_BUNDLE=""
+_mkbs() { # _mkbs <results> <cell> <pressure> <p99_ns> [achieved]：backfill 類別的 attempt
+  local r="$1" cell="$2" pressure="$3" p99="$4" ach="${5:-20000}"
+  local d="$r/$cell/r1/attempts/a1"
+  wj "$d/baseline.json" \
+    "{\"shape\":\"4k\",\"pressure\":\"${pressure}\",\"target_iops\":20000,\"achieved_iops\":${ach},\"p99_ns\":${p99}}"
+  wj "$d/prediction.json" \
+    "{\"cell_id\":\"${cell}\",\"fault\":\"osd-down\",\"fault_params\":{\"manual_out\":true},\"shape\":\"4k\",\"pressure\":\"${pressure}\"}"
+  : > "$d/DONE"
+  printf '%s\n' "$d"
+}
+_mkbs_pool() { # _mkbs_pool <results>：兩個組合各鋪 4 筆一致值（MAD 0 → 門檻 = 15% 下限）
+  local r="$1" i
+  wj "$r/calibration.json" "$BCS_CAL"
+  for i in 1 2 3 4; do
+    _mkbs "$r" "osd-down-4k-low+p$i" low 3000000 >/dev/null
+    _mkbs "$r" "osd-down-4k-mid+p$i" mid 5210000 >/dev/null
+  done
+}
+# bcs <results> <cell> <pressure> <p99> [achieved]：跑一格，結果放進 BCS_OUT/BCS_RC/BCS_BUNDLE
+# （不用命令替換包整個函式，否則 rc 與 bundle 路徑會留在子 shell 裡）
+bcs() {
+  local d extra="${BCS_EXTRA:-}"
+  d="$(_mkbs "$@")"
+  BCS_BUNDLE="$d"
+  BCS_RC=0
+  # shellcheck disable=SC2086  # extra 刻意分詞成旗標（bash 3.2 沒有陣列預設值語法）
+  BCS_OUT="$(python3 "$V" baseline-check "$d" --results "$1" $extra 2>/dev/null)" || BCS_RC=$?
+}
+
+# (18) 跨組合的三筆單一離群值不得停佇列（真機第五次假停佇列的最小重現）
+BCS1="$BCS/cross"; mkdir -p "$BCS1"; _mkbs_pool "$BCS1"
+bcs "$BCS1" "osd-down-4k-low+s1" low 6000000
+contains "$BCS_OUT" "baseline-drift baseline-p99" "前置：low 組合第一筆離群值要判漂移"
+bcs "$BCS1" "osd-down-4k-mid+s1" mid 10420000
+contains "$BCS_OUT" "baseline-drift baseline-p99" "前置：mid 組合第一筆離群值要判漂移"
+bcs "$BCS1" "osd-down-4k-mid+s2" mid 10420000
+contains "$BCS_OUT" "baseline-drift baseline-p99" "前置：mid 組合第二筆離群值要判漂移"
+lacks "$BCS_OUT" "HUMAN-NEEDED" \
+  "三筆跨兩個母體（low×1 + mid×2）不是「同一母體連續 3 次」，不得停佇列"
+eq "$BCS_RC" "0" "跨母體的離群值不得以 rc=4 停佇列"
+eq "$(jget "$BCS1/baseline-drift-state.json" combos.4k/low/backfill.consecutive)" "1" \
+  "low 組合只出現 1 次離群值"
+eq "$(jget "$BCS1/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "2" \
+  "mid 組合出現 2 次，仍未到門檻"
+
+# (19) 偵測力不得消失：**同一個組合**連續 3 次仍必須停佇列
+BCS2="$BCS/same"; mkdir -p "$BCS2"; _mkbs_pool "$BCS2"
+for k in 1 2 3; do
+  bcs "$BCS2" "osd-down-4k-mid+d$k" mid 10420000
+done
+contains "$BCS_OUT" "baseline-check: HUMAN-NEEDED recalibrate 3" \
+  "同一組合連續 3 次必須停佇列（逐組合計數不得把偵測力關掉）"
+eq "$BCS_RC" "4" "同組合連續 3 次要以 rc=4 交人工裁決"
+eq "$(jget "$BCS2/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "3" \
+  "停在正確的組合上"
+eq "$(jget "$BCS2/baseline-drift-state.json" combo)" "4k/mid/backfill" \
+  "頂層鏡射要指出這次計的是哪個組合"
+
+# (20) 別的組合的乾淨結果不得歸零這個組合的計數（交錯執行是常態）
+BCS3="$BCS/interleave"; mkdir -p "$BCS3"; _mkbs_pool "$BCS3"
+bcs "$BCS3" "osd-down-4k-mid+i1" mid 10420000
+bcs "$BCS3" "osd-down-4k-low+c1" low 3000000
+lacks "$BCS_OUT" "baseline-drift" "前置：low 組合這格是乾淨的"
+bcs "$BCS3" "osd-down-4k-mid+i2" mid 10420000
+bcs "$BCS3" "osd-down-4k-low+c2" low 3000000
+bcs "$BCS3" "osd-down-4k-mid+i3" mid 10420000
+contains "$BCS_OUT" "HUMAN-NEEDED" \
+  "別組合的乾淨結果不得抹掉這個組合累積的漂移證據（全域計數會在這裡歸零）"
+eq "$(jget "$BCS3/baseline-drift-state.json" combos.4k/low/backfill.consecutive)" "0" \
+  "low 組合自己量到且乾淨 → 它自己歸零"
+
+# (21) 同組合量到且乾淨才歸零
+BCS4="$BCS/reset"; mkdir -p "$BCS4"; _mkbs_pool "$BCS4"
+bcs "$BCS4" "osd-down-4k-mid+r1" mid 10420000
+bcs "$BCS4" "osd-down-4k-mid+r2" mid 5210000
+lacks "$BCS_OUT" "baseline-drift" "前置：同組合這格量到且在容忍內"
+eq "$(jget "$BCS4/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "0" \
+  "同組合量到且乾淨 → 該組合歸零"
+bcs "$BCS4" "osd-down-4k-mid+r3" mid 10420000
+eq "$(jget "$BCS4/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "1" \
+  "歸零後重新起算"
+lacks "$BCS_OUT" "HUMAN-NEEDED" "歸零後的第一筆不得停佇列"
+
+# (22) 兩條軸在**同一個組合內**仍各自計數（共用一個計數器會把交替訊號串成連續）
+BCS5="$BCS/axes"; mkdir -p "$BCS5"; _mkbs_pool "$BCS5"
+bcs "$BCS5" "osd-down-4k-mid+x1" mid 5210000 15000   # 供給達成率 0.75 → achieve-ratio
+contains "$BCS_OUT" "baseline-drift achieve-ratio" "前置：achieve-ratio 訊號"
+lacks "$BCS_OUT" "baseline-drift baseline-p99" "前置：這格的 p99 是乾淨的"
+bcs "$BCS5" "osd-down-4k-mid+x2" mid 10420000 20000  # p99 超標、供給達成率正常
+contains "$BCS_OUT" "baseline-drift baseline-p99" "前置：p99 訊號"
+bcs "$BCS5" "osd-down-4k-mid+x3" mid 5210000 15000
+contains "$BCS_OUT" "baseline-drift achieve-ratio" "前置：再一次 achieve-ratio 訊號"
+lacks "$BCS_OUT" "HUMAN-NEEDED" \
+  "兩條軸交替出訊號 ≠ 任一條軸連續 3 次（共用計數器會在這裡假停）"
+eq "$(jget "$BCS5/baseline-drift-state.json" combos.4k/mid/backfill.axes.achieve-ratio)" "1" \
+  "achieve-ratio 這條軸被中間那格量到且乾淨 → 歸零後重新起算"
+eq "$(jget "$BCS5/baseline-drift-state.json" combos.4k/mid/backfill.axes.baseline-p99)" "0" \
+  "baseline-p99 這條軸最後一格量到且乾淨 → 歸零"
+# 同一條軸在同一組合連續 3 次照樣要停
+BCS6="$BCS/axis-same"; mkdir -p "$BCS6"; _mkbs_pool "$BCS6"
+for k in 1 2 3; do
+  bcs "$BCS6" "osd-down-4k-mid+a$k" mid 5210000 15000
+done
+contains "$BCS_OUT" "HUMAN-NEEDED" "同一條軸在同一組合連續 3 次仍要停佇列"
+
+# (23) 停佇列判準必須取「**當前 execution 所屬組合**」的 streak，不是別組的最大值
+# 別的組合刻意**已經到門檻**（3）：取 max、取全域、或取錯 key 都會在這裡誤停。
+BCS7="$BCS/wrongcombo"; mkdir -p "$BCS7"; _mkbs_pool "$BCS7"
+wj "$BCS7/baseline-drift-state.json" \
+  '{"combos":{"4k/mid/backfill":{"axes":{"achieve-ratio":0,"baseline-p99":3},"consecutive":3,"recent":[]}}}'
+bcs "$BCS7" "osd-down-4k-low+w1" low 6000000
+contains "$BCS_OUT" "baseline-drift baseline-p99" "前置：low 組合這格超標"
+lacks "$BCS_OUT" "HUMAN-NEEDED" "別的組合已到門檻 3，不得讓這一格（low，才第 1 次）停佇列"
+eq "$BCS_RC" "0" "取錯組合的 streak 會在這裡以 rc=4 停佇列"
+contains "$BCS_OUT" "combo=4k/low/backfill n=1" "streak 行要報這次這個組合的數字，不是別組的"
+eq "$(jget "$BCS7/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "3" \
+  "不屬於這次 execution 的組合，計數必須原封不動"
+
+# (24) 可觀測性：stdout 與 baseline-check.json 都要看得出「這次計的是哪個組合、多少」
+BCS8="$BCS/observe"; mkdir -p "$BCS8"; _mkbs_pool "$BCS8"
+bcs "$BCS8" "osd-down-4k-mid+o1" mid 10420000
+bcs "$BCS8" "osd-down-4k-mid+o2" mid 10420000
+contains "$BCS_OUT" "baseline-check: streak combo=4k/mid/backfill n=2 limit=3" \
+  "stdout 要印出這次的組合、streak 與門檻（判準不可以悄悄變動而看不出來）"
+contains "$BCS_OUT" "achieve-ratio=0 baseline-p99=2" "streak 行要逐軸列出來"
+eq "$(jget "$BCS_BUNDLE/baseline-check.json" drift_combo)" "4k/mid/backfill" \
+  "baseline-check.json 要記下這次計數用的組合鍵"
+eq "$(jget "$BCS_BUNDLE/baseline-check.json" drift_scope)" "combo" \
+  "計數粒度要寫進輸出（之後回看才知道用的是哪一版判準）"
+eq "$(jget "$BCS_BUNDLE/baseline-check.json" consecutive_drift)" "2" \
+  "consecutive_drift 現在是**該組合**的 streak"
+eq "$(jget "$BCS_BUNDLE/baseline-check.json" drift_limit)" "3" "生效門檻要記進輸出"
+eq "$(jget "$BCS_BUNDLE/baseline-check.json" drift_axes.baseline-p99)" "2" "逐軸計數也要記"
+# 沒有量到（covariate-only）的那格一樣要印 streak 行，否則 operator 看不出計數狀態
+BCS9="$BCS/observe-cov"; mkdir -p "$BCS9"; wj "$BCS9/calibration.json" "$BCS_CAL"
+bcs "$BCS9" "osd-down-4k-mid+cv" mid 5210000
+contains "$BCS_OUT" "baseline-check: streak combo=4k/mid/backfill n=0 limit=3" \
+  "covariate-only 也要印 streak 行"
+contains "$BCS_OUT" "covariate-only" "前置：這格確實沒開 p99 偵測"
+
+# (25) 舊格式（全域 consecutive/axes）遷移：不得 crash，且**一律不繼承**
+# 舊計數是把不同母體串起來累加出來的，無法歸屬到任何單一組合；繼承它等於把已知
+# 無效的「連續」直接搬進新語意。所以捨棄、從 0 起算，被丟掉的值留痕供回看。
+BCS10="$BCS/legacy"; mkdir -p "$BCS10"; _mkbs_pool "$BCS10"
+wj "$BCS10/baseline-drift-state.json" \
+  '{"axes":{"achieve-ratio":2,"baseline-p99":2},"consecutive":2,"recent":["earlier"]}'
+bcs "$BCS10" "osd-down-4k-mid+l1" mid 10420000
+lacks "$BCS_OUT" "HUMAN-NEEDED" "舊的全域計數 2 + 這次 1 次訊號，不得湊成連續 3 次"
+eq "$BCS_RC" "0" "遷移不得讓第一格就 rc=4"
+eq "$(jget "$BCS10/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "1" \
+  "舊的全域計數一律捨棄，逐組合從 0 起算"
+eq "$(jget "$BCS10/baseline-drift-state.json" legacy_consecutive_dropped)" "2" \
+  "被捨棄的舊計數要留痕（遷移語意必須看得出來）"
+# 壞掉的狀態檔（型別全錯）不得 crash
+BCS11="$BCS/legacy-junk"; mkdir -p "$BCS11"; _mkbs_pool "$BCS11"
+wj "$BCS11/baseline-drift-state.json" \
+  '{"combos":5,"consecutive":"x","axes":[1,2],"recent":"nope"}'
+bcs "$BCS11" "osd-down-4k-mid+j1" mid 5210000
+eq "$BCS_RC" "0" "狀態檔型別全錯不得讓 baseline-check 死掉（rc=1 會被 pipeline 靜默吞掉）"
+eq "$(jget "$BCS11/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "0" \
+  "壞掉的狀態檔要被當成空的重建"
+# combos 內單一 entry 壞掉也一樣（欄位型別錯 + entry 根本不是 dict，兩種都要擋）
+BCS12="$BCS/legacy-entry"; mkdir -p "$BCS12"; _mkbs_pool "$BCS12"
+wj "$BCS12/baseline-drift-state.json" \
+  '{"combos":{"4k/mid/backfill":{"axes":"bad","consecutive":null,"recent":7}}}'
+bcs "$BCS12" "osd-down-4k-mid+j2" mid 10420000
+eq "$BCS_RC" "0" "entry 的欄位型別錯不得讓 baseline-check 死掉"
+eq "$(jget "$BCS12/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "1" \
+  "欄位壞掉的 entry 從 0 起算"
+BCS14="$BCS/legacy-entry2"; mkdir -p "$BCS14"; _mkbs_pool "$BCS14"
+wj "$BCS14/baseline-drift-state.json" '{"combos":{"4k/mid/backfill":5}}'
+bcs "$BCS14" "osd-down-4k-mid+j3" mid 10420000
+eq "$BCS_RC" "0" "entry 根本不是 dict（手改壞了）也不得讓 baseline-check 死掉"
+eq "$(jget "$BCS14/baseline-drift-state.json" combos.4k/mid/backfill.consecutive)" "1" \
+  "非 dict 的 entry 要被整個重建"
+
+# (26) --drift-limit：PIPELINE_DRIFT_LIMIT 仍是有效旋鈕（門檻政策只實作在這裡一處）
+BCS13="$BCS/limit"; mkdir -p "$BCS13"; _mkbs_pool "$BCS13"
+BCS_EXTRA="--drift-limit 2"
+bcs "$BCS13" "osd-down-4k-mid+n1" mid 10420000
+lacks "$BCS_OUT" "HUMAN-NEEDED" "limit=2 時第 1 次不得停"
+contains "$BCS_OUT" "limit=2" "stdout 要印出這次生效的門檻"
+bcs "$BCS13" "osd-down-4k-mid+n2" mid 10420000
+contains "$BCS_OUT" "baseline-check: HUMAN-NEEDED recalibrate 2" "limit=2 時第 2 次就要停"
+eq "$BCS_RC" "4" "旗標要真的改變停佇列判準"
+BCS_EXTRA=""
 
 # =========================================================== schedule-estimate ==
 SRES="$tmp/sres"

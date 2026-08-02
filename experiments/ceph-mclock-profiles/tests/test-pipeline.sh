@@ -763,43 +763,59 @@ pipeline_run_execution "$tmp/ex-node.json" >/dev/null || fail "node-isolation �
 has "$TRACE" "fault_node_isolate node=mclock-osd-3" "node 故障分派到 node 狀態機"
 has "$TRACE" "fault_node_heal node=mclock-osd-3" "node 回歸走 node_heal"
 
-# ================================================== 14. baseline drift（漂移分級）==
+# ============ 14. baseline drift gate：停佇列判準的單一事實來源是 verdict.py ======
+# 「連續 N 次」的判定完全由 verdict.py 做——只有它知道這一格屬於哪個
+# (形態,壓力,backfill 類別) 母體，而門檻本來就是逐組合校準的，計數必須同粒度。
+# pipeline 這裡只做兩件事：
+#   (1) 把 verdict.py 算出來的 streak 鏡射進 watchdog-state.json（純可觀測性）
+#   (2) 看 rc=4 停佇列
+# **不得自己數、也不得自己判門檻**：同一套政策實作兩次，兩邊必然漂開——真機
+# 2026-08-02 的第五次假停佇列就是「門檻已逐組合、計數還全域」造成的。
 reset_state
 mk_exec "$tmp/ex-drift.json" fault osd-down mid 4k
-FAKE_BASELINE_LINE="baseline-drift achieved_ratio -22.0"
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=1 limit=3 achieve-ratio=0 baseline-p99=1\nbaseline-drift baseline-p99 22.0\nbaseline-check: DRIFT 1 covariate'
 pipeline_run_execution "$tmp/ex-drift.json" >/dev/null || fail "單次 drift 只記 covariate，不該擋"
-eq "$(pipeline_drift_streak)" "1" "單次 drift → streak=1（covariate）"
+eq "$(pipeline_drift_streak)" "1" "drift_streak 鏡射 verdict.py 回報的組合 streak"
 watchdog_halted && fail "單次 drift 不得停佇列"
 ok
-# 連續 3 次 → HUMAN gate
-for _i in 2 3; do
-  rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
-  pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
-done
-eq "$(pipeline_drift_streak)" "3" "連續 3 次 drift"
-if watchdog_halted; then ok; else fail "連續 3 次 drift 必須停佇列要求 recalibrate 裁決"; fi
+has "$FAKE_VERDICT_LOG" "--drift-limit 3" \
+  "PIPELINE_DRIFT_LIMIT 要傳給 verdict.py（門檻只能有一份實作）"
 
-# 14b) covariate-only（參考池不可比 → 這格根本沒開 p99 偵測）不得清掉 drift streak：
-# 「量不了」≠「沒漂移」。佇列成塊執行，跨 group 邊界必然出現數格 covariate-only，
-# 若在那裡歸零，先前累積的漂移證據會被反覆抹掉。
+# 14a) **關鍵回歸鎖**：verdict.py 說沒到門檻（rc=0），pipeline 就不得自己停佇列，
+# 即使鏡射到的數字已經 >= PIPELINE_DRIFT_LIMIT。那個數字有可能是別的母體湊出來的，
+# 正是假停佇列的成因；停佇列判準只有 rc=4 一個。
 reset_state
-FAKE_BASELINE_LINE="baseline-drift baseline-p99 22.0"
-for _i in 1 2; do
-  rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
-  pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
-done
-eq "$(pipeline_drift_streak)" "2" "前置：drift streak 已累積 2"
-FAKE_BASELINE_LINE="baseline-check: OK covariate-only class=backfill n=2"
-rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=9 limit=3 achieve-ratio=0 baseline-p99=9\nbaseline-drift baseline-p99 500.0\nbaseline-check: DRIFT 1 covariate'
 pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
-eq "$(pipeline_drift_streak)" "2" "covariate-only 要維持 streak（不 bump 也不 clear）"
-watchdog_halted && fail "covariate-only 不得自己觸發停佇列"
+eq "$(pipeline_drift_streak)" "9" "streak 照實鏡射（可觀測性欄位不得自作主張）"
+watchdog_halted && fail "rc=0 時 pipeline 不得自己據 streak 停佇列"
 ok
-# 真的量到而且乾淨，才可以清掉
-FAKE_BASELINE_LINE="baseline-check: OK"
-rm -rf "$RESULTS_DIR/osd-down-4k-mid+balanced"
+
+# 14b) rc=4 = 唯一的停佇列判準
+reset_state
+FAKE_BASELINE_RC=4
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=3 limit=3 achieve-ratio=0 baseline-p99=3\nbaseline-drift baseline-p99 500.0\nbaseline-check: HUMAN-NEEDED recalibrate 3'
 pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
-eq "$(pipeline_drift_streak)" "0" "量到且在容忍內才歸零 drift streak"
+if watchdog_halted; then ok; else fail "verdict.py 的 rc=4 必須停佇列"; fi
+eq "$(pipeline_drift_streak)" "3" "停佇列時一樣要留下當時的 streak（人工裁決要看得到）"
+FAKE_BASELINE_RC=0
+
+# 14c) 解析不到 streak 行（verdict.py 死掉／輸出被截斷）→ drift_streak 維持不變。
+# 憑空歸零 = 把先前累積的證據抹掉，等同「偵測失效偽裝成通過」。
+reset_state
+FAKE_BASELINE_LINE="baseline-check: OK covariate-only class=backfill n=2"
+_pipeline_py state "$(watchdog_state_path)" drift-set 2 >/dev/null
+pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+eq "$(pipeline_drift_streak)" "2" "沒有 streak 行時 drift_streak 必須維持不變"
+watchdog_halted && fail "解析不到 streak 不得自己停佇列"
+ok
+
+# 14d) 鏡射照 verdict.py 給的值走，包含歸零（該組合量到且在容忍內）
+reset_state
+_pipeline_py state "$(watchdog_state_path)" drift-set 2 >/dev/null
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=0 limit=3 achieve-ratio=0 baseline-p99=0\nbaseline-check: OK p99-tol=15.00% (floor)'
+pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+eq "$(pipeline_drift_streak)" "0" "verdict.py 說 0 就是 0"
 
 FAKE_BASELINE_LINE="baseline-check: OK"
 
@@ -855,7 +871,7 @@ reset_state
 W="$(watchdog_state_path)"
 _pipeline_py state "$W" bump collector-heartbeat >/dev/null
 _pipeline_py state "$W" bump collector-heartbeat >/dev/null
-_pipeline_py state "$W" drift-bump >/dev/null
+_pipeline_py state "$W" drift-set 1 >/dev/null
 _pipeline_halt_queue "collector-heartbeat 修不好"
 if watchdog_halted; then ok; else fail "前置：佇列應為 halted"; fi
 
@@ -901,8 +917,7 @@ eq "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["unhal
 
 # 18e) 未停佇列時 --clear-counts 仍要生效：誤報成因修掉後，殘留的 drift_streak
 #      會讓下一個訊號立刻再停；否則就只能手改 JSON，而這支工具就是為了取代手改。
-_pipeline_py state "$W" drift-bump >/dev/null
-_pipeline_py state "$W" drift-bump >/dev/null
+_pipeline_py state "$W" drift-set 2 >/dev/null
 eq "$(jget "$W" drift_streak)" "2" "前置：drift_streak 已累積"
 out="$(_pipeline_py state "$W" unhalt "成因已修，清計數" --clear-counts)" \
   || fail "未停佇列時的 --clear-counts 應成功"

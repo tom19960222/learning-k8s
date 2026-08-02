@@ -70,7 +70,8 @@ CLAIM_STALE_SECS="${CLAIM_STALE_SECS:-3600}"
 PIPELINE_TAINT_BUDGET="${PIPELINE_TAINT_BUDGET:-3}"
 # coverage supervisor 連續幾次退化算「持續 gap」（30s cadence × 3 = 90s）
 PIPELINE_COVERAGE_GAP_LIMIT="${PIPELINE_COVERAGE_GAP_LIMIT:-3}"
-# 連續幾個 replicate 出現 baseline drift 就停佇列要求 recalibrate 裁決
+# **同一個 (形態,壓力,backfill 類別)** 連續幾次 baseline drift 就停佇列要求 recalibrate。
+# 這個值只是傳給 verdict.py 的 `--drift-limit`——判定在那邊做，這裡不再自己數。
 PIPELINE_DRIFT_LIMIT="${PIPELINE_DRIFT_LIMIT:-3}"
 # final_clean 的零進展 deadline（逾時 → watchdog pg-no-progress）
 PIPELINE_PROGRESS_SECS="${PIPELINE_PROGRESS_SECS:-600}"
@@ -201,13 +202,16 @@ def cmd_state(path, op, *rest):
             doc["counts"] = {}
             doc["drift_streak"] = 0
         out = "unhalt: OK cleared-counts" if clear else "unhalt: OK"
-    elif op == "drift-bump":
-        n = int(doc.get("drift_streak", 0)) + 1
+    elif op == "drift-set":
+        # 純鏡射：值由 verdict.py 算好（它才知道這格屬於哪個
+        # (形態,壓力,backfill 類別) 母體）。這裡刻意**沒有** bump／clear——
+        # 有的話就等於把「什麼叫連續」這套政策在 pipeline 再實作一次。
+        try:
+            n = max(0, int(rest[0]))
+        except (IndexError, ValueError):
+            die("drift-set 需要一個非負整數：state <path> drift-set <n>")
         doc["drift_streak"] = n
         out = str(n)
-    elif op == "drift-clear":
-        doc["drift_streak"] = 0
-        out = "0"
     else:
         die("未知的 state 操作：%s" % op)
     doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -435,6 +439,9 @@ watchdog_count() { # <trigger>
 
 watchdog_halted() { _pipeline_py state "$(watchdog_state_path)" halted; }
 
+# watchdog-state.json 的 drift_streak = verdict.py 上一次回報的「**該組合**的 streak」
+# 鏡射，純可觀測性欄位（`run/unhalt.sh --clear-counts` 會清它）。**停佇列判準不看它**，
+# 只看 verdict.py 的 rc=4——見 `_pipeline_baseline_gate`。
 pipeline_drift_streak() { _pipeline_py state "$(watchdog_state_path)" drift; }
 
 # pipeline_unhalt <理由> [--clear-counts]：人工排除問題後解除停佇列（run/unhalt.sh 的核心）。
@@ -1006,28 +1013,56 @@ _pipeline_recover() {
   esac
 }
 
-# drift gate：單次只記 covariate，連續 PIPELINE_DRIFT_LIMIT 次才停佇列要求 recalibrate。
+# `baseline-check: streak combo=<鍵> n=<streak> limit=<門檻> <軸>=<n> ...` 的欄位擷取。
+# 找不到該行就印空字串（呼叫端據此決定「維持不變」）。
+_pipeline_baseline_field() { # <baseline-check 的 stdout> <欄位名>
+  printf '%s\n' "$1" | awk -v key="$2" '
+    $1 == "baseline-check:" && $2 == "streak" {
+      for (i = 3; i <= NF; i++) {
+        eq = index($i, "=")
+        if (eq > 1 && substr($i, 1, eq - 1) == key) { val = substr($i, eq + 1) }
+      }
+    }
+    END { if (val != "") print val }'
+}
+
+# drift gate：**停佇列判準的單一事實來源是 verdict.py 的 rc=4。**
+#
+# 為什麼這裡不再自己數（真機 2026-08-02 的第五次假停佇列）：漂移門檻早已逐
+# (形態,壓力,backfill 類別) 依實測 MAD 校準，而「連續 N 次」的語意是「**同一個量測
+# 母體**連續 N 次偏離」。pipeline 只看得到 verdict.py 的 stdout，它不知道這格屬於哪個
+# 組合，所以它數出來的必然是跨母體的全域數字——佇列又是 Latin square 輪替，各組合
+# 交錯出現，全域計數一定會把獨立事件串成假的「連續」。
+#
+# 兩邊各實作一次同一套政策，是「修正本身造成迴歸」的溫床（本 repo 已有四次前例，
+# 見 HYPOTHESES.md H-032 / H-036）。所以這裡只保留兩件事：
+#   (1) 把 verdict.py 算出來的該組合 streak 鏡射進 watchdog-state.json（可觀測性，
+#       `run/unhalt.sh --clear-counts` 會清它）；解析不到就**維持不變**，不憑空歸零。
+#   (2) rc=4 → 停佇列。rc 是獨立於 stdout 格式的通道，比字串比對更耐改。
+# `PIPELINE_DRIFT_LIMIT` 用 `--drift-limit` 傳給 verdict.py，門檻仍然只有一份實作。
 _pipeline_baseline_gate() {
-  local out rc=0 streak
-  out="$(python3 "$VERDICT_PY" baseline-check "$_PIPE_BUNDLE" --results "$RESULTS_DIR")" || rc=$?
+  local out rc=0 streak combo
+  out="$(python3 "$VERDICT_PY" baseline-check "$_PIPE_BUNDLE" --results "$RESULTS_DIR" \
+        --drift-limit "$PIPELINE_DRIFT_LIMIT")" || rc=$?
   printf '%s\n' "$out" >&2
+  combo="$(_pipeline_baseline_field "$out" combo)"
+  streak="$(_pipeline_baseline_field "$out" n)"
+  if [ -n "$streak" ]; then
+    _pipeline_py state "$(watchdog_state_path)" drift-set "$streak" >/dev/null \
+      || log "drift streak 鏡射寫入失敗（續行）：${streak}"
+  else
+    log "baseline-check 沒有回報 streak 行（rc=${rc}）——drift_streak 維持不變"
+  fi
   case "$out" in
     *baseline-drift*)
-      streak="$(_pipeline_py state "$(watchdog_state_path)" drift-bump)" || streak=0
-      log "baseline drift：連續 ${streak} 個 replicate"
-      if [ "${streak:-0}" -ge "$PIPELINE_DRIFT_LIMIT" ]; then
-        _pipeline_halt_queue "baseline drift 連續 ${streak} 次——需要 recalibrate 裁決"
-      fi
+      log "baseline drift：${combo:-unknown} 這個組合連續 ${streak:-?} 次（門檻 ${PIPELINE_DRIFT_LIMIT}）"
       ;;
     *covariate-only*)
       # 參考池不可比／樣本不足 → 這格根本沒開 p99 漂移偵測。「量不了」≠「沒漂移」，
-      # 所以 streak 維持不變（不 bump 也不 clear）。佇列成塊執行，跨 group 邊界必然
-      # 出現數格 covariate-only，若在那裡歸零，先前累積的漂移證據會被反覆抹掉。
-      log "baseline-check covariate-only：這格沒有可比參考，drift streak 維持不變"
+      # streak 的維持語意由 verdict.py 負責（逐軸逐組合），這裡只記錄。
+      log "baseline-check covariate-only：${combo:-unknown} 這格沒有可比參考，不判漂移"
       ;;
-    *)
-      _pipeline_py state "$(watchdog_state_path)" drift-clear >/dev/null || true
-      ;;
+    *) : ;;
   esac
   if [ "$rc" -eq 4 ]; then
     _pipeline_halt_queue "baseline-check HUMAN-NEEDED（recalibrate）"

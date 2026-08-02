@@ -1888,44 +1888,113 @@ def _tol_note(tol, mad, source, n):
 
 
 DRIFT_AXES = ("achieve-ratio", "baseline-p99")
+# 「連續幾次算漂移」的**唯一**實作點。pipeline.sh 用 `--drift-limit` 把
+# PIPELINE_DRIFT_LIMIT（同樣是 3）傳進來，它自己不再數、也不再據以停佇列
+# ——見 `_pipeline_baseline_gate` 的註解與 README §4.6。
+BASELINE_DRIFT_LIMIT = 3
+UNKNOWN_CLASS = "unknown"
 
 
-def _update_drift_state(state, measured_axes, signal_axes, bundle):
-    """漂移連續計數的三態更新（就地改 state）。
+def _drift_combo(shape, pressure, klass):
+    """連續計數的母體鍵 = (形態, 壓力, backfill 類別)——粒度與門檻一致。
 
-    - 量到了、超標   → 該軸 +1
-    - 量到了、在容忍內 → 該軸歸零
+    分類判不出來時歸 `unknown`：那條路徑本來就退回 covariate-only、不判 p99 漂移，
+    但 achieve-ratio 仍量得到，所以還是需要一個桶子，不能沒有鍵。
+    """
+    return "%s/%s/%s" % (shape, pressure, klass or UNKNOWN_CLASS)
+
+
+def _int0(v):
+    """任何東西轉成非負整數，轉不動就 0。
+
+    狀態檔壞掉（型別全錯／人工手改壞了）不得讓 baseline-check 以 rc=1 死掉——
+    pipeline 會把 rc=1 靜默吞掉（見 `_read_json_soft` 的說明），漂移偵測會就此靜默失效。
+    """
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _update_drift_state(state, combo, measured_axes, signal_axes, bundle):
+    """漂移連續計數的三態更新（就地改 state），**逐 (形態,壓力,backfill 類別)**。
+
+    - 量到了、超標   → 該組合的該軸 +1
+    - 量到了、在容忍內 → 該組合的該軸歸零
     - **量不了 → 該軸維持不變**（「量不了」≠「沒漂移」）
 
-    為什麼逐軸記：兩條軸「量得到與否」不同步——achieve-ratio 只要有 target 就量得到，
-    baseline-p99 得有同條件參考池才算量到。共用一個計數器的話，p99 盲的那些 cell 會被
-    achieve-ratio 的乾淨結果把 p99 已累積的漂移證據抹掉。而佇列是成塊執行的
-    （manifest 依 (group_index, replicate_n, latin_position) 排序），每跨一個 group
-    邊界就會有數格因同類別樣本不足而退回 covariate-only，抹掉的機會很多。
+    為什麼逐組合記（真機 2026-08-02 的第五次假停佇列）：門檻已經逐組合依實測 MAD
+    校準（見 `_p99_tolerance`），但「連續 N 次」的計數器還是全域的。造成停機的三筆
+    跨了**兩個母體**——low/backfill +243.08%（該組合門檻 87.75%）、mid/backfill
+    +41.29%（15.48%）、mid/backfill +498.73%（17.20%）。「連續 3 次漂移」的語意是
+    「**同一個量測母體**連續 3 次偏離」，不是「三個互不相干的母體各出現一次離群值」。
+    佇列是 Latin square 輪替執行，各組合本來就交錯出現，全域計數必然把獨立事件串成
+    假的「連續」。決定性反證：4k/mid/backfill 的注入前窗（主指標的分母）跨 5 天 9 個
+    attempt 是 3.228–3.424ms（全距 6%）——叢集根本沒有漂移。
 
-    對外仍以 `consecutive`（= 各軸最大值）當停佇列判準，門檻不變（連續 3 次）。
+    為什麼**兩條軸都**逐組合：achieve-ratio 量的是「fio 有沒有打到目標速率」，而目標
+    速率本來就隨 (形態,壓力) 而異（低/中/高壓各是 ceiling 的 25/50/80%，見
+    `_calibration_target`）；而且 baseline.json 是善後復測，backfill 還在排的時候
+    供給達成率本來就會掉——backfill 類別同樣是它的母體邊界。兩條軸共用同一個母體鍵，
+    在那個鍵底下各自計數。
+
+    為什麼仍逐軸記：兩條軸「量得到與否」不同步——achieve-ratio 只要有 target 就量得到，
+    baseline-p99 得有同條件參考池才算量到。共用一個計數器的話，p99 盲的那些 cell 會被
+    achieve-ratio 的乾淨結果把 p99 已累積的漂移證據抹掉。
+
+    停佇列判準用的是**當前這個 execution 所屬組合**的 `consecutive`（= 該組合各軸的
+    最大值），門檻不變。回傳該組合的 entry。
     """
-    axes = state.get("axes")
+    combos = state.get("combos")
+    if not isinstance(combos, dict):
+        # --- 舊格式遷移（不得 crash）---------------------------------------
+        # 舊檔是全域的 `{"axes": {...}, "consecutive": N}`。那個 N 是把不同母體串起來
+        # 累加出來的，**無法歸屬到任何單一組合**；繼承它等於把已知無效的「連續」直接
+        # 搬進新語意，下一格真訊號就會被舊帳推過門檻。所以一律捨棄、各組合從 0 起算，
+        # 只把丟掉的值留痕成 `legacy_consecutive_dropped` 供回看。
+        # 型別壞掉（combos 是數字、consecutive 是字串…）走同一條路：當成空的重建。
+        dropped = _int0(state.get("consecutive"))
+        combos = {}
+        if dropped:
+            state["legacy_consecutive_dropped"] = dropped
+    entry = combos.get(combo)
+    if not isinstance(entry, dict):
+        entry = {}
+    axes = entry.get("axes")
     if not isinstance(axes, dict):
-        # 舊格式（只有 consecutive）：兩軸都先繼承那個值，之後各自照三態演進
-        legacy = int(state.get("consecutive", 0) or 0)
-        axes = dict((a, legacy) for a in DRIFT_AXES)
+        axes = {}
     new_axes = {}
     for axis in DRIFT_AXES:
-        n = int(axes.get(axis, 0) or 0)
+        n = _int0(axes.get(axis))
         if axis in signal_axes:
             n += 1
         elif axis in measured_axes:
             n = 0
         new_axes[axis] = n
-    state["axes"] = new_axes
-    state["consecutive"] = max(new_axes.values())
+    recent = entry.get("recent")
+    if not isinstance(recent, list):
+        recent = []
+    entry["axes"] = new_axes
+    entry["consecutive"] = max(new_axes.values())
     if signal_axes:
-        state["recent"] = (state.get("recent") or [])[-4:] + [bundle]
-    elif state["consecutive"] == 0:
-        state["recent"] = []
+        entry["recent"] = recent[-4:] + [bundle]
+    elif entry["consecutive"] == 0:
+        entry["recent"] = []
+    else:
+        entry["recent"] = recent
+    entry["updated_at"] = utc_now()
+    combos[combo] = entry
+    state["combos"] = combos
+    # 頂層欄位 = **當前這個組合**的鏡射（相容既有讀法，也讓人一眼看出這次計的是誰）。
+    # 別的組合的計數只存在 combos 底下，不會被這裡蓋掉。
+    state["combo"] = combo
+    state["scope"] = "combo"
+    state["axes"] = dict(new_axes)
+    state["consecutive"] = entry["consecutive"]
+    state["recent"] = list(entry["recent"])
     state["updated_at"] = utc_now()
-    return state
+    return entry
 
 
 def cmd_baseline_check(args):
@@ -2012,15 +2081,21 @@ def cmd_baseline_check(args):
                             " " + _tol_note(p99_tolerance, ref_mad, tol_source, len(prior))))
 
     state_path = os.path.join(results_dir, "baseline-drift-state.json")
-    state = read_json(state_path, {"consecutive": 0, "recent": []}) or {
-        "consecutive": 0, "recent": []}
+    state = read_json(state_path, {}) or {}
+    if not isinstance(state, dict):
+        state = {}
     measured_axes = set()
     if achieve_ratio is not None:
         measured_axes.add("achieve-ratio")
     if measured and p99_shift is not None:
         measured_axes.add("baseline-p99")
-    _update_drift_state(state, measured_axes, set(s[0] for s in signals), bundle)
+    # 連續計數的母體 = 這一格自己的 (形態,壓力,backfill 類別)，與門檻同粒度。
+    combo = _drift_combo(shape, pressure, klass)
+    entry = _update_drift_state(state, combo, measured_axes,
+                                set(s[0] for s in signals), bundle)
     write_json(state_path, state)
+    drift_limit = max(1, _int0(getattr(args, "drift_limit", None)) or BASELINE_DRIFT_LIMIT)
+    consecutive = entry["consecutive"]
 
     out = {
         "schema_version": SCHEMA_VERSION,
@@ -2049,20 +2124,33 @@ def cmd_baseline_check(args):
         "p99_mad_multiplier": BASELINE_P99_MAD_MULTIPLIER,
         "reference_mad_pct": ref_mad,
         "drift_signals": [s[0] for s in signals],
-        "consecutive_drift": state["consecutive"],
+        # consecutive_drift = **這一格所屬組合**的 streak（不是全 campaign 的）。
+        # drift_scope / drift_combo / drift_limit 讓人回頭看得出判準的粒度與門檻，
+        # 「判準不可以悄悄變動而看不出來」。
+        "consecutive_drift": consecutive,
+        "drift_scope": "combo",
+        "drift_combo": combo,
+        "drift_axes": dict(entry["axes"]),
+        "drift_limit": drift_limit,
         "covariate": True,
         "calibration": cal_path,
     }
     write_json(os.path.join(bundle, "baseline-check.json"), out)
 
+    # 每次都印：operator 要看得出「這次計的是哪個組合的 streak、目前是多少、門檻多少」。
+    # 刻意避開 `baseline-drift` 與 `covariate-only` 這兩個子字串——pipeline.sh 的
+    # `_pipeline_baseline_gate` 是用它們做 case 比對的（stdout 契約）。
+    emit("baseline-check: streak combo=%s n=%d limit=%d %s"
+         % (combo, consecutive, drift_limit,
+            " ".join("%s=%d" % (a, entry["axes"][a]) for a in DRIFT_AXES)))
     for metric, pct, note in signals:
         emit("baseline-drift %s %.2f%s" % (metric, pct, note))
-    # HUMAN-NEEDED 只在「這次真的量到而且超標」時才發。consecutive 現在會跨
-    # covariate-only 的 execution 維持，若不加 signals 這個條件，殘留的計數會讓
-    # 下一格「量不了」的 cell 直接停佇列——那不是連續 3 次漂移，是拿舊帳停人。
-    # 門檻本身（連續 3 次）不變；這條只是還原「停佇列必由本次訊號觸發」的原契約。
-    if signals and state["consecutive"] >= 3:
-        emit("baseline-check: HUMAN-NEEDED recalibrate %d" % state["consecutive"])
+    # HUMAN-NEEDED 只在「這次真的量到而且超標」時才發。streak 會跨 covariate-only 的
+    # execution 維持，若不加 signals 這個條件，殘留的計數會讓下一格「量不了」的 cell
+    # 直接停佇列——那不是連續 N 次漂移，是拿舊帳停人。
+    # 門檻本身不變（3）；判準的**母體**才是這次改的東西。
+    if signals and consecutive >= drift_limit:
+        emit("baseline-check: HUMAN-NEEDED recalibrate %d" % consecutive)
         return 4
     if signals:
         emit("baseline-check: DRIFT %d covariate" % len(signals))
@@ -2538,6 +2626,9 @@ def build_parser():
     b.add_argument("bundle")
     b.add_argument("--results")
     b.add_argument("--calibration")
+    b.add_argument("--drift-limit", type=int, default=BASELINE_DRIFT_LIMIT,
+                   help="同一個 (形態,壓力,backfill 類別) 連續幾次漂移才停佇列"
+                        "（pipeline.sh 用 PIPELINE_DRIFT_LIMIT 傳進來）")
     b.set_defaults(func=cmd_baseline_check)
 
     s = sub.add_parser("schemas")
