@@ -1700,8 +1700,9 @@ def _read_json_soft(path):
 
     參考池會掃過全 campaign 上百個 prior bundle，只要其中一個檔壞掉就讓
     baseline-check 以 rc=1 死掉的話，`_pipeline_baseline_gate`（pipeline.sh）
-    只認 rc=4 與 stdout 的 `baseline-drift`，rc=1 會被靜默吞掉、還會順手
-    drift-clear——drift gate 就此永久靜默失效（「偵測失效偽裝成通過」）。
+    只讀 stdout、會把 rc=1 靜默吞掉——這一格的訊號、streak 與 baseline-check.json
+    就整個不見了（「偵測失效偽裝成通過」）。漂移現在只告警不停機，但**記錄仍是
+    收官報告的稽核依據**，這條路徑因此照舊必須「讀不到就當分類不明」。
     而 `prediction.json` 正是全 bundle 唯一非 atomic 的寫入（freeze_prediction
     直接 open().write()），最可能留下截斷檔。所以這條路徑一律「讀不到就當分類
     不明」，讓那個 prior 不進池，而不是把整個 gate 拖死。
@@ -1818,7 +1819,7 @@ def _mad_pct(values, center):
     的——backfill 排乾 ≈2.9–4.1ms、沒排乾 ≈9.5–12.4ms），單一離群值會把標準差整個
     拉走。實測 4k/mid/backfill：MAD 5.2%，標準差 40%——後者會讓那個組合的門檻變成
     120%，等於一顆離群值就把整組的偵測力關掉。MAD 對離群值穩健，孤立離群值因此
-    **仍會**被記成訊號（單次訊號本來就只記 covariate，連續 3 次才停佇列）。
+    **仍會**被記成訊號（單次訊號本來就只記 covariate，連續 3 次才發 DRIFT-ALERT）。
 
     center 固定用呼叫端當作參考基準的那個中位數，讓「偏移量」與「離散度」是同一個
     原點量出來的，不會出現偏移用 A、門檻用 B 的錯配。
@@ -1889,8 +1890,9 @@ def _tol_note(tol, mad, source, n):
 
 DRIFT_AXES = ("achieve-ratio", "baseline-p99")
 # 「連續幾次算漂移」的**唯一**實作點。pipeline.sh 用 `--drift-limit` 把
-# PIPELINE_DRIFT_LIMIT（同樣是 3）傳進來，它自己不再數、也不再據以停佇列
-# ——見 `_pipeline_baseline_gate` 的註解與 README §4.6。
+# PIPELINE_DRIFT_LIMIT（同樣是 3）傳進來，它自己不再數——見 `_pipeline_baseline_gate`
+# 的註解與 README §4.6。**數值未動**：達到它現在只發 DRIFT-ALERT，不停佇列
+# （使用者 2026-08-03 的裁示；判定側完全不變，見 `cmd_baseline_check` 末段）。
 BASELINE_DRIFT_LIMIT = 3
 UNKNOWN_CLASS = "unknown"
 
@@ -1943,8 +1945,8 @@ def _update_drift_state(state, combo, measured_axes, signal_axes, bundle):
     baseline-p99 得有同條件參考池才算量到。共用一個計數器的話，p99 盲的那些 cell 會被
     achieve-ratio 的乾淨結果把 p99 已累積的漂移證據抹掉。
 
-    停佇列判準用的是**當前這個 execution 所屬組合**的 `consecutive`（= 該組合各軸的
-    最大值），門檻不變。回傳該組合的 entry。
+    告警判準（以前是停佇列判準）用的是**當前這個 execution 所屬組合**的 `consecutive`
+    （= 該組合各軸的最大值），門檻不變。回傳該組合的 entry。
     """
     combos = state.get("combos")
     if not isinstance(combos, dict):
@@ -2096,6 +2098,11 @@ def cmd_baseline_check(args):
     write_json(state_path, state)
     drift_limit = max(1, _int0(getattr(args, "drift_limit", None)) or BASELINE_DRIFT_LIMIT)
     consecutive = entry["consecutive"]
+    # 到門檻的判準**與過去一字不差**：「這次真的量到而且超標」+ 該組合 streak >= 門檻。
+    # 改的只有「達到之後做什麼」（見下方 DRIFT-ALERT）。streak 會跨 covariate-only 的
+    # execution 維持，若不加 signals 這個條件，殘留的計數會讓下一格「量不了」的 cell
+    # 直接告警——那不是連續 N 次漂移，是拿舊帳報警。
+    drift_alert = bool(signals) and consecutive >= drift_limit
 
     out = {
         "schema_version": SCHEMA_VERSION,
@@ -2132,6 +2139,12 @@ def cmd_baseline_check(args):
         "drift_combo": combo,
         "drift_axes": dict(entry["axes"]),
         "drift_limit": drift_limit,
+        # drift_alert = 「這格到門檻了」（**以前就是在這裡停佇列的那一格**）。
+        # drift_halts_queue 恆為 false = 這格是在「漂移只告警、不停機」的政策下跑的。
+        # 兩個欄位都是給收官報告做事後稽核用的：哪幾格會被舊政策擋下、擋在哪個組合、
+        # 那時的 streak 與門檻是多少，全部留在這份 JSON 裡。
+        "drift_alert": drift_alert,
+        "drift_halts_queue": False,
         "covariate": True,
         "calibration": cal_path,
     }
@@ -2145,13 +2158,26 @@ def cmd_baseline_check(args):
             " ".join("%s=%d" % (a, entry["axes"][a]) for a in DRIFT_AXES)))
     for metric, pct, note in signals:
         emit("baseline-drift %s %.2f%s" % (metric, pct, note))
-    # HUMAN-NEEDED 只在「這次真的量到而且超標」時才發。streak 會跨 covariate-only 的
-    # execution 維持，若不加 signals 這個條件，殘留的計數會讓下一格「量不了」的 cell
-    # 直接停佇列——那不是連續 N 次漂移，是拿舊帳停人。
-    # 門檻本身不變（3）；判準的**母體**才是這次改的東西。
-    if signals and consecutive >= drift_limit:
-        emit("baseline-check: HUMAN-NEEDED recalibrate %d" % consecutive)
-        return 4
+    # 到門檻 → **只告警，不停佇列**（使用者 2026-08-03 的裁示）。
+    #
+    # 為什麼：baseline drift gate 在 8 天內停機 6 次，事後**全部**判定為誤報、
+    # 零次真陽性（成因逐次修掉：參考基準不可比 → 樣本不足退回 → backfill 類別混池 →
+    # 門檻未依實測離散度 → 計數跨母體；見 results/watchdog-state.json 的 unhalt_log）。
+    # campaign 已完成 123/164，裁示是「讓漂移偵測不要再停機，先把量測跑完」。
+    #
+    # **改的只有「達到門檻之後做什麼」，不是「什麼算達到門檻」**：訊號判定、streak
+    # 累加、逐組合門檻計算、baseline-check.json 的欄位一律照舊，只是這裡改成印一行
+    # 可 grep 的 DRIFT-ALERT 然後照常回 0（以前是 HUMAN-NEEDED + rc=4，而 rc=4 正是
+    # pipeline 的停佇列判準）。收官報告要靠 `drift_alert` / `consecutive_drift` /
+    # `drift_limit` / `drift_signals` 做事後稽核，一個欄位都不能少。
+    # 補償措施：環境劣化改由人工監看注入前窗（主指標的分母）。
+    #
+    # 這行刻意避開 `baseline-drift` 與 `covariate-only` 兩個子字串——pipeline.sh 的
+    # `_pipeline_baseline_gate` 用它們做 case 比對（stdout 契約），且全 ASCII。
+    if drift_alert:
+        emit("baseline-check: DRIFT-ALERT combo=%s n=%d limit=%d axes=%s queue=continue"
+             % (combo, consecutive, drift_limit,
+                ",".join(s[0] for s in signals)))
     if signals:
         emit("baseline-check: DRIFT %d covariate" % len(signals))
         return 0
@@ -2627,8 +2653,8 @@ def build_parser():
     b.add_argument("--results")
     b.add_argument("--calibration")
     b.add_argument("--drift-limit", type=int, default=BASELINE_DRIFT_LIMIT,
-                   help="同一個 (形態,壓力,backfill 類別) 連續幾次漂移才停佇列"
-                        "（pipeline.sh 用 PIPELINE_DRIFT_LIMIT 傳進來）")
+                   help="同一個 (形態,壓力,backfill 類別) 連續幾次漂移才發 DRIFT-ALERT"
+                        "（pipeline.sh 用 PIPELINE_DRIFT_LIMIT 傳進來；告警不停佇列）")
     b.set_defaults(func=cmd_baseline_check)
 
     s = sub.add_parser("schemas")

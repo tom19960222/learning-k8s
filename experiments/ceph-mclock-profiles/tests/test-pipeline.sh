@@ -763,12 +763,13 @@ pipeline_run_execution "$tmp/ex-node.json" >/dev/null || fail "node-isolation �
 has "$TRACE" "fault_node_isolate node=mclock-osd-3" "node 故障分派到 node 狀態機"
 has "$TRACE" "fault_node_heal node=mclock-osd-3" "node 回歸走 node_heal"
 
-# ============ 14. baseline drift gate：停佇列判準的單一事實來源是 verdict.py ======
+# ============ 14. baseline drift gate：**只鏡射與記錄，永不停佇列** =============
 # 「連續 N 次」的判定完全由 verdict.py 做——只有它知道這一格屬於哪個
 # (形態,壓力,backfill 類別) 母體，而門檻本來就是逐組合校準的，計數必須同粒度。
-# pipeline 這裡只做兩件事：
+# 而自 2026-08-03 的使用者裁示起（8 天內 6 次停機、事後全數判定為誤報、零次真陽性），
+# **漂移不再停佇列**：verdict.py 到門檻只印 DRIFT-ALERT，pipeline 這裡只做兩件事：
 #   (1) 把 verdict.py 算出來的 streak 鏡射進 watchdog-state.json（純可觀測性）
-#   (2) 看 rc=4 停佇列
+#   (2) 照原樣把 stdout 轉成 log
 # **不得自己數、也不得自己判門檻**：同一套政策實作兩次，兩邊必然漂開——真機
 # 2026-08-02 的第五次假停佇列就是「門檻已逐組合、計數還全域」造成的。
 reset_state
@@ -781,9 +782,8 @@ ok
 has "$FAKE_VERDICT_LOG" "--drift-limit 3" \
   "PIPELINE_DRIFT_LIMIT 要傳給 verdict.py（門檻只能有一份實作）"
 
-# 14a) **關鍵回歸鎖**：verdict.py 說沒到門檻（rc=0），pipeline 就不得自己停佇列，
-# 即使鏡射到的數字已經 >= PIPELINE_DRIFT_LIMIT。那個數字有可能是別的母體湊出來的，
-# 正是假停佇列的成因；停佇列判準只有 rc=4 一個。
+# 14a) **關鍵回歸鎖**：pipeline 不得自己據鏡射到的 streak 停佇列，即使那個數字已經
+# >= PIPELINE_DRIFT_LIMIT。那個數字有可能是別的母體湊出來的，正是假停佇列的成因。
 reset_state
 FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=9 limit=3 achieve-ratio=0 baseline-p99=9\nbaseline-drift baseline-p99 500.0\nbaseline-check: DRIFT 1 covariate'
 pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
@@ -791,13 +791,25 @@ eq "$(pipeline_drift_streak)" "9" "streak 照實鏡射（可觀測性欄位不�
 watchdog_halted && fail "rc=0 時 pipeline 不得自己據 streak 停佇列"
 ok
 
-# 14b) rc=4 = 唯一的停佇列判準
+# 14b) **到門檻（DRIFT-ALERT）也不得停佇列**（使用者 2026-08-03 的裁示）
+# 8 天內 6 次停機事後全數判定為誤報、零次真陽性，campaign 已完成 123/164 →
+# 漂移偵測改為只告警。streak 照樣鏡射，資訊一個都不少，只是不再擋量測。
+reset_state
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=3 limit=3 achieve-ratio=0 baseline-p99=3\nbaseline-drift baseline-p99 500.0\nbaseline-check: DRIFT-ALERT combo=4k/mid/backfill n=3 limit=3 axes=baseline-p99 queue=continue\nbaseline-check: DRIFT 1 covariate'
+pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
+watchdog_halted && fail "drift 到門檻不得停佇列（DRIFT-ALERT 只告警）"
+ok
+eq "$(pipeline_drift_streak)" "3" "到門檻一樣要留下當時的 streak（事後稽核要看得到）"
+
+# 14b') 連 verdict.py 的 rc 都不再是停機通道：baseline gate 已經完全不呼叫
+# _pipeline_halt_queue。把 rc=4 的分支加回去，這條會紅。
 reset_state
 FAKE_BASELINE_RC=4
-FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=3 limit=3 achieve-ratio=0 baseline-p99=3\nbaseline-drift baseline-p99 500.0\nbaseline-check: HUMAN-NEEDED recalibrate 3'
+FAKE_BASELINE_LINE=$'baseline-check: streak combo=4k/mid/backfill n=3 limit=3 achieve-ratio=0 baseline-p99=3\nbaseline-drift baseline-p99 500.0\nbaseline-check: DRIFT-ALERT combo=4k/mid/backfill n=3 limit=3 axes=baseline-p99 queue=continue'
 pipeline_run_execution "$tmp/ex-drift.json" >/dev/null 2>&1 || true
-if watchdog_halted; then ok; else fail "verdict.py 的 rc=4 必須停佇列"; fi
-eq "$(pipeline_drift_streak)" "3" "停佇列時一樣要留下當時的 streak（人工裁決要看得到）"
+watchdog_halted && fail "baseline gate 不得因任何 rc 停佇列"
+ok
+eq "$(pipeline_drift_streak)" "3" "非 0 rc 時 streak 一樣照常鏡射"
 FAKE_BASELINE_RC=0
 
 # 14c) 解析不到 streak 行（verdict.py 死掉／輸出被截斷）→ drift_streak 維持不變。

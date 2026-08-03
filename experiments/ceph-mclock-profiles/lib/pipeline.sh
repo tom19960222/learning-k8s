@@ -440,8 +440,8 @@ watchdog_count() { # <trigger>
 watchdog_halted() { _pipeline_py state "$(watchdog_state_path)" halted; }
 
 # watchdog-state.json 的 drift_streak = verdict.py 上一次回報的「**該組合**的 streak」
-# 鏡射，純可觀測性欄位（`run/unhalt.sh --clear-counts` 會清它）。**停佇列判準不看它**，
-# 只看 verdict.py 的 rc=4——見 `_pipeline_baseline_gate`。
+# 鏡射，純可觀測性欄位（`run/unhalt.sh --clear-counts` 會清它）。**drift 已經完全不停
+# 佇列**（2026-08-03 的裁示，到門檻只發 DRIFT-ALERT）——見 `_pipeline_baseline_gate`。
 pipeline_drift_streak() { _pipeline_py state "$(watchdog_state_path)" drift; }
 
 # pipeline_unhalt <理由> [--clear-counts]：人工排除問題後解除停佇列（run/unhalt.sh 的核心）。
@@ -1026,9 +1026,18 @@ _pipeline_baseline_field() { # <baseline-check 的 stdout> <欄位名>
     END { if (val != "") print val }'
 }
 
-# drift gate：**停佇列判準的單一事實來源是 verdict.py 的 rc=4。**
+# drift gate：**只記錄，永不停佇列**（使用者 2026-08-03 的裁示）。
 #
-# 為什麼這裡不再自己數（真機 2026-08-02 的第五次假停佇列）：漂移門檻早已逐
+# 為什麼不再停：這道 gate 在 8 天內停機 6 次，事後**全部**判定為誤報、零次真陽性
+# （成因逐次修掉：參考基準不可比 → 樣本不足退回 → backfill 類別混池 → 門檻未依實測
+# 離散度 → 計數跨母體；見 results/watchdog-state.json 的 unhalt_log）。campaign 已完成
+# 123/164，裁示是「讓漂移偵測不要再停機，先把量測跑完」。**判定側完全沒有放寬**：
+# verdict.py 照舊判訊號、累加 streak、算逐組合門檻、寫滿 baseline-check.json，到門檻
+# 時改印一行可 grep 的 `baseline-check: DRIFT-ALERT ...`；環境劣化改由人工監看注入前窗。
+# 這條**只針對 drift**——coverage taint、sampler 失聯、taint-budget、watchdog 的
+# pg-no-progress / collector-heartbeat、pilot gate 一律不動。
+#
+# 為什麼這裡不自己數（真機 2026-08-02 的第五次假停佇列）：漂移門檻早已逐
 # (形態,壓力,backfill 類別) 依實測 MAD 校準，而「連續 N 次」的語意是「**同一個量測
 # 母體**連續 N 次偏離」。pipeline 只看得到 verdict.py 的 stdout，它不知道這格屬於哪個
 # 組合，所以它數出來的必然是跨母體的全域數字——佇列又是 Latin square 輪替，各組合
@@ -1038,7 +1047,7 @@ _pipeline_baseline_field() { # <baseline-check 的 stdout> <欄位名>
 # 見 HYPOTHESES.md H-032 / H-036）。所以這裡只保留兩件事：
 #   (1) 把 verdict.py 算出來的該組合 streak 鏡射進 watchdog-state.json（可觀測性，
 #       `run/unhalt.sh --clear-counts` 會清它）；解析不到就**維持不變**，不憑空歸零。
-#   (2) rc=4 → 停佇列。rc 是獨立於 stdout 格式的通道，比字串比對更耐改。
+#   (2) 把 verdict.py 的 stdout 照原樣轉成 log（含 DRIFT-ALERT）。
 # `PIPELINE_DRIFT_LIMIT` 用 `--drift-limit` 傳給 verdict.py，門檻仍然只有一份實作。
 _pipeline_baseline_gate() {
   local out rc=0 streak combo
@@ -1054,6 +1063,11 @@ _pipeline_baseline_gate() {
     log "baseline-check 沒有回報 streak 行（rc=${rc}）——drift_streak 維持不變"
   fi
   case "$out" in
+    *DRIFT-ALERT*)
+      # 到門檻了：**這裡本來會停佇列，現在只告警**。人工看到這行要去對注入前窗
+      # （主指標的分母）確認叢集是不是真的劣化——那是不停機之後的補償措施。
+      log "baseline drift 到門檻但不停佇列（只告警）：${combo:-unknown} 連續 ${streak:-?} 次（門檻 ${PIPELINE_DRIFT_LIMIT}）——請人工對注入前窗覆核"
+      ;;
     *baseline-drift*)
       log "baseline drift：${combo:-unknown} 這個組合連續 ${streak:-?} 次（門檻 ${PIPELINE_DRIFT_LIMIT}）"
       ;;
@@ -1064,9 +1078,8 @@ _pipeline_baseline_gate() {
       ;;
     *) : ;;
   esac
-  if [ "$rc" -eq 4 ]; then
-    _pipeline_halt_queue "baseline-check HUMAN-NEEDED（recalibrate）"
-  fi
+  # 這裡刻意**沒有** `_pipeline_halt_queue`：drift 不再是停佇列的理由（見上方註解）。
+  # 其他停佇列路徑（watchdog trigger、taint-budget…）不受影響。
   return 0
 }
 

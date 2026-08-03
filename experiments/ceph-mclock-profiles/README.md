@@ -139,7 +139,7 @@ steady / fault / chaos 走**同一台狀態機**（`lib/pipeline.sh::pipeline_ru
    │              ── 記 H-008 兩時戳（回歸開始 → final_clean）+ 該區間 recovery bytes/s
    │                 → return-backfill.json（全實驗唯一 best_effort `lim` 會 binding 的場景）
    │
-   ├─ baseline 復測（60s，同形態同壓力固定速率）→ verdict.py baseline-check（drift gate）
+   ├─ baseline 復測（60s，同形態同壓力固定速率）→ verdict.py baseline-check（drift gate：只告警不停佇列，§4.6）
    │
    ├─ sampler_stop → collect_cell → aggregate → verdict
    │              → verdict.py schemas <kind> --verify（cell/profile/manifest-hash/時間窗交叉核對）
@@ -227,7 +227,7 @@ bash run/all.sh --yes-really-inject --resume
 | `calibrate.sh` | 每步驟寫 `results/calibrate/<step>.done`，重入跳過；journal 在 `results/calibrate/journal.log` | 任一步失敗即 die **停在原地**，修好後重跑會從斷點續。`--redo <step>` 清單一步驟的 marker |
 | `steady` / `faults` / `chaos` | `reconcile` → `manifest.py next` 只回還沒有 `results/<cell>/<rN>/DONE` 的 execution | 未 finalize 的 attempt 會被 reconcile 標 `ABORTED`，該 replicate 下一輪重跑 |
 | `all.sh` | `results/.stage-<name>.done` | 段內續跑交給該段自己 |
-| 全域狀態 | `results/schedule-amendments.json`（append-only JSONL，唯一持久 SoT）、`results/watchdog-state.json`（計數 / halted / drift streak 鏡射，resume **不重置**）、`results/baseline-drift-state.json`（逐組合 drift 計數，停佇列判準的 SoT） | crash 後重讀即恢復 |
+| 全域狀態 | `results/schedule-amendments.json`（append-only JSONL，唯一持久 SoT）、`results/watchdog-state.json`（計數 / halted / drift streak 鏡射，resume **不重置**）、`results/baseline-drift-state.json`（逐組合 drift 計數，`DRIFT-ALERT` 告警判準的 SoT；**drift 不停佇列**，見 §4.6） | crash 後重讀即恢復 |
 
 **`--redo` 的紅線**：`raw-nvme-baseline` 在 `deploy` 完成後一律拒絕重跑——OSD 建立後直打 raw device 會毀掉 BlueStore。腳本內有順序不變條件，`fio_raw_nvme_baseline` 內另有 blkid / `ceph-volume inventory` 的 RAWGUARD，兩道防線都在。
 
@@ -321,9 +321,28 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
 **處置**：讀 die 訊息指名的那顆，查 `journalctl -b -u ceph-<fsid>@osd.<N>`，確認是 bench 真的失敗、還是 log 管道問題。修好之後 `--redo capacity`。
 
-### 4.6 baseline drift：同一組合連續 3 次（佇列停，`recalibrate` 裁決）
+### 4.6 baseline drift：同一組合連續 3 次（**只告警，不停佇列**）
 
-**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對**同條件參考中位數**的偏移超過**該組合自己的容忍值**（`max(15%, 3 × MAD)`，見下方「門檻依實測解析度逐組合校準」）。單次只印 `baseline-drift <metric> <pct> tol=...` 並記 covariate；**同一個 (形態, 壓力, backfill 類別) 連續 3 個 replicate** 超標才停佇列（`PIPELINE_DRIFT_LIMIT`，由 `--drift-limit` 傳給 `verdict.py`）。
+> **2026-08-03 起這道 gate 不再停機**（使用者裁示）。它在 8 天內停機 **6 次，事後全部判定為誤報、零次真陽性**（`results/watchdog-state.json` 的 `unhalt_log` 逐次留痕：參考基準條件不可比 → 樣本不足退回校準值 → 混不同 backfill 類別的參考池 → 門檻未依實測離散度 → 連續計數跨母體）。campaign 已完成 123/164，裁示是「**讓漂移偵測不要再停機，先把量測跑完**」。
+>
+> **改的只有「達到門檻之後做什麼」，不是「什麼算達到門檻」**：
+>
+> | 項目 | 改動前 | 現在 |
+> |---|---|---|
+> | 訊號判定 | achieve-ratio < 85%；\|p99 偏移\| > `max(15%, 3 × MAD)` | **一字未動** |
+> | 逐組合連續計數（streak）與三態更新 | 逐 (形態,壓力,backfill 類別) 逐軸 | **一字未動** |
+> | 門檻常數 `BASELINE_P99_TOLERANCE` / `BASELINE_P99_MAD_MULTIPLIER` / `BASELINE_ACHIEVE_MIN` / `PIPELINE_DRIFT_LIMIT` | 0.15 / 3.0 / 0.85 / 3 | **同值，一個都沒改** |
+> | `baseline-check.json` 的欄位 | 31 個 | **31 個一個都沒少**，另加 `drift_alert` / `drift_halts_queue` 兩個稽核欄位 |
+> | stdout 的 `baseline-check: streak ...` / `baseline-drift ...` / `DRIFT <n> covariate` | 都印 | **照印** |
+> | **到門檻時** | `baseline-check: HUMAN-NEEDED recalibrate <n>` + `rc=4` → **停佇列** | `baseline-check: DRIFT-ALERT combo=<組合> n=<streak> limit=<門檻> axes=<軸> queue=continue` + `rc=0` → **續跑** |
+>
+> **事後稽核照樣做得到**：每一格的 `baseline-check.json` 都記著 `drift_alert`（這格在舊政策下會不會被擋下）、`consecutive_drift`、`drift_combo`、`drift_axes`、`drift_limit`、`drift_signals`、`p99_shift` 與生效門檻。收官報告要盤點「哪幾格帶著漂移訊號跑完」，`grep -l '"drift_alert": true' results/*/r*/attempts/*/baseline-check.json` 就列得出來。
+>
+> **補償措施（不可省）**：不停機之後，環境劣化改由**人工監看注入前窗**——那是主指標 `p99_degradation_ratio` 的分母，也是這幾次誤報裡每次都證明「叢集其實正常」的那個量（例如 `4k/mid/backfill` 跨 5 天 9 個 attempt 全距只有 6%，而善後復測抖了 6.9×）。看到 log 裡的 `DRIFT-ALERT`（或事後 grep `drift_alert`）就去比對該組合的注入前窗時間序列；真的漂了才人工停機重新校準。
+>
+> **其餘 gate 一律沒動**：coverage-proof / coverage taint、sampler heartbeat 失聯的 taint、inject taint、taint-budget → needs-human、watchdog 的各種 trigger 與 halt、pilot gate（exit 10/11）全部照舊。**這次放寬的只有「漂移要不要擋量測」，不是任何一條資料有效性把關。**
+
+**觸發**：`verdict.py baseline-check` 對每個 replicate 的 60s baseline 復測有兩個判定——(a) 供給達成率（achieved/target）< 85%；(b) baseline p99 相對**同條件參考中位數**的偏移超過**該組合自己的容忍值**（`max(15%, 3 × MAD)`，見下方「門檻依實測解析度逐組合校準」）。單次只印 `baseline-drift <metric> <pct> tol=...` 並記 covariate；**同一個 (形態, 壓力, backfill 類別) 連續 3 個 replicate** 超標才發 `DRIFT-ALERT`（`PIPELINE_DRIFT_LIMIT`，由 `--drift-limit` 傳給 `verdict.py`）。
 
 **「連續」的母體 = (形態, 壓力, backfill 類別)，與門檻同粒度**（2026-08-02 的第五次假停佇列）：門檻在 2026-08-01 已改成逐組合依實測 MAD 校準，但「連續 N 次」的計數器仍是全域的。造成那次停機的三筆**跨了兩個母體**：
 
@@ -337,7 +356,7 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 
 **兩條軸都逐組合**：`achieve-ratio` 量的是「fio 有沒有打到目標速率」，而目標速率本來就隨 (形態, 壓力) 而異（低/中/高壓各是 ceiling 的 25/50/80%）；而且 baseline 是善後復測，backfill 還在排的時候供給達成率本來就會掉——backfill 類別同樣是它的母體邊界。兩條軸共用同一個母體鍵，在鍵底下**各自**計數（兩條軸「量得到與否」不同步，共用一個計數器會讓 p99 盲的 cell 被 achieve-ratio 的乾淨結果抹掉證據）。
 
-**停佇列判準只有一個**：`verdict.py baseline-check` 的 `rc=4`。`lib/pipeline.sh` 的 `_pipeline_baseline_gate` **不再自己數、也不再據 `drift_streak` 停佇列**——pipeline 只看得到 stdout，它不知道這格屬於哪個組合，自己數出來的必然是跨母體的全域數字。它現在只做兩件事：(1) 把 `verdict.py` 回報的**該組合** streak 鏡射進 `watchdog-state.json` 的 `drift_streak`（純可觀測性；解析不到就維持不變，不憑空歸零）；(2) `rc=4` → 停佇列。**同一套政策不再實作兩次**（本 repo 已有四次「修正本身造成迴歸」的前例，見 `HYPOTHESES.md` H-032 / H-036）。
+**判定只實作在一處**：`verdict.py baseline-check`。`lib/pipeline.sh` 的 `_pipeline_baseline_gate` **不自己數、不判門檻，現在也完全不停佇列**——pipeline 只看得到 stdout，它不知道這格屬於哪個組合，自己數出來的必然是跨母體的全域數字。它只做兩件事：(1) 把 `verdict.py` 回報的**該組合** streak 鏡射進 `watchdog-state.json` 的 `drift_streak`（純可觀測性；解析不到就維持不變，不憑空歸零）；(2) 把 stdout 照原樣轉成 log（含 `DRIFT-ALERT` 那行，並提醒去覆核注入前窗）。**同一套政策不再實作兩次**（本 repo 已有四次「修正本身造成迴歸」的前例，見 `HYPOTHESES.md` H-032 / H-036）。`_pipeline_baseline_gate` 裡已經沒有任何 `_pipeline_halt_queue` 呼叫；其他停佇列路徑（watchdog trigger、taint-budget…）不受影響。
 
 **可觀測性**：每次 `baseline-check` 都會印一行
 
@@ -345,7 +364,13 @@ python3 lib/manifest.py amend --type cap-update --key <fault> --value <你決定
 baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baseline-p99=2
 ```
 
-`baseline-check.json` 同步記 `drift_combo` / `drift_scope`（= `combo`）/ `drift_axes` / `drift_limit` / `consecutive_drift`（**該組合**的 streak）。判準的粒度與門檻都寫在輸出裡——**判準不可以悄悄變動而看不出來**。
+到門檻的那一格再多印一行（**這裡本來會停佇列**）：
+
+```
+baseline-check: DRIFT-ALERT combo=4k/mid/backfill n=3 limit=3 axes=baseline-p99 queue=continue
+```
+
+`baseline-check.json` 同步記 `drift_combo` / `drift_scope`（= `combo`）/ `drift_axes` / `drift_limit` / `consecutive_drift`（**該組合**的 streak）/ `drift_alert`（這格有沒有到門檻）/ `drift_halts_queue`（恆 `false`＝這格是在「只告警」政策下跑的）。判準的粒度與門檻都寫在輸出裡——**判準不可以悄悄變動而看不出來**。
 
 全 campaign 依時序回放（134 個 attempt、真 CLI、`/tmp` 沙箱、逐格增量搬入以還原「當下的參考池」）：
 
@@ -363,6 +388,8 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
 | `4k/mid/backfill` | ✅ `rc=4` | 該組合第 3 個連續訊號（`20260731T175023Z`，+91.36%） | ✅ `combo=4k/mid/backfill` |
 
 `4k/low/backfill` 在 ×2 下**仍抓不到**——那是它自己 87.7% 門檻的已知限制（見下方「已知限制」），與計數粒度無關。
+
+> 上面兩張表是 2026-08-02（逐組合計數）當時的回放，那時到門檻還會停佇列。**判定側自那之後一個字都沒改**，所以同一份回放在現在的碼上結果完全相同，只是「`rc=4` 停佇列」整列要讀成「`DRIFT-ALERT` 告警、佇列續跑」。2026-08-03 的不停機改動另有一次回放驗證（同樣的沙箱手法，145 個 attempt、真 CLI）：新舊碼的**訊號行、streak、combo、covariate-only 逐格完全相同（不一致 0 格）**，訊號總數 **17 = 17**，到門檻的點也一樣是那 **2** 格（`20260802T084849Z` 的 `4k/mid/backfill`、`20260803T014339Z` 的 `4k/extreme/backfill`）——差別只有停佇列 **2 → 0**（那 2 格改印 `DRIFT-ALERT`；新碼全 campaign 的 `rc` 只剩 0）。6 個歷史停機點（`unhalt_log` 的 5 次 + 目前這次）逐一回放，新碼在每一點都是 `rc=0`、不停佇列。
 
 **「同條件」= 同 (形態, 壓力, backfill 類別)**：這個 baseline 是「注入 → 回復 → final_clean 之後」的復測，量到的是**善後成本**。真機實測（DONE 且未 tainted 的 attempt，單位 ms）：
 
@@ -385,7 +412,7 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
 
 **量不到就明講**：同條件樣本 < 3（含 `prediction.json` 損毀或判不出類別）時退回校準值（`reference_source = calibration`），stdout 印 `baseline-check: OK covariate-only class=<類別> n=<樣本數>`，**值仍記進 `baseline-check.json`（`p99_shift` / `baseline_p99_ns` / `measured: false`）當 covariate，但不判漂移**。連續計數**維持不變**（不是歸零）——「量不了」≠「沒漂移」，佇列成塊執行，跨 group 邊界必然出現數格 covariate-only，在那裡歸零會把先前累積的證據反覆抹掉。
 
-`baseline-drift-state.json` 的 schema：**`combos.<形態>/<壓力>/<類別>` 底下逐軸記**（`axes.achieve-ratio` / `axes.baseline-p99`），因為兩條軸「量得到與否」不同步；該組合的 `consecutive` = 兩軸最大值，門檻仍是連續 3 次，且**只有本次真的量到且超標**才會升級成 `HUMAN-NEEDED`（殘留計數不會讓一格「量不了」的 cell 停佇列）。頂層的 `combo` / `consecutive` / `axes` / `recent` 是**當前這個 execution 所屬組合**的鏡射（相容舊讀法、也讓人一眼看出這次計的是誰），別的組合的計數只存在 `combos` 底下。分類判不出來的走 `<形態>/<壓力>/unknown` 這個桶（那條路徑本來就只有 achieve-ratio 量得到）。
+`baseline-drift-state.json` 的 schema：**`combos.<形態>/<壓力>/<類別>` 底下逐軸記**（`axes.achieve-ratio` / `axes.baseline-p99`），因為兩條軸「量得到與否」不同步；該組合的 `consecutive` = 兩軸最大值，門檻仍是連續 3 次，且**只有本次真的量到且超標**才會升級成 `DRIFT-ALERT`（殘留計數不會讓一格「量不了」的 cell 憑空告警）。頂層的 `combo` / `consecutive` / `axes` / `recent` 是**當前這個 execution 所屬組合**的鏡射（相容舊讀法、也讓人一眼看出這次計的是誰），別的組合的計數只存在 `combos` 底下。分類判不出來的走 `<形態>/<壓力>/unknown` 這個桶（那條路徑本來就只有 achieve-ratio 量得到）。
 
 **舊格式遷移**：舊檔是全域的 `{"axes": {...}, "consecutive": N}`。那個 `N` 是把不同母體串起來累加出來的，**無法歸屬到任何單一組合**，繼承它等於把已知無效的「連續」搬進新語意——所以**一律捨棄**、各組合從 0 起算，被丟掉的值留痕成 `legacy_consecutive_dropped`。型別壞掉的狀態檔（人工手改壞了等）走同一條路：當成空的重建，**不得讓 `baseline-check` 以 `rc=1` 死掉**（`rc=1` 會被 pipeline 靜默吞掉 → 偵測失效偽裝成通過）。
 
@@ -430,7 +457,7 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
 | 4.4478 | 7 | 0 |
 | 6.0 | 6 | 0 |
 
-`C = 3` 保留了 7 個訊號（含 `+203.61%`、`+129.25%`、`+100.00%` 這些真的離群的讀數）——**孤立離群值本來就該記訊號**，連續 3 次才停佇列。合成劣化驗證（沙箱內把 campaign 中段之後的所有復測乘上劣化倍數再回放）：×1.5 與 ×2 在 `C = 3` 都仍會停佇列，且**首次停佇列的時間點與 C=0 完全相同**（例如劣化起於 07-30 → 兩者都停在 `20260730T033747Z`）。
+`C = 3` 保留了 7 個訊號（含 `+203.61%`、`+129.25%`、`+100.00%` 這些真的離群的讀數）——**孤立離群值本來就該記訊號**，連續 3 次才到門檻。合成劣化驗證（沙箱內把 campaign 中段之後的所有復測乘上劣化倍數再回放）：×1.5 與 ×2 在 `C = 3` 都仍會停佇列，且**首次停佇列的時間點與 C=0 完全相同**（例如劣化起於 07-30 → 兩者都停在 `20260730T033747Z`）。
 
 > **已知限制：重尾組合的偵測力本質上較低。** `4k/low/backfill` 的善後復測是**雙峰**的——backfill 排乾 ≈2.9–4.1 ms、沒排乾 ≈9.5–12.4 ms（全距 4.3×），這是真實的物理變異不是量測噪音（按故障型再細分也沒有變窄：osd-down 子集 MAD 24%、rack-isolation 子集 27.7%，反而樣本不足）。它的生效門檻 87.7% 代表**要 ×1.9 以上的劣化才抓得到**，×1.5 抓不到。這不是被這次改動弄壞的——15% 門檻在那個組合的訊號率是 **73%**（11 筆有 8 筆超標），等於擲硬幣，那種「偵測」不帶任何資訊、而且保證遲早湊成連續 3 次假停機。叢集層級的劣化仍由其餘 10 個緊的組合負責偵測。若這個組合日後又反覆送訊號，正確的下一步是**把它改記 covariate-only**（承認那個組合沒有偵測力），而不是再把 C 調大——調大會連 ×2 劣化都放過。
 
@@ -444,7 +471,7 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
 - 漂移**來回抖動**（同一 cell 有時超標有時不超）→ 噪音升高而非漂移。接受並續跑，但把該時段標進 covariate，report 的 noise margin 要用含這段的資料重算。
 - 漂移只出現在**單一 client**（看 `fio/` 各 client 的 per-client log）→ 那台 client VM 的問題，不是叢集漂移。重做該 client 的 unmap/map + smoke。
 
-裁決後要恢復佇列，見 §4.7 的解除步驟。**注意 drift 的連續計數有兩個檔、`unhalt.sh` 只清得掉其中一個**，兩個都要處理（§4.7 步驟 4）。
+**現在 drift 不會停佇列**，所以上面這棵決策樹是**人工**在看到 `DRIFT-ALERT`（或事後 grep `drift_alert`）之後主動走的，不是被 harness 攔下來才走。真的判定要重新校準時才自己停 runner（佇列在 execution 邊界才開新格，等當前這格收尾完再停最乾淨），再照 §4.7 的步驟處理狀態檔。**注意 drift 的連續計數有兩個檔、`unhalt.sh` 只清得掉其中一個**，兩個都要處理（§4.7 步驟 4）。
 
 ### 4.7 `watchdog: HUMAN-NEEDED <trigger> <ctx>`（佇列停，exit 3）
 
@@ -480,10 +507,10 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
 
    | 檔 | 誰維護 | 是停佇列判準？ | `--clear-counts` 清得掉？ |
    |---|---|---|---|
-   | `results/baseline-drift-state.json` 的 `combos.<組合>` | `verdict.py baseline-check` 自己 | ✅ **唯一判準**（`rc=4`） | ❌ **完全不碰** |
+   | `results/baseline-drift-state.json` 的 `combos.<組合>` | `verdict.py baseline-check` 自己 | ❌ **drift 已不停佇列**（2026-08-03 起只發 `DRIFT-ALERT`）；它是**告警判準**的 SoT | ❌ **完全不碰** |
    | `results/watchdog-state.json` 的 `drift_streak` | `lib/pipeline.sh` 鏡射 `verdict.py` 回報的值 | ❌ 純可觀測性（見 §4.6） | ✅ |
 
-   前者是 `baseline-check` 判 `HUMAN-NEEDED recalibrate` 的依據。因為連續計數會跨 covariate-only 的 execution **維持**（見 §4.6），假警報造成的殘留不會自己消失——確認是誤報、或重新校準完之後，要**手動歸零**（目前沒有 CLI 入口，這是唯一需要手改的狀態檔）：
+   前者是 `baseline-check` 發 `DRIFT-ALERT` 的依據。因為連續計數會跨 covariate-only 的 execution **維持**（見 §4.6），誤報造成的殘留不會自己消失——確認是誤報、或重新校準完之後，要**手動歸零**（目前沒有 CLI 入口，這是唯一需要手改的狀態檔）：
 
    ```bash
    # 先看現況：combos 底下哪個組合累積了幾次、recent 是哪幾個 bundle
@@ -495,7 +522,7 @@ baseline-check: streak combo=4k/mid/backfill n=2 limit=3 achieve-ratio=0 baselin
    printf '{"combos":{}}\n' > results/baseline-drift-state.json
    ```
 
-   不歸零的後果：**該組合**的計數停在門檻邊緣，它下一個「真的量到且超標」的 replicate 會立刻把它推過 3 而再次停佇列——那不是連續 3 次漂移，是拿舊帳停人。（反過來說，沒有訊號的 execution 已經不會因為殘留計數而停佇列，別的組合的計數也不會互相影響，所以這件事不緊急，但報告前一定要清乾淨，否則 `consecutive_drift` 這個 covariate 欄位會是假的。）
+   不歸零的後果：**該組合**的計數停在門檻邊緣，它下一個「真的量到且超標」的 replicate 會立刻把它推過 3 而再次告警——那不是連續 3 次漂移，是拿舊帳報警。（現在告警不擋量測，所以更不緊急，但報告前一定要清乾淨，否則 `consecutive_drift` / `drift_alert` 這兩個稽核欄位會是假的。）
 
    把「做了什麼、為什麼」寫進 journal 留痕：
 
@@ -704,7 +731,7 @@ descoped 的 executions 也**不計入 `queue_progress` 的分母**（`steady: P
 | `CALIB_NET_WARN_GBPS` | `5.0` | **警告門檻**：正常 L8s_v3 應有 ~12 Gbps。低於此值但高於地板 → 只警告 + 記成 covariate，繼續跑。若換 SKU 或 region，這個值要跟著該 SKU 的標稱頻寬重設（大約設在標稱值的 40%） |
 | `CALIB_REBOOT_SECS` | `900` | reboot canary 等 node 帶新 boot ID 回來的上限。Azure 偶爾慢，看到 canary 逾時但 node 其實活著就調高 |
 | `MEASUREMENT_CAP` | `2700` | pilot 前的預設量測上限（45min）。對單 OSD backfill 寬裕、對 rack loss 偏緊——**operator 要有心理準備 rack cells 會 censored**。pilot 之後由 `cap-update` amendment 接管，不要手動改這個變數 |
-| `PIPELINE_DRIFT_LIMIT` | `3` | **同一個 (形態,壓力,backfill 類別)** 連續幾次 baseline drift 才停佇列（用 `--drift-limit` 傳給 `verdict.py`，判定只實作在那一處）。環境本來就抖（例如已知的鄰居效應時段）可暫時調高，但要記進 covariate |
+| `PIPELINE_DRIFT_LIMIT` | `3` | **同一個 (形態,壓力,backfill 類別)** 連續幾次 baseline drift 才發 `DRIFT-ALERT`（用 `--drift-limit` 傳給 `verdict.py`，判定只實作在那一處；**到門檻只告警、不停佇列**，見 §4.6）。環境本來就抖（例如已知的鄰居效應時段）可暫時調高，但要記進 covariate |
 | `PIPELINE_TAINT_BUDGET` | `3` | 同一 replicate 連續幾次 taint 就轉 needs-human 並跳過 |
 | `FAULTS_REPORT_SECS` | `43200` | 回報週期。想要更密的進度就調小（例如 `3600`） |
 | `FAULTS_BUDGET_USD` | `1000` | budget-warning 門檻 |
@@ -789,7 +816,8 @@ experiments/ceph-mclock-profiles/
 | `faults: PILOT-CENSORED <f>` | 需 cap 裁示（exit 11） | §4.3，先落 cap-update amendment |
 | `faults: AZ-LOGIN-STALE` | 2b 救援憑證失效 | bastion 重新 `az login` |
 | `budget-warning: cost_usd=...` | 逼近天花板 | 通知使用者，評估 descope（§7.3） |
-| `baseline-drift <metric> <pct> [tol=...]` | 單次漂移（p99 軸會一併印生效門檻） | 記 covariate，續跑；連 3 次才停 |
+| `baseline-drift <metric> <pct> [tol=...]` | 單次漂移（p99 軸會一併印生效門檻） | 記 covariate，續跑；同組合連 3 次才發 `DRIFT-ALERT` |
+| `baseline-check: DRIFT-ALERT combo=<組合> n=<streak> limit=<門檻> axes=<軸> queue=continue` | 同一組合連續到門檻——**這裡本來會停佇列，現在只告警** | 佇列照跑；人工去對該組合的**注入前窗**（主指標分母）確認叢集是不是真的劣化，見 §4.6 |
 | `baseline-check: OK p99-tol=<x>% (<來源>, mad <y>% x3.0, n=<k>)` | 正常通過，且**明示這格生效的門檻**（`floor` = 15% 下限／`mad` = 被該組合實測離散度放寬） | 正常續跑；門檻怎麼推導見 §4.6 |
 | `baseline-check: OK covariate-only class=<c> n=<k>` | 這格**沒有**可比參考，p99 漂移偵測沒開 | 正常續跑；盲區規模見 §4.6 |
 | `watchdog: HUMAN-NEEDED <t> <ctx>` | 佇列停（exit 3） | §4.7，**別 deallocate** |
