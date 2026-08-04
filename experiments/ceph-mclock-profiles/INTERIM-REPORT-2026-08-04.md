@@ -11,9 +11,9 @@
 本輪研究比較 `balanced`、`high_client_ops`、`high_recovery_ops` 三個 mClock profile。
 目前最穩健的結論，是在本 Ceph v19.2.2、Azure single-NIC、固定 capacity 環境的 steady 狀態下，沒有觀察到三個 profile 對 4K 或 sequential workload 造成超過事前實務門檻與實測 noise 的差異。
 steady 4K 的 36/36 個規劃 executions 均已完成，依壓力層彙整後的 IOPS profile 最大差距只有 0.03%–0.48%。
-同一批 steady 4K 的 p99 差距只有 0.34%–1.45%。
+同一批 steady 4K 的 profile mean p99 gap 只有 0.011–0.699 ms。
 steady sequential 有 35/36 個規劃 executions 可用，依壓力層彙整後的 throughput 差距為 0.30%–1.58%。
-sequential 的 p99 group 差距曾出現 9.1% 與 11.6%，但 cell 內 noise 可到約 16%。
+steady sequential 的 profile mean p99 gap 為 0.841–2.447 ms，而單一 cell 的 replicate 全距可到 8.913 ms。
 因此，steady 資料沒有支持任何 profile 的穩健排名；這是 operationally indistinguishable，不是正式統計 equivalence proof。
 排除一筆明確離群資料後，usable finalized datasets 為 136。
 在 16 個完整可比較 group（8 個 steady controls、8 個 fault groups）中，只有 4 個 pair comparisons 跨過事前 margin，而且全落在 2 個 fault groups。
@@ -50,7 +50,7 @@ handoff 粗估約 179.9 小時、US$1,439；模型是自 `.campaign-start` 起�
 | replicate | 相同 cell 的一次獨立 execution |
 | steady | 沒有主動 fault injection 的量測 |
 | fault | 有明確 fault injection 與 recovery 觀察窗的量測 |
-| p99 ratio | fault window p99 相對指定 baseline 的比值；不可任意跨 pressure 排名 |
+| p99 latency | 同一次 execution 的 fault window p99 latency，以 ms 呈現；profile 比較只在同 shape、同 pressure、同 scenario 的 group 內進行 |
 | stall | client I/O 沒有前進的連續時間 |
 | TTR | time to recovery；依本 campaign 的 recovery completion 定義計算 |
 | finalized | verdict 已完成且進入目前分析帳的 dataset |
@@ -144,7 +144,7 @@ handoff 粗估約 179.9 小時、US$1,439；模型是自 `.campaign-start` 起�
 
 四台 fio client 各使用獨立 300 GiB RBD image，`randseed=4242`。`rate=0` 代表不限速的 closed-loop extreme。steady 與 fault/chaos 都以 300 秒 fio segment、30 秒 ramp 執行；fault/chaos 若需更久會 back-to-back 跑相同 segment，每個新 segment 都重新 ramp 30 秒，STOP 只在完整 segment 邊界生效。
 
-注入前先等 60 秒穩定窗：四台裝置層 IOPS 每秒都要有資料、aggregate IOPS > 0、CoV ≤ 0.10，最長等 900 秒。這個 readiness gate 不是 p99 ratio 的直接資料來源；正式 denominator 來自同一次 fio histogram 的注入前 60 秒。回退並達 `final_clean` 後另跑 60 秒、10 秒 ramp 的 post-clean baseline，寫入 `fio-baseline/`；它不進 primary ratio。
+注入前先等 60 秒穩定窗：四台裝置層 IOPS 每秒都要有資料、aggregate IOPS > 0、CoV ≤ 0.10，最長等 900 秒。這個 readiness gate 不是 primary p99 evidence；正式 pre-window p99 來自同一次 fio histogram 的注入前 60 秒。回退並達 `final_clean` 後另跑 60 秒、10 秒 ramp 的 post-clean baseline，寫入 `fio-baseline/`；它不進 fault-window p99 比較。
 
 ### 2.6 fault knobs、持有時間與 heal
 
@@ -165,13 +165,13 @@ handoff 粗估約 179.9 小時、US$1,439；模型是自 `.campaign-start` 起�
 
 ### 2.8 primary endpoints 與 denominator
 
-- `p99_degradation_ratio = fault-window p99 / 同 replicate 注入前 60 秒 p99`。分母窗是 `[max(observation_start, fault_t0−60), fault_t0−1]`；numerator 從 `fault_t0` 到 measurement end。它與 post-clean `baseline.json` 無關。
+- 稽核註記：harness 原始 primary field 是 `p99_degradation_ratio = aggregate.endpoints.p99_ns / aggregate.windows.baseline.p99_ns`；本文以這兩個 raw ns 欄位呈現 pre-window 與 fault-window 的 ms，但 formal verdict 仍沿用原始 normalized estimand，且不把其 margin 偽裝成 ms threshold。
 - measurement end 取實際觀測尾端、`recovery_complete_t`、measurement deadline，以及存在時的 `heal_t0−1` 四者最早者。
 - `time_to_recovery_complete_s = recovery_complete_t − fault_t0`。`fault_t0` 在注入動作前記錄，所以包含注入、down detection、manual out 與 backfill；不是從 down epoch、heal 或 `final_clean` 起算。
 - `recovery_complete` 的 predicate 是所有 PG state set 恰為 `active+clean`；managed-out target 此時可以仍 down+out。之後把 OSD heal 成 up+in 的 `final_clean` 是另一個 gate。
 - 超過 cap 時，TTR 記 `deadline−fault_t0` 作 right-censored lower bound，不代表 recovery 已完成。
 - `max_stall_seconds` 先加總所有 client/job/direction 的每秒 IOPS；aggregate IOPS ≤0，或該秒不是 coverage gap、工具 heartbeat 仍存活卻沒有 fio 樣本，皆算 stall。coverage gap 與不完整 segment 尾秒不算；endpoint 取 measurement window 內最長連續區段。
-- recovery throughput 的 25% pair margin，以該 pair 兩個 profile mean 的平均為 reference；p99 ratio 的 50% relative margin也用 pair mean 平均，再與絕對 1.0 取較大。TTR 同理用 pair mean 平均計 20%，再與 300 秒取較大。
+- recovery throughput 的 25% pair margin，以該 pair 兩個 profile mean 的平均為 reference；p99 formal verdict 沿用 preregistered normalized rule，raw ms 只作 human-readable descriptive evidence，不另外創造 ms margin。TTR 同理用 pair mean 平均計 20%，再與 300 秒取較大。
 
 chaos 尚有一項 code-as-written evidence debt：pipeline 寫 `chaos_t0`，aggregate 目前只辨識 `fault_t0`，因此可能錯走 steady denominator 分支。因 chaos 仍是 0 finalized，本報告不產生 chaos endpoint；執行前必須先修正或以 bundle 證明時間窗正確。
 
@@ -249,7 +249,7 @@ profile 可以 runtime 切換，但「設定已送出」不等於「8 個 OSD �
 | A-1 | steady 4K，4 壓力 × 3 profiles | 作為 negative control，先量 profile 自身是否製造差異 | 三者 equivalent | ✅ 未觀察到超過實務門檻/noise 的差異，36/36 完成 |
 | A-2 | steady sequential，4 壓力 × 3 profiles | 驗證 large-I/O cost model 下的 negative control | 三者 equivalent | ✅ 未觀察到超過實務門檻/noise 的差異，35/36 可用 |
 | B-1 | OSD down，4K low/mid/extreme | 找 reservation 由不 binding 轉為 binding 的壓力點 | low 等效；mid R 傷 client；extreme C < B < R，TTR 反向 | ❌ 已完成組未出現預測的穩健分離 |
-| B-2 | flapping，4K low/mid/extreme | 分離 peering stall 與 profile effect | stall equivalent；p99 分離小於 OSD down | ⏳ mid stall 有 provisional mean hits；其餘未齊 |
+| B-2 | flapping，4K low/mid/extreme | 分離 peering stall 與 profile effect | stall equivalent；p99 分離小於 OSD down | ⏳ mid p99 latency 方向相反、stall 有 provisional mean hits；low/extreme 未齊 |
 | B-3 | rack isolation，4K low/mid/extreme | 放大 backfill footprint 與 fault domain loss | extreme 分離最大；C client 最佳但 TTR 最長 | ❌ mid/extreme 不支持；low 含一筆排除點 |
 | C | node isolation，4K mid | 與 OSD down 同 footprint、只改故障路徑 | 對齊 down epoch 後與 OSD down mid equivalent | ⏳ profile 無分離；對齊與 timestamps debt 未結案 |
 | D | sequential contention，mid/extreme | 測試 large-I/O 與 recovery 競爭 | 六 cells equivalent | ⏳ mid recovery throughput 有 provisional mean hits |
@@ -263,7 +263,7 @@ profile 可以 runtime 切換，但「設定已送出」不等於「8 個 OSD �
 
 | endpoint | 跨 margin 的最低條件 |
 |---|---|
-| p99 ratio | Δ ≥ `max(1.0, 50% relative)` |
+| p99 latency | formal verdict 沿用原 preregistered normalized rule；本文不列 normalized 數值，也不換造成 ms threshold |
 | stall | Δ ≥ 2 秒 |
 | recovery throughput | Δ ≥ 25% |
 | TTR | Δ ≥ `max(300 秒, 20%)` |
@@ -289,26 +289,26 @@ steady client IOPS／bandwidth 沒有另外註冊 formal equivalence bound 或 c
 ### 6.1 steady 結論
 
 steady 4K 的 36/36 個規劃 executions 均完成；依四個壓力層彙整，IOPS profile 最大差距為 0.03%–0.48%。
-steady 4K 的 p99 profile 差距為 0.34%–1.45%。
-這兩組差距未超過已觀察 noise；IOPS 沒有 formal equivalence bound，p99 則遠小於事前實務 margin。
+steady 4K 的 profile mean p99 gap 為 0.011–0.699 ms。
+這些 gap 都小於同 pressure 的 within-profile replicate range；IOPS 與 p99 都沒有 formal equivalence bound。
 steady sequential 有 35/36 個規劃 executions 可用。
 其 throughput 差距為 0.30%–1.58%。
-sequential p99 group 差距曾為 9.1% 與 11.6%。
-但 individual cell noise 可到約 16%。
+sequential 的 profile mean p99 gap 為 0.841–2.447 ms。
+但 individual cell 的 replicate 全距可到 8.913 ms。
 因此 steady 的結論是：在本環境與 workload 下，沒有觀察到超過事前實務門檻與 cell noise 的 profile 差異；這不是 formal equivalence analysis。
 
-完整 steady control 如下。4K throughput 單位是 IOPS；sequential throughput 單位是 MiB/s（2^20 B/s），不是 IOPS。每格格式為 `mean [min,max]；n`；最後一欄是三個 profile mean 的最大百分比 span，只是 effect size，不是 formal equivalence test。
+完整 steady control 如下。4K throughput 單位是 IOPS；sequential throughput 單位是 MiB/s（2^20 B/s），不是 IOPS。每格格式為 `mean [min,max]；n`；最後一欄將 throughput effect size 留在百分比、p99 effect size 直接寫成 ms，不是 formal equivalence test。
 
-| steady group | throughput B | throughput C | throughput R | p99 B ms | p99 C ms | p99 R ms | 最大 mean span（throughput / p99） |
+| steady group | throughput B | throughput C | throughput R | p99 B ms | p99 C ms | p99 R ms | 最大 mean gap（throughput / p99） |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 4K low | 15426.617 [15363.176,15518.259]；3 | 15368.334 [15263.810,15435.249]；3 | 15409.753 [15379.335,15450.569]；3 | 2.310144 [2.244608,2.375680]；3 | 2.310144 [2.277376,2.342912]；3 | 2.288299 [2.277376,2.310144]；3 | 0.38% / 0.95% |
-| 4K mid | 30700.754 [30618.850,30799.653]；3 | 30848.242 [30809.781,30919.916]；3 | 30779.565 [30554.314,30954.365]；3 | 3.227648 [3.227648,3.227648]；3 | 3.238571 [3.227648,3.260416]；3 | 3.227648 [3.194880,3.260416]；3 | 0.48% / 0.34% |
-| 4K high | 49248.702 [49116.477,49368.130]；3 | 49399.900 [49342.066,49451.077]；3 | 49330.909 [49261.606,49412.990]；3 | 6.105771 [6.062080,6.193152]；3 | 6.040235 [5.996544,6.127616]；3 | 6.018389 [5.865472,6.193152]；3 | 0.31% / 1.45% |
-| 4K extreme | 60420.594 [60286.155,60567.747]；3 | 60414.531 [60365.309,60479.065]；3 | 60401.731 [60056.633,60587.365]；3 | 52.865707 [52.166656,53.739520]；3 | 53.389995 [53.215232,53.739520]；3 | 53.564757 [53.215232,53.739520]；3 | 0.03% / 1.32% |
-| seq low | 567.299 [566.285,568.817]；3 | 567.021 [564.835,569.942]；3 | 568.736 [568.581,568.929]；3 | 9.895936 [8.847360,10.682368]；3 | 9.229653 [8.290304,10.158080]；3 | 10.070699 [9.764864,10.551296]；3 | 0.30% / 9.11% |
-| seq mid | 1122.803 [1107.267,1141.096]；3 | 1130.952 [1119.110,1137.912]；3 | 1124.461 [1114.287,1138.378]；3 | 21.452117 [18.743296,25.296896]；3 | 22.675456 [18.481152,27.394048]；3 | 20.316160 [18.219008,23.724032]；3 | 0.72% / 11.61% |
-| seq high | 1789.969 [1782.609,1803.577]；3 | 1797.007 [1787.596,1808.155]；3 | 1793.214 [1788.202,1798.225]；2 | 76.021760 [71.827456,79.167488]；3 | 75.672235 [73.924608,78.118912]；3 | 78.118912 [76.021760,80.216064]；2 | 0.39% / 3.23% |
-| seq extreme | 2215.360 [2174.221,2244.088]；3 | 2201.596 [2179.602,2222.262]；3 | 2236.303 [2231.050,2244.109]；3 | 104.333312 [103.284736,105.381888]；3 | 103.284736 [101.187584,107.479040]；3 | 102.585685 [101.187584,103.284736]；3 | 1.58% / 1.70% |
+| 4K low | 15426.617 [15363.176,15518.259]；3 | 15368.334 [15263.810,15435.249]；3 | 15409.753 [15379.335,15450.569]；3 | 2.310144 [2.244608,2.375680]；3 | 2.310144 [2.277376,2.342912]；3 | 2.288299 [2.277376,2.310144]；3 | 0.38% / 0.022 ms |
+| 4K mid | 30700.754 [30618.850,30799.653]；3 | 30848.242 [30809.781,30919.916]；3 | 30779.565 [30554.314,30954.365]；3 | 3.227648 [3.227648,3.227648]；3 | 3.238571 [3.227648,3.260416]；3 | 3.227648 [3.194880,3.260416]；3 | 0.48% / 0.011 ms |
+| 4K high | 49248.702 [49116.477,49368.130]；3 | 49399.900 [49342.066,49451.077]；3 | 49330.909 [49261.606,49412.990]；3 | 6.105771 [6.062080,6.193152]；3 | 6.040235 [5.996544,6.127616]；3 | 6.018389 [5.865472,6.193152]；3 | 0.31% / 0.087 ms |
+| 4K extreme | 60420.594 [60286.155,60567.747]；3 | 60414.531 [60365.309,60479.065]；3 | 60401.731 [60056.633,60587.365]；3 | 52.865707 [52.166656,53.739520]；3 | 53.389995 [53.215232,53.739520]；3 | 53.564757 [53.215232,53.739520]；3 | 0.03% / 0.699 ms |
+| seq low | 567.299 [566.285,568.817]；3 | 567.021 [564.835,569.942]；3 | 568.736 [568.581,568.929]；3 | 9.895936 [8.847360,10.682368]；3 | 9.229653 [8.290304,10.158080]；3 | 10.070699 [9.764864,10.551296]；3 | 0.30% / 0.841 ms |
+| seq mid | 1122.803 [1107.267,1141.096]；3 | 1130.952 [1119.110,1137.912]；3 | 1124.461 [1114.287,1138.378]；3 | 21.452117 [18.743296,25.296896]；3 | 22.675456 [18.481152,27.394048]；3 | 20.316160 [18.219008,23.724032]；3 | 0.72% / 2.359 ms |
+| seq high | 1789.969 [1782.609,1803.577]；3 | 1797.007 [1787.596,1808.155]；3 | 1793.214 [1788.202,1798.225]；2 | 76.021760 [71.827456,79.167488]；3 | 75.672235 [73.924608,78.118912]；3 | 78.118912 [76.021760,80.216064]；2 | 0.39% / 2.447 ms |
+| seq extreme | 2215.360 [2174.221,2244.088]；3 | 2201.596 [2179.602,2222.262]；3 | 2236.303 [2231.050,2244.109]；3 | 104.333312 [103.284736,105.381888]；3 | 103.284736 [101.187584,107.479040]；3 | 102.585685 [101.187584,103.284736]；3 | 1.58% / 1.748 ms |
 
 steady controls 沒有 fault injection，因此 recovery throughput 是結構性 0，TTR 為 null／不適用；不能把 recovery 的 `0 ≥ 0` 當 threshold hit。seq high 的 R 只有 n=2，因另一個 execution 是 needs-human。
 
@@ -324,20 +324,20 @@ sequential-mid recovery 的 B-R mean gap 為 126.144 MB/s，25% 門檻為 99.610
 這 4 個比較的 replicate 範圍全部重疊。
 所以它們只能標為 Provisional / Underpowered。
 沒有任何 TTR pair comparison 跨過 TTR margin。
-p99 沒有形成 robust profile ranking。
+fault-window p99 latency 沒有形成 robust profile ranking。
 
-下表補上 fault 前後的絕對 p99 範圍，避免只看 ratio。範圍合併同一 group 內三個 profile 的已納入 replicates；它適合描述故障量級，不可用來取代 profile pair test。
+下表直接呈現 fault 前後的 p99 latency。範圍合併同一 group 內三個 profile 的已納入 replicates；最後一欄用每個 profile 的 raw mean 寫成 `pre-window → fault-window（Δms）`，不要求讀者心算。
 
-| fault group | pre-window p99 ms | fault-window p99 ms | profile mean p99 ratio（B / C / R） |
+| fault group | pre-window p99 ms | fault-window p99 ms | profile mean pre → fault（Δms），B / C / R |
 |---|---:|---:|---:|
-| flapping 4K mid | 2.97–3.19 | 304–472 | 142.866 / 108.130 / 137.673 |
-| OSD down 4K low | 2.34–2.47 | 8.45–9.63 | 3.726 / 3.594 / 3.810 |
-| OSD down 4K mid | 3.23–3.42 | 10.68–13.04 | 3.287 / 3.881 / 3.432 |
-| OSD down 4K extreme | 47.45–53.74 | 55.31–60.56 | 1.235 / 1.154 / 1.151 |
-| rack isolation 4K mid | 3.06–3.52 | 19.79–28.44 | 7.358 / 5.891 / 7.225 |
-| rack isolation 4K extreme | 48.50–55.31 | 70.78–78.12 | 1.449 / 1.506 / 1.388 |
-| node isolation 4K mid | 3.26–3.49 | 25.30–32.64 | 8.130 / 8.189 / 8.759 |
-| sequential contention mid | 22.94–33.16 | 46.40–62.65 | 2.220 / 1.618 / 1.806 |
+| flapping 4K mid | 2.97–3.19 | 304–472 | B 2.998→427.819（+424.821）/ C 3.113→335.544（+332.431）/ R 3.031→417.333（+414.302） |
+| OSD down 4K low | 2.34–2.47 | 8.45–9.63 | B 2.408→8.978（+6.570）/ C 2.408→8.651（+6.242）/ R 2.425→9.241（+6.816） |
+| OSD down 4K mid | 3.23–3.42 | 10.68–13.04 | B 3.310→10.879（+7.569）/ C 3.293→12.780（+9.486）/ R 3.342→11.469（+8.126） |
+| OSD down 4K extreme | 47.45–53.74 | 55.31–60.56 | B 47.972→59.245（+11.272）/ C 49.807→57.410（+7.602）/ R 52.167→60.031（+7.864） |
+| rack isolation 4K mid | 3.06–3.52 | 19.79–28.44 | B 3.064→22.544（+19.481）/ C 3.473→20.447（+16.974）/ R 3.424→24.773（+21.348） |
+| rack isolation 4K extreme | 48.50–55.31 | 70.78–78.12 | B 51.380→74.449（+23.069）/ C 48.759→73.400（+24.642）/ R 54.002→74.973（+20.972） |
+| node isolation 4K mid | 3.26–3.49 | 25.30–32.64 | B 3.424→27.787（+24.363）/ C 3.326→27.263（+23.937）/ R 3.408→29.884（+26.477） |
+| sequential contention mid | 22.94–33.16 | 46.40–62.65 | B 25.821→55.837（+30.015）/ C 30.933→50.070（+19.137）/ R 28.443→51.380（+22.938） |
 
 ### 6.3 完整 fault endpoint 矩陣
 
@@ -345,74 +345,74 @@ p99 沒有形成 robust profile ranking。
 
 | fault group | endpoint | B | C | R |
 |---|---|---:|---:|---:|
-| flapping 4K mid | p99 ratio | 142.866 [126.616,159.116]；2 | 108.130 [95.179,121.081]；2 | 137.673 [136.393,138.952]；2 |
+| flapping 4K mid | p99 ms：pre→fault（Δ）；fault range | 2.998→427.819（+424.821）；[383.779,471.859]；2 | 3.113→335.544（+332.431）；[304.087,367.002]；2 | 3.031→417.333（+414.302）；[408.945,425.722]；2 |
 |  | stall s | 23.000 [21,25]；2 | 23.500 [22,25]；2 | 21.000 [20,22]；2 |
 |  | recovery MB/s | 0 [0,0]；2 | 0 [0,0]；2 | 0 [0,0]；2 |
 |  | TTR s | 2700 [2700,2700]；2 censored | 2700 [2700,2700]；2 censored | 2700 [2700,2700]；2 censored |
-| OSD down 4K low | p99 ratio | 3.726 [3.559,3.893]；2 | 3.594 [3.523,3.664]；2 | 3.810 [3.673,3.946]；2 |
+| OSD down 4K low | p99 ms：pre→fault（Δ）；fault range | 2.408→8.978（+6.570）；[8.454,9.503]；2 | 2.408→8.651（+6.242）；[8.585,8.716]；2 | 2.425→9.241（+6.816）；[8.847,9.634]；2 |
 |  | stall s | 21.500 [21,22]；2 | 20.500 [20,21]；2 | 21.500 [21,22]；2 |
 |  | recovery MB/s | 641.414 [554.697,728.131]；2 | 597.758 [587.552,607.964]；2 | 565.882 [565.532,566.231]；2 |
 |  | TTR s | 824.000 [759,889]；2 | 815.500 [796,835]；2 | 769.000 [751,787]；2 |
-| OSD down 4K mid | p99 ratio | 3.287 [3.276,3.298]；2 | 3.881 [3.878,3.883]；2 | 3.432 [3.426,3.437]；2 |
+| OSD down 4K mid | p99 ms：pre→fault（Δ）；fault range | 3.310→10.879（+7.569）；[10.682,11.076]；2 | 3.293→12.780（+9.486）；[12.517,13.042]；2 | 3.342→11.469（+8.126）；[11.207,11.731]；2 |
 |  | stall s | 21.000 [21,21]；2 | 20.000 [20,20]；2 | 20.500 [20,21]；2 |
 |  | recovery MB/s | 483.394 [471.859,494.928]；2 | 534.774 [510.307,559.241]；2 | 509.783 [480.248,539.318]；2 |
 |  | TTR s | 883.500 [871,896]；2 | 767.000 [734,800]；2 | 814.500 [764,865]；2 |
-| OSD down 4K extreme | p99 ratio | 1.235 [1.221,1.249]；2 | 1.154 [1.093,1.214]；2 | 1.151 [1.127,1.176]；2 |
+| OSD down 4K extreme | p99 ms：pre→fault（Δ）；fault range | 47.972→59.245（+11.272）；[57.934,60.555]；2 | 49.807→57.410（+7.602）；[55.312,59.507]；2 | 52.167→60.031（+7.864）；[59.507,60.555]；2 |
 |  | stall s | 20.500 [20,21]；2 | 20.500 [20,21]；2 | 20.500 [20,21]；2 |
 |  | recovery MB/s | 407.547 [394.265,420.829]；2 | 411.217 [400.556,421.877]；2 | 412.265 [408.246,416.285]；2 |
 |  | TTR s | 971.500 [956,987]；2 | 953.500 [953,954]；2 | 963.000 [898,1028]；2 |
-| rack isolation 4K mid | p99 ratio | 7.358 [7.316,7.401]；2 | 5.891 [5.619,6.163]；2 | 7.225 [6.222,8.227]；2 |
+| rack isolation 4K mid | p99 ms：pre→fault（Δ）；fault range | 3.064→22.544（+19.481）；[22.413,22.675]；2 | 3.473→20.447（+16.974）；[19.792,21.103]；2 | 3.424→24.773（+21.348）；[21.103,28.443]；2 |
 |  | stall s | 23.000 [23,23]；2 | 22.500 [22,23]；2 | 24.000 [22,26]；2 |
 |  | recovery MB/s | 805.936 [788.040,823.831]；2 | 847.983 [806.774,889.192]；2 | 921.873 [871.716,972.030]；2 |
 |  | TTR s | 1258.500 [1253,1264]；2 | 1178.500 [1174,1183]；2 | 1115.000 [1090,1140]；2 |
-| rack isolation 4K extreme | p99 ratio | 1.449 [1.440,1.457]；2 | 1.506 [1.444,1.568]；2 | 1.388 [1.363,1.412]；2 |
+| rack isolation 4K extreme | p99 ms：pre→fault（Δ）；fault range | 51.380→74.449（+23.069）；[72.876,76.022]；2 | 48.759→73.400（+24.642）；[70.779,76.022]；2 | 54.002→74.973（+20.972）；[71.827,78.119]；2 |
 |  | stall s | 23.500 [23,24]；2 | 23.000 [23,23]；2 | 23.000 [23,23]；2 |
 |  | recovery MB/s | 803.734 [802.161,805.306]；2 | 814.918 [737.498,892.338]；2 | 804.922 [801.811,808.033]；2 |
 |  | TTR s | 1325.500 [1294,1357]；2 | 1269.000 [1139,1399]；2 | 1283.000 [1274,1292]；2 |
-| node isolation 4K mid | p99 ratio | 8.130 [7.324,8.937]；2 | 8.189 [7.759,8.618]；2 | 8.759 [8.078,9.441]；2 |
+| node isolation 4K mid | p99 ms：pre→fault（Δ）；fault range | 3.424→27.787（+24.363）；[25.559,30.015]；2 | 3.326→27.263（+23.937）；[25.297,29.229]；2 | 3.408→29.884（+26.477）；[27.132,32.637]；2 |
 |  | stall s | 22.500 [22,23]；2 | 24.000 [23,25]；2 | 24.000 [24,24]；2 |
 |  | recovery MB/s | 432.443 [425.183,439.703]；2 | 431.839 [332.049,531.628]；2 | 414.537 [323.660,505.414]；2 |
 |  | TTR s | 720.000 [702,738]；2 | 708.000 [645,771]；2 | 719.000 [707,731]；2 |
-| sequential contention mid | p99 ratio | 2.220 [1.708,2.731]；2 | 1.618 [1.616,1.621]；2 | 1.806 [1.787,1.824]；2 |
+| sequential contention mid | p99 ms：pre→fault（Δ）；fault range | 25.821→55.837（+30.015）；[49.021,62.652]；2 | 30.933→50.070（+19.137）；[46.399,53.740]；2 | 28.443→51.380（+22.938）；[48.497,54.264]；2 |
 |  | stall s | 20.500 [20,21]；2 | 20.500 [20,21]；2 | 20.500 [20,21]；2 |
 |  | recovery MB/s | 335.370 [196.433,474.306]；2 | 441.725 [360.910,522.540]；2 | 461.513 [343.164,579.863]；2 |
 |  | TTR s | 925.000 [855,995]；2 | 766.500 [733,800]；2 | 772.500 [713,832]；2 |
 
 ### 6.4 每個 fault group × endpoint 的 margin audit
 
-每列取該 endpoint 三組 pair 中 mean gap 最大者；若另一組 pair 也 hit，會在 verdict 明列。p99 margin=`max(1.0, pair mean × 50%)`、stall=`2 s`、recovery=`pair mean × 25%`、TTR=`max(300 s, pair mean × 20%)`。
+每列取該 endpoint 三組 pair 中 mean gap 最大者；若另一組 pair 也 hit，會在 verdict 明列。p99 列只顯示 raw fault-window latency gap，formal verdict 仍沿用原 preregistered normalized rule，不把它換算成 ms margin；stall=`2 s`、recovery=`pair mean × 25%`、TTR=`max(300 s, pair mean × 20%)`。
 
 | fault group | endpoint | 最大 gap pair | gap / margin | ranges overlap | verdict |
 |---|---|---|---:|---|---|
-| flapping mid | p99 | B–C | 34.736 / 62.749 | 否 | No hit |
+| flapping mid | p99 latency | B–C | raw gap 92.275 ms；margin 不換算 | raw ms：否 | 原 preregistered normalized rule：No hit |
 |  | stall | C–R | 2.500 / 2.000 s | 是 | Hit / Underpowered；B–R 2.000/2.000 也 hit |
 |  | recovery | 全部 | 0 / 0 MB/s | 是 | N/A；`0 ≥ 0` 是退化 artifact |
 |  | TTR | 全部 | 0 / 540 s | 是 | Censored / No hit |
-| OSD down low | p99 | C–R | 0.216 / 1.851 | 否 | No hit |
+| OSD down low | p99 latency | C–R | raw gap 0.590 ms；margin 不換算 | raw ms：否 | 原 preregistered normalized rule：No hit |
 |  | stall | B–C、C–R | 1.000 / 2.000 s | 是 | No hit |
 |  | recovery | B–R | 75.532 / 150.912 MB/s | 是 | No hit |
 |  | TTR | B–R | 55.000 / 300 s | 是 | No hit |
-| OSD down mid | p99 | B–C | 0.594 / 1.792 | 否 | No hit |
+| OSD down mid | p99 latency | B–C | raw gap 1.901 ms；margin 不換算 | raw ms：否 | 原 preregistered normalized rule：No hit |
 |  | stall | B–C | 1.000 / 2.000 s | 否 | No hit |
 |  | recovery | B–C | 51.380 / 127.271 MB/s | 否 | No hit |
 |  | TTR | B–C | 116.500 / 300 s | 否 | No hit |
-| OSD down extreme | p99 | B–R | 0.083 / 1.000 | 否 | No hit |
+| OSD down extreme | p99 latency | C–R | raw gap 2.621 ms；margin 不換算 | raw ms：是 | 原 preregistered normalized rule：No hit |
 |  | stall | 全部 | 0 / 2.000 s | 是 | No hit |
 |  | recovery | B–R | 4.719 / 102.476 MB/s | 是 | No hit |
 |  | TTR | B–C | 18.000 / 300 s | 否 | No hit |
-| rack isolation mid | p99 | B–C | 1.468 / 3.312 | 否 | No hit |
+| rack isolation mid | p99 latency | C–R | raw gap 4.325 ms；margin 不換算 | raw ms：是 | 原 preregistered normalized rule：No hit |
 |  | stall | C–R | 1.500 / 2.000 s | 是 | No hit |
 |  | recovery | B–R | 115.938 / 215.976 MB/s | 否 | No hit |
 |  | TTR | B–R | 143.500 / 300 s | 否 | No hit |
-| rack isolation extreme | p99 | C–R | 0.118 / 1.000 | 否 | No hit |
+| rack isolation extreme | p99 latency | C–R | raw gap 1.573 ms；margin 不換算 | raw ms：是 | 原 preregistered normalized rule：No hit |
 |  | stall | B–C、B–R | 0.500 / 2.000 s | 是 | No hit |
 |  | recovery | B–C | 11.185 / 202.331 MB/s | 是 | No hit |
 |  | TTR | B–C | 56.500 / 300 s | 是 | No hit |
-| node isolation mid | p99 | B–R | 0.629 / 4.222 | 是 | No hit |
+| node isolation mid | p99 latency | C–R | raw gap 2.621 ms；margin 不換算 | raw ms：是 | 原 preregistered normalized rule：No hit |
 |  | stall | B–C、B–R | 1.500 / 2.000 s | B–C 是；B–R 否 | No hit |
 |  | recovery | B–R | 17.906 / 105.872 MB/s | 是 | No hit |
 |  | TTR | B–C | 12.000 / 300 s | 是 | No hit |
-| sequential contention mid | p99 | B–C | 0.601 / 1.000 | 否 | No hit |
+| sequential contention mid | p99 latency | B–C | raw gap 5.767 ms；margin 不換算 | raw ms：是 | 原 preregistered normalized rule：No hit |
 |  | stall | 全部 | 0 / 2.000 s | 是 | No hit |
 |  | recovery | B–R | 126.144 / 99.610 MB/s | 是 | Hit / Underpowered；B–C 106.356/97.137 也 hit |
 |  | TTR | B–C | 158.500 / 300 s | 否 | No hit |
@@ -426,7 +426,7 @@ p99 沒有形成 robust profile ranking。
 1. **調整參數**：固定 Ceph、PG 與 OSD capacity，依 4K low、mid、high、extreme 四個 pressure 切換 B、C、R。
 2. **為何測**：先確認 profile 是否在沒有 fault 時犧牲 client IOPS 或 p99。
 3. **事前預測**：三個 profile 應 indistinguishable（equivalent）；沒有 recovery 流量時 client 是唯一 active class，reservation 是下限而不是上限。
-4. **結果**：36/36 IOPS 最大差距僅 0.03%–0.48%，p99 差距僅 0.34%–1.45%。
+4. **結果**：36/36 IOPS 最大差距僅 0.03%–0.48%，profile mean p99 gap 僅 0.011–0.699 ms。
 5. **建議**：判為 operationally indistinguishable；steady 4K 不構成離開 `balanced` 的理由，但不宣稱正式統計等效。
 
 ### 7.2 steady sequential
@@ -434,16 +434,16 @@ p99 沒有形成 robust profile ranking。
 1. **調整參數**：使用 sequential low、mid、high、extreme 四個 pressure，比較 B、C、R。
 2. **為何測**：確認 sequential bandwidth 與 latency 是否對 profile 更敏感。
 3. **事前預測**：同 steady 4K，三個 profile 應 indistinguishable（equivalent）。
-4. **結果**：35/36 sequential throughput 差距為 0.30%–1.58%；p99 group 差 9.1%/11.6%，cell noise 可到約 16%。
+4. **結果**：35/36 sequential throughput 差距為 0.30%–1.58%；profile mean p99 gap 為 0.841–2.447 ms，cell 內 replicate 全距可到 8.913 ms。
 5. **建議**：判為 operationally indistinguishable；不可用 group mean 順序製造 profile 排名，也不宣稱正式統計等效。
 
 ### 7.3 flapping-mid
 
 1. **調整參數**：在 mid pressure 下重複 flapping fault，分別套用 B、C、R。
 2. **為何測**：觀察反覆 membership/availability 擾動是否放大 client stall 與 recovery 不穩定。
-3. **事前預測**：max stall 三者應 indistinguishable，因 peering 主導；p99 ratio 的 profile 分離應小於同壓力 OSD down，recovery 差異可能落在 margin 內。
-4. **結果**：p99 ratio mean 為 B 142.866×、C 108.130×、R 137.673×，mean span 34.736；同壓力 OSD down 的 span 只有 0.594，descriptive direction 與預測相反。stall mean 為 23、23.5、21 秒，replicate 範圍依序為 `[21,25]`、`[22,25]`、`[20,22]` 秒。
-5. **建議**：p99 的方向雖違反預測，但 pair 未跨 p99 margin，仍屬 inferentially underpowered；B-R 與 C-R stall gap 剛跨 2 秒 margin，但 n=2 且 replicate 範圍重疊，只能 Provisional。low/extreme 尚待完成。
+3. **事前預測**：max stall 三者應 indistinguishable，因 peering 主導；p99 latency 的 profile 分離應小於同壓力 OSD down，recovery 差異可能落在 margin 內。
+4. **結果**：p99 mean 由 B 2.998→427.819（+424.821）、C 3.113→335.544（+332.431）、R 3.031→417.333 ms（+414.302）；fault-window 最大 raw gap 為 92.275 ms，同壓力 OSD down 只有 1.901 ms，描述方向與預測相反。stall mean 為 23、23.5、21 秒，replicate 範圍依序為 `[21,25]`、`[22,25]`、`[20,22]` 秒。
+5. **建議**：原 preregistered normalized p99 rule 為 No hit，raw 92.275 ms gap 只作 human-readable magnitude；B-R 與 C-R stall gap 剛跨 2 秒 margin，但 n=2 且 replicate 範圍重疊，只能 Provisional。low/extreme 尚待完成。
 
 flapping-mid 的 TTR 三者都是 2,700 秒 censored。
 不能把 2,700 秒解讀為三者真正相同的完成時間。
@@ -455,7 +455,7 @@ H-033 也使 flapping 的操作風險高於單純 profile 比較。
 1. **調整參數**：4K low pressure 下執行 OSD down，依序比較 B、C、R。
 2. **為何測**：測試輕壓力時 client latency 與 recovery 是否能被 profile 明顯分離。
 3. **事前預測**：client 面三者應 indistinguishable；recovery throughput 應為 R ≥ B ≈ C，因 recovery 可取用 client 未使用的資源。
-4. **結果**：p99 ratio mean 為 B 3.726×、C 3.594×、R 3.810×；recovery throughput mean 為 B 641.414、C 597.758、R 565.882 MB/s，與預測方向相反；TTR 為 824、815.5、769 秒。
+4. **結果**：p99 mean 由 B 2.408→8.978（+6.570）、C 2.408→8.651（+6.242）、R 2.425→9.241 ms（+6.816）；recovery throughput mean 為 B 641.414、C 597.758、R 565.882 MB/s，與預測方向相反；TTR 為 824、815.5、769 秒。
 5. **建議**：descriptive recovery 方向違反預測，但沒有 pair 跨過 preregistered margin；維持 Underpowered、無穩健排名。
 
 ### 7.5 OSD down、4K mid
@@ -463,7 +463,7 @@ H-033 也使 flapping 的操作風險高於單純 profile 比較。
 1. **調整參數**：4K mid pressure 下執行 OSD down，比較 B、C、R。
 2. **為何測**：檢查 pressure 上升後，client 與 recovery 資源競爭是否顯現。
 3. **事前預測**：R 的 client 劣化應顯著，B ≈ C；recovery throughput 應為 R > B ≳ C。
-4. **結果**：p99 ratio mean 為 B 3.287×、C 3.881×、R 3.432×；TTR 為 883.5、767、814.5 秒。
+4. **結果**：p99 mean 由 B 3.310→10.879（+7.569）、C 3.293→12.780（+9.486）、R 3.342→11.469 ms（+8.126）；TTR 為 883.5、767、814.5 秒。
 5. **建議**：平均值方向與預測不一致，且未跨 margin；不要據此選 C 或 R。
 
 ### 7.6 OSD down、4K extreme
@@ -471,31 +471,31 @@ H-033 也使 flapping 的操作風險高於單純 profile 比較。
 1. **調整參數**：在最高 4K pressure 層執行 OSD down，比較 B、C、R。
 2. **為何測**：測試接近 calibration 上緣時 profile 是否產生可操作的差異。
 3. **事前預測**：client 劣化應完整分離為 C < B < R，client throughput 約依 0.6 : 0.5 : 0.3；TTR 應為 R < B < C。
-4. **結果**：p99 ratio mean 為 B 1.235×、C 1.154×、R 1.151×，descriptive 順序是 R < C < B；TTR 為 971.5、953.5、963 秒，順序是 C < R < B。兩者都與凍結預測相反。
-5. **建議**：descriptive direction 違反預測，但所有 pair 仍未跨 margin，故 primary endpoints 只能判 Underpowered；post-clean achieve_ratio 另列 descriptive 訊號。
+4. **結果**：p99 mean 由 B 47.972→59.245（+11.272）、C 49.807→57.410（+7.602）、R 52.167→60.031 ms（+7.864）。raw fault-window ms 的 C < B < R 只屬 post hoc descriptive ordering；原 preregistered normalized p99 direction 並未符合凍結預測。TTR 為 971.5、953.5、963 秒，順序 C < R < B，也與凍結方向相反。
+5. **建議**：原 preregistered normalized p99 rule 與 TTR 都沒有 pair hit，raw absolute ordering 不得改寫 prediction fate；primary endpoints 只能判 Underpowered。post-clean achieve_ratio 另列 descriptive 訊號。
 
 ### 7.7 rack isolation、4K mid
 
 1. **調整參數**：隔離一個 synthetic rack，在 4K mid pressure 下比較 B、C、R。
 2. **為何測**：觀察同時失去兩個 OSD fault domain 時的 client impact 與 recovery。
 3. **事前預測**：R 的 client 劣化應顯著；兩顆 OSD 同時失去後，backfill footprint 與絕對 recovery 成本應大於單一 OSD down。
-4. **結果**：p99 ratio mean 為 B 7.358×、C 5.891×、R 7.225×；TTR 為 1,258.5、1,178.5、1,115 秒。
-5. **建議**：mean 順序具描述性，但沒有通過 margin/noise 雙重要求，不做 profile 排名。
+4. **結果**：p99 mean 由 B 3.064→22.544（+19.481）、C 3.473→20.447（+16.974）、R 3.424→24.773 ms（+21.348）。raw fault-window ms 的 R 最高只屬 post hoc descriptive ordering；原 preregistered normalized p99 direction 未支持凍結預測。TTR 為 1,258.5、1,178.5、1,115 秒。
+5. **建議**：原 preregistered normalized p99 rule 為 No hit，raw 最大 gap 4.325 ms 只描述絕對量級，不做 profile 排名。
 
 ### 7.8 rack isolation、4K extreme
 
 1. **調整參數**：隔離一個 synthetic rack，在最高 4K pressure 層比較 B、C、R。
 2. **為何測**：測試高 client pressure 與大 fault domain loss 的交互影響。
 3. **事前預測**：這應是全矩陣 profile 分離最大的區塊；C 的 client 保護最好，但 TTR 最長且最可能 censored，R 應最快。
-4. **結果**：p99 ratio mean 為 B 1.449×、C 1.506×、R 1.388×，C 反而最差；TTR 為 1,325.5、1,269、1,283 秒，C 反而最短。descriptive direction 與兩個預測都相反。
-5. **建議**：所有 pair 仍未跨 margin，故 primary endpoints 只能判 Underpowered；rack post-clean achieve_ratio 也未超過 C 的 within-profile range。
+4. **結果**：p99 mean 由 B 51.380→74.449（+23.069）、C 48.759→73.400（+24.642）、R 54.002→74.973 ms（+20.972）。raw fault-window ms 的 C 最低只屬 post hoc descriptive ordering；原 preregistered normalized p99 direction 並未支持「C client 最佳」的凍結預測。TTR 為 1,325.5、1,269、1,283 秒，C 反而最短，也與凍結方向相反。
+5. **建議**：原 preregistered normalized p99 rule 與 TTR 都沒有 pair hit，raw absolute ordering 不得改寫 prediction fate；primary endpoints 只能判 Underpowered。rack post-clean achieve_ratio 也未超過 C 的 within-profile range。
 
 ### 7.9 node isolation、4K mid
 
 1. **調整參數**：隔離完整 OSD node，在 4K mid pressure 下比較 B、C、R。
 2. **為何測**：確認 node-level fault 是否與單一 OSD down 呈現不同 profile 敏感度。
 3. **事前預測**：以 OSDMap down epoch 對齊後，四個 primary endpoints 應與 OSD down 4K mid indistinguishable；`fault_t0` 到 down epoch 約 20–30 秒，而直接 OSD down 應小於 5 秒。
-4. **結果**：p99 ratio mean 為 B 8.130×、C 8.189×、R 8.759×；TTR 為 720、708、719 秒。
+4. **結果**：p99 mean 由 B 3.424→27.787（+24.363）、C 3.326→27.263（+23.937）、R 3.408→29.884 ms（+26.477）；TTR 為 720、708、719 秒。
 5. **建議**：差距不跨 margin；node return-backfill timestamps 不可信，不能補強排名。
 
 ### 7.10 sequential contention、mid
@@ -503,7 +503,7 @@ H-033 也使 flapping 的操作風險高於單純 profile 比較。
 1. **調整參數**：在 sequential mid pressure 與 recovery contention 下比較 B、C、R。
 2. **為何測**：測試 bandwidth-heavy client 與 recovery 是否比 4K workload 更容易被 mClock 分離。
 3. **事前預測**：六個 sequential contention cells 應全部 indistinguishable；任一 profile pair 跨 margin，便會對名義 cost model 的假設構成證偽壓力。
-4. **結果**：p99 ratio mean 為 B 2.220×、C 1.618×、R 1.806×；TTR 為 925、766.5、772.5 秒。
+4. **結果**：p99 mean 由 B 25.821→55.837（+30.015）、C 30.933→50.070（+19.137）、R 28.443→51.380 ms（+22.938）；TTR 為 925、766.5、772.5 秒。
 5. **建議**：recovery 有兩個跨 margin 的 pair，但 replicate 範圍重疊且 n=2，先補 replicate。
 
 sequential-mid recovery throughput 如下。
@@ -574,14 +574,11 @@ C 的 within-profile range 為 0.243890。
 mean span 小於 C 自己的 within-profile range。
 因此目前無法宣稱 rack extreme 有 robust three-profile descriptive separation。
 
-### 8.4 不可跨 pressure 用 p99 ratio 排名
+### 8.4 跨 pressure 只描述 latency，不推論 profile effect
 
-rack low 的 p99 ratio 約為 5.7–6.8。
-rack mid 約為 5.6–8.2。
-rack extreme 約為 1.36–1.57。
-方向看似在 extreme 反轉，原因是 extreme pre-window 本來就約 50 ms。
-ratio 的分母已隨 pressure 改變。
-因此不可把 low、mid、extreme 的 ratio 放在同一排名尺上。
+排除明確離群後，rack low 的 fault-window p99 為 13.828–16.450 ms，rack mid 為 19.792–28.443 ms，rack extreme 為 70.779–78.119 ms。
+這些 raw latency 直接呈現 workload pressure 上升時 client 面承受的絕對延遲。
+但 low、mid、extreme 的 workload 與 pre-window latency 不同，因此跨 pressure 的絕對值不能用來推論 profile effect；profile 比較仍須留在同 pressure group 的 formal verdict audit，並以 raw ms 呈現人類可讀的 magnitude。
 
 ## 九、明確離群資料與 baseline 語意
 
@@ -592,7 +589,7 @@ ratio 的分母已隨 pressure 改變。
 該次 injection-window baseline p99 為 28.966912 ms。
 同 shape、同 pressure 的 4K/low baseline median 為 2.375680 ms。
 MAD 為 0.065536 ms。
-離群倍數為 12.193103x。
+該次 baseline 比同組 median 高 26.591232 ms。
 verdict 已 recorded，且 `tainted=false`。
 這表示 harness 當時沒有攔到它。
 分析層必須明確排除，才能得到 usable=136。
@@ -607,7 +604,7 @@ drift gate 在 8 天內停止 campaign 6 次。
 6 次沒有任何一次是 true positive。
 原 gate 量到的是 post-event 善後複測。
 該階段受 backfill heavy-tail 影響。
-例如 4K/low/backfill 的 MAD 為 29.2%、live 全距達 4.90×；4K/mid/backfill 的 live 全距達 8.99×，並出現 10.3、12.4、30.8、38.0 ms 的重尾值。
+例如 4K/low/backfill 的 post-clean p99 從 2.899968 升到 14.221312 ms，raw gap 為 11.321344 ms；4K/mid/backfill 從 4.227072 升到 38.010880 ms，raw gap 為 33.783808 ms，並出現 10.3、12.4、30.8、38.0 ms 的重尾值。
 它不是 cluster 的 injection 前 pre-window 基準。
 因此原 gate 的資料語意與名稱不一致。
 目前已改成 warn-only。
@@ -616,9 +613,20 @@ threshold、streak、detection 邏輯沒有修改。
 截至固定快照，`DRIFT-ALERT=0`。
 final report 前必須手動清零 `results/baseline-drift-state.json`。
 清零後必須重新執行 audit。
-相較之下，8 個 `(shape, pressure)` 組合的 injection pre-window MAD 只有 1.1%–9.5%。
-後續環境監看的 proposed heuristic 是：依同 shape、同 pressure 分組，取 `aggregate.json.windows.baseline.p99_ns` 的中位數；偏離該組中位數超過 50% 就列為離群。
-這個 50% 門檻尚未驗證 false-positive/false-negative；暫定單筆離群先排除並查 evidence，只有多筆新離群同時出現才升級為 cluster 環境劣化訊號。
+相較之下，injection pre-window 必須依 8 個 `(shape, pressure)` 組合分開保留 raw p99 ms 分布，不能用跨組百分比壓成同一尺度。原 proposed heuristic 是同組 median 偏離超過 50%；下表已把規則展開成可直接操作的 ms 界線，讀者不需心算。
+
+| shape / pressure | clean n | median p99 ms | lower bound ms | upper bound ms | 狀態 |
+|---|---:|---:|---:|---:|---|
+| 4K low | 24 | 2.359296 | 1.179648 | 3.538944 | Provisional；已排除明確離群 attempt |
+| 4K mid | 33 | 3.194880 | 1.597440 | 4.792320 | Provisional |
+| 4K high | 9 | 5.931008 | 2.965504 | 8.896512 | Provisional；樣本僅 9 |
+| 4K extreme | 26 | 52.690944 | 26.345472 | 79.036416 | Provisional |
+| sequential low | 9 | 10.027008 | 5.013504 | 15.040512 | Provisional；樣本僅 9 |
+| sequential mid | 15 | 24.248320 | 12.124160 | 36.372480 | Provisional |
+| sequential high | 8 | 76.546048 | 38.273024 | 114.819072 | Provisional；另有一筆 needs-human 未納入 |
+| sequential extreme | 12 | 103.809024 | 51.904512 | 155.713536 | Provisional |
+
+表內 clean set 固定在本報告快照，且不含 `20260802T000016Z`；因此 4K/low 的 2.359296 ms clean median，會與第九節用完整候選集合偵測該離群點時的 2.375680 ms reference median 不同。後續遇到 pre-window p99 低於 lower bound 或高於 upper bound 時，先標記、排除並查 evidence；這些界線必須以歷史 clean samples 回測 false-positive/false-negative，在完成前維持 warn-only，只有多筆新越界同時出現才升級為 cluster 環境劣化訊號。
 
 ### 10.2 rack fake-taint annotation
 
@@ -663,9 +671,9 @@ cephadm systemd unit 在 30 分鐘內第 5 次啟動可觸發 start-limit。
 | steady 4K / sequential | 三 profile equivalent | ✅ operationally indistinguishable；差距未超過 noise 或 production margin，但未做 formal equivalence test |
 | OSD down low | client equivalent；recovery R ≥ B ≈ C | ❌ recovery mean 實為 B > C > R，descriptive direction 相反；但未跨 margin，仍是 Underpowered |
 | OSD down mid | R 的 client 劣化顯著、B ≈ C；recovery R > B ≳ C | ❌ 目前平均值方向不符，且沒有 pair 通過完整判定 |
-| OSD down extreme | client 劣化 C < B < R；TTR R < B < C | ❌ p99 descriptive 順序 R < C < B、TTR 為 C < R < B，方向均相反；所有 pair 未跨 margin |
-| flapping | stall equivalent；p99 分離小於同壓力 OSD down | ⏳ mid p99 mean span 34.736，遠大於 OSD-down-mid 的 0.594，descriptive direction 相反；stall 有兩個 mean hit，但均 n=2、範圍重疊；low/extreme 未齊 |
-| rack isolation | extreme 分離最大；C client 最佳但 TTR 最長 | ❌ rack-extreme 的 C p99 ratio 最高、TTR 最短，descriptive direction 相反；所有 pair 未跨 margin，low 又有一筆明確排除點 |
+| OSD down extreme | client 劣化 C < B < R；TTR R < B < C | ❌ 原 preregistered normalized p99 direction 不符合預測；raw fault-window p99 的 C 57.410 < B 59.245 < R 60.031 ms 只作 post hoc 描述，不改寫 verdict；TTR 為 C < R < B，方向相反 |
+| flapping | stall equivalent；p99 分離小於同壓力 OSD down | ⏳ 原 preregistered normalized p99 direction 與預測相反；raw fault-window gap 為 92.275 ms，OSD-down-mid 為 1.901 ms；stall 有兩個 mean hit，但均 n=2、範圍重疊；low/extreme 未齊 |
+| rack isolation | extreme 分離最大；C client 最佳但 TTR 最長 | ❌ 原 preregistered normalized p99 direction 不支持 C client 最佳；raw rack-extreme C 73.400 ms 最低只作 post hoc 描述，不改寫 verdict；C 的 TTR 反而最短，low 又有一筆明確排除點 |
 | node isolation | 對齊 down epoch 後與 OSD down mid equivalent | ⏳ 尚須完成對齊分析；return-backfill timestamps 不能使用 |
 | sequential contention | 六 cells 全部 equivalent | ⏳ recovery throughput 出現兩個 provisional mean hits，對 cost model 形成證偽壓力，但範圍仍重疊 |
 | chaos | n=1 descriptive；累積 stall C < B < R | ⏳ 0 finalized |
@@ -677,7 +685,7 @@ cephadm systemd unit 在 30 分鐘內第 5 次啟動可觸發 start-limit。
 
 | 決策 | 目前值／動作 | 依據與效果量 | 證據強度 | 可調性／成本 | 升級條件 |
 |---|---|---|---|---|---|
-| 一般預設 profile | 維持 `balanced` | A-1/A-2：steady 4K IOPS 差 0.03%–0.48%、p99 差 0.34%–1.45% | Operationally indistinguishable | runtime、無須重啟；仍須 8 OSD effective gate | final audit 不推翻 negative-control 判讀 |
+| 一般預設 profile | 維持 `balanced` | A-1/A-2：steady 4K IOPS 差 0.03%–0.48%；4K p99 gap 0.011–0.699 ms、sequential p99 gap 0.841–2.447 ms，均小於同 cell replicate 全距 | Operationally indistinguishable | runtime、無須重啟；仍須 8 OSD effective gate | final audit 不推翻 negative-control 判讀 |
 | 全域切換 profile | 不要切換 | B/C/D：只有 4 個 mean hit，均 n=2 且範圍重疊；TTR 0 hit | 中期決策 | 不變更 | 多 scenario、足夠 replicate 的一致勝出 |
 | OSD down + 4K extreme + post-clean throughput | 僅把 C 列為 follow-up 假說，不作 production 切換依據 | B-1 descriptive：C/B/R achieve_ratio 1.024839/0.905303/0.883061 | Descriptive only | 研究排程；若未來要切仍是 runtime + 8 OSD gate | 先事前註冊 follow-up，再完成 r3、audit、dataset seal |
 | recovery 導向預設 | 不採用 R 作全域預設 | D mid recovery 有 provisional hits，但所有 TTR pair 0 hit | Underpowered | 不變更 | recovery/TTR 同時跨 margin 且 replicate 範圍不重疊 |
@@ -700,10 +708,10 @@ systemd start-limit 應有獨立監控，不應只看 Ceph health summary。
 
 ### 12.2 暫時不要做的事項
 
-不要以單一 p99 ratio mean 最低者作全域 profile。
+不要以單一 fault-window p99 mean 最低者作全域 profile。
 不要以 post-clean achieve_ratio 取代 primary endpoints。
 不要把 2,700 秒 censored TTR 當成精確完成時間。
-不要跨 pressure 比較 p99 ratio 排名。
+不要跨 pressure 用絕對 p99 latency 推論 profile effect。
 不要把 23 個 fake-taint annotations 寫成 23 個 invalid datasets。
 不要把 auto-out、gray、adaptive-grace 寫成 descoped。
 不要把 capacity 改回 21,500。
@@ -744,7 +752,7 @@ handoff 粗估為約 179.9 小時、US$1,439。
 
 | 優先序 | 時點 | owner | 工作與完成定義 |
 |---|---|---|---|
-| P0 | campaign 仍在跑時，每 2 小時 | campaign operator | 檢查 supervisor/runner、pre-window >50% proposed outlier、`DRIFT-ALERT`、Azure 登入與 rollback health；不平行啟動第二個 gate |
+| P0 | campaign 仍在跑時，每 2 小時 | campaign operator | 檢查 supervisor/runner、pre-window 是否超出 §10.1 同 shape/pressure 的 direct-ms lower／upper bound、`DRIFT-ALERT`、Azure 登入與 rollback health；不平行啟動第二個 gate |
 | P0 | `pending=0` 後第一個工作區段 | campaign operator + evidence analyst | 凍結新 execution、逐筆裁定 4 個 needs-human、確認 optional decisions，不把 decision-open 混入 execution ledger |
 | P0 | needs-human 裁定後、寫 final report 前 | evidence analyst | 手動清零 drift state、重跑 audit、套用明確 exclusion、產生完整矩陣與 dataset seal；任一 validity failure 都阻擋 final report |
 | P1 | 同一個 final review cycle | SRE reviewer | 審核 H-033 告警、`repeer` allowlist／核准／失敗流程、systemd start-limit 與 30/60 秒 timeout staging plan |
