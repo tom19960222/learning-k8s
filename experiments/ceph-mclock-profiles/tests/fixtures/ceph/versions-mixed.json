@@ -1,0 +1,16 @@
+{
+ "mon": {
+  "ceph version 19.2.2 (0eceb0defba60152a8182f7bd87d164b639885b8) squid (stable)": 3
+ },
+ "mgr": {
+  "ceph version 19.2.2 (0eceb0defba60152a8182f7bd87d164b639885b8) squid (stable)": 1
+ },
+ "osd": {
+  "ceph version 19.2.2 (0eceb0defba60152a8182f7bd87d164b639885b8) squid (stable)": 7,
+  "ceph version 19.2.1 (deadbeef) squid (stable)": 1
+ },
+ "overall": {
+  "ceph version 19.2.2 (0eceb0defba60152a8182f7bd87d164b639885b8) squid (stable)": 11,
+  "ceph version 19.2.1 (deadbeef) squid (stable)": 1
+ }
+}

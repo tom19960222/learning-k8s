@@ -1,0 +1,10 @@
+[
+ {
+  "addr": "10.60.1.10",
+  "hostname": "mclock-admin",
+  "labels": [
+   "_admin"
+  ],
+  "status": ""
+ }
+]

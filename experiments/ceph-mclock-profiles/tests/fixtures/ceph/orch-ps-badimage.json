@@ -1,0 +1,345 @@
+[
+ {
+  "daemon_name": "alertmanager.mclock-osd-3",
+  "daemon_type": "alertmanager",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/prometheus/alertmanager:v0.25.0",
+  "version": "0.25.0"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-admin",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-mon-1",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-mon-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-mon-2",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-mon-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-1",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-2",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-3",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-4",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-4",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-5",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-5",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-6",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-6",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-7",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-7",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "ceph-exporter.mclock-osd-8",
+  "daemon_type": "ceph-exporter",
+  "hostname": "mclock-osd-8",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-admin",
+  "daemon_type": "crash",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-mon-1",
+  "daemon_type": "crash",
+  "hostname": "mclock-mon-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-mon-2",
+  "daemon_type": "crash",
+  "hostname": "mclock-mon-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-1",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-2",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-3",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-4",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-4",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-5",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-5",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-6",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-6",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-7",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-7",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "crash.mclock-osd-8",
+  "daemon_type": "crash",
+  "hostname": "mclock-osd-8",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "grafana.mclock-osd-3",
+  "daemon_type": "grafana",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/ceph/grafana:10.4.0",
+  "version": "10.4.0"
+ },
+ {
+  "daemon_name": "mgr.mclock-admin.jaqmtb",
+  "daemon_type": "mgr",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/ceph/ceph:v19.2.2",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "mgr.mclock-osd-1.udvymw",
+  "daemon_type": "mgr",
+  "hostname": "mclock-osd-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "mon.mclock-admin",
+  "daemon_type": "mon",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/ceph/ceph:v19.2.2",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "mon.mclock-mon-1",
+  "daemon_type": "mon",
+  "hostname": "mclock-mon-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "mon.mclock-mon-2",
+  "daemon_type": "mon",
+  "hostname": "mclock-mon-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-admin",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-mon-1",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-mon-1",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-mon-2",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-mon-2",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-1",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-1",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-2",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-2",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-3",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-4",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-4",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-5",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-5",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-6",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-6",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-7",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-7",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "node-exporter.mclock-osd-8",
+  "daemon_type": "node-exporter",
+  "hostname": "mclock-osd-8",
+  "container_image_name": "quay.io/prometheus/node-exporter:v1.7.0",
+  "version": "1.7.0"
+ },
+ {
+  "daemon_name": "osd.0",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-1",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.1",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-2",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.2",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-3",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.3",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-4",
+  "container_image_name": "docker.io/someoneelse/ceph@sha256:dead000000000000000000000000000000000000000000000000000000000000",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.4",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-5",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.5",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-6",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.6",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-7",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "osd.7",
+  "daemon_type": "osd",
+  "hostname": "mclock-osd-8",
+  "container_image_name": "quay.io/ceph/ceph@sha256:8214ebff6133ac27d20659038df6962dbf9d77da21c9438a296b2e2059a56af6",
+  "version": "19.2.2"
+ },
+ {
+  "daemon_name": "prometheus.mclock-admin",
+  "daemon_type": "prometheus",
+  "hostname": "mclock-admin",
+  "container_image_name": "quay.io/prometheus/prometheus:v2.51.0",
+  "version": "2.51.0"
+ }
+]

@@ -1,0 +1,5 @@
+{
+ "pool": "mclock",
+ "pool_id": 2,
+ "crush_rule": "mclock-rack"
+}

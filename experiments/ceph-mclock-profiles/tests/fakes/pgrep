@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# fake pgrep v1（Task supervisor）——可程式化的 pgrep 替身，供 PATH 覆蓋使用。
+# 風格對齊 tests/fakes/ssh，但語意是「對一張假的 process 表做 pgrep -f 的比對」，
+# 所以刻意用真的 `grep -E`：受測的是 run/campaign-supervisor.sh 交出來的 pattern
+# 本身會不會誤中，pattern 語意必須是真的 ERE，不能由替身自己定義。
+#
+# 協定：
+#   FAKE_PGREP_DIR  必填。目錄內放 table.<n> = 第 n 次呼叫時的 process 表，
+#                   每行一個完整 cmdline。缺 table.<n> 時沿用「編號最大且 ≤ n」的那張
+#                   （方便表達「狀態不變」）；一張都沒有 = 沒有任何程序。
+#                   count 檔記累計呼叫次數。
+#   FAKE_PGREP_LOG  每次呼叫記一行 pattern
+#
+# 只支援 `-f <pattern>`（受測程式只用這一種）；其他用法一律 exit 95，不得靜默成功。
+set -u
+
+pattern=""
+full=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f) full=1 ;;
+    -*) printf 'fake-pgrep: 不支援的旗標 %s\n' "$1" >&2; exit 95 ;;
+    *) pattern="$1" ;;
+  esac
+  shift
+done
+if [ "$full" -eq 0 ] || [ -z "$pattern" ]; then
+  printf 'fake-pgrep: 只支援 -f <pattern>\n' >&2
+  exit 95
+fi
+
+dir="${FAKE_PGREP_DIR:-}"
+[ -n "$dir" ] || { printf 'fake-pgrep: 缺 FAKE_PGREP_DIR\n' >&2; exit 95; }
+mkdir -p "$dir" 2>/dev/null || true
+
+n=0
+[ -f "$dir/count" ] && n="$(cat "$dir/count")"
+n=$((n + 1))
+printf '%s\n' "$n" > "$dir/count"
+if [ -n "${FAKE_PGREP_LOG:-}" ]; then
+  printf '%s\n' "$pattern" >> "$FAKE_PGREP_LOG"
+fi
+
+table=""
+i="$n"
+while [ "$i" -ge 1 ]; do
+  if [ -f "$dir/table.$i" ]; then
+    table="$dir/table.$i"
+    break
+  fi
+  i=$((i - 1))
+done
+[ -n "$table" ] && [ -s "$table" ] || exit 1
+
+# pgrep 的輸出是 pid；這裡用行號當假 pid（受測程式只看回傳碼）。
+# 回傳碼一定要取自 grep：`grep | cut` 的回傳碼是 cut 的（永遠 0），
+# 那樣「沒有任何程序」會被回報成「有」，替身本身就先壞了。
+grep -qE -- "$pattern" "$table" || exit 1
+grep -nE -- "$pattern" "$table" | cut -d: -f1
+exit 0

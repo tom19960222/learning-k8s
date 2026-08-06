@@ -1,0 +1,82 @@
+[
+ {
+  "can_update_at_runtime": true,
+  "level": "advanced",
+  "mask": "",
+  "name": "osd_pool_default_size",
+  "section": "global",
+  "value": "3"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_profile",
+  "section": "osd",
+  "value": "balanced"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.0",
+  "value": "45282.421000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.1",
+  "value": "44980.113000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.2",
+  "value": "46001.774000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.3",
+  "value": "45510.002000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.4",
+  "value": "44720.556000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.5",
+  "value": "45899.320000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.6",
+  "value": "45120.881000"
+ },
+ {
+  "can_update_at_runtime": true,
+  "level": "basic",
+  "mask": "",
+  "name": "osd_mclock_max_capacity_iops_ssd",
+  "section": "osd.7",
+  "value": "45330.447000"
+ }
+]

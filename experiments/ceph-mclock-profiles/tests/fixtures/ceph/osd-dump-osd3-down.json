@@ -1,0 +1,371 @@
+{
+ "epoch": 512,
+ "fsid": "3f2b1c8e-7a41-4c9d-9b0e-2d5a6f7c8b90",
+ "created": "2026-07-24T10:00:00.000000+0000",
+ "modified": "2026-07-25T03:00:00.000000+0000",
+ "last_up_change": "2026-07-25T02:00:00.000000+0000",
+ "last_in_change": "2026-07-25T02:00:00.000000+0000",
+ "flags": "noscrub,nodeep-scrub",
+ "flags_num": 786432,
+ "flags_set": [
+  "nodeep-scrub",
+  "noscrub"
+ ],
+ "crush_version": 30,
+ "full_ratio": 0.95,
+ "backfillfull_ratio": 0.9,
+ "nearfull_ratio": 0.85,
+ "cluster_snapshot": "",
+ "pool_max": 2,
+ "max_osd": 8,
+ "require_min_compat_client": "luminous",
+ "min_compat_client": "jewel",
+ "require_osd_release": "squid",
+ "pools": [
+  {
+   "pool": 2,
+   "pool_name": "mclock",
+   "size": 3,
+   "min_size": 2,
+   "crush_rule": 1,
+   "pg_num": 128
+  }
+ ],
+ "osds": [
+  {
+   "osd": 0,
+   "uuid": "00000000-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.21:6800",
+      "nonce": 100
+     }
+    ]
+   },
+   "public_addr": "10.60.1.21:6801/1000",
+   "cluster_addr": "10.60.1.21:6802/1000",
+   "heartbeat_back_addr": "10.60.1.21:6803/1000",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 1,
+   "uuid": "00000001-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.22:6800",
+      "nonce": 101
+     }
+    ]
+   },
+   "public_addr": "10.60.1.22:6801/1001",
+   "cluster_addr": "10.60.1.22:6802/1001",
+   "heartbeat_back_addr": "10.60.1.22:6803/1001",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 2,
+   "uuid": "00000002-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.23:6800",
+      "nonce": 102
+     }
+    ]
+   },
+   "public_addr": "10.60.1.23:6801/1002",
+   "cluster_addr": "10.60.1.23:6802/1002",
+   "heartbeat_back_addr": "10.60.1.23:6803/1002",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 3,
+   "uuid": "00000003-0000-0000-0000-000000000000",
+   "up": 0,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 520,
+   "lost_at": 0,
+   "state": [
+    "exists"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.24:6800",
+      "nonce": 103
+     }
+    ]
+   },
+   "public_addr": "10.60.1.24:6801/1003",
+   "cluster_addr": "10.60.1.24:6802/1003",
+   "heartbeat_back_addr": "10.60.1.24:6803/1003",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 4,
+   "uuid": "00000004-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.25:6800",
+      "nonce": 104
+     }
+    ]
+   },
+   "public_addr": "10.60.1.25:6801/1004",
+   "cluster_addr": "10.60.1.25:6802/1004",
+   "heartbeat_back_addr": "10.60.1.25:6803/1004",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 5,
+   "uuid": "00000005-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.26:6800",
+      "nonce": 105
+     }
+    ]
+   },
+   "public_addr": "10.60.1.26:6801/1005",
+   "cluster_addr": "10.60.1.26:6802/1005",
+   "heartbeat_back_addr": "10.60.1.26:6803/1005",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 6,
+   "uuid": "00000006-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.27:6800",
+      "nonce": 106
+     }
+    ]
+   },
+   "public_addr": "10.60.1.27:6801/1006",
+   "cluster_addr": "10.60.1.27:6802/1006",
+   "heartbeat_back_addr": "10.60.1.27:6803/1006",
+   "device_class": "ssd"
+  },
+  {
+   "osd": 7,
+   "uuid": "00000007-0000-0000-0000-000000000000",
+   "up": 1,
+   "in": 1,
+   "weight": 1.0,
+   "primary_affinity": 1.0,
+   "last_clean_begin": 0,
+   "last_clean_end": 0,
+   "up_from": 15,
+   "up_thru": 512,
+   "down_at": 0,
+   "lost_at": 0,
+   "state": [
+    "exists",
+    "up"
+   ],
+   "public_addrs": {
+    "addrvec": [
+     {
+      "type": "v2",
+      "addr": "10.60.1.28:6800",
+      "nonce": 107
+     }
+    ]
+   },
+   "public_addr": "10.60.1.28:6801/1007",
+   "cluster_addr": "10.60.1.28:6802/1007",
+   "heartbeat_back_addr": "10.60.1.28:6803/1007",
+   "device_class": "ssd"
+  }
+ ],
+ "osd_xinfo": [
+  {
+   "osd": 0,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 1,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 2,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 3,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.12,
+   "laggy_interval": 45,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 4,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 5,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 6,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  },
+  {
+   "osd": 7,
+   "down_stamp": "0.000000",
+   "laggy_probability": 0.0,
+   "laggy_interval": 0,
+   "features": 4540138322906710015,
+   "old_weight": 0,
+   "last_purged_snaps_scrub": "2026-07-24T12:00:00.000000+0000",
+   "dead_epoch": 0
+  }
+ ],
+ "pg_upmap": [],
+ "pg_upmap_items": [],
+ "pg_temp": [],
+ "primary_temp": [],
+ "blocklist": {},
+ "erasure_code_profiles": {}
+}

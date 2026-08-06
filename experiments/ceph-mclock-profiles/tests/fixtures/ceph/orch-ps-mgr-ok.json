@@ -1,0 +1,12 @@
+[
+ {
+  "daemon_name": "mgr.mclock-admin.aaa",
+  "daemon_type": "mgr",
+  "hostname": "mclock-admin"
+ },
+ {
+  "daemon_name": "mgr.mclock-mon-1.ccc",
+  "daemon_type": "mgr",
+  "hostname": "mclock-mon-1"
+ }
+]

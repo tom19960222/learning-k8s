@@ -1,0 +1,5 @@
+{
+ "pool": "mclock",
+ "pool_id": 2,
+ "pg_autoscale_mode": "off"
+}

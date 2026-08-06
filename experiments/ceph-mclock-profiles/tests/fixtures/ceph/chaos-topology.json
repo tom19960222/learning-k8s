@@ -1,0 +1,42 @@
+[
+ {
+  "node": "mclock-osd-1",
+  "rack": "rack1",
+  "osd": 0
+ },
+ {
+  "node": "mclock-osd-2",
+  "rack": "rack1",
+  "osd": 1
+ },
+ {
+  "node": "mclock-osd-3",
+  "rack": "rack2",
+  "osd": 2
+ },
+ {
+  "node": "mclock-osd-4",
+  "rack": "rack2",
+  "osd": 3
+ },
+ {
+  "node": "mclock-osd-5",
+  "rack": "rack3",
+  "osd": 4
+ },
+ {
+  "node": "mclock-osd-6",
+  "rack": "rack3",
+  "osd": 5
+ },
+ {
+  "node": "mclock-osd-7",
+  "rack": "rack4",
+  "osd": 6
+ },
+ {
+  "node": "mclock-osd-8",
+  "rack": "rack4",
+  "osd": 7
+ }
+]

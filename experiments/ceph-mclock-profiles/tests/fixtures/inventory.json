@@ -1,0 +1,20 @@
+{
+  "admin_public_ip": "20.63.11.5",
+  "nodes": [
+    {"name": "mclock-admin", "role": "admin", "private_ip": "10.60.1.10"},
+    {"name": "mclock-mon-1", "role": "mon", "private_ip": "10.60.1.11"},
+    {"name": "mclock-mon-2", "role": "mon", "private_ip": "10.60.1.12"},
+    {"name": "mclock-osd-1", "role": "osd", "private_ip": "10.60.1.21", "rack": "rack1", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-1"},
+    {"name": "mclock-osd-2", "role": "osd", "private_ip": "10.60.1.22", "rack": "rack1", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-2"},
+    {"name": "mclock-osd-3", "role": "osd", "private_ip": "10.60.1.23", "rack": "rack2", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-3"},
+    {"name": "mclock-osd-4", "role": "osd", "private_ip": "10.60.1.24", "rack": "rack2", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-4"},
+    {"name": "mclock-osd-5", "role": "osd", "private_ip": "10.60.1.25", "rack": "rack3", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-5"},
+    {"name": "mclock-osd-6", "role": "osd", "private_ip": "10.60.1.26", "rack": "rack3", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-6"},
+    {"name": "mclock-osd-7", "role": "osd", "private_ip": "10.60.1.27", "rack": "rack4", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-7"},
+    {"name": "mclock-osd-8", "role": "osd", "private_ip": "10.60.1.28", "rack": "rack4", "nvme_device": "/dev/disk/by-id/nvme-MSFT_NVMe_osd-8"},
+    {"name": "mclock-client-1", "role": "client", "private_ip": "10.60.1.31"},
+    {"name": "mclock-client-2", "role": "client", "private_ip": "10.60.1.32"},
+    {"name": "mclock-client-3", "role": "client", "private_ip": "10.60.1.33"},
+    {"name": "mclock-client-4", "role": "client", "private_ip": "10.60.1.34"}
+  ]
+}

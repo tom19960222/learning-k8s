@@ -1,0 +1,22 @@
+{
+ "arch": "x86_64",
+ "back_addr": "10.60.1.25:6802/1004",
+ "back_iface": "eth0",
+ "bluestore_bdev_type": "ssd",
+ "ceph_version": "ceph version 19.2.2 (unknown) squid (stable)",
+ "ceph_version_short": "19.2.2",
+ "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+ "device_ids": "nvme0n1=MSFT_NVMe_osd",
+ "distro": "ubuntu",
+ "distro_version": "22.04",
+ "front_addr": "10.60.1.25:6801/1004",
+ "front_iface": "eth0",
+ "hb_back_addr": "[v2:10.60.1.25:6804/1004,v1:10.60.1.25:6805/1004]",
+ "hb_front_addr": "[v2:10.60.1.25:6806/1004,v1:10.60.1.25:6807/1004]",
+ "hostname": "mclock-osd-5",
+ "id": 4,
+ "kernel_version": "6.8.0-52-generic",
+ "osd_data": "/var/lib/ceph/osd/ceph-4",
+ "osd_objectstore": "bluestore",
+ "rotational": "0"
+}
