@@ -1022,3 +1022,34 @@ rc >= 2 才是真正的錯誤。原本的 `|| die` 不分青紅皂白，等於
 「異常即失敗」判斷都要重新檢視一次——因為那個異常很可能正是實驗要捕捉的東西。
 這類地方的正確做法是**分辨嚴重度**（tar rc1 vs rc2、TIMEOUT vs 非 0 exit），
 而不是一律作廢，也不是一律容忍。
+
+---
+
+## 2026-08-07 focused charter：宣告容量落差與 profile 無差異
+
+- **Goal**：判定 Azure campaign 中約 6.4K 的 per-OSD 宣告容量是否造成三個 built-in profile 無法拉開差異；若否，找出使差異消失的必要條件與主要機制。
+- **Scope**：in = capacity → cost → dmclock tag/dequeue 因果鏈、三個 built-in profile、既有 4K client/recovery workload、`immediate` 旁路與 scheduler 外瓶頸；out = raw device 重測、OSD 重建、custom profile、把 raw NVMe IOPS 直接當成 OSD capacity、把 Azure 絕對數字外推到其他環境。
+- **Version anchors**：T1 以 Ceph v19.2.2 解釋原 campaign，並對 v19.2.3 做相關 source diff；T3 仍是同一組 Azure japanwest 15-VM lab。
+- **Tiers available**：T1 pinned source、T2 version-matched Ceph 官方文件、T3 可回退的 live capacity A/B；任何 live run 都必須 `inject → observe → collect → rollback → assert`，且不得與其他實驗並行。
+
+### H-038：低宣告容量本身會壓縮 built-in profile 的可觀測差異
+
+- Status: predicted
+- Priority: P0
+- Tier: T1 → T3
+- Origin: framing-dialog（使用者對既有 campaign 的主要疑問）
+- Prediction: 把八顆 OSD 的宣告容量從 OSD bench 值約 6.4K 降為十分之一、固定 4K low workload（15,908 aggregate IOPS）與同一個 `osd-down` recovery mechanism 後，small-op `qos_cost` 應約為原本十倍、等效 reservation IOPS 約為十分之一；若每個 shard 的 client 與 `background_recovery` queue 都持續 backlog，`high_client_ops` 應比 `high_recovery_ops` 呈現較低的 fault-window client p99、但較慢的 recovery。必須同步確認 `background_recovery`、`background_best_effort` 與 `immediate` queue，否則該次 run 無法裁決本假說。source 不保證 profile gap 對 capacity 單調，因此不預先要求十分之一 capacity 的 gap 必須更大。每個 run 的 observation window 從 `fault_t0` 到 recovery complete，最長 2,700 秒；不以事後挑選的單一秒或 endpoint 改寫 verdict。
+- Evidence: T1 prediction = Ceph v19.2.2 `src/osd/scheduler/mClockScheduler.cc:166-224,250-275,320-373,427-435,476-499,548-583`；dmclock `e4ccdcfa:src/dmclock_server.h:97-120,147-182,248-260,1124-1195`。T3 首次 attempt 的 QoS/readiness/fault-window 證據有效，但 return-backfill cleanup 期間 runner 的 hard-deadline gate 誤判成 no-progress，並錯誤重啟 osd.0；因缺少配對的 `high_recovery_ops` run，不裁決本假說。
+- Artifacts: `results/capacity-ab-under10x-osd-down-4k-low+high_client_ops/r1/attempts/20260807T032330Z/`（位於原 campaign worktree；inconclusive，不可納入正式比較）
+- Notes: T1 能確定較低 capacity 會提高 small-op floor cost、降低等效 reservation IOPS，但不能單靠 source 推得 profile gap 必然放大或縮小。本次保留原標題，讓配對 A/B 裁決，而不是事後改寫問題。首次 T3 attempt 的 fault window 為 727 秒，四台 fio client 均正常結束；錯誤重啟發生在 osd.3 已回到 `up/in` 後的 return-backfill cleanup，不污染已收下的 fault-window 原始觀測，但會污染後續 baseline，且沒有配對 run、沒有 scheduler class/backlog gate，所以只能列為工程診斷資料。
+
+### H-039：`immediate` 表外工作與雙 class 競爭不足，比宣告容量更能解釋 profile 無差異
+
+- Status: proposed
+- Priority: P0
+- Tier: T1 → T3
+- Origin: framing-dialog unknown-unknown + 既有 H-005/H-006 的 negative space
+- Prediction: 待 source 與既有 evidence 交叉檢查後凍結；至少要同時觀察 client、`background_recovery`、`background_best_effort` 與 `immediate` queue，不能只用 aggregate client IOPS/p99 下結論。
+- Evidence:
+- Artifacts:
+- Notes: healthy steady state 只有 client class 時，三個 profile 的 client limit 都是 max，原本就不應期待 profile 分離。低優先度 recovery 可由 `priority_to_scheduler_class()` 分到 `background_best_effort`；其 finite limit 在 `high_client_ops` 為 `.7C`、`balanced` 為 `.9C`，`high_recovery_ops` 才是 max。
