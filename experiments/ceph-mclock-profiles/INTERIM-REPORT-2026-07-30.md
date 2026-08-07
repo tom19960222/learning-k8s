@@ -62,11 +62,16 @@
 
 mClock 的 res/lim 是比例，乘上每顆 OSD 鎖定的名義 capacity 才變成實際額度。
 
-- **per-OSD osd bench（4K randwrite，走完整 OSD stack）**：8 顆 6,057–6,646 IOPS，
+- **per-OSD osd bench（4K randwrite）**：8 顆 6,057–6,646 IOPS，
   平均 **6,439**，跨顆 **CoV 3.19%**（gate 上限 20%，遠低於 → 裝置同質性成立）。
   全部 `accepted`、鎖定來源 = bench。（`results/capacity-lock.json`、`capacity-provenance.json`）
+  > **2026-08-07 更正**：原文寫「走完整 OSD stack」與下一項的「BlueStore + replication
+  > stack 的通過量」皆為誤述。`OSD::run_osd_bench_test` 直接 `queue_transaction` 到
+  > `coll_t::meta()`，**不經 messenger / PG / replication / op scheduler**；計時段是
+  > 3,000 個 4 KiB op、約 0.47 秒。此值系統性低估，以收官報告 §2.2 為準。
 - **raw NVMe 4K randwrite（不經 Ceph）**：276,735–304,158 IOPS——osd bench 量的是
-  BlueStore + replication stack 的通過量，兩者差 ~45× 是預期行為，不是量錯。
+  BlueStore 單一 sequencer 的單執行緒通過量，兩者差 ~45× 不代表 osd bench 量錯，
+  但也不代表它等於這顆 OSD 的服務能力（見上方更正）。
 - **叢集 4K randrw 70/30 ceiling**：**63,634 IOPS**（3 輪 63,232–64,942）；
   **1M seq write ceiling：2,374 MiB/s**（3 輪幾乎重合）。（`results/calibration.json`）
 
