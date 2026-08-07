@@ -149,7 +149,11 @@
 - Artifacts: 報告的參數建議總表必須附「cost_per_io 交叉點」欄位（鎖定 capacity 後的實際 bytes 值）。
 
 ### H-005: 壓力等級（相對 balanced-healthy ceiling）與 mClock 的 res 門檻分母不同，必須用校準後的 ρ 換算；只有當「per-OSD client-class 需求比 > 該 profile 的 client res」時 profile 才會分離
-- Status: proposed
+- Status: **REFUTED**（2026-08-07 收官複查）
+- Result: ρ = 63,634 ÷ (8 × 6,439) = **1.235**；中／高／極端壓的 ρ×L = 0.62 / 0.99 / 1.24 全落在
+  「三 profile 完整分離」分支，實測全部 indistinguishable → **明文證偽條件「ρ×L ≥ 0.6 卻三者等效」成立**。
+  依本假說預先指定的第一嫌疑轉向 H-006。收官報告已補進 §3.1（預測）／§5.2（推翻）／§5.4（歸因）。
+  註：ρ > 1 本身即「osd bench 低估 per-OSD 能力」的量化形式——8 × C = 51,512 < ceiling 63,634。
 - Priority: **P0**（決定全部 63 cells 的方向性預測）
 - Tier: T1 → T3
 - Origin: 讀碼 + 矩陣推導（ceiling 的分母是實測 aggregate、res 的分母是鎖定的名義 per-OSD capacity）
@@ -193,7 +197,12 @@
 - 路由：`OSD::enqueue_op` 先判 `PGRecoveryMsg::is_recovery_msg(op)`，是則包成 `PGRecoveryMsg`，否則包成 `PGOpItem`（`OSD.cc:9698-9711`）。本地發起的 recovery 走 `_queue_for_recovery`，item priority 用 `osd_recovery_priority`、cost 用 `cost_per_object × reserved_pushes`（`OSD.cc:2060-2087`）。
 
 ### H-006: replica 寫（`MSG_OSD_REPOP` 等非 `CEPH_MSG_OSD_OP` 訊息）在 replica OSD 上被判為 `immediate`，完全繞過 mClock；replica 3 下每顆 OSD 有可觀比例的裝置工作是「不計入任何 class」的表外負載，這會系統性壓縮 mClock 能分配的實際容量
-- Status: proposed
+- Status: **機制已確認（T1），佇列組成未量測** — 升為虛無結果的主要解釋候選
+- Result: 機制經 v19.2.3 複驗（`OpSchedulerItem.h` 的 `PGOpItem::get_scheduler_class` 白名單只有
+  `CEPH_MSG_OSD_OP` / `CEPH_MSG_OSD_BACKOFF`）。由 ceiling 63,634 拆算，每顆 OSD 每秒 12,727 個 op 中
+  **4,773（37.5%）走 immediate**，與 Prediction 1 的 37.5% 完全一致。
+  **但 Artifacts 要求的 per-OSD per-shard 四個 mclock 佇列長度從未被收集**（`collect.sh` 無此項），
+  所以只有推算、沒有直接觀測。列為收官報告 §14 第 2 題。
 - Priority: **P0**（頭牌機制發現）
 - Tier: T1 → T3
 - Origin: 讀碼（`PGOpItem::get_scheduler_class` 的白名單只有兩個訊息型別）
@@ -215,7 +224,11 @@
 - Artifacts: sampler 必須能切出 peering 區間（PG state 含 `peering`/`activating` 的時窗）供分段統計。
 
 ### H-008: 回歸階段（heal → `osd in`）的 backfill 因為 PG 只是 misplaced 而非 degraded，落在 `background_best_effort` class — 那是三個 profile 的 `lim`（90% / 70% / max）**唯一**會 binding 的地方，而現行 pipeline 把這段當成純安全 gate、沒有量測
-- Status: proposed
+- Status: **未量測，但證偽條件的處置義務已觸發**（2026-08-07）
+- Result: 回歸區段從未被量測（Artifacts 的時戳與分段標記未實作），所以 Prediction 無法檢驗。
+  但主矩陣三者 indistinguishable，已滿足證偽條件所要求的**報告義務**：「應在報告標註 lim 在本拓撲
+  不可觀測」。收官報告 §5.4 第三點補上（`osd_max_backfills=1` 為 mClock 模式強制值，
+  `OSD::maybe_override_options_for_qos` 的 `recovery_qos_defaults`）。
 - Priority: **P0**（同時是對 plan 的具體修改建議）
 - Tier: T1 → T3
 - Origin: 讀碼（`get_recovery_op_priority()` 的 `BEST_EFFORT=5` 分支 → `priority_to_scheduler_class` 落在 best_effort）
