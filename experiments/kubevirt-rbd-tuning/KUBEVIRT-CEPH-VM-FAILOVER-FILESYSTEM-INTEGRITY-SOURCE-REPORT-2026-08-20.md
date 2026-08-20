@@ -1,55 +1,57 @@
-# KubeVirt／Ceph VM 斷電 failover：filesystem 完整性 source-first production 決策報告
+# KubeVirt VM 斷電後的 Ceph RBD 完整性：原始碼調查與生產建議
 
 > 研究日期：2026-08-20
-> 決策依據：[GitHub Issue #32](https://github.com/tom19960222/learning-k8s/issues/32)；完整性優先，fencing 確認完成前不得在其他 node 重啟 VM
-> 交付性質：指定版本 source review；未讀取 production、未執行故障實驗，也不把既有舊版本 Lab 當成這套環境的證據
+> 依據：[GitHub Issue #32](https://github.com/tom19960222/learning-k8s/issues/32)
+> 原則：資料完整性優先。舊 node 完成 fencing 前，不得在其他 node 重啟 VM。
+> 證據範圍：指定版本原始碼；尚未讀取生產環境，也沒有執行故障實驗。
+
+## 一句話結論
+
+只要同一時間只有一個能寫入的 VM、每一層都確實傳遞 `flush`，而且底層裝置沒有謊報寫入完成，compute node 突然斷電後，ext4 或 XFS 應該做正常的 journal／log replay，不該壞到必須 `fsck` 或 `xfs_repair`。生產環境既然已經出現後者，就要找出哪一層違反了這個前提，不能把它當成正常斷電結果，也不能靠調短 timeout 蒙混過去。
 
 ## 兩分鐘決策摘要
 
-**結論：在 single writer、flush contract 正常、storage hardware 誠實履約且沒有未知 defect 的前提下，這套 source contract 應把 compute-only worker 突然斷電收斂成 guest filesystem 的正常 journal／log recovery，而不是需要 `fsck` 或 `xfs_repair` 的 structural corruption。既然 production 已看到後者，就不能把它當成「斷電本來就會這樣」，也不能靠盲調 timeout 或 CSI sidecar 解決。先阻止多 writer，再逐層證明 effective cache、flush 與 krbd mapping，才有資格談 failover。**
+| 現在要做什麼 | 原因 | 不處理的代價 |
+|---|---|---|
+| fencing 完成後才能在新 node 啟動 VM | Kubernetes 刪掉 `VolumeAttachment` 不代表舊 host 已經解除 RBD mapping | 可能同時出現兩個 writer，這比單純斷電更容易毀損檔案系統 |
+| 保持 `CSIDriver.spec.attachRequired=true` | 這是 RWO volume 的 attach 排他機制；Rook 也明確警告不可關閉 | 為了快幾分鐘而拆掉一道防止多重掛載的保護 |
+| 系統碟和每顆資料碟都要逐顆對盤 | YAML 只代表設定意圖；真正生效的是 libvirt XML、QEMU block graph 和 host krbd mapping | 查錯 disk 或誤判 `cache`／`io`，後續調整全部失去依據 |
+| 先確認 `flush` 沒有被忽略 | `cache=none`、`writethrough`、`writeback` 都不能只看名稱判斷；重點是實際 block graph 是否保留 flush | journal 以為資料已經穩定，實際上仍留在揮發性 cache |
+| 保留 ext4／XFS 的正常 recovery | ext4 的 barrier、XFS 的 log flush，以及兩者的 replay 都是斷電後恢復的核心 | 用 `noload`、`norecovery` 等選項略過 replay，反而會把不一致內容直接暴露出來 |
+| timeout、CSI sidecar 和 queue tuning 先不要動 | 它們主要影響多久報錯或何時重新排程，不會讓資料更耐斷電 | RTO 可能改變，但結構損壞的根因仍在 |
 
-生產處置順序如下：
+### 先不要做
 
-1. **先守住 fencing-before-restart。** 舊 node 的寫入能力沒有被硬體 fencing 排除前，不得建立新 node 上的 writer。Kubernetes force-detach 與 `VolumeAttachment` 刪除只是 control-plane sequencing，不是 host fencing；ceph-csi 的 `ControllerUnpublishVolume` 在 v3.14.0 甚至是 NOOP。
-2. **保留 RWO attach serialization。** `CSIDriver.spec.attachRequired` 必須是 `true`；不得為了縮短 RTO 關掉。Rook v1.17.2 的 source default 也是 `true`，而且明確警告 RWO RBD 關掉後可能造成 data corruption。
-3. **查 effective disk，不接受「YAML 看起來對」。** 對每顆 root/data disk，把 VMI effective spec、libvirt domain XML、QEMU block graph/cmdline、launcher `/dev/<volume>`、host `/sys/bus/rbd/devices/*` 串成同一顆 disk。KubeVirt v1.6.4 的 `cache`／`io` 留空會在啟動前動態決定，不是固定 YAML default。
-4. **完整性優先的 Block PVC 目標是不用 host page cache。** 對可 O_DIRECT 的 block backend，KubeVirt 省略 `cache`／`io` 時預期會產生 `cache=none, io=native`；這是 source 決策邏輯，production 仍須以 XML/QMP 證明。不要主動改成 `writeback`；它雖不等於忽略 flush，卻增加一層 node 斷電會失去的 host page cache，沒有必要先承擔這個變因。
-5. **不要關 filesystem recovery 保護。** ext4 保持 barrier 與 `data=ordered` 預設；XFS 這版已沒有可用的 `nobarrier`。不得以 ext4 `noload`／`norecovery` 或 XFS `norecovery` 逃避 journal/log recovery；它們不是修復 corruption 的參數。
-6. **不要把 timeout 當 durability。** Kubernetes 的 6 分鐘 force-detach、ceph-csi watcher retry、krbd `osd_request_timeout` 都只改變失敗多久才顯現或 orchestration 何時繼續。它們不讓已 acknowledgement 的 write 更 durable。
-7. **先做唯讀稽核，再決定升級或實驗。** production QEMU/libvirt 版本、external-attacher v4.8.0 finalizer 實作、現場 RBD image features、OSD media write-cache contract 都不在目前 pinned source 組合內；未補證據前不得宣稱「改某個參數就能根治」。
+- fencing 尚未確認前，不要 force-delete 舊 VMI／Pod、加 out-of-service taint 後直接在新 node 重開。
+- 不要把 `CSI_RBD_ATTACH_REQUIRED=false` 當成加速 failover 的方法。
+- 不要把 registrar、CSI liveness、leader election 或 attach/detach timeout 當成完整性參數。
+- 不要把 `cache=none` 解讀成「guest 沒有 write cache」。它代表 direct I/O，而且 flush 仍然有效。
+- 不要先認定 `cache=writeback` 就是事故根因。它會多一層揮發性 host cache，但是否造成這次損壞仍要看實際設定與故障證據。
+- 不要把應用程式沒有呼叫 `fsync` 造成的近期資料遺失，和檔案系統結構損壞混為一談。
 
-### 現在不要做的事
+## 1. 這份報告要解決什麼
 
-- 不要在 fencing 未確認完成前 force-delete 舊 VMI／Pod、加 out-of-service taint，然後在新 node 重開。
-- 不要把 `CSI_RBD_ATTACH_REQUIRED=false` 當 failover 加速。
-- 不要把 registrar、CSI liveness、leader-election 或 attach/detach timeout 當 filesystem 完整性參數。
-- 不要把 `cache=none` 說成「guest 沒有 write cache」；QEMU 的 `none` 是 direct I/O 且仍保留 flush，語意不是 no-cache/no-flush。
-- 不要把 `cache=writeback` 直接定罪成這次 corruption 的已證實根因；source 只能證明它增加 volatile host cache，因果仍需 effective-state 證據與可回退實驗。
-- 不要把 application 沒有送出 `fsync`／等價 durability operation 所造成的資料遺失，誤判成 filesystem metadata structural corruption。
+這次要釐清的不是「斷電會不會掉最後幾筆資料」，而是為什麼 VM 在 compute node 斷電後，檔案系統會壞到無法 mount，必須執行修復工具。
 
-## 1. 問題、判定標準與版本釘定
+報告回答四個問題：
 
-### 1.1 要回答的問題
+1. guest 完成一次需要持久化的寫入後，資料會經過哪些層，Ceph 到哪裡才回覆成功？
+2. ext4／XFS 的正常斷電 recovery，和真正需要修復的結構損壞有什麼差別？
+3. 哪些設定真的影響完整性，哪些只影響效能、錯誤時間或 failover 速度？
+4. 在不變更生產環境的前提下，要怎麼查出實際生效的設定？
 
-本報告只回答四件事：
+### 調查前提
 
-1. guest acknowledgement 之後，一次需要 durability 的 write／flush 要穿過哪些層，哪裡才是 Ceph 的持久化邊界？
-2. ext4／XFS 正常 crash recovery 與 repair-required structural corruption 如何區分？
-3. 哪些設定真的改變 durability 或多 writer 風險，哪些只改 RTO、效能或可觀測性？
-4. 不改 production 的前提下，如何把 default、configured 與 effective runtime 拆開查清楚？
+- 斷電的是只承載 VM 的 compute node；Ceph MON 和 OSD 持續運作。
+- VM 系統碟與資料碟都是 Ceph RBD，host 使用 krbd，PVC 是 `volumeMode: Block`。
+- ext4 與 XFS 都在調查範圍。
+- 正常的 journal／log replay 不算事故；無法 mount、必須 `fsck`／`xfs_repair` 才算本報告要追的結構損壞。
+- 完整性高於 RTO。fencing 已存在，本報告不重新設計它，只把「舊 node 已失去寫入能力」當成重啟前置條件。
+- 應用程式若沒有呼叫 `fsync` 或等價操作，底層無法替它創造持久化保證。
 
-### 1.2 Failure model
+### 研究版本
 
-- 突然斷電的是只承載 compute workload 的 worker；Ceph MON／OSD 持續可用。
-- VM root disk 與 data disk 都是 Ceph RBD、host krbd、PVC `volumeMode: Block`。
-- ext4 與 XFS 都在範圍內。
-- 問題是 filesystem 無法 mount、必須 `fsck`／`xfs_repair` 的 structural corruption；正常 journal／log replay 不算 failure。
-- 完整性高於 RTO。硬體 fencing 已存在，但本報告不設計 fencing，只把「確認來源 node 已失去寫入能力」當重啟前置條件。
-- 不研究 application-specific transaction consistency；application 若沒有發出 durability operation，下層不能替它創造保證。
-
-### 1.3 Source baseline
-
-| 元件 | 指定版本／commit | 本報告中的角色 |
+| 元件 | 指定版本／commit | 這份報告查什麼 |
 |---|---|---|
 | KubeVirt | v1.6.4 / `ac5324e8f6e7cda1cfe92542df3ceb0cd0d8e68f` | Disk API、defaulting、Block PVC、domain XML |
 | Kubernetes | v1.31.6 / `6b3560758b37680cb713dfc71da03c04cadd657c` | Block volume lifecycle、VolumeAttachment、node-loss force-detach |
@@ -58,48 +60,48 @@
 | Rook | v1.17.2 / `f6266772d2095c8af312745d9cbe045c98a380df` | generated CSI images、args、`attachRequired` |
 | Ceph | v19.2.2 / `0eceb0defba60152a8182f7bd87d164b639885b8` | OSD acknowledgement、replication、BlueStore persistence |
 | Ubuntu kernel | 6.8.0-52.53 / `6e81b9ec35b52955f286e56ffc159e1c934bce10` | ext4、XFS、block layer、virtio-blk、krbd/libceph |
-| QEMU | production version **未知**；v9.1.0 / `fd1952d…` 僅作 reference | cache／flush 機制參考，不可冒充 deployed behavior |
-| libvirt | production version與 source **未釘定** | domain XML 到 QEMU block graph 必須 runtime 驗證 |
-| external-attacher | Rook source default v4.8.0；source **未納入** | finalizer／retry 細節保留為 evidence gap |
+| QEMU | 生產版本**未知**；v9.1.0 / `fd1952d…` 只作機制參考 | 不可把參考版本當成現場行為 |
+| libvirt | 生產版本與原始碼**未釘定** | domain XML 到 QEMU block graph 必須現場確認 |
+| external-attacher | Rook 預設 v4.8.0；原始碼**未納入** | finalizer 與 retry 細節仍是證據缺口 |
 
-### 1.4 證據標記
+### 怎麼看證據標記
 
 | 標記 | 意義 | 可以支撐什麼 |
 |---|---|---|
-| **source-proven** | 指定版本 source 直接顯示的分支、default、flag 或 completion condition | 機制結論 |
-| **reference-source-proven** | 非 deployed、但版本已釘定的 reference source | 只能解釋機制與設計實驗，不可冒充 production behavior |
-| **upstream-commit-proven** | upstream exact commit 與 diff 可查，但尚未釘 first release／backport | 只能證明 main 已有變更，不能直接下升級建議 |
-| **documentation-supported** | 同版本官方說明與 source 一致 | 幫助解讀，不能覆蓋 source |
-| **inference** | 多個 source hop 合在一起的因果判斷 | 必須同句寫出前提與限制 |
-| **runtime-required** | source 能說明怎麼查，但沒有 production readback | 不可寫成現場事實 |
-| **experiment-needed** | source 無法證明 timing、硬體誠實性或 incident 因果 | 不列為無條件參數要求 |
+| **source-proven** | 指定版本原始碼直接顯示的行為或預設值 | 可以說明機制 |
+| **reference-source-proven** | 版本已釘定，但不是生產環境使用的參考原始碼 | 只能幫助理解與設計實驗 |
+| **upstream-commit-proven** | upstream commit 與 diff 可查，但還不知道進入哪個正式版本 | 不能直接下升級建議 |
+| **documentation-supported** | 同版本官方說明與原始碼一致 | 補充解讀，不取代原始碼 |
+| **inference** | 把多段證據串起來後得到的推論 | 必須同時寫出前提與限制 |
+| **runtime-required** | 原始碼告訴我們怎麼查，但尚未讀取生產環境 | 不能寫成現場事實 |
+| **experiment-needed** | 原始碼無法回答時間、硬體行為或事故因果 | 必須用隔離實驗補證據 |
 
-## 2. 一次 durability operation 的完整路徑
+## 2. 一筆資料怎麼走到 Ceph
 
-先把後文反覆使用的三個詞講清楚：
+先說三個後面會一直出現的詞：
 
-- **FUA（Force Unit Access）**：要求這次 write 在回覆前到達裝置宣告的持久化邊界；backend 沒有 native FUA 時，Linux／QEMU 可以用 write 後 flush 模擬。
-- **ONDISK**：Ceph client 要求 OSD 只在 ObjectStore transaction commit 後完成 request；它不等於「已驗證每顆 NAND 都不怕斷電」。
-- **acting set**：這一刻實際承擔 PG write 的 OSD 集合；degraded 時可能少於 pool target `size`。
+- **FUA（Force Unit Access）**：要求這筆資料到達裝置宣告的持久化邊界後才能回覆。若 backend 沒有原生 FUA，Linux 或 QEMU 可以在寫入後補一次 `flush`。
+- **ONDISK**：krbd 要求 Ceph OSD 完成 ObjectStore transaction 後才回覆。它證明軟體走完承諾的持久化路徑，不代表我們已經驗證每顆 SSD 的實體 NAND。
+- **acting set**：當下實際負責某個 PG 寫入的 OSD 集合。PG degraded 時，這個集合可能少於 pool 設定的 `size`。
 
-以下是本報告唯一承認的 end-to-end seam：
+一筆需要持久化的資料，完整路徑如下：
 
 ```text
-application fsync/sync or filesystem transaction
-  → ext4 journal / XFS log orders metadata and data
-  → Linux guest block layer emits write + flush/FUA semantics
-  → virtio-blk sends writes and VIRTIO_BLK_T_FLUSH
-  → QEMU/libvirt effective block graph
-  → launcher /dev/<volume> block device
-  → host krbd/libceph request with ONDISK completion requirement
-  → primary OSD + replica transaction commit
-  → BlueStore/BlueFS/block device stable-media boundary
-  → fenced old node cannot write; new node maps and mounts the same image
-  → ext4 journal / XFS log replays committed records
-  → normal recovery completes, or a verifier/error marks it repair-required
+應用程式呼叫 fsync／sync，或檔案系統提交 transaction
+  → ext4 journal／XFS log 排好資料與 metadata 的順序
+  → guest Linux block layer 送出 write 與 flush／FUA
+  → virtio-blk 送出資料與 VIRTIO_BLK_T_FLUSH
+  → QEMU／libvirt 實際生效的 block graph
+  → virt-launcher 裡的 /dev/<volume>
+  → host krbd 要求 Ceph 回 ONDISK
+  → primary OSD 與當下所有 replica 完成 transaction
+  → BlueStore／BlueFS／block device 的持久化邊界
+  → 舊 node 已 fenced，新 node 重新 map 並 mount 同一個 image
+  → ext4 journal／XFS log replay
+  → 正常恢復，或檢查器發現結構錯誤並要求修復
 ```
 
-control plane 是另一條路，不能拿來填 data path 的空白：
+Kubernetes 管理 volume 的路徑是另一回事：
 
 ```text
 Kubernetes VolumeAttachment
@@ -108,94 +110,96 @@ Kubernetes VolumeAttachment
   → NodePublish: staging bind to Pod target
 ```
 
-第一條決定已 acknowledgement write 的 durability；第二條決定哪個 node 何時可以看到 block device。兩條都必須正確，但「attach 成功」不能證明「write 已落地」，「write 已落地」也不能取代 fencing。
+第一條決定資料何時算穩定；第二條只決定哪個 node 何時看得到 block device。`attach` 成功不代表資料已落地，資料已落地也不能取代 fencing。
 
-### 2.1 最可能把 hard power loss 放大成 structural corruption 的三類斷點
+### 最該先查的三個斷點
 
 | 斷點 | 會發生什麼 | 參數能否處理 |
 |---|---|---|
-| application 沒送 durability operation | 最近的 application data／transaction 可能遺失；filesystem 應仍靠 journal/log recovery 保持結構可 mount | filesystem／storage 參數不能替 application 補 `fsync` |
-| 某一層提早 acknowledgement、忽略 flush，或硬體 write cache 說謊 | journal/log 以為 ordering 已成立，斷電後可能看到缺頁、舊 metadata 或不完整 transaction | 先查 effective cache／flush；軟體參數仍無法修正失信硬體 |
-| fencing 前出現第二個 writer | 兩個 kernel/filesystem instance 可能同時改同一 RBD image；單機 filesystem 不具 shared-disk 協調能力 | 只能用 fencing、attach serialization與 writer ownership 防止；timeout 不是解法 |
+| 應用程式沒有呼叫 `fsync` | 最近幾筆資料可能消失，但檔案系統結構仍應靠 journal／log recovery 保持可 mount | 儲存層參數無法替應用程式補上持久化邊界 |
+| 某一層提早回覆、忽略 `flush`，或硬體 cache 謊報完成 | journal／log 以為順序已成立，斷電後卻看到舊 metadata 或不完整 transaction | 先查實際生效的 cache 與 flush；軟體無法修補失信硬體 |
+| fencing 前出現第二個 writer | 兩個 kernel 可能同時修改同一個 RBD image；ext4／XFS 不是 shared-disk 檔案系統 | 只能靠 fencing、RWO attach 排他與 writer ownership 防止；timeout 沒用 |
 
-因此，這次「需要 repair 才能 mount」不能只用「斷電導致未 flush 的 application data」解釋。這個症狀至少表示應追查 durability chain 被破壞、未 fenced 的多 writer、kernel／QEMU／Ceph defect，或儲存媒體違反 flush contract。
+所以，「斷電後必須 repair 才能 mount」不能只用「應用程式最後幾筆資料沒 flush」解釋。至少要查：完整寫入路徑在哪裡斷掉、是否曾出現第二個 writer、是否踩到 kernel／QEMU／Ceph bug，以及底層裝置有沒有違反 flush 承諾。
 
-## 3. Guest filesystem 與 virtio 邊界
+## 3. ext4、XFS 與 virtio 各自保證什麼
 
 ### 3.1 ext4
 
-Ubuntu 6.8.0-52 source 的 ext4 預設啟用 barrier；journal 支援 revoke 時，預設 data mode 是 `ordered`。`fsync` 先處理 file data，再 commit journal；當 commit path 沒帶 barrier 時，還會補 block-device flush。這表示正常斷電後，dirty filesystem 應走 JBD2 scan、revoke 與 replay，而不是直接被分類成 structural corruption。
+Ubuntu 6.8.0-52 的 ext4 預設開啟 barrier。journal 支援 revoke 時，預設 data mode 是 `ordered`。`fsync` 會先等檔案資料完成，再提交 journal；若 journal commit 沒有帶 barrier，ext4 會再補一次 block-device `flush`。
+
+正常斷電後，未乾淨卸載的 ext4 應該走 JBD2 scan、revoke、replay。這是正常 recovery，不是檔案系統已經損壞。
 
 以下狀態要分開看：
 
-- **正常 recovery**：superblock 表示未乾淨卸載，mount 期間執行 JBD2 recovery。
-- **structural corruption**：例如 superblock checksum、group descriptor 或 root inode 驗證失敗，source 回 `EFSBADCRC`／`EFSCORRUPTED`。
-- **危險繞過**：dirty filesystem 使用 `noload`／`norecovery`；read-write mount 會被 source 拒絕，不能當修復方式。
+- **正常 recovery**：superblock 顯示上次沒有乾淨卸載，mount 時執行 JBD2 recovery。
+- **真的壞了**：superblock checksum、group descriptor 或 root inode 驗證失敗，kernel 回 `EFSBADCRC`／`EFSCORRUPTED`。
+- **不安全的繞過**：對 dirty filesystem 使用 `noload`／`norecovery`。read-write mount 會被拒絕，這也不是修復方法。
 
-完整性優先的 production policy：保留 ext4 barrier 與 `data=ordered`；不要用 `nobarrier`、`data=writeback` 或 `noload` 當 failover tuning。這些設定不是縮短 RTO 的安全旋鈕。
+生產環境應保留 barrier 與 `data=ordered`，不要把 `nobarrier`、`data=writeback` 或 `noload` 當成 failover tuning。
 
 ### 3.2 XFS
 
-這版 XFS 已移除 `barrier`／`nobarrier` mount option；同步 log force 直接提交 `REQ_PREFLUSH | REQ_FUA`。dirty log 只有在 tail 與 head 不同時才進入兩階段 recovery；filesystem 已標 `needsrepair` 時則拒絕 mount，要求 repair。
+這版 XFS 已經沒有 `barrier`／`nobarrier` mount option。需要同步 log 時，XFS 會直接送出 `REQ_PREFLUSH | REQ_FUA`。dirty log 的 head 與 tail 不同時才進入兩階段 recovery；若檔案系統已標記 `needsrepair`，mount 會被拒絕。
 
 因此 XFS 的判讀也要分三層：
 
-- **正常 recovery**：dirty log 被分析並 replay。
-- **repair-required**：`needsrepair` 或 metadata verifier 使 mount 失敗。
-- **只讀鑑識**：`norecovery` 只允許 read-only，而且內容可能不一致；它不是 production recovery 設定。
+- **正常 recovery**：分析並 replay dirty log。
+- **需要修復**：`needsrepair` 或 metadata verifier 讓 mount 失敗。
+- **只讀鑑識**：`norecovery` 只能搭配 read-only，而且內容可能不一致，不能拿來正常提供服務。
 
-完整性優先 policy 不是「替 XFS 打開 barrier」；在此 kernel 根本沒有那個旋鈕。真正要查的是 guest queue 的 flush 能力、QEMU effective cache、host krbd completion 與 fencing。
+所以，XFS 的重點不是找一個已經不存在的 barrier 開關，而是確認 guest queue 的 flush 能力、QEMU 實際 cache mode、host krbd 的完成條件與 fencing。
 
-### 3.3 guest FUA 如何穿過 virtio
+### 3.3 FUA 經過 virtio 後會變成什麼
 
-virtio-blk 會協商 FLUSH 與 write-cache configuration，但 Linux driver 對這個 queue 宣告 `writeback=true, fua=false`。因此 guest block layer 看到需要 FUA 的 request 時，會在必要時轉成 write 後的 POSTFLUSH；wire 上由 virtio driver送出獨立 `VIRTIO_BLK_T_FLUSH`。
+virtio-blk 會協商 FLUSH 與 write-cache 能力，但這版 Linux driver 對 queue 宣告 `writeback=true, fua=false`。guest block layer 收到需要 FUA 的 request 時，會在必要時改成「先寫入、再 flush」；virtio driver 在 wire 上送出獨立的 `VIRTIO_BLK_T_FLUSH`。
 
-這個細節排除一個常見誤解：**不能寫成「guest FUA bit 原封不動穿過 virtio」**。在這版 kernel，保留下來的是 durability semantics，實作形狀是 flush。
+也就是說，guest 的 FUA bit 並不是原封不動穿過 virtio。保留下來的是「資料要穩定後才能完成」的語意，實際做法是 `flush`。
 
-## 4. KubeVirt、libvirt 與 QEMU effective disk
+## 4. 真正生效的 disk 設定不一定寫在 YAML 裡
 
-### 4.1 root 與 data disk 沒有不同 converter
+### 4.1 系統碟與資料碟走同一條轉換路徑
 
-KubeVirt v1.6.4 對 `vmi.Spec.Domain.Devices.Disks` 使用同一條 per-disk conversion。root disk 的特殊之處只是可能帶 `bootOrder`；只要 root/data 都是相同類型的 Block PVC，它們會進入同一個 launcher block-device 與 converter path。
+KubeVirt v1.6.4 逐顆處理 `vmi.Spec.Domain.Devices.Disks`。系統碟唯一可能的特殊欄位是 `bootOrder`；只要系統碟和資料碟都是同類型的 Block PVC，後面的 block-device 與轉換路徑就相同。
 
-但「同一路徑」不等於「同一有效值」。每顆 Disk 各自有 `bus`、`cache`、`io`、`dedicatedIOThread`，所以稽核必須逐顆做，不能抽一顆 data disk 代表 root disk。
+不過，同一路徑不代表設定值相同。每顆 disk 都有自己的 `bus`、`cache`、`io`、`dedicatedIOThread`，所以不能只查一顆資料碟就推論系統碟也一樣。
 
-### 4.2 `cache`／`io` 留空的真正語意
+### 4.2 `cache`／`io` 留空時，KubeVirt 會在啟動前決定
 
-對 `volumeMode: Block`，KubeVirt 會把 volume render 成 compute container 的 `VolumeDevice` `/dev/<volume-name>`，再以 `os.Stat` 確認為 block device，最後產生 `<disk type='block'><source dev='…'><driver type='raw'>`。
+對 `volumeMode: Block`，KubeVirt 會把 volume 放到 compute container 的 `/dev/<volume-name>`，用 `os.Stat` 確認它是 block device，再產生 `<disk type='block'><source dev='…'><driver type='raw'>`。
 
 啟動前才做兩個決策：
 
-1. `cache` 省略：以 `O_DIRECT` probe backend；成功選 `none`，失敗選 `writethrough`。若使用者明示 `none` 但 direct I/O 不可用，VMI 啟動失敗。
-2. `io` 省略：只有 effective `cache=none` 且 backend 是 block device，或 file 已 preallocated，才補 `native`；否則保持省略。
+1. 沒寫 `cache`：用 `O_DIRECT` 測 backend。成功就選 `none`，失敗就選 `writethrough`。若明確指定 `none`，但 direct I/O 不可用，VMI 會啟動失敗。
+2. 沒寫 `io`：只有實際 `cache=none` 且 backend 是 block device，或檔案已 preallocated，才補成 `native`；其他情況維持省略。
 
-所以 production 可採用的陳述是：「對存在且支援 O_DIRECT 的 Block PVC，source 預期 `cache=none, io=native`。」不能把它縮成「KubeVirt default 永遠是 none/native」。
+因此，原始碼只支持這句話：「對已存在且支援 O_DIRECT 的 Block PVC，預期結果是 `cache=none, io=native`。」它不是所有環境都固定套用的 YAML 預設值。
 
-### 4.3 QEMU reference 能證明與不能證明的事
+### 4.3 QEMU 的 cache mode 到底代表什麼
 
-QEMU v9.1.0 reference 對 cache mode 的定義如下；production 必須先查實際 QEMU version：
+以下是 QEMU v9.1.0 的定義，只能用來解釋機制。生產環境必須先查實際 QEMU 版本。
 
-| domain cache mode | QEMU reference writeback | direct | no-flush | operational meaning |
+| cache mode | QEMU writeback | direct | no-flush | 實際意思 |
 |---|---:|---:|---:|---|
-| `none` | on | on | off | bypass host page cache；guest flush 仍有效 |
-| `writethrough` | off | off | off | 每次 write 走 FUA，backend 不支援時以 flush 模擬 |
-| `writeback` | on | off | off | 使用 host page cache；flush 沒被關掉，但多一層 volatile state |
+| `none` | on | on | off | 繞過 host page cache；guest flush 仍有效 |
+| `writethrough` | off | off | off | 每次 write 要求 FUA，backend 不支援時用 flush 模擬 |
+| `writeback` | on | off | off | 使用 host page cache；flush 仍有效，但多一層揮發性資料 |
 
-只有 `no-flush=on`／unsafe 類模式才是刻意忽略 flush；KubeVirt API 不接受 unsafe cache mode。`cache=none` 也不是 guest write cache 關閉，而是 direct I/O 與正常 flush semantics 的組合。
+真正刻意忽略 flush 的是 `no-flush=on`／unsafe 類模式；KubeVirt API 不接受 unsafe cache mode。`cache=none` 代表 direct I/O 加上正常 flush，不代表 guest write cache 已關閉。
 
-### 4.4 v1.6.4 已定位但不能過度解讀的 regression
+### 4.4 v1.6.4 有一個 bug，但目前不能把事故算在它頭上
 
-`SetDriverCacheMode` 在選到 `Source.Dev` 後，`isBlockDev` 仍維持 false，因而呼叫 `CheckFile` 而不是 `CheckBlockDevice`。兩個 checker 對已存在 device 都以 `O_RDONLY | O_DIRECT` probe，主要差異是 `CheckFile` 在 path 不存在時可嘗試建立。因此：
+`SetDriverCacheMode` 選到 `Source.Dev` 後，`isBlockDev` 仍是 false，所以程式呼叫 `CheckFile`，而不是 `CheckBlockDevice`。兩個檢查對已存在的 device 都使用 `O_RDONLY | O_DIRECT`；主要差異是 path 不存在時，`CheckFile` 可能嘗試建立檔案。
 
-- source-proven：分類分支有錯；後續 main commit `d7c683cde613869fda86e333957976b6bba8faa6` 改用 `BackendIsBlock()`。
-- 尚未證明：這會讓正常、已存在的 `/dev/<volume>` 選錯 cache mode，或就是 production corruption 根因。
-- upgrade advice：先取得該 fix 首次進入的正式 release tag與 backport 狀態；目前不能聲稱某個指定 release 已包含。
+- **已確認**：這個分類分支有錯；後續 main commit `d7c683cde613869fda86e333957976b6bba8faa6` 改用 `BackendIsBlock()`。
+- **尚未確認**：正常且已存在的 `/dev/<volume>` 是否因此選錯 cache mode，更沒有證據能把這次結構損壞歸因於它。
+- **升級前要補的證據**：這個修正第一次進入哪個正式版本、是否有 backport，以及相同 Block PVC 在修正前後的 domain XML 差異。
 
-## 5. CSI、Rook、Kubernetes 與 failover sequencing
+## 5. Kubernetes 能安排接手，但不能替你 fencing
 
-### 5.1 `VolumeAttachment` 不是 device，也不是 fencing
+### 5.1 `VolumeAttachment` 不是實體 device，也不是 fencing
 
-ceph-csi v3.14.0 的 RBD `ControllerPublishVolume` 只驗證 request 後回空 `PublishContext`；`ControllerUnpublishVolume` 同樣回成功。真正 map 在 node side：
+ceph-csi v3.14.0 的 RBD `ControllerPublishVolume` 只驗證 request，然後回傳空的 `PublishContext`；`ControllerUnpublishVolume` 也直接成功。真正的 RBD mapping 發生在 node：
 
 ```text
 NodeStageVolume
@@ -216,29 +220,29 @@ NodeUnstageVolume
   → remove stash
 ```
 
-舊 node 斷電時，kubelet 無法執行正常的 Unpublish／Unstage。控制面刪除 `VolumeAttachment`，不會隔空讓舊 host kernel unmap krbd，也不會證明舊 node 已失去寫入能力。
+舊 node 斷電後，kubelet 當然無法執行正常的 Unpublish／Unstage。控制面刪除 `VolumeAttachment`，不會隔空讓舊 host kernel 執行 krbd unmap，也不能證明舊 node 已失去寫入能力。
 
-### 5.2 Rook 與 registrar 的正確責任
+### 5.2 Rook 與 registrar 各自只負責什麼
 
-Rook v1.17.2 source default 對 RBD 設 `attachRequired=true`，並把它寫進 `CSIDriver`；只有這個值為 true 才部署 external-attacher。這個 control 是 RWO writer serialization 的必要防線，不能為了 failover 速度關掉。
+Rook v1.17.2 預設把 RBD 的 `attachRequired` 設為 `true`，並寫進 `CSIDriver`；只有這個值為 true 才會部署 external-attacher。這是 RWO volume 避免同時 attach 到多個 node 的必要防線，不能為了縮短 failover 而關掉。
 
-node-driver-registrar 只做三件事：連 CSI socket取得 driver name、建立 kubelet registration socket、回 `GetInfo`／registration status。它不碰 Kubernetes API、不建立 `VolumeAttachment`、不 map RBD、不處理 flush，也不提供 fencing。調 registrar timeout 或 liveness 不可能修正 filesystem corruption。
+node-driver-registrar 只負責連上 CSI socket、取得 driver name、建立 kubelet registration socket，再回報 registration status。它不碰 Kubernetes API、不建立 `VolumeAttachment`、不 map RBD、不處理 flush，也不提供 fencing。調 registrar timeout 或 liveness，無法修復檔案系統結構損壞。
 
-### 5.3 Kubernetes 的 6 分鐘不是 failover RTO
+### 5.3 Kubernetes 的 6 分鐘不是完整 failover 時間
 
-attach/detach controller 的最大 unmount wait 是 6 分鐘，但 timer 不是從 node 斷電那一刻開始，而是 volume 已不再存在於 desired state 後才開始。之後還要滿足 unhealthy+timeout 或 out-of-service taint，才會略過 mounted safety；後面仍有舊 VA 刪除、external-attacher、new VA、ceph-csi watcher check、NodeStage/Publish 與 VMI startup。
+attach/detach controller 最多等 6 分鐘再 force detach，但計時不是從 node 斷電當下開始，而是 volume 已經不在 desired state 後才開始。時間到後，還要符合 node unhealthy 或 out-of-service 條件，才會略過「volume 仍 mounted」的保護。接著仍有舊 `VolumeAttachment` 刪除、external-attacher、新 attachment、ceph-csi watcher 檢查、NodeStage／Publish 和 VMI 啟動。
 
-因此不能把這些 timeout 相加後宣稱「VM 會在 N 分鐘恢復」。它們是 availability sequencing，和已 acknowledgement write 的 durability 是兩件事。
+所以不能把幾個 timeout 相加，就宣稱 VM 會在幾分鐘內恢復。這些時間只影響接手流程，和已回覆成功的資料是否真的穩定是兩回事。
 
-### 5.4 root/data disk 的 CSI 結論
+### 5.4 CSI 不知道哪顆是系統碟
 
-Kubernetes與 ceph-csi lower layer 只看 PV、volume handle／attributes、volumeMode、access mode、target path與 node name，沒有 root/data role。若兩顆 disk 的 `volumeMode`、access mode、StorageClass/PV attributes 與 pool policy相同，durability path相同；上層差異只在 root 通常跟 VM lifecycle 綁定，data disk 可能 hotplug/unplug。
+Kubernetes 和 ceph-csi 只看 PV、volume handle／attributes、volumeMode、access mode、target path 與 node name，不知道哪顆是系統碟。兩顆 disk 若使用相同的 volumeMode、access mode、PV attributes 與 pool policy，底層持久化路徑就相同。差別只在上層 lifecycle：系統碟通常跟著 VM，資料碟可能 hotplug／unplug。
 
-## 6. host krbd 的 write-through contract
+## 6. host krbd 與 Ceph 何時才算寫入完成
 
-kernel 6.8.0-52 的 krbd queue 只接 READ、WRITE、DISCARD 與 WRITE_ZEROES，沒有 `REQ_OP_FLUSH`。這不是「Ceph 忘了實作 flush」：krbd 沒有宣告 write cache，也沒有宣告 native FUA，所以 block layer 把它呈現為 write-through device；libceph 對每個 request 要求 `CEPH_OSD_FLAG_ONDISK`，收到帶 ONDISK 的 reply 才完成 request。
+kernel 6.8.0-52 的 krbd queue 只處理 READ、WRITE、DISCARD、WRITE_ZEROES，沒有 `REQ_OP_FLUSH`。這不是 Ceph 漏做 flush。krbd 沒有宣告 write cache，也沒有宣告原生 FUA，因此 Linux 把它視為 write-through device；libceph 對每筆 request 都要求 `CEPH_OSD_FLAG_ONDISK`，收到 ONDISK reply 才算完成。
 
-因此這條路徑的 durability 形狀是：
+因此，這條路徑何時算完成可以寫成：
 
 ```text
 guest flush/FUA ordering
@@ -247,148 +251,148 @@ guest flush/FUA ordering
   → host rbd device 不需要另一個 volatile write cache flush
 ```
 
-production expected invariant 是 host `/sys/class/block/rbdN/queue/write_cache` 顯示 `write through`、`fua` 顯示 `0`。這兩個值合在一起才符合 source；看到 `fua=0` 不能單獨判定 unsafe。
+生產環境應看到 `/sys/class/block/rbdN/queue/write_cache` 為 `write through`，`fua` 為 `0`。兩個值要一起看；只看到 `fua=0`，不能直接判定不安全。
 
-### 6.1 exclusive-lock 與 fencing 不是同一件事
+### 6.1 `exclusive-lock` 不是硬體 fencing
 
-image 有 `exclusive-lock` feature 時，krbd write 前必須取得 lock；`object-map` 或 `lock_on_read` 還會讓 read 也要求 lock。這能降低同一 image 被多個 client 同時寫入的機會，但不是硬體 fencing：
+image 開啟 `exclusive-lock` 時，krbd 寫入前必須先取得 lock；`object-map` 或 `lock_on_read` 還可能讓讀取也需要 lock。它能降低多個 client 同時寫同一個 image 的機會，但不能取代硬體 fencing：
 
-- 舊 node partition、watch 失效、blocklist 與 lock handoff 都有各自的時間與錯誤路徑。
+- 舊 node 網路中斷、watch 失效、blocklist 與 lock handoff 都有各自的時間窗和錯誤路徑。
 - `exclusive` map option 會拒絕 peer 要求釋放 lock，可能直接阻擋 handoff／live migration。
-- Ceph lock 成功不能證明來源 node 已斷電；完整性優先流程仍以硬體 fencing 為重啟 gate。
+- Ceph lock 成功不能證明舊 node 已經斷電；重啟 gate 仍然必須看硬體 fencing。
 
-### 6.2 timeout 只改失敗呈現
+### 6.2 timeout 只決定多久回錯，不會讓資料更安全
 
-krbd 的 block mq ops 沒有 `.timeout` handler。即使 sysfs `io_timeout` 初值看起來是 30 秒，generic block layer 到期後只會重新掛 timer，不會 abort request。真正能讓 libceph OSD request 回 `ETIMEDOUT` 的是 `osd_request_timeout`，而 default `0` 是無限等待。
+krbd 的 block mq ops 沒有 `.timeout` handler。即使 sysfs 的 `io_timeout` 顯示 30 秒，generic block layer 到期後也只會重新掛 timer，不會中止 request。真正能讓 libceph OSD request 回 `ETIMEDOUT` 的是 `osd_request_timeout`；預設值 `0` 代表無限等待。
 
 所以：
 
-- 調 `/sys/block/rbdN/queue/io_timeout` 期待 30 秒後 failover，是 ineffective。
-- 設非零 `osd_request_timeout` 可能把暫時 network partition 轉成 guest I/O error與 filesystem shutdown；它是故障政策，需要可回退 lab，不是完整性修正。
+- 調 `/sys/block/rbdN/queue/io_timeout`，不會讓 krbd 在 30 秒後自動 failover。
+- 設定非零 `osd_request_timeout`，可能把暫時網路中斷轉成 guest I/O error 或檔案系統 shutdown。這是錯誤處理政策，必須先在隔離 lab 驗證，不是完整性修正。
 
-### 6.3 Ceph `ONDISK` 不是 replica 多數決
+### 6.3 Ceph `ONDISK` 不是收到多數 replica 就算完成
 
-Ceph v19.2.2 replicated backend 對一次 mutation 建立的 commit wait set，是當下整個 `acting_recovery_backfill` set，包含 primary：
+Ceph v19.2.2 對一筆 replicated write 建立的等待集合，是當下整個 `acting_recovery_backfill` set，包含 primary：
 
-1. primary local ObjectStore transaction `on_commit` 後，移除 primary。
-2. 每個 replica 也在自己的 ObjectStore `on_commit` 後，才回 ONDISK，primary再移除該 replica。
-3. wait set 清空後，`PrimaryLogPG::repop_all_committed()` 才標成 all committed，之後才執行 client的 `ACK | ONDISK` reply callback。
+1. primary 本機 ObjectStore transaction 完成 `on_commit` 後，才從集合移除 primary。
+2. 每個 replica 也要等自己的 `on_commit` 完成才回 ONDISK，primary 收到後才移除該 replica。
+3. 集合清空後，`PrimaryLogPG::repop_all_committed()` 才標記 all committed，最後才回覆 client `ACK | ONDISK`。
 
-因此 `min_size` 不是「收到幾份就提早 ACK」的 quorum。它決定 current acting set 少到什麼程度時 PG 還允許 write：
+所以 `min_size` 不是「收到幾份就提早回覆」的 quorum。它只決定 acting set 少到什麼程度時，PG 還允許寫入：
 
-- `size=3,min_size=2`、PG active+clean且三份都在 write set：成功 ONDISK代表當下三份都 commit。
-- degraded 到兩份仍可 write：成功 ONDISK只代表當下兩份都 commit。
-- 若政策要求「每筆成功 write 必須先落滿 size份」，可評估 `min_size=size`；代價是少一份就停止 write。
+- `size=3,min_size=2`，而且 PG 是 active+clean：成功回覆代表當下三份都已 commit。
+- PG degraded 到只剩兩份仍可寫：成功回覆只代表當下兩份已 commit。
+- 若政策要求每筆成功 write 都必須落滿 `size` 份，可以評估 `min_size=size`；代價是少一份 replica 就停止寫入。
 
-compute-only node 在收到 ONDISK 之後消失，已完成的 storage transaction不依賴 compute node RAM。若 node 在收到 reply前消失，該 write可能已 durable、也可能尚未 durable；這是 ambiguous completion，application不得由「沒收到成功」推論「一定沒寫入」。
+compute node 在收到 ONDISK 後消失，已完成的 transaction 不依賴該 node 的 RAM。若 node 在收到 reply 前消失，這筆 write 可能已經穩定，也可能尚未穩定；應用程式不能因為「沒收到成功」就假設「一定沒寫入」。
 
-### 6.4 BlueStore 的 persistent boundary
+### 6.4 BlueStore 的 ONDISK 到底保證到哪裡
 
-BlueStore commit 的精確意思是「crash後可恢復的 transaction已穩定」，不一定是 payload已位於最後 logical extent：
+BlueStore commit 的精確意思是「crash 後可恢復的 transaction 已經穩定」，不一定表示資料已經放到最後的 logical extent：
 
-- 一般 data write先以 direct AIO送 block device，AIO完成後仍被追蹤為 unstable。
-- KV sync cycle必要時先 flush data device，再同步提交 RocksDB transaction。
-- RocksDB WAL啟用時，final sync transaction使用 `WriteOptions.sync=true`；BlueFS-backed WAL的 `Sync()` 進入 `BlueFS::fsync()`，等待AIO、flush dirty device，必要時同步 metadata log。
-- kernel block backend的 `flush()` 最後用 `fdatasync()`。
-- deferred write先把 payload編碼成 RocksDB deferred transaction key；ONDISK可代表這份可 replay transaction已 durable，final extent之後才 materialize，並在 stable後移除 deferred key。
+- 一般資料先透過 direct AIO 寫入 block device；AIO 完成後，BlueStore 仍把它視為尚未穩定。
+- KV sync cycle 會在需要時先 flush data device，再同步提交 RocksDB transaction。
+- RocksDB WAL 開啟時，最後的 sync transaction 使用 `WriteOptions.sync=true`。若 WAL 位於 BlueFS，`Sync()` 會進入 `BlueFS::fsync()`，等待 AIO、flush dirty device，必要時同步 metadata log。
+- kernel block backend 最後以 `fdatasync()` 實作 `flush()`。
+- deferred write 會先把資料編碼成 RocksDB key。此時 ONDISK 可能代表「可 replay 的 transaction 已穩定」，而不是資料已經搬到最後位置；資料穩定後才移除 deferred key。
 
-所以報告不能把 ONDISK 翻成「已寫進 NAND、任何斷電都不會失去」。Ceph source最多證明 `fdatasync()` 成功返回；NVMe／RAID controller／hypervisor是否誠實履行 flush、是否有 PLP／BBU，必須由硬體證據或非 production power-cut實驗補上。
+因此，ONDISK 不能翻成「已寫進 NAND，任何斷電都不會掉」。Ceph 原始碼最多證明 `fdatasync()` 成功返回；NVMe、RAID controller 或 hypervisor 是否真的履行 flush，以及是否有 PLP／BBU，仍要靠硬體資料或非生產環境的斷電實驗確認。
 
-### 6.5 RBD features 不要混進 OSD persistence
+### 6.5 這些 RBD features 不是持久化保證
 
-| Feature | 正確角色 | 不是什麼 |
+| Feature | 它負責什麼 | 它不負責什麼 |
 |---|---|---|
-| `exclusive-lock` | single-client ownership、lock handoff與cache coherency | 不改OSD replica commit或media flush |
-| `object-map` | object existence metadata與查詢最佳化 | 不是data journal，不增加replica |
-| `journaling` | userspace librbd journal/replay/mirroring | production krbd不走這條userspace write path |
-| `fast-diff` | 差異追蹤／維運最佳化 | 不提高power-loss durability |
+| `exclusive-lock` | single-client ownership、lock handoff、cache coherency | 不改 OSD replica commit 或 media flush |
+| `object-map` | 記錄 object 是否存在，加速查詢 | 不是資料 journal，也不增加 replica |
+| `journaling` | userspace librbd 的 journal／replay／mirroring | host krbd 不走這條 userspace write path |
+| `fast-diff` | 差異追蹤與維運最佳化 | 不提高斷電持久性 |
 
-production是host krbd，因此不能用 `src/librbd/io/ImageRequest.cc` 的journaling path替現場write背書。
+生產環境使用 host krbd，不能拿 `src/librbd/io/ImageRequest.cc` 的 userspace journaling path 替現場寫入背書。
 
-## 7. 參數與控制矩陣
+## 7. 哪些要保留，哪些不要亂動
 
-### 7.1 Mandatory integrity controls
+### 7.1 必須保留
 
-| 層 | 控制／設定 | Production 要求 | 保證什麼 | 不保證什麼 | 如何變更 |
+| 層 | 控制／設定 | 生產要求 | 能保護什麼 | 不能保證什麼 | 變更方式 |
 |---|---|---|---|---|---|
-| Failover | hardware fencing before restart | 來源 node 的寫入能力被確認排除後，才允許新 node 啟動 VM | 避免兩個 host 同時成為 writer | 不保證最後一次 application transaction 已 `fsync` | 維運流程／HA controller |
-| Kubernetes/Rook | `CSIDriver.spec.attachRequired=true` | 保持 Rook default，不得為縮短 RTO 關閉 | 保留 RWO attachment serialization | 不是 fencing；不證明 host 已 unmap | generated CSIDriver；需控制面 rollout |
-| Disk audit | VMI → domain XML → QMP/cmdline → host krbd identity 全對上 | root/data 每顆都查 | 讓後續建議針對真正 effective path | 不會自動修正 drift | 唯讀稽核 |
-| KubeVirt/QEMU | effective block graph 必須保留 flush | 逐顆確認 cache／AIO mode；不得出現 `no-flush`／unsafe 等忽略 flush 的語意 | 讓 guest journal／log 的 ordering 可以傳到 host backend | `writeback` 本身不是 corruption 證據；不證明 OSD media 誠實 | VM restart 才套用新 domain |
-| ext4 | barrier on、預設 `data=ordered`、錯誤時至少 remount-ro | 不得用 `nobarrier`／`data=writeback`／`errors=continue` | 保留 journal ordering並限制錯誤擴散 | 不替 application 補 `fsync` | mount/fstab；通常需 remount或 reboot |
-| XFS | 保留內建 log FLUSH/FUA、正常 recovery | 不用也不能新增 `barrier`；不得以 `norecovery` 正常服務 | 保留 log ordering與 crash replay | 不保證未 `fsync` data | kernel 固定；mount policy |
-| Application | database WAL／`fsync` contract | 對聲稱已提交的 transaction 必須明確同步 | 建立 application durability boundary | 不處理底層提早 ack／硬體失信 | application config/code |
-| CSI/krbd | RWO volume single-writer；現場證明 krbd | PV access mode、VA、host mapping與 lock owner一致 | 防止 orchestration 層明顯多 attach | 不取代 fencing；不保證 Ceph replica commit | PV/SC 建置期＋runtime audit |
-| Ceph pool | 明確核准 `size`／`min_size`／CRUSH failure domain | 查實際 pool 與 acting set，不只看 `HEALTH_OK` | 決定成功 write 的 current commit參與者與可承受故障 | 不保證 device flush 誠實 | pool policy；online但高風險 |
-| Ceph OSD | BlueStore且durability debug bypass全部關閉 | blackhole/omit-write/omit-kv為false，crash injection為0 | 保留source-proven data/KV commit path | 不證明硬體PLP | daemon config；不要任意改 |
-| OSD media | controller/device履行flush，或有PLP/BBU | 保存model/firmware/cache/PLP證據 | 讓`fdatasync`／flush有物理意義 | Ceph config無法修補失信硬體 | 硬體選型與驗證 |
+| Failover | restart 前先做 hardware fencing | 確認來源 node 已失去寫入能力，才能在新 node 啟動 VM | 避免兩台 host 同時寫同一顆 disk | 不保證應用程式最後一筆 transaction 已執行 `fsync` | 維運流程／HA controller |
+| Kubernetes/Rook | `CSIDriver.spec.attachRequired=true` | 保持 Rook 預設值，不得為縮短 RTO 關閉 | 讓 RWO volume 依序 attach | 不是 fencing，也不證明 host 已 unmap | 重新產生 CSIDriver；需 rollout 控制面 |
+| Disk 稽核 | VMI → domain XML → QMP／cmdline → host krbd 全部對上 | 系統碟與每顆資料碟都要查 | 確認後續建議套在真正生效的路徑 | 不會自動修正設定落差 | 唯讀檢查 |
+| KubeVirt/QEMU | 實際 block graph 必須保留 flush | 逐顆確認 cache／AIO mode；不得出現忽略 flush 的 `no-flush`／unsafe 語意 | 讓 guest journal／log 的寫入順序能傳到 host backend | `writeback` 本身不是損壞證據，也不證明 OSD media 誠實 | VM 重新啟動後才會套用新 domain |
+| ext4 | barrier 開啟、預設 `data=ordered`，發生錯誤時至少 remount-ro | 不得使用 `nobarrier`、`data=writeback` 或 `errors=continue` | 保留 journal ordering，並限制錯誤繼續擴散 | 不會替應用程式補做 `fsync` | mount／fstab；通常要 remount 或 reboot |
+| XFS | 保留內建的 log FLUSH／FUA 與正常 recovery | 不必也不能新增 `barrier`；不得把 `norecovery` 當正常服務模式 | 保留 log ordering 與斷電後 replay | 不保證尚未 `fsync` 的資料 | kernel 內建；mount policy |
+| 應用程式 | database WAL／`fsync` 約定 | 聲稱已提交的 transaction 必須明確同步 | 建立應用程式自己的持久化界線 | 無法補救底層提早回覆或硬體失信 | 應用程式設定／程式碼 |
+| CSI/krbd | RWO volume 維持 single-writer，並在現場確認使用 krbd | PV access mode、VolumeAttachment、host mapping 與 lock owner 必須一致 | 避免編排層明顯的重複 attach | 不取代 fencing，也不保證 Ceph replica 已完成 commit | PV／StorageClass 建立時設定，加上執行期間稽核 |
+| Ceph pool | 明確核准 `size`、`min_size` 與 CRUSH failure domain | 查實際 pool 與 acting set，不能只看 `HEALTH_OK` | 決定成功寫入要等哪些 OSD，以及能承受多少故障 | 不保證 device 真的履行 flush | pool policy；可線上變更但風險高 |
+| Ceph OSD | 使用 BlueStore，並關閉所有持久化除錯 bypass | blackhole、omit-write、omit-kv 都是 false，crash injection 是 0 | 保留原始碼所顯示的 data／KV commit 路徑 | 不證明硬體有 PLP | daemon 設定；不要任意修改 |
+| OSD media | controller／device 確實履行 flush，或具備 PLP／BBU | 保存型號、firmware、cache 與 PLP 證據 | 讓 `fdatasync`／flush 對實體儲存有意義 | Ceph 設定無法修補不誠實的硬體 | 硬體選型與驗證 |
 
-### 7.2 Conditional controls
+### 7.2 看情況再用
 
 | 設定 | 何時才考慮 | 本報告的限制 |
 |---|---|---|
-| KubeVirt 明示 `cache: none` | 要把 O_DIRECT 不可用變成啟動失敗，而不是靜默 fallback 到 `writethrough` | 對正常 Block PVC 可能與省略值完全相同；先查 effective state |
-| KubeVirt `cache: writeback` | workload 明確需要 host page cache，且已在隔離 lab 驗證 flush、斷電 recovery 與效能收益 | flush 正常時不能直接判成 corruption 根因；但會擴大未同步資料留在 node-local volatile cache 的窗口 |
-| KubeVirt 明示 `io: native` | 已證明 effective direct I/O，且需要固定 runtime contract | `native` 搭非 direct cache 在 QEMU reference 會開啟失敗；不是完整性增益 |
+| KubeVirt 明示 `cache: none` | 要把 O_DIRECT 不可用變成啟動失敗，而不是默默退回 `writethrough` | 對正常 Block PVC 可能與留空完全相同；先查實際值 |
+| KubeVirt `cache: writeback` | workload 明確需要 host page cache，且已在隔離 lab 驗證 flush、斷電 recovery 與效能收益 | flush 正常時不能直接把它當成損壞原因；但未同步資料會在 node 本機的揮發性 cache 停留更久 |
+| KubeVirt 明示 `io: native` | 已證明實際使用 direct I/O，而且需要把執行設定固定下來 | QEMU v9.1.0 中，`native` 搭配非 direct cache 會開啟失敗；它不是完整性增益 |
 | ext4 `data=journal` | 有明確資料 journaling需求且接受效能／功能代價 | 代價高，會限制 delayed allocation、O_DIRECT、fast commit；不是第一線修復 |
 | ext4 `data_err=abort` | 希望 ordered-data writeback error 直接 abort journal | 以 availability 換 fail-stop；需故障測試 |
 | XFS `wsync` | HA namespace operation 需要更強同步 | 不能取代 file data `fsync` |
 | krbd `lock_on_read` | object-map 或嚴格 single-owner read有明確需求 | 可能增加 lock contention |
-| `abort_on_full` | 希望 full 時回 ENOSPC，不無限等 | 只改 failure mode，不增加 durability |
-| Ceph `min_size=size` | 每筆成功 write 必須落滿目標 size，高於 degraded write availability | 任一 replica缺失即停止write；先評估業務可用性 |
-| Ceph `size=3,min_size=2` | 接受 degraded 到兩份仍可 write | 健康 full acting set仍等全員；degraded成功只代表當下兩份 |
-| RBD `exclusive-lock` | single-writer ownership與handoff policy需要 | 不取代hardware fencing或application flush |
+| `abort_on_full` | 希望空間用盡時回覆 ENOSPC，不要一直等待 | 只改變失敗方式，不提高持久性 |
+| Ceph `min_size=size` | 每筆成功寫入都必須落到目標 `size`，願意犧牲 degraded write 的可用性 | 任一 replica 缺失就停止寫入；要先評估業務能否接受 |
+| Ceph `size=3,min_size=2` | 接受 degraded 到兩份時仍可寫入 | 健康時仍會等完整 acting set；degraded 時成功只代表當下兩份 |
+| RBD `exclusive-lock` | single-writer ownership 與 handoff policy 有明確需要 | 不取代 hardware fencing 或應用程式 flush |
 
-### 7.3 Ineffective for structural-corruption prevention
+### 7.3 對結構損壞沒有幫助
 
 | 設定／做法 | 為什麼無效 |
 |---|---|
-| 調 node-driver-registrar | 不在 attach data path，也不碰 write／flush／krbd |
-| 開 CSI liveness metrics | 只輸出 gauge，不是 nodeplugin restart probe |
-| 把 `ControllerPublishVolume` 成功當 device ready | ceph-csi RBD controller RPC 是 NOOP；map 在 NodeStage |
-| 事後改 StorageClass `mapOptions` | 既有 PV 的 CSI attributes immutable，不會跟著 SC 改 |
-| 調 `queue_depth`、discard、read affinity | 影響 concurrency、space reclaim或 read locality，沒有 durability contract |
-| 調 Kubernetes 6 分鐘 timer／leader election | 影響 availability sequencing，不改 acknowledgement boundary |
-| 調 `/sys/block/rbdN/queue/io_timeout` | krbd 沒 timeout callback，timer 到期不會 abort request |
-| ext4 調小 `commit=` 取代 `fsync` | 只限制 journal transaction age，不建立 application transaction boundary |
-| 因 guest／host `fua=0` 就判定 unsafe | virtio 可用 POSTFLUSH 模擬；krbd 每筆 write 等 ONDISK completion |
-| mClock、OSD queue、recovery priority | 改 scheduling 與 latency，不改 all-current-participants commit gate |
-| `object-map`／`fast-diff` | 是 metadata／維運最佳化，不是 write journal或replica durability |
-| 對 krbd 啟用 librbd journaling期待改變 write path | host krbd不走userspace librbd journaling path |
+| 調 node-driver-registrar | 它不在 attach 的資料路徑，也不處理 write、flush 或 krbd |
+| 開 CSI liveness metrics | 只會輸出 gauge，不是 nodeplugin 的重新啟動 probe |
+| 把 `ControllerPublishVolume` 成功當成 device 已就緒 | ceph-csi RBD 的 controller RPC 是 NOOP；真正 map 發生在 NodeStage |
+| 事後修改 StorageClass `mapOptions` | 既有 PV 的 CSI attributes 不可變，不會跟著 StorageClass 更新 |
+| 調 `queue_depth`、discard、read affinity | 只影響 concurrency、空間回收或讀取位置，沒有持久化保證 |
+| 調 Kubernetes 6 分鐘 timer／leader election | 只影響接手順序與可用性，不改變寫入何時算完成 |
+| 調 `/sys/block/rbdN/queue/io_timeout` | krbd 沒有 timeout callback，timer 到期不會中止 request |
+| 用較小的 ext4 `commit=` 取代 `fsync` | 只縮短 journal transaction 的最長時間，不會建立應用程式 transaction 的持久化界線 |
+| 看到 guest／host `fua=0` 就判定不安全 | virtio 可以用 POSTFLUSH 模擬；krbd 每筆 write 會等待 ONDISK completion |
+| 調 mClock、OSD queue 或 recovery priority | 只改變 scheduling 與 latency，不改變「目前所有參與者都 commit」這道門檻 |
+| `object-map`／`fast-diff` | 它們是 metadata 與維運最佳化，不是 write journal，也不增加 replica 持久性 |
+| 對 krbd 啟用 librbd journaling，期待它改變寫入路徑 | host krbd 不走 userspace librbd journaling path |
 
-### 7.4 Unsafe or misleading
+### 7.4 危險或容易誤導
 
 | 設定／操作 | 風險 |
 |---|---|
-| fencing 前 force restart／out-of-service taint | 可略過 mounted safety，製造第二個 writer |
-| `CSI_RBD_ATTACH_REQUIRED=false` | 移除 RWO attachment serialization；Rook source明確警告 data corruption |
-| 把 `cache: writeback` 當成無條件 throughput tuning | 增加 host volatile page cache；若未驗證 flush 與 power-loss recovery，就不能用效能假設直接推到 production |
-| `io: native` 搭非 direct cache | admission 可能通過，但 QEMU reference 會 runtime failure |
+| fencing 前強制重啟或加上 out-of-service taint | 可能略過 mounted safety，製造第二個 writer |
+| `CSI_RBD_ATTACH_REQUIRED=false` | 拿掉 RWO attach 的順序控制；Rook 原始碼旁的範例明確警告可能造成 data corruption |
+| 把 `cache: writeback` 當成無條件的吞吐量調校 | 會增加 host 揮發性 page cache；未驗證 flush 與斷電 recovery 前，不能直接放進生產環境 |
+| `io: native` 搭配非 direct cache | admission 可能通過，但 QEMU v9.1.0 會在執行時開啟失敗 |
 | ext4 `nobarrier`／`data=writeback`／`errors=continue` | 削弱 ordering或讓錯誤後繼續寫入 |
 | ext4 `noload`／XFS `norecovery` 當正常開機方式 | 刻意略過 replay，暴露未恢復的不一致狀態 |
 | XFS `nouuid` 用在可寫 duplicate image | 關閉 duplicate-mount UUID protection，可能讓 clone/snapshot 被雙重寫入 |
 | `unmapOptions: force`／`rbd unmap --force` | freeze queue、mark disk dead；不是診斷工具 |
 | krbd `exclusive` 未經設計就套用 | 可能拒絕 peer lock handoff，阻擋 migration/failover |
-| pool `size=1` 或 `min_size=1` | storage failure後沒有足夠 replica安全邊界 |
+| pool `size=1` 或 `min_size=1` | 儲存故障後沒有足夠的 replica 安全邊界 |
 | RocksDB `disableWAL=true` | final sync transaction失去本報告依賴的 WAL sync durability |
 | `objectstore_blackhole`／BlueStore omit-write／omit-kv／crash injection | 直接繞過 data 或 KV commit，只能用於開發故障注入 |
 
-### 7.5 Upgrade or experiment required
+### 7.5 先補證據再決定
 
 | 項目 | 為什麼不能直接下結論 | 下一個證據 |
 |---|---|---|
-| KubeVirt `SetDriverCacheMode` 後續 fix | v1.6.4 有分類 regression，但尚未證明 valid block device會選錯 cache | 查 first release/backport tag；用相同 Block PVC比較 domain XML |
-| production QEMU/libvirt | Issue 沒釘版本，reference v9.1.0 不能冒充現場 | `virsh version`、QEMU binary version、QMP `query-block` |
-| external-attacher v4.8.0 | Rook 有 image default，但本研究沒有其 source | pin source，追 finalizer與 force-detach retry |
-| 非零 `osd_request_timeout` | 可能把 hang 轉成 guest I/O error與 filesystem shutdown | 隔離 lab 做 partition／recovery A/B |
-| `mounter: rbd-nbd`／fallback | failure model、userspace process lifecycle不同；Rook example仍標 Alpha healer | 獨立 source trace與故障實驗 |
-| kernel/Ceph 升級 | 目前沒有 incident signature指向特定已修 bug | 蒐集 exact corruption、dmesg、lock/watch timeline，再做 precise diff |
+| KubeVirt `SetDriverCacheMode` 後續修正 | v1.6.4 有分類 bug，但尚未證明有效的 block device 會因此選錯 cache | 查第一個納入修正的 release／backport tag；用相同 Block PVC 比較 domain XML |
+| 生產環境 QEMU/libvirt | Issue 沒有釘版本，QEMU v9.1.0 只能當參考 | `virsh version`、QEMU binary version、QMP `query-block` |
+| external-attacher v4.8.0 | Rook 有預設 image，但本次研究沒有納入它的原始碼 | 釘定原始碼，追 finalizer 與 force-detach retry |
+| 非零 `osd_request_timeout` | 可能把無限等待變成 guest I/O error 與 filesystem shutdown | 在隔離 lab 對 partition／recovery 做 A/B 實驗 |
+| `mounter: rbd-nbd`／fallback | 故障模式與 userspace process lifecycle 不同；Rook 範例仍把 healer 標成 Alpha | 另外追原始碼並做故障實驗 |
+| kernel／Ceph 升級 | 目前沒有事故特徵指向某個已修 bug | 先蒐集精確的損壞訊息、dmesg、lock／watch 時間線，再做版本差異比對 |
 
-## 8. 唯讀 production 稽核
+## 8. 生產環境唯讀檢查
 
-以下命令只讀；本研究沒有執行。所有 `<...>` 都必須由 operator 換成實際名稱，不要整段盲貼。
+以下命令只讀，本次研究沒有在生產環境執行。執行前要把所有 `<...>` 換成實際名稱，不要整段直接貼上。
 
-### 8.0 先證明 deployed version
+### 8.0 先確認實際版本
 
 ```bash
 kubectl version -o json |
@@ -407,9 +411,9 @@ kubectl -n rook-ceph exec <CSI_RBDPLUGIN_POD_ON_VM_NODE> -c csi-rbdplugin -- \
   uname -r
 ```
 
-Expected invariant：Kubernetes、KubeVirt、Rook、ceph-csi／sidecar image 與 host kernel 必須逐項對到 §1.3 的 pinned baseline；有差異就先記為 version gap，不能套用本報告的精確行號結論。guest kernel、QEMU／libvirt 與 Ceph version 分別在 §8.2、§8.5、§8.6 補齊。
+判讀方式：Kubernetes、KubeVirt、Rook、ceph-csi／sidecar image 與 host kernel 都要逐項對到 §1 的研究版本。只要版本不同，就先記下差異，不能直接套用本報告的精確行號。guest kernel、QEMU／libvirt 與 Ceph 版本分別在 §8.2、§8.5、§8.6 補齊。
 
-### 8.1 先對齊 VM、Pod、PV 與 host node
+### 8.1 先把 VM、Pod、PV 與 host node 對起來
 
 ```bash
 kubectl -n <VM_NAMESPACE> get vm <VM_NAME> -o json |
@@ -434,9 +438,9 @@ kubectl get pv <ROOT_PV> <DATA_PV> -o json |
        attrs:.spec.csi.volumeAttributes}'
 ```
 
-Expected invariant：root/data 都明確是 `Block`、RWO、核准的 RBD CSI driver；真正有效的 `mounter`／`mapOptions` 以 PV `volumeAttributes` 為準，不能用目前 StorageClass 猜舊 PV。
+應該看到：系統碟與資料碟都是 `Block`、RWO，並使用核准的 RBD CSI driver。真正生效的 `mounter`／`mapOptions` 以 PV `volumeAttributes` 為準，不能拿目前的 StorageClass 猜既有 PV。
 
-### 8.2 驗 VMI → libvirt → QEMU
+### 8.2 確認 VMI → libvirt → QEMU
 
 ```bash
 POD=$(kubectl -n <VM_NAMESPACE> get pod \
@@ -477,9 +481,9 @@ kubectl -n <VM_NAMESPACE> exec "$POD" -c compute -- sh -c '
   done'
 ```
 
-Expected invariant：同一顆 disk 的 VMI name、domain alias／target、QMP block node與 launcher device必須一一對上；每顆 Block PVC 要看見 `type=block`、`source dev=...`，並記錄 effective `cache`／`io`。launcher device 的 major:minor 必須再與 §8.4 host `rbdN` 完全相同，不能只靠 volume name 或 `/dev/rbd0` 猜。先記錄實際 QEMU/libvirt version，再套用該版本語意。
+應該看到：同一顆 disk 的 VMI name、domain alias／target、QMP block node 與 launcher device 能一一對上。每顆 Block PVC 都要看到 `type=block`、`source dev=...`，並記錄實際 `cache`／`io`。launcher device 的 major:minor 必須與 §8.4 的 host `rbdN` 完全相同，不能只靠 volume name 或 `/dev/rbd0` 猜。先記錄實際 QEMU／libvirt 版本，再按該版本解讀。
 
-### 8.3 驗 attach serialization 與 CSI 實作
+### 8.3 確認 RWO attach 順序與 CSI 實作
 
 ```bash
 kubectl get csidriver rook-ceph.rbd.csi.ceph.com -o json |
@@ -506,9 +510,9 @@ kubectl get volumeattachment -o json |
     | @tsv'
 ```
 
-Expected invariant：`attachRequired=true`；active RWO PV 不應有兩個成功 attachment；舊 VA 若仍 active，不得以新 VA 或 Pod 狀態假設舊 host 已 fenced。`attached=true` 也不能代替 host mapping查核。
+應該看到：`attachRequired=true`，使用中的 RWO PV 沒有兩個成功的 attachment。舊 VolumeAttachment 若仍有效，不能因為新 VolumeAttachment 或 Pod 看起來正常，就假設舊 host 已完成 fencing。`attached=true` 也不能取代 host mapping 查核。
 
-### 8.4 驗 host krbd，不輸出敏感 connection material
+### 8.4 確認 host krbd，避免輸出敏感連線資料
 
 先選出 VM node 上的 RBD CSI Pod，再在該 Pod 的 privileged plugin container 讀 host state：
 
@@ -545,9 +549,9 @@ cat "/sys/class/block/${RBDDISK}/queue/io_timeout"
 cat "/sys/class/block/${RBDDISK}/queue/nr_requests"
 ```
 
-Expected invariant：device identity 與 PV handle/image 對得上，且 major:minor 與 launcher `/dev/<volume>` 相同；`write_cache=write through`、`fua=0`；單 writer image 的 watcher／lock owner符合預期。不要把 `io_timeout=30000` 解讀成 request 30 秒後必定回錯。`config_info` 可能含 connection或credential material，本報告不建議直接輸出到共用 ticket／chat。
+應該看到：device identity 能對到 PV handle／image，major:minor 也與 launcher `/dev/<volume>` 相同；`write_cache=write through`、`fua=0`；single-writer image 的 watcher／lock owner 符合預期。`io_timeout=30000` 不代表 request 一定會在 30 秒後回錯。`config_info` 可能含連線或 credential 資料，不要直接貼到共用 ticket 或聊天頻道。
 
-### 8.5 guest filesystem 與 queue
+### 8.5 確認 guest filesystem 與 queue
 
 ```bash
 MNT=/
@@ -580,9 +584,9 @@ journalctl -k -b --no-pager |
   grep -E 'XFS .*Starting recovery|XFS .*Ending recovery|needs repair|Corruption|shut down|Log I/O'
 ```
 
-Expected invariant：driver 是 `virtio_blk`；ext4 effective mount沒有 `nobarrier`、`noload`、`data=writeback`、`errors=continue`；XFS 沒有 `needs repair`、corruption或 forced shutdown。`recovery complete`、`Starting recovery`、`Ending recovery` 本身可以是正常 unclean-shutdown recovery。
+應該看到：driver 是 `virtio_blk`；ext4 實際 mount option 沒有 `nobarrier`、`noload`、`data=writeback`、`errors=continue`；XFS 沒有 `needs repair`、corruption 或 forced shutdown。`recovery complete`、`Starting recovery`、`Ending recovery` 本身可能只是正常的斷電後 recovery，不能單獨當成結構損壞證據。
 
-### 8.6 驗 Ceph current write set 與 persistent path
+### 8.6 確認 Ceph 當下寫入成員與持久化路徑
 
 下列輸出留在受限的 incident bundle；`ceph health detail`、CRUSH tree、watcher／lock與硬體資訊可能含 hostname、IP、client ID、image或device識別資訊，貼到共用 ticket／chat 前必須遮蔽。設定只查 durability allowlist，不匯出全域 config。
 
@@ -612,7 +616,7 @@ for key in objectstore_blackhole \
 done
 ```
 
-Expected invariant：相關 PG 是 `active+clean`，沒有 `undersized`、`degraded`、`inconsistent`；`size`／`min_size` 符合核准政策；實際 RBD data object的acting OSD數量與host failure domain符合預期；steady state只有預期 writer／lock owner；OSD objectstore是BlueStore。
+應該看到：相關 PG 是 `active+clean`，沒有 `undersized`、`degraded`、`inconsistent`；`size`／`min_size` 符合核准政策；實際 RBD data object 的 acting OSD 數量與 host failure domain 符合預期；穩定狀態只有預期的 writer／lock owner；OSD objectstore 是 BlueStore。
 
 另外確認以下安全值：
 
@@ -623,7 +627,7 @@ bluestore_debug_omit_kv_commit = false
 bdev_inject_crash = 0
 ```
 
-`bluestore_rocksdb_options` 與 annex不得包含 `disableWAL=true`。這些檢查只證明software path沒有被debug／custom option繞過；media還要查：
+`bluestore_rocksdb_options` 與 annex 不得包含 `disableWAL=true`。這些檢查只能證明軟體路徑沒有被 debug／custom option 繞過；儲存硬體還要查：
 
 ```bash
 lsblk -o NAME,KNAME,TYPE,MODEL,ROTA,FSTYPE,MOUNTPOINTS
@@ -634,26 +638,26 @@ sudo smartctl -x /dev/<DEVICE> |
   grep -E 'Device Model|Model Number|Firmware Version|Write Cache|Power_Loss|Unsafe_Shutdowns'
 ```
 
-它們能盤點write cache、device identity、firmware與error state，但仍不能取代vendor PLP證明或非production power-cut實驗。
+這些資訊能盤點 write cache、device identity、firmware 與錯誤狀態，但不能取代供應商的 PLP 證明或非生產環境的斷電實驗。
 
-### 8.7 incident 發生時最小證據包
+### 8.7 事故發生時至少要保存什麼
 
-不做 repair 前先保存唯讀證據：
+執行 repair 前，先保存以下唯讀證據：
 
 1. VM/VMI/PVC/PV/VolumeAttachment JSON與事件時間線。
 2. virt-launcher domain XML、QMP `query-block`、QEMU/libvirt version。
-3. 新舊 node 的 RBD mapping、watcher／lock owner、kernel log。
-4. guest 前一次 boot與本次 boot的 kernel log；ext4/XFS mount failure原文。
-5. 在既有、已隔離的 image snapshot／clone 上執行 `fsck -n` 或 `xfs_repair -n` 的輸出；若尚無副本，建立 snapshot／clone 是另需授權的 production mutation。不要先對唯一副本做寫入式 repair。
-6. Ceph health detail、OSD slow/error log、blocklist與 image status，時間要與斷電／fencing／新 VMI啟動對齊。
+3. 新舊 node 的 RBD mapping、watcher／lock owner 與 kernel log。
+4. guest 前一次 boot 與本次 boot 的 kernel log，以及 ext4／XFS mount 失敗原文。
+5. 在既有、已隔離的 image snapshot／clone 上執行 `fsck -n` 或 `xfs_repair -n` 的輸出。若尚無副本，建立 snapshot／clone 是另一項需要授權的生產變更；不要先對唯一副本執行寫入式 repair。
+6. Ceph health detail、OSD slow／error log、blocklist 與 image status；時間要與斷電、fencing、新 VMI 啟動對齊。
 
-## 9. Source evidence ledger
+## 9. 原始碼證據 ledger
 
-這份 ledger 使用 upstream repository相對路徑；每列的 version 是證據的一部分。`source-proven` 只涵蓋「證明範圍」，不能拿來延伸成欄位中明列的限制之外。
+這裡保留完整代號，方便回查。路徑都是 upstream repository 的相對路徑，版本本身也是證據的一部分。`source-proven` 只代表原始碼能直接支持該列結論，不能跨過「限制」欄繼續延伸。
 
 ### 9.1 ext4、XFS、block layer、virtio與 krbd
 
-| ID | Claim | Component/version | Source anchor | Source 證明 | 限制 | Strength |
+| ID | 結論 | 元件／版本 | 原始碼位置 | 直接支持 | 限制 | 證據等級 |
 |---|---|---|---|---|---|---|
 | L-01 | ext4 default barrier on | Linux 6.8.0-52 | `fs/ext4/super.c:4358-4402` `ext4_set_def_opts` | mount初始化會設 barrier，除非 on-disk default覆寫 | effective mount仍可被 option覆寫 | source-proven |
 | L-02 | ext4 default通常是 `data=ordered` | Linux 6.8.0-52 | `fs/ext4/super.c:4933-4956` | journal有 revoke且未明示 mode時選 ordered | journal capability不同可能選 journal | source-proven |
@@ -665,7 +669,7 @@ sudo smartctl -x /dev/<DEVICE> |
 | L-08 | ext4 journal預設主要保護 metadata；writeback更弱 | Linux 6.8.0-52 | `Documentation/filesystems/ext4/journal.rst:6-35` | data modes的crash contract | bundled docs，不取代 application contract | documentation-supported |
 | L-09 | XFS `fsync` 等 data並同步 force log | Linux 6.8.0-52 | `fs/xfs/xfs_file.c:101-198` | file data與inode log ordering | 只涵蓋 fsync範圍 | source-proven |
 | L-10 | XFS同步 log I/O送 PREFLUSH/FUA | Linux 6.8.0-52 | `fs/xfs/xfs_log.c:1899-1933,3180-3248` | stable log force如何下到 block layer | backend必須履約 | source-proven |
-| L-11 | XFS沒有 `barrier`／`nobarrier` 旋鈕 | Linux 6.8.0-52 | `Documentation/admin-guide/xfs.rst:249-261`; `fs/xfs/xfs_super.c:98-150` | option已移除且 parser無欄位 | 不能用舊版文件下建議 | source-proven |
+| L-11 | XFS沒有 `barrier`／`nobarrier` 旋鈕 | Linux 6.8.0-52 | `Documentation/admin-guide/xfs.rst:249-261`; `fs/xfs/xfs_super.c:98-150` | option已移除且 parser無欄位 | 不能用舊版說明下建議 | source-proven |
 | L-12 | XFS dirty log做兩階段 recovery | Linux 6.8.0-52 | `fs/xfs/xfs_log_recover.c:3235-3303,3384-3515` | normal replay path與finish | 只 replay committed record | source-proven |
 | L-13 | XFS `needsrepair` 明確拒絕 mount | Linux 6.8.0-52 | `fs/xfs/xfs_super.c:1609-1613` | repair-required state回 `EFSCORRUPTED` | 不指向特定下層原因 | source-proven |
 | L-14 | XFS `norecovery` 必須 ro且可能不一致 | Linux 6.8.0-52 | `fs/xfs/xfs_super.c:1397-1405`; `Documentation/admin-guide/xfs.rst:152-164` | 跳過 log recovery的限制 | 只適合 offline鑑識 | source-proven |
@@ -683,9 +687,9 @@ sudo smartctl -x /dev/<DEVICE> |
 | L-26 | source changelog列入兩個RBD exclusive mapping修正 | Linux 6.8.0-52 | `debian/changelog:2303,2316-2317`; `drivers/block/rbd.c:4337-4358` | 這份Ubuntu source已含state-aware lock code | 不證明incident是同一個bug | source-proven |
 | L-27 | source changelog列入XFS legacy recovery與ext4 fast-commit修正 | Linux 6.8.0-52 | `debian/changelog:1594,2044` | package maintainer記錄fix已納入 | 缺upstream commit與incident signature，不作causal attribution | documentation-supported |
 
-### 9.2 KubeVirt、QEMU reference 與 virt-launcher
+### 9.2 KubeVirt、QEMU 參考版本與 virt-launcher
 
-| ID | Claim | Component/version | Source anchor | Source 證明 | 限制 | Strength |
+| ID | 結論 | 元件／版本 | 原始碼位置 | 直接支持 | 限制 | 證據等級 |
 |---|---|---|---|---|---|---|
 | K-01 | Block PVC進launcher `/dev/<volume>` | KubeVirt v1.6.4 | `pkg/virt-controller/services/rendervolumes.go:564-590` | compute container使用VolumeDevice | 不證明backend是krbd | source-proven |
 | K-02 | virt-launcher runtime確認block device | KubeVirt v1.6.4 | `pkg/virt-launcher/virtwrap/manager.go:999-1019,1671-1694` | `os.Stat`與block map | 現場path需runtime查 | source-proven |
@@ -706,11 +710,11 @@ sudo smartctl -x /dev/<DEVICE> |
 
 ### 9.3 Kubernetes、ceph-csi、Rook與 registrar
 
-| ID | Claim | Component/version | Source anchor | Source 證明 | 限制 | Strength |
+| ID | 結論 | 元件／版本 | 原始碼位置 | 直接支持 | 限制 | 證據等級 |
 |---|---|---|---|---|---|---|
 | C-01 | Rook defaults pin CSI v3.14、registrar v2.13、attacher v4.8 | Rook v1.17.2 | `pkg/operator/ceph/csi/spec.go:129-141` | source image defaults | runtime ConfigMap可覆寫 | source-proven |
 | C-02 | RBD attachRequired default true | Rook v1.17.2 | `pkg/operator/ceph/csi/csi.go:299-305`; `pkg/operator/ceph/csi/csidriver.go:35-60` | generated CSIDriver值 | runtime object才是現場事實 | source-proven |
-| C-03 | 關RWO attach有data-corruption warning | Rook v1.17.2 | `deploy/examples/operator.yaml:526-535` | upstream operator警告 | 文件警告不是單獨mechanism proof | documentation-supported |
+| C-03 | 關RWO attach有data-corruption warning | Rook v1.17.2 | `deploy/examples/operator.yaml:526-535` | upstream operator警告 | 說明中的警告不能單獨證明機制 | documentation-supported |
 | C-04 | registrar只有socket registration mounts/args | Rook v1.17.2 | `pkg/operator/ceph/csi/template/rbd/csi-rbdplugin.yaml:35-60` | generated sidecar responsibility | runtime pod可覆寫 | source-proven |
 | C-05 | 真正host access在csi-rbdplugin | Rook v1.17.2 | `pkg/operator/ceph/csi/template/rbd/csi-rbdplugin.yaml:61-124` | `/dev`,`/sys`,`/lib/modules`, kubelet mounts | 不證明每次map成功 | source-proven |
 | C-06 | ControllerPublish/Unpublish是NOOP | ceph-csi v3.14.0 | `internal/rbd/controllerserver.go:1672-1702` | controller attach不map/unmap | Kubernetes仍用VA sequencing | source-proven |
@@ -731,7 +735,7 @@ sudo smartctl -x /dev/<DEVICE> |
 
 ### 9.4 Ceph RBD／OSD／BlueStore
 
-| ID | Claim | Component/version | Source anchor | Source 證明 | 限制 | Strength |
+| ID | 結論 | 元件／版本 | 原始碼位置 | 直接支持 | 限制 | 證據等級 |
 |---|---|---|---|---|---|---|
 | O-01 | source版本是19.2.2 | Ceph v19.2.2 | `CMakeLists.txt:3-5` | project version字串 | commit由tag export外部釘定 | source-proven |
 | O-02 | protocol定義ACK/ONDISK want/is flags | Ceph v19.2.2 | `src/include/rados.h:447-455`; `src/messages/MOSDOpReply.h:51-57,143-153` | request/reply flag語意 | flag名不證明硬體NAND | source-proven |
@@ -758,70 +762,69 @@ sudo smartctl -x /dev/<DEVICE> |
 | O-23 | omit-kv與omit-block-write會繞過commit | Ceph v19.2.2 | `src/os/bluestore/BlueStore.cc:14044,14575,14871,16706` | debug bypass的實際branch | 僅在非default配置 | source-proven |
 | O-24 | blackhole/crash injection會丟I/O或注入crash | Ceph v19.2.2 | `src/blk/kernel/KernelDevice.cc:482-487,1017-1047,1064-1066` | debug failure path | 僅在非default配置 | source-proven |
 
-## 10. 已定位缺陷、版本差異與不該亂升級的地方
+## 10. 已知 bug 與版本缺口
 
-### 10.1 已有精確 source evidence
+### 10.1 已經確認的事
 
-1. **KubeVirt v1.6.4 cache backend分類 regression。** `SetDriverCacheMode` 對 `Source.Dev` 仍走 `CheckFile`；後續 main commit `d7c683cde613869fda86e333957976b6bba8faa6` 改用 `BackendIsBlock()`。目前沒有足夠tag/backport evidence聲稱哪個正式release已修，也沒有證據把它直接連到這次corruption。
-2. **Ubuntu kernel source已包含兩個RBD exclusive mapping修正。** changelog列出「don't assume lock owner／LOCKED state」；現有state-aware code在 `drivers/block/rbd.c:4337-4358`。它只能證明修正已存在，不能說incident就是同一個bug。
-3. **同一kernel changelog含XFS legacy recovery allocation與ext4 fast-commit replay修正。** 缺少incident signature、upstream commit與可重現case，因此不列為升級理由。
+1. **KubeVirt v1.6.4 的 cache backend 分類有 bug。** `SetDriverCacheMode` 遇到 `Source.Dev` 仍會走 `CheckFile`。upstream main 的 commit `d7c683cde613869fda86e333957976b6bba8faa6` 已改用 `BackendIsBlock()`。但目前不知道第一個納入修正的正式版本，也沒有證據顯示這個 bug 造成了本次損壞。
+2. **Ubuntu kernel 原始碼已包含兩個 RBD exclusive mapping 修正。** changelog 提到「don't assume lock owner／LOCKED state」，目前的 state-aware code 位於 `drivers/block/rbd.c:4337-4358`。這只能證明修正已經存在，不能反推本次事故就是同一個 bug。
+3. **同一份 kernel changelog 還有 XFS legacy recovery allocation 與 ext4 fast-commit replay 修正。** 目前缺少事故特徵、對應的 upstream commit 與可重現案例，因此不能拿它們當成升級理由。
 
-### 10.2 不足以聲稱已修的項目
+### 10.2 還不能說哪個版本已經修好
 
-- production QEMU/libvirt版本未知；不能拿QEMU v9.1.0 reference替它下verdict。
-- external-attacher v4.8.0 source未納入，finalizer字串、加入／移除與retry細節不能由Kubernetes API type反推。
-- 未做Ceph v19.2.2到後續Squid patch release的durability diff。
-- 未取得production corruption signature；不能把「kernel／Ceph升級」列成無條件解法。
+- 生產環境的 QEMU／libvirt 版本未知，不能用 QEMU v9.1.0 的參考原始碼替現場下結論。
+- 本次沒有納入 external-attacher v4.8.0 原始碼，不能從 Kubernetes API type 反推 finalizer 字串、加入／移除時機與 retry 細節。
+- 尚未比較 Ceph v19.2.2 與後續 Squid patch release 的持久化路徑差異。
+- 尚未取得生產事故的精確損壞特徵，不能把「升級 kernel／Ceph」列成無條件解法。
 
-升級要進mandatory前，至少要有「incident錯誤訊息／stack或on-disk signature → exact upstream issue/commit → first fixed release/backport → 相同path驗證」四段證據。
+要把升級列為必要措施，至少要串起四段證據：事故的錯誤訊息、stack 或 on-disk 特徵 → 對應的 upstream issue／commit → 第一個修正版或 backport → 在相同路徑完成驗證。
 
-## 11. Residual risk 與 open findings
+## 11. 這份報告還不能回答什麼
 
-即使矩陣中的mandatory項目全部成立，仍有以下無法由參數消除的風險：
+即使 §7.1 全部符合，以下風險仍不能靠調一個參數消除：
 
-1. application沒有正確使用`fsync`／WAL protocol，或錯誤處理ambiguous completion。
-2. production QEMU/libvirt block graph與KubeVirt期待不同，或現場有sidecar／hook改寫domain。
-3. device firmware、RAID controller、hypervisor或NVMe write cache謊報flush completion，且沒有PLP／BBU。
-4. 未fenced node在partition恢復後重新取得network與write能力；exclusive-lock/watch/blocklist交接有時間窗。
-5. kernel、QEMU、libvirt、Ceph未識別bug；目前source trace只能說明contract，不能證明實作無缺陷。
-6. degraded PG在`min_size`允許下持續write，成功write的replica數少於target `size`。
-7. repair工具先寫回唯一image而沒有snapshot，破壞後續root-cause鑑識。
+1. 應用程式沒有正確使用 `fsync`／WAL protocol，或沒有處理「送出成功但回覆遺失」這種不確定狀態。
+2. 生產環境的 QEMU／libvirt block graph 與 KubeVirt 預期不同，或被 sidecar／hook 改寫 domain。
+3. device firmware、RAID controller、hypervisor 或 NVMe write cache 提早回覆 flush completion，而且沒有 PLP／BBU。
+4. 未完成 fencing 的 node 在 partition 恢復後重新取得網路與寫入能力；exclusive-lock、watch、blocklist 交接本身有時間窗。
+5. kernel、QEMU、libvirt 或 Ceph 仍有未知 bug。原始碼追查能說明正常約定，不能證明實作完全沒有缺陷。
+6. PG degraded 時，`min_size` 仍允許寫入；此時成功寫入的 replica 數可能低於目標 `size`。
+7. repair 工具先寫回唯一 image，卻沒有 snapshot，導致後續無法鑑識根因。
 
-目前必須保留的open findings：
+還缺以下現場證據：
 
-- guest與host是否都真的是Ubuntu kernel 6.8.0-52.53。
-- 每顆root/data disk的effective bus/cache/io、QEMU/libvirt版本與block graph。
-- host backend是否全為krbd，是否有volume偷偷走rbd-nbd或userspace librbd。
-- incident當時舊node是否確實完成fencing；新舊node的VA、watcher、lock與blocklist時間線。
-- pool `size`／`min_size`、CRUSH failure domain、實際acting set、OSD store layout與media cache/PLP。
-- ext4／XFS exact mount options、repair-required signature與offline no-write checker輸出。
-- application是否對聲稱已提交的資料使用正確durability API。
+- guest 與 host 是否真的都使用 Ubuntu kernel 6.8.0-52.53。
+- 系統碟與每顆資料碟實際的 bus／cache／io、QEMU／libvirt 版本與 block graph。
+- host backend 是否全為 krbd，有沒有 volume 走 rbd-nbd 或 userspace librbd。
+- 事故當下舊 node 是否確實完成 fencing，以及新舊 node 的 VolumeAttachment、watcher、lock、blocklist 時間線。
+- pool `size`／`min_size`、CRUSH failure domain、實際 acting set、OSD store layout 與 media cache／PLP。
+- ext4／XFS 實際 mount option、需要 repair 的精確訊息，以及離線唯讀 checker 輸出。
+- 應用程式是否對聲稱已提交的資料使用正確的持久化 API。
 
-## 12. Ordered production checklist
+## 12. 建議執行順序
 
-這是建議直接採用的順序；本報告提供的命令全部唯讀。任何 snapshot／clone、設定變更或重啟都必須另行核准，不包含在本次執行範圍：
+以下命令與查核都是唯讀。snapshot／clone、設定變更與重新啟動都要另外核准，不在本次執行範圍內。
 
-1. **唯讀核對restart gate**：確認HA流程把hardware fencing success放在new VMI creation之前；若不符合，另開核准的change workflow，本報告不替你修改或凍結production流程。
-2. **匯出現況**：保存VM/VMI/PVC/PV/StorageClass/CSIDriver/VolumeAttachment與Rook CSI workload JSON。
-3. **逐顆對盤**：root與每顆data disk從VMI name一路對到domain XML、QMP block node、launcher `/dev/<volume>`、host `rbdN`與RBD image。
-4. **查effective cache**：記錄production QEMU/libvirt version；確認Block PVC沒有意外落到host-page-cache writeback或unsafe/no-flush語意。
-5. **查guest recovery contract**：ext4保留barrier/ordered/remount-ro；XFS不用`norecovery`；保存本次與前次boot kernel log。
-6. **查single-writer**：`attachRequired=true`；active RWO PV沒有第二個成功VA；新舊node watcher／lock／mapping與fencing時間線一致。
-7. **查krbd contract**：host queue為`write through,fua=0`，identity與image對得上；不要把generic `io_timeout`當abort保證。
-8. **查Ceph current write set**：pool policy、PG state、acting OSD與CRUSH failure domain符合核准值；確認debug durability bypass全關。
-9. **查media boundary**：保存OSD device model、firmware、controller cache與PLP/BBU證明；沒有就列為風險，不能用`HEALTH_OK`掩蓋。
-10. **保存corruption evidence**：優先使用事前snapshot／已隔離clone跑只讀checker；若沒有副本，先取得建立snapshot／clone的變更授權。保留exact error與time correlation，之後才決定repair。
-11. **只針對已證明缺口變更**：例如effective cache drift、unsafe mount、attachRequired錯誤、pool policy或硬體不符合；每項獨立change與rollback。
-12. **其餘進lab**：QEMU mode、timeout、`min_size=size`、kernel/Ceph upgrade、rbd-nbd等都先做可回退、prediction-first實驗，不直接在production試。
+1. **先核對 restart 條件**：確認 HA 流程一定先收到 hardware fencing 成功，再建立新的 VMI。若流程不符合，另開變更工作；本報告不會替現場修改或凍結生產流程。
+2. **匯出現況**：保存 VM、VMI、PVC、PV、StorageClass、CSIDriver、VolumeAttachment 與 Rook CSI workload JSON。
+3. **逐顆對盤**：從 VMI name 一路對到 domain XML、QMP block node、launcher `/dev/<volume>`、host `rbdN` 與 RBD image；系統碟和每顆資料碟都要查。
+4. **查實際 cache**：記錄生產環境的 QEMU／libvirt 版本；確認 Block PVC 沒有意外使用 host page cache 的 writeback，或任何 unsafe／no-flush 語意。
+5. **查 guest recovery 約定**：ext4 保留 barrier、ordered、remount-ro；XFS 不使用 `norecovery`；保存本次與前次 boot 的 kernel log。
+6. **查 single-writer**：`attachRequired=true`；使用中的 RWO PV 沒有第二個成功的 VolumeAttachment；新舊 node 的 watcher、lock、mapping 與 fencing 時間線一致。
+7. **查 krbd**：host queue 是 `write through,fua=0`，device identity 能對到 image；不要把通用的 `io_timeout` 當成中止 request 的保證。
+8. **查 Ceph 當下寫入成員**：pool policy、PG state、acting OSD 與 CRUSH failure domain 符合核准值，持久化除錯 bypass 全部關閉。
+9. **查實體儲存界線**：保存 OSD device 型號、firmware、controller cache 與 PLP／BBU 證明。缺少證據就列為風險，不能用 `HEALTH_OK` 帶過。
+10. **保存損壞證據**：優先在事前 snapshot 或已隔離 clone 上跑唯讀 checker。若沒有副本，先取得建立 snapshot／clone 的變更授權。保留原始錯誤與時間關係，再決定是否 repair。
+11. **只修已證明的缺口**：例如實際 cache 與預期不符、不安全的 mount option、`attachRequired` 錯誤、pool policy 或硬體不符合。每項變更都要能獨立回退。
+12. **其他項目先進 lab**：QEMU mode、timeout、`min_size=size`、kernel／Ceph 升級、rbd-nbd 都要先做可回退且事前寫明預期結果的實驗，不要直接在生產環境嘗試。
 
-## 13. 最終判定
+## 13. 最後判斷
 
-這份exact-version source review沒有找到一個「只要改這個參數就能保證不再corruption」的旋鈕。相反地，它把問題縮成兩個production gate與三個evidence gap：
+沒有任何單一參數可以保證 ext4／XFS 不再損壞。生產流程真正不能退讓的只有兩件事：
 
-- Gate 1：**fencing完成前絕不建立第二個writer**。
-- Gate 2：**guest durability operation必須一路對到Ceph all-current-participants ONDISK commit**。
-- Gap 1：production QEMU/libvirt effective block graph尚未讀取。
-- Gap 2：incident當下的新舊node mapping／watcher／lock／fencing時間線尚未保存。
-- Gap 3：OSD media是否誠實履行flush／具PLP尚未證明。
+1. fencing 完成前，絕不能讓第二個 writer 啟動。
+2. guest 的持久化操作必須保留 flush／FUA 語意，一路走到 Ceph 對當下所有 acting OSD 完成 ONDISK commit。
 
-只要這三個gap尚未補齊，就不能把repair-required ext4／XFS corruption歸因於「正常斷電」，也不能把任一timeout、CSI sidecar或performance knob包裝成修復。完整性優先的正確下一步是完成本報告的唯讀稽核，依證據找出斷掉的hop，再把有風險的變更帶到隔離lab驗證。
+目前仍缺三塊關鍵證據：生產環境實際的 QEMU／libvirt block graph；事故當下新舊 node 的 mapping、watcher、lock 與 fencing 時間線；OSD media 是否真的履行 flush，或具備 PLP。
+
+這三塊補齊前，不能把需要 repair 的 ext4／XFS 損壞說成「正常斷電」，也不能把 timeout、CSI sidecar 或效能調校包裝成修復。下一步是完成 §8 的唯讀檢查，找出寫入路徑在哪一層失去保證，再把需要變更的項目帶到隔離 lab 驗證。
